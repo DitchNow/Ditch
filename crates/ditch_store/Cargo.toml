@@ -1,0 +1,10 @@
+[package]
+name = "ditch_store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ditch_core.workspace = true
+serde.workspace = true
+thiserror.workspace = true

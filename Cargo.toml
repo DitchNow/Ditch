@@ -1,0 +1,31 @@
+[workspace]
+members = [
+  "crates/ditch_agents",
+  "crates/ditch_cli",
+  "crates/ditch_core",
+  "crates/ditch_orchestrator",
+  "crates/ditch_protocol",
+  "crates/ditch_runtime",
+  "crates/ditch_store",
+  "crates/ditchd",
+]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+license = "UNLICENSED"
+version = "0.1.0"
+
+[workspace.dependencies]
+ditch_agents = { path = "crates/ditch_agents" }
+ditch_core = { path = "crates/ditch_core" }
+ditch_orchestrator = { path = "crates/ditch_orchestrator" }
+ditch_protocol = { path = "crates/ditch_protocol" }
+ditch_runtime = { path = "crates/ditch_runtime" }
+ditch_store = { path = "crates/ditch_store" }
+
+chrono = { version = "0.4.42", features = ["serde"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+thiserror = "2.0.17"
+uuid = { version = "1.19.0", features = ["serde", "v4"] }

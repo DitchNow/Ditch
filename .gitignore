@@ -1,0 +1,17 @@
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.packages
+build/
+target/
+
+*.iml
+*.log
+
+apps/macos/macos/Flutter/ephemeral/
+apps/macos/macos/Pods/
+!.ditch/
+!.ditch/agents/
+!.ditch/hooks/
+!.ditch/mcp/
+!.ditch/**/.gitkeep

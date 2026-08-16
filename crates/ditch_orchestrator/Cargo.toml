@@ -1,0 +1,13 @@
+[package]
+name = "ditch_orchestrator"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+chrono.workspace = true
+ditch_agents.workspace = true
+ditch_core.workspace = true
+ditch_runtime.workspace = true
+serde.workspace = true
+thiserror.workspace = true
