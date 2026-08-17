@@ -52,6 +52,7 @@ where
             task_id: request.task_id,
             pane_id: Some(pane.id),
             native_session_id: None,
+            origin_codex_home: None,
             current_prompt: Some(request.prompt),
             last_visible_action: None,
             state_confidence: 0.35,

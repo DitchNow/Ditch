@@ -107,6 +107,32 @@ void main() {
     expect(find.text('Codex started'), findsNothing);
   });
 
+  testWidgets('a project without saved sessions shows a ready agent card', (
+    tester,
+  ) async {
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: AgentsSurface(
+            sessions: const [],
+            expandedAgentLocalId: null,
+            chatController: ScrollController(),
+            composerKey: GlobalKey<AgentComposerState>(),
+            initialPrompt: 'Start here',
+            onStartCodex: () {},
+            onStartPrompt: (_) {},
+            onSubmitPrompt: (_, _) {},
+            onStopCodex: (_) {},
+            onToggleExpanded: (_) {},
+          ),
+        ),
+      ),
+    );
+
+    expect(find.byKey(const Key('ready-agent-card')), findsOneWidget);
+    expect(find.text('Ready for a new prompt'), findsOneWidget);
+  });
+
   testWidgets('attention cards expose session actions', (tester) async {
     var opened = false;
     var dismissed = false;

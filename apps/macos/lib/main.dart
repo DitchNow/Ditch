@@ -87,6 +87,7 @@ class AgentSession {
     required this.messages,
     this.projectId,
     this.codexThreadId,
+    this.originCodexHome,
     this.currentPrompt,
     this.lastVisibleAction,
     DateTime? createdAt,
@@ -100,6 +101,7 @@ class AgentSession {
   final DateTime createdAt;
   AgentStatus status;
   String? codexThreadId;
+  final String? originCodexHome;
   String? currentPrompt;
   String? lastVisibleAction;
   DateTime updatedAt;
@@ -458,6 +460,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
   bool _runtimeReconnectScheduled = false;
   bool _runtimeHomeMismatchReported = false;
   bool _runtimeCodexHomeMatches = true;
+  String? _effectiveRuntimeCodexHome;
   bool _legacyRecoveryChecked = false;
   int _selectedProjectIndex = 0;
   String? _expandedAgentLocalId = 'agent-0';
@@ -538,15 +541,6 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
     } on Object {
       // Quit should still close the control surface if the runtime is absent.
     }
-  }
-
-  AgentSession? get _expandedSession {
-    final expandedId = _expandedAgentLocalId;
-    if (expandedId == null) {
-      return null;
-    }
-    final session = _agentSessionByLocalId(expandedId);
-    return _visibleSessions.contains(session) ? session : null;
   }
 
   AgentSession? _agentSessionByLocalId(String localId) {
@@ -635,10 +629,12 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
         unawaited(_offerLegacyProjectRecovery());
       }
     } on Object catch (error) {
-      _addChatMessage(
-        _expandedSession ?? _agentSessions.first,
-        ChatMessageRole.system,
-        'The Ditch Runtime is not connected: $error',
+      _addAttentionRequired(
+        kind: AttentionKind.failed,
+        icon: Icons.cloud_off_outlined,
+        title: 'Runtime not connected',
+        body: '$error',
+        global: true,
       );
     }
   }
@@ -646,6 +642,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
   void _checkRuntimeCodexHome(Map<String, dynamic> status) {
     final requested = Platform.environment['CODEX_HOME'];
     final effective = status['codex_home']?.toString();
+    _effectiveRuntimeCodexHome = effective;
     if (requested == null || requested.isEmpty || effective == requested) {
       _runtimeHomeMismatchReported = false;
       _runtimeCodexHomeMatches = true;
@@ -1137,6 +1134,20 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
       return;
     }
 
+    if (session.originCodexHome != null &&
+        _effectiveRuntimeCodexHome != null &&
+        session.originCodexHome != _effectiveRuntimeCodexHome) {
+      _addAttentionRequired(
+        kind: AttentionKind.failed,
+        sessionLocalId: session.localId,
+        icon: Icons.account_circle_outlined,
+        title: 'Resume requires the original Codex home',
+        body:
+            'This session used ${session.originCodexHome}, while the runtime currently uses $_effectiveRuntimeCodexHome. Its history remains available; start a new agent to use the current Codex account.',
+      );
+      return;
+    }
+
     if (session.status == AgentStatus.failed ||
         session.status == AgentStatus.stopped) {
       await _resumeCodexRuntime(session, cleanPrompt);
@@ -1447,6 +1458,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
             ]
           : List<AgentChatMessage>.from(messages),
       codexThreadId: agentJson['native_session_id']?.toString(),
+      originCodexHome: agentJson['origin_codex_home']?.toString(),
       currentPrompt: agentJson['current_prompt']?.toString(),
       lastVisibleAction: agentJson['last_visible_action']?.toString(),
       createdAt: _dateTimeFromRuntime(agentJson['started_at']),
@@ -1603,7 +1615,9 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
                 chatController: _chatController,
                 composerKey: _composerKey,
                 initialPrompt: _defaultStartPrompt,
+                effectiveCodexHome: _effectiveRuntimeCodexHome,
                 onStartCodex: _startCodex,
+                onStartPrompt: _startCodexRuntime,
                 onSubmitPrompt: _submitComposer,
                 onStopCodex: _stopCodex,
                 onToggleExpanded: (session) {
@@ -1794,7 +1808,9 @@ class AgentsSurface extends StatelessWidget {
     required this.chatController,
     required this.composerKey,
     required this.initialPrompt,
+    this.effectiveCodexHome,
     required this.onStartCodex,
+    this.onStartPrompt,
     required this.onSubmitPrompt,
     required this.onStopCodex,
     required this.onToggleExpanded,
@@ -1806,7 +1822,9 @@ class AgentsSurface extends StatelessWidget {
   final ScrollController chatController;
   final GlobalKey<AgentComposerState> composerKey;
   final String initialPrompt;
+  final String? effectiveCodexHome;
   final VoidCallback onStartCodex;
+  final ValueChanged<String>? onStartPrompt;
   final void Function(AgentSession session, String prompt) onSubmitPrompt;
   final ValueChanged<AgentSession> onStopCodex;
   final ValueChanged<AgentSession> onToggleExpanded;
@@ -1842,6 +1860,8 @@ class AgentsSurface extends StatelessWidget {
                 chatController: chatController,
                 composerKey: composerKey,
                 initialPrompt: initialPrompt,
+                effectiveCodexHome: effectiveCodexHome,
+                onStartPrompt: onStartPrompt ?? (_) {},
                 onToggleExpanded: onToggleExpanded,
                 onSubmitPrompt: onSubmitPrompt,
                 onStopCodex: onStopCodex,
@@ -1861,6 +1881,8 @@ class AgentSessionList extends StatelessWidget {
     required this.chatController,
     required this.composerKey,
     required this.initialPrompt,
+    this.effectiveCodexHome,
+    required this.onStartPrompt,
     required this.onToggleExpanded,
     required this.onSubmitPrompt,
     required this.onStopCodex,
@@ -1872,12 +1894,57 @@ class AgentSessionList extends StatelessWidget {
   final ScrollController chatController;
   final GlobalKey<AgentComposerState> composerKey;
   final String initialPrompt;
+  final String? effectiveCodexHome;
+  final ValueChanged<String> onStartPrompt;
   final ValueChanged<AgentSession> onToggleExpanded;
   final void Function(AgentSession session, String prompt) onSubmitPrompt;
   final ValueChanged<AgentSession> onStopCodex;
 
   @override
   Widget build(BuildContext context) {
+    if (sessions.isEmpty) {
+      final colors = Theme.of(context).colorScheme;
+      return DecoratedBox(
+        key: const Key('ready-agent-card'),
+        decoration: BoxDecoration(
+          border: Border.all(color: colors.outlineVariant),
+          borderRadius: BorderRadius.circular(8),
+        ),
+        child: Padding(
+          padding: const EdgeInsets.all(12),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Row(
+                children: [
+                  Icon(Icons.memory, size: 24),
+                  SizedBox(width: 12),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [Text('Codex'), Text('Ready for a new prompt')],
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 12),
+              Expanded(
+                child: AgentChatPanel(
+                  messages: const [],
+                  controller: chatController,
+                  composerKey: composerKey,
+                  initialPrompt: initialPrompt,
+                  hasSession: false,
+                  isWorking: false,
+                  onSubmitPrompt: onStartPrompt,
+                  onStopCodex: () {},
+                ),
+              ),
+            ],
+          ),
+        ),
+      );
+    }
     return ListView.separated(
       itemCount: sessions.length,
       separatorBuilder: (_, _) => const SizedBox(height: 12),
@@ -1890,6 +1957,7 @@ class AgentSessionList extends StatelessWidget {
           chatController: expanded ? chatController : null,
           composerKey: expanded ? composerKey : null,
           initialPrompt: initialPrompt,
+          effectiveCodexHome: effectiveCodexHome,
           onTap: () => onToggleExpanded(session),
           onSubmitPrompt: (prompt) => onSubmitPrompt(session, prompt),
           onStopCodex: () => onStopCodex(session),
@@ -1906,6 +1974,7 @@ class ExpandableAgentPanel extends StatelessWidget {
     required this.chatController,
     required this.composerKey,
     required this.initialPrompt,
+    this.effectiveCodexHome,
     required this.onTap,
     required this.onSubmitPrompt,
     required this.onStopCodex,
@@ -1917,6 +1986,7 @@ class ExpandableAgentPanel extends StatelessWidget {
   final ScrollController? chatController;
   final GlobalKey<AgentComposerState>? composerKey;
   final String initialPrompt;
+  final String? effectiveCodexHome;
   final VoidCallback onTap;
   final ValueChanged<String> onSubmitPrompt;
   final VoidCallback onStopCodex;
@@ -1924,6 +1994,10 @@ class ExpandableAgentPanel extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final colors = Theme.of(context).colorScheme;
+    final resumeBlocked = session.hasCodexThread &&
+        session.originCodexHome != null &&
+        effectiveCodexHome != null &&
+        session.originCodexHome != effectiveCodexHome;
 
     return LayoutBuilder(
       builder: (context, constraints) {
@@ -2026,6 +2100,10 @@ class ExpandableAgentPanel extends StatelessWidget {
                             : initialPrompt,
                         hasSession: session.hasCodexThread,
                         isWorking: session.isWorking,
+                        enabled: !resumeBlocked,
+                        disabledMessage: resumeBlocked
+                            ? 'This session used ${session.originCodexHome}. Switch the runtime to that CODEX_HOME to resume it, or start a new agent.'
+                            : null,
                         onSubmitPrompt: onSubmitPrompt,
                         onStopCodex: onStopCodex,
                       ),
@@ -2065,6 +2143,8 @@ class AgentChatPanel extends StatelessWidget {
     required this.initialPrompt,
     required this.hasSession,
     required this.isWorking,
+    this.enabled = true,
+    this.disabledMessage,
     required this.onSubmitPrompt,
     required this.onStopCodex,
     super.key,
@@ -2076,6 +2156,8 @@ class AgentChatPanel extends StatelessWidget {
   final String initialPrompt;
   final bool hasSession;
   final bool isWorking;
+  final bool enabled;
+  final String? disabledMessage;
   final ValueChanged<String> onSubmitPrompt;
   final VoidCallback onStopCodex;
 
@@ -2107,11 +2189,17 @@ class AgentChatPanel extends StatelessWidget {
           ),
           const Divider(height: 1),
           ThinkingStatusStrip(visible: isWorking),
+          if (disabledMessage != null)
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
+              child: Text(disabledMessage!),
+            ),
           AgentComposer(
             key: composerKey,
             initialText: initialPrompt,
             hasSession: hasSession,
             isWorking: isWorking,
+            enabled: enabled,
             onSubmit: onSubmitPrompt,
             onStop: onStopCodex,
           ),
@@ -2210,6 +2298,7 @@ class AgentComposer extends StatefulWidget {
     required this.initialText,
     required this.hasSession,
     required this.isWorking,
+    this.enabled = true,
     required this.onSubmit,
     required this.onStop,
     super.key,
@@ -2218,6 +2307,7 @@ class AgentComposer extends StatefulWidget {
   final String initialText;
   final bool hasSession;
   final bool isWorking;
+  final bool enabled;
   final ValueChanged<String> onSubmit;
   final VoidCallback onStop;
 
@@ -2253,7 +2343,7 @@ class AgentComposerState extends State<AgentComposer> {
   }
 
   Future<void> submit() async {
-    if (widget.isWorking) {
+    if (!widget.enabled || widget.isWorking) {
       return;
     }
 
@@ -2282,7 +2372,7 @@ class AgentComposerState extends State<AgentComposer> {
     final hasText = _draftText.trim().isNotEmpty;
     final actionLabel = widget.hasSession ? 'Send' : 'Start';
     final actionIcon = widget.hasSession ? Icons.send : Icons.play_arrow;
-    final enabled = !widget.isWorking;
+    final enabled = widget.enabled && !widget.isWorking;
 
     return Padding(
       padding: const EdgeInsets.all(12),

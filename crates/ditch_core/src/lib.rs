@@ -164,6 +164,8 @@ pub struct AgentRun {
     pub task_id: Option<TaskId>,
     pub pane_id: Option<RuntimePaneId>,
     pub native_session_id: Option<String>,
+    #[serde(default)]
+    pub origin_codex_home: Option<String>,
     pub current_prompt: Option<String>,
     pub last_visible_action: Option<String>,
     pub state_confidence: f32,

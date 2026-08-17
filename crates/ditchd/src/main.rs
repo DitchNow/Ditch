@@ -8,8 +8,8 @@ use ditch_protocol::{
     RuntimeAttention, RuntimeStatus, ServerEvent, ServerResponse, Snapshot,
 };
 use ditch_store::{
-    discover_legacy_projects, ensure_app_dirs, ensure_project_metadata, load_project_config,
-    load_project_registry, save_project_config, save_project_registry,
+    DitchStore, discover_legacy_projects, ensure_app_dirs, ensure_project_metadata,
+    load_project_config, save_project_config,
 };
 use serde_json::Value;
 use std::collections::HashMap;
@@ -34,6 +34,7 @@ fn main() {
 
 struct RuntimeState {
     paths: AppPaths,
+    store: DitchStore,
     projects: HashMap<String, Project>,
     agents: HashMap<AgentId, AgentRecord>,
     children: HashMap<AgentId, Arc<Mutex<Child>>>,
@@ -55,27 +56,50 @@ struct AgentRecord {
 }
 
 impl RuntimeState {
-    fn new(paths: AppPaths) -> Self {
-        let projects = load_project_registry(&paths)
-            .unwrap_or_default()
+    fn new(paths: AppPaths) -> Result<Self, ditch_store::StoreError> {
+        let mut store = DitchStore::open(&paths)?;
+        store.reconcile_active_agents()?;
+        let durable = store.load()?;
+        let projects = durable
+            .projects
             .into_iter()
             .map(|project| (project.root_key(), project))
+            .collect::<HashMap<_, _>>();
+        let agents = durable
+            .agents
+            .into_iter()
+            .filter_map(|agent| {
+                let project = projects
+                    .values()
+                    .find(|project| project.id == agent.run.project_id)?;
+                Some((
+                    agent.run.id,
+                    AgentRecord {
+                        run: agent.run,
+                        project_root: project.root.clone(),
+                        allow_non_git: project.git_policy == ProjectGitPolicy::AllowOutsideGit,
+                        messages: agent.messages,
+                        terminal_failure: agent.terminal_failure,
+                    },
+                ))
+            })
             .collect();
         let codex_home = std::env::var_os("CODEX_HOME").map(PathBuf::from);
         let codex_binary = find_binary("codex");
-        Self {
+        Ok(Self {
             paths,
+            store,
             projects,
-            agents: HashMap::new(),
+            agents,
             children: HashMap::new(),
             subscribers: Vec::new(),
             next_sequence: 1,
             instance_id: uuid::Uuid::new_v4(),
-            attention: Vec::new(),
+            attention: durable.attention,
             started_at: Utc::now(),
             codex_home,
             codex_binary,
-        }
+        })
     }
 
     fn runtime_status(&self) -> RuntimeStatus {
@@ -142,6 +166,30 @@ impl RuntimeState {
         }
         self.subscribers = live;
     }
+
+    fn persist_agent(&mut self, agent_id: AgentId) {
+        let Some(record) = self.agents.get(&agent_id) else {
+            return;
+        };
+        let run = record.run.clone();
+        let failure = record.terminal_failure.clone();
+        let home = self
+            .codex_home
+            .as_ref()
+            .map(|value| value.to_string_lossy().into_owned());
+        if let Err(error) = self
+            .store
+            .upsert_agent(&run, failure.as_deref(), home.as_deref())
+        {
+            eprintln!("{RUNTIME_IDENTITY} failed to persist agent {agent_id:?}: {error}");
+        }
+    }
+
+    fn persist_message(&mut self, message: &AgentChatMessage) {
+        if let Err(error) = self.store.append_message(message) {
+            eprintln!("{RUNTIME_IDENTITY} failed to persist message: {error}");
+        }
+    }
 }
 
 #[derive(serde::Serialize)]
@@ -153,7 +201,9 @@ struct SequencedEvent {
 fn serve(paths: AppPaths) -> io::Result<()> {
     remove_stale_socket(&paths.socket_path)?;
     let listener = UnixListener::bind(&paths.socket_path)?;
-    let state = Arc::new(Mutex::new(RuntimeState::new(paths)));
+    let state = Arc::new(Mutex::new(
+        RuntimeState::new(paths).map_err(io::Error::other)?,
+    ));
 
     for stream in listener.incoming() {
         let stream = stream?;
@@ -322,12 +372,10 @@ fn handle_request(request: ClientRequest, state: Arc<Mutex<RuntimeState>>) -> Se
             let mut state = state
                 .lock()
                 .expect("runtime state lock should not be poisoned");
-            state.projects.insert(project.root_key(), project.clone());
-            let projects = state.projects.values().cloned().collect::<Vec<_>>();
-            if let Err(error) = save_project_registry(&state.paths, &projects) {
-                state.projects.remove(&project.root_key());
-                return protocol_error("project_registry_failed", error.to_string());
+            if let Err(error) = state.store.upsert_project(&project) {
+                return protocol_error("project_store_failed", error.to_string());
             }
+            state.projects.insert(project.root_key(), project.clone());
             state.broadcast(ServerEvent::ProjectChanged(project.clone()));
             ServerResponse::ProjectCreated(project)
         }
@@ -349,6 +397,9 @@ fn handle_request(request: ClientRequest, state: Arc<Mutex<RuntimeState>>) -> Se
             let mut state = state
                 .lock()
                 .expect("runtime state lock should not be poisoned");
+            if let Err(error) = state.store.dismiss_attention(attention_id) {
+                return protocol_error("attention_store_failed", error.to_string());
+            }
             state.attention.retain(|item| item.id != attention_id);
             state.broadcast(ServerEvent::AttentionDismissed { attention_id });
             ServerResponse::Accepted
@@ -375,6 +426,7 @@ fn shutdown_runtime(state: Arc<Mutex<RuntimeState>>) -> ServerResponse {
                 .expect("child lock should not be poisoned")
                 .kill();
         }
+        let mut changed = Vec::new();
         for record in state.agents.values_mut() {
             if matches!(
                 record.run.state,
@@ -386,7 +438,11 @@ fn shutdown_runtime(state: Arc<Mutex<RuntimeState>>) -> ServerResponse {
                 record.run.state = AgentState::Interrupted;
                 record.run.last_visible_action = Some("Runtime stopped by user".to_owned());
                 record.run.updated_at = Utc::now();
+                changed.push(record.run.id);
             }
+        }
+        for agent_id in changed {
+            state.persist_agent(agent_id);
         }
         state.paths.socket_path.clone()
     };
@@ -407,10 +463,6 @@ fn start_codex_session(
     prompt: String,
     mode: CodexLaunchMode,
 ) -> ServerResponse {
-    let Some(binary) = find_binary("codex") else {
-        return protocol_error("codex_not_found", "codex binary was not found on PATH");
-    };
-
     let project = project_for_launch(&state, project_name, project_root);
     if let Err(error) = ensure_project_metadata(&project) {
         return protocol_error("project_metadata_failed", error.to_string());
@@ -426,6 +478,7 @@ fn start_codex_session(
         task_id: None,
         pane_id: None,
         native_session_id: None,
+        origin_codex_home: std::env::var("CODEX_HOME").ok(),
         current_prompt: Some(prompt.clone()),
         last_visible_action: Some("Starting Codex".to_owned()),
         state_confidence: 0.8,
@@ -438,30 +491,67 @@ fn start_codex_session(
         return error;
     }
     let allow_non_git = project.git_policy == ProjectGitPolicy::AllowOutsideGit;
+    let user_message = AgentChatMessage {
+        agent_id: run.id,
+        role: AgentChatRole::User,
+        text: prompt.clone(),
+        created_at: Utc::now(),
+    };
+    let Some(binary) = find_binary("codex") else {
+        return persist_launch_failure(
+            &state,
+            project,
+            run,
+            user_message,
+            allow_non_git,
+            "Codex binary was not found on PATH".to_owned(),
+        );
+    };
     let child = match spawn_codex_child(&binary, &project.root, &prompt, &mode, None, allow_non_git)
     {
         Ok(child) => Arc::new(Mutex::new(child)),
-        Err(error) => return protocol_error("codex_start_failed", error.to_string()),
+        Err(error) => {
+            return persist_launch_failure(
+                &state,
+                project,
+                run,
+                user_message,
+                allow_non_git,
+                error.to_string(),
+            );
+        }
     };
 
     run.state = AgentState::Working;
     run.updated_at = Utc::now();
     run.state_evidence = "Codex process is running under The Ditch Runtime.".to_owned();
 
-    let user_message = AgentChatMessage {
-        agent_id: run.id,
-        role: AgentChatRole::User,
-        text: prompt,
-        created_at: Utc::now(),
-    };
-
     {
         let mut state = state
             .lock()
             .expect("runtime state lock should not be poisoned");
+        if let Err(error) = state.store.upsert_project(&project) {
+            let _ = child
+                .lock()
+                .expect("child lock should not be poisoned")
+                .kill();
+            return protocol_error("project_store_failed", error.to_string());
+        }
+        let home = state
+            .codex_home
+            .as_ref()
+            .map(|value| value.to_string_lossy().into_owned());
+        if let Err(error) = state
+            .store
+            .persist_new_agent(&run, &user_message, home.as_deref())
+        {
+            let _ = child
+                .lock()
+                .expect("child lock should not be poisoned")
+                .kill();
+            return protocol_error("agent_store_failed", error.to_string());
+        }
         state.projects.insert(project.root_key(), project.clone());
-        let projects = state.projects.values().cloned().collect::<Vec<_>>();
-        let _ = save_project_registry(&state.paths, &projects);
         state.agents.insert(
             run.id,
             AgentRecord {
@@ -480,6 +570,72 @@ fn start_codex_session(
 
     attach_codex_io(Arc::clone(&state), run.id, child);
     ServerResponse::AgentStarted(run)
+}
+
+fn persist_launch_failure(
+    state: &Arc<Mutex<RuntimeState>>,
+    project: Project,
+    mut run: AgentRun,
+    user_message: AgentChatMessage,
+    allow_non_git: bool,
+    error: String,
+) -> ServerResponse {
+    run.state = AgentState::Failed;
+    run.updated_at = Utc::now();
+    run.last_visible_action = Some("Codex could not be started".to_owned());
+    run.state_evidence = error.clone();
+    let system_message = AgentChatMessage {
+        agent_id: run.id,
+        role: AgentChatRole::System,
+        text: error.clone(),
+        created_at: Utc::now(),
+    };
+    let attention = RuntimeAttention {
+        id: uuid::Uuid::new_v4(),
+        kind: AttentionKind::Failed,
+        agent_id: Some(run.id),
+        project_id: Some(project.id),
+        title: "Codex failed to start".to_owned(),
+        body: error.clone(),
+        created_at: Utc::now(),
+    };
+    let mut state = state
+        .lock()
+        .expect("runtime state lock should not be poisoned");
+    let home = state
+        .codex_home
+        .as_ref()
+        .map(|value| value.to_string_lossy().into_owned());
+    let persisted = state.store.upsert_project(&project).and_then(|_| {
+        state.store.persist_failed_agent(
+            &run,
+            &user_message,
+            &system_message,
+            &attention,
+            home.as_deref(),
+        )
+    });
+    if let Err(store_error) = persisted {
+        return protocol_error("agent_store_failed", store_error.to_string());
+    }
+    state.projects.insert(project.root_key(), project.clone());
+    state.agents.insert(
+        run.id,
+        AgentRecord {
+            run: run.clone(),
+            project_root: project.root.clone(),
+            allow_non_git,
+            messages: vec![user_message.clone(), system_message.clone()],
+            terminal_failure: Some(error.clone()),
+        },
+    );
+    state.attention.push(attention.clone());
+    state.broadcast(ServerEvent::ProjectChanged(project));
+    state.broadcast(ServerEvent::AgentChanged(run));
+    state.broadcast(ServerEvent::AgentMessageAppended(user_message));
+    state.broadcast(ServerEvent::AgentMessageAppended(system_message));
+    state.broadcast(ServerEvent::AttentionRaised(attention));
+    protocol_error("codex_start_failed", error)
 }
 
 fn project_for_launch(
@@ -526,10 +682,6 @@ fn resume_codex_session(
     thread_id: String,
     prompt: String,
 ) -> ServerResponse {
-    let Some(binary) = find_binary("codex") else {
-        return protocol_error("codex_not_found", "codex binary was not found on PATH");
-    };
-
     let project = project_for_launch(&state, project_name, project_root);
     if let Err(message) = validate_thread_project(&state, &thread_id, &project.root) {
         return protocol_error("codex_thread_project_mismatch", message);
@@ -548,6 +700,7 @@ fn resume_codex_session(
         task_id: None,
         pane_id: None,
         native_session_id: Some(thread_id.clone()),
+        origin_codex_home: std::env::var("CODEX_HOME").ok(),
         current_prompt: Some(prompt.clone()),
         last_visible_action: Some("Resuming Codex".to_owned()),
         state_confidence: 0.8,
@@ -560,6 +713,22 @@ fn resume_codex_session(
         return error;
     }
     let allow_non_git = project.git_policy == ProjectGitPolicy::AllowOutsideGit;
+    let user_message = AgentChatMessage {
+        agent_id: run.id,
+        role: AgentChatRole::User,
+        text: prompt.clone(),
+        created_at: Utc::now(),
+    };
+    let Some(binary) = find_binary("codex") else {
+        return persist_launch_failure(
+            &state,
+            project,
+            run,
+            user_message,
+            allow_non_git,
+            "Codex binary was not found on PATH".to_owned(),
+        );
+    };
     let child = match spawn_codex_child(
         &binary,
         &project.root,
@@ -569,27 +738,48 @@ fn resume_codex_session(
         allow_non_git,
     ) {
         Ok(child) => Arc::new(Mutex::new(child)),
-        Err(error) => return protocol_error("codex_start_failed", error.to_string()),
+        Err(error) => {
+            return persist_launch_failure(
+                &state,
+                project,
+                run,
+                user_message,
+                allow_non_git,
+                error.to_string(),
+            );
+        }
     };
 
     run.state = AgentState::Working;
     run.updated_at = Utc::now();
     run.state_evidence = "Codex resume process is running under The Ditch Runtime.".to_owned();
 
-    let user_message = AgentChatMessage {
-        agent_id: run.id,
-        role: AgentChatRole::User,
-        text: prompt,
-        created_at: Utc::now(),
-    };
-
     {
         let mut state = state
             .lock()
             .expect("runtime state lock should not be poisoned");
+        if let Err(error) = state.store.upsert_project(&project) {
+            let _ = child
+                .lock()
+                .expect("child lock should not be poisoned")
+                .kill();
+            return protocol_error("project_store_failed", error.to_string());
+        }
+        let home = state
+            .codex_home
+            .as_ref()
+            .map(|value| value.to_string_lossy().into_owned());
+        if let Err(error) = state
+            .store
+            .persist_new_agent(&run, &user_message, home.as_deref())
+        {
+            let _ = child
+                .lock()
+                .expect("child lock should not be poisoned")
+                .kill();
+            return protocol_error("agent_store_failed", error.to_string());
+        }
         state.projects.insert(project.root_key(), project.clone());
-        let projects = state.projects.values().cloned().collect::<Vec<_>>();
-        let _ = save_project_registry(&state.paths, &projects);
         state.agents.insert(
             run.id,
             AgentRecord {
@@ -615,19 +805,22 @@ fn validate_thread_project(
     thread_id: &str,
     requested_root: &Path,
 ) -> Result<(), String> {
-    let original_root = state
+    let state = state
         .lock()
-        .expect("runtime state lock should not be poisoned")
+        .expect("runtime state lock should not be poisoned");
+    let original = state
         .agents
         .values()
-        .find(|record| record.run.native_session_id.as_deref() == Some(thread_id))
-        .map(|record| record.project_root.clone());
-    match original_root {
-        Some(original_root) if original_root != requested_root => Err(format!(
+        .find(|record| record.run.native_session_id.as_deref() == Some(thread_id));
+    match original {
+        Some(record) if record.project_root != requested_root => Err(format!(
             "Codex thread {thread_id} belongs to {}, not {}. Start a new Codex session for the selected project.",
-            original_root.display(),
+            record.project_root.display(),
             requested_root.display()
         )),
+        Some(record) if record.run.origin_codex_home.as_deref() != state.codex_home.as_ref().map(|value| value.to_string_lossy()).as_deref() => Err(
+            "This Codex thread was created under a different CODEX_HOME. Its history is readable, but it cannot be resumed with the current Codex account.".to_owned()
+        ),
         _ => Ok(()),
     }
 }
@@ -638,9 +831,11 @@ fn prompt_agent(
     prompt: String,
 ) -> ServerResponse {
     let Some(binary) = find_binary("codex") else {
-        return protocol_error("codex_not_found", "codex binary was not found on PATH");
+        let message = "Codex binary was not found on PATH".to_owned();
+        record_terminal_failure(&state, agent_id, message.clone());
+        finish_agent(&state, agent_id, Some(1));
+        return protocol_error("codex_not_found", message);
     };
-
     let (project_root, thread_id, allow_non_git) = {
         let state = state
             .lock()
@@ -650,6 +845,16 @@ fn prompt_agent(
         };
         if matches!(record.run.state, AgentState::Starting | AgentState::Working) {
             return protocol_error("agent_busy", "agent session is already working");
+        }
+        let current_home = state
+            .codex_home
+            .as_ref()
+            .map(|value| value.to_string_lossy());
+        if record.run.origin_codex_home.as_deref() != current_home.as_deref() {
+            return protocol_error(
+                "codex_home_mismatch",
+                "This session belongs to a different CODEX_HOME. Start a new agent with the current Codex account.",
+            );
         }
         (
             record.project_root.clone(),
@@ -667,7 +872,12 @@ fn prompt_agent(
         allow_non_git,
     ) {
         Ok(child) => Arc::new(Mutex::new(child)),
-        Err(error) => return protocol_error("codex_start_failed", error.to_string()),
+        Err(error) => {
+            let message = error.to_string();
+            record_terminal_failure(&state, agent_id, message.clone());
+            finish_agent(&state, agent_id, Some(1));
+            return protocol_error("codex_start_failed", message);
+        }
     };
 
     let user_message = AgentChatMessage {
@@ -690,6 +900,8 @@ fn prompt_agent(
         record.run.updated_at = Utc::now();
         record.messages.push(user_message.clone());
         let run = record.run.clone();
+        state.persist_message(&user_message);
+        state.persist_agent(agent_id);
         state.children.insert(agent_id, Arc::clone(&child));
         state.broadcast(ServerEvent::AgentChanged(run));
         state.broadcast(ServerEvent::AgentMessageAppended(user_message));
@@ -725,6 +937,7 @@ fn stop_agent(state: Arc<Mutex<RuntimeState>>, agent_id: AgentId) -> ServerRespo
     record.run.last_visible_action = Some("Stopped by user".to_owned());
     record.run.updated_at = Utc::now();
     let run = record.run.clone();
+    state.persist_agent(agent_id);
     state.broadcast(ServerEvent::AgentChanged(run));
     ServerResponse::Accepted
 }
@@ -836,6 +1049,7 @@ fn handle_codex_stdout_line(state: &Arc<Mutex<RuntimeState>>, agent_id: AgentId,
                 record.run.native_session_id = Some(thread_id.to_owned());
                 record.run.updated_at = Utc::now();
                 let run = record.run.clone();
+                state.persist_agent(agent_id);
                 state.broadcast(ServerEvent::AgentChanged(run));
             }
         }
@@ -896,6 +1110,7 @@ fn handle_codex_stdout_line(state: &Arc<Mutex<RuntimeState>>, agent_id: AgentId,
             record.run.last_visible_action = Some("Turn completed".to_owned());
             record.run.updated_at = Utc::now();
             let run = record.run.clone();
+            state.persist_agent(agent_id);
             state.broadcast(ServerEvent::AgentChanged(run));
         }
         "turn.failed" | "error" => {
@@ -1003,6 +1218,7 @@ fn update_agent_action(state: &Arc<Mutex<RuntimeState>>, agent_id: AgentId, acti
     record.run.last_visible_action = Some(action.to_owned());
     record.run.updated_at = Utc::now();
     let run = record.run.clone();
+    state.persist_agent(agent_id);
     state.broadcast(ServerEvent::AgentChanged(run));
 }
 
@@ -1031,6 +1247,8 @@ fn append_message(
     };
     record.messages.push(message.clone());
     record.run.updated_at = Utc::now();
+    state.persist_message(&message);
+    state.persist_agent(agent_id);
     state.broadcast(ServerEvent::AgentMessageAppended(message));
 }
 
@@ -1087,8 +1305,12 @@ fn finish_agent(state: &Arc<Mutex<RuntimeState>>, agent_id: AgentId, code: Optio
         };
         (record.run.clone(), attention)
     };
+    state.persist_agent(agent_id);
     state.broadcast(ServerEvent::AgentChanged(run));
     if let Some(attention) = attention {
+        if let Err(error) = state.store.upsert_attention(&attention) {
+            eprintln!("{RUNTIME_IDENTITY} failed to persist attention: {error}");
+        }
         state.attention.push(attention.clone());
         state.broadcast(ServerEvent::AttentionRaised(attention));
     }
@@ -1203,6 +1425,19 @@ impl ProjectRootKey for Project {
 mod tests {
     use super::*;
 
+    fn test_runtime() -> RuntimeState {
+        let root = std::env::temp_dir().join(format!("ditchd-test-{}", uuid::Uuid::new_v4()));
+        let paths = AppPaths {
+            data_dir: root.clone(),
+            database_path: root.join("ditch.sqlite3"),
+            socket_path: root.join("ditchd.sock"),
+            logs_dir: root.join("logs"),
+            scrollback_dir: root.join("scrollback"),
+        };
+        ensure_app_dirs(&paths).expect("test app directories should be created");
+        RuntimeState::new(paths).expect("test runtime should initialize")
+    }
+
     #[test]
     fn live_runtime_socket_is_never_removed() {
         let path = std::env::temp_dir().join(format!(
@@ -1277,9 +1512,10 @@ mod tests {
 
     #[test]
     fn failed_agent_creates_attention_with_stderr_detail() {
-        let paths = AppPaths::for_current_user();
-        let mut runtime = RuntimeState::new(paths);
+        let mut runtime = test_runtime();
         let project = Project::new("Fixture", "/tmp/fixture");
+        runtime.store.upsert_project(&project).unwrap();
+        runtime.projects.insert(project.root_key(), project.clone());
         let agent_id = AgentId::new();
         let now = Utc::now();
         runtime.agents.insert(
@@ -1294,6 +1530,7 @@ mod tests {
                     task_id: None,
                     pane_id: None,
                     native_session_id: None,
+                    origin_codex_home: None,
                     current_prompt: Some("test".to_owned()),
                     last_visible_action: None,
                     state_confidence: 1.0,
@@ -1325,9 +1562,10 @@ mod tests {
 
     #[test]
     fn structured_turn_failure_is_visible_in_chat_and_attention() {
-        let paths = AppPaths::for_current_user();
-        let mut runtime = RuntimeState::new(paths);
+        let mut runtime = test_runtime();
         let project = Project::new("Fixture", "/tmp/fixture");
+        runtime.store.upsert_project(&project).unwrap();
+        runtime.projects.insert(project.root_key(), project.clone());
         let agent_id = AgentId::new();
         let now = Utc::now();
         runtime.agents.insert(
@@ -1342,6 +1580,7 @@ mod tests {
                     task_id: None,
                     pane_id: None,
                     native_session_id: Some("thread-quota".to_owned()),
+                    origin_codex_home: None,
                     current_prompt: Some("test".to_owned()),
                     last_visible_action: None,
                     state_confidence: 1.0,
@@ -1378,9 +1617,10 @@ mod tests {
 
     #[test]
     fn codex_thread_cannot_resume_in_another_project() {
-        let paths = AppPaths::for_current_user();
-        let mut runtime = RuntimeState::new(paths);
+        let mut runtime = test_runtime();
         let project = Project::new("Original", "/tmp/original");
+        runtime.store.upsert_project(&project).unwrap();
+        runtime.projects.insert(project.root_key(), project.clone());
         let agent_id = AgentId::new();
         let now = Utc::now();
         runtime.agents.insert(
@@ -1395,6 +1635,7 @@ mod tests {
                     task_id: None,
                     pane_id: None,
                     native_session_id: Some("thread-123".to_owned()),
+                    origin_codex_home: None,
                     current_prompt: None,
                     last_visible_action: None,
                     state_confidence: 1.0,

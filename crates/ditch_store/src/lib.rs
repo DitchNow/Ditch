@@ -1,4 +1,7 @@
-use ditch_core::{AppPaths, Project};
+use chrono::{DateTime, Utc};
+use ditch_core::{AgentRun, AgentState, AppPaths, Project, ProjectId};
+use ditch_protocol::{AgentChatMessage, RuntimeAttention};
+use rusqlite::{Connection, Transaction, params};
 use std::fs;
 use std::io;
 use std::path::Path;
@@ -8,6 +11,284 @@ use thiserror::Error;
 pub enum StoreError {
     #[error("filesystem error: {0}")]
     Io(#[from] io::Error),
+    #[error("database error: {0}")]
+    Database(#[from] rusqlite::Error),
+    #[error("stored data is invalid: {0}")]
+    InvalidData(String),
+}
+
+pub struct DurableAgent {
+    pub run: AgentRun,
+    pub messages: Vec<AgentChatMessage>,
+    pub terminal_failure: Option<String>,
+    pub codex_home: Option<String>,
+}
+
+pub struct DurableState {
+    pub projects: Vec<Project>,
+    pub agents: Vec<DurableAgent>,
+    pub attention: Vec<RuntimeAttention>,
+}
+
+pub struct DitchStore {
+    connection: Connection,
+}
+
+impl DitchStore {
+    pub fn open(paths: &AppPaths) -> Result<Self, StoreError> {
+        let connection = Connection::open(&paths.database_path)?;
+        connection.pragma_update(None, "foreign_keys", "ON")?;
+        connection.execute_batch(SCHEMA)?;
+        ensure_column(
+            &connection,
+            "projects",
+            "git_policy",
+            "TEXT NOT NULL DEFAULT '\"RequireRepository\"'",
+        )?;
+        ensure_column(&connection, "agents", "run_json", "TEXT")?;
+        ensure_column(&connection, "agents", "terminal_failure", "TEXT")?;
+        ensure_column(&connection, "agents", "codex_home", "TEXT")?;
+        connection.pragma_update(None, "user_version", 1)?;
+        let mut store = Self { connection };
+        store.import_legacy_registry_if_empty(paths)?;
+        Ok(store)
+    }
+
+    fn import_legacy_registry_if_empty(&mut self, paths: &AppPaths) -> Result<(), StoreError> {
+        let count: i64 = self
+            .connection
+            .query_row("SELECT COUNT(*) FROM projects", [], |r| r.get(0))?;
+        if count == 0 {
+            for project in load_project_registry(paths)? {
+                self.upsert_project(&project)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn load(&self) -> Result<DurableState, StoreError> {
+        let mut projects_stmt = self.connection.prepare(
+            "SELECT id, name, root, created_at, archived_at, git_policy FROM projects ORDER BY created_at",
+        )?;
+        let projects = projects_stmt
+            .query_map([], |row| {
+                Ok(Project {
+                    id: ProjectId(parse_uuid(row.get::<_, String>(0)?)?),
+                    name: row.get(1)?,
+                    root: std::path::PathBuf::from(row.get::<_, String>(2)?),
+                    created_at: parse_time(row.get::<_, String>(3)?)?,
+                    archived_at: row
+                        .get::<_, Option<String>>(4)?
+                        .map(parse_time)
+                        .transpose()?,
+                    git_policy: from_json(&row.get::<_, String>(5)?)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let mut agents_stmt = self.connection.prepare(
+            "SELECT run_json, terminal_failure, codex_home FROM agents ORDER BY started_at",
+        )?;
+        let mut agents = agents_stmt
+            .query_map([], |row| {
+                Ok(DurableAgent {
+                    run: from_json(&row.get::<_, String>(0)?)?,
+                    messages: Vec::new(),
+                    terminal_failure: row.get(1)?,
+                    codex_home: row.get(2)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        for agent in &mut agents {
+            let mut stmt = self.connection.prepare(
+                "SELECT message_json FROM agent_messages WHERE agent_id = ?1 ORDER BY sequence",
+            )?;
+            agent.messages = stmt
+                .query_map(params![agent.run.id.0.to_string()], |row| {
+                    from_json(&row.get::<_, String>(0)?)
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+        }
+
+        let mut attention_stmt = self.connection.prepare(
+            "SELECT attention_json FROM attention_events WHERE dismissed_at IS NULL ORDER BY created_at",
+        )?;
+        let attention = attention_stmt
+            .query_map([], |row| from_json(&row.get::<_, String>(0)?))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(DurableState {
+            projects,
+            agents,
+            attention,
+        })
+    }
+
+    pub fn upsert_project(&mut self, project: &Project) -> Result<(), StoreError> {
+        self.connection.execute(
+            "INSERT INTO projects(id,name,root,created_at,archived_at,git_policy) VALUES(?1,?2,?3,?4,?5,?6)
+             ON CONFLICT(id) DO UPDATE SET name=excluded.name,root=excluded.root,archived_at=excluded.archived_at,git_policy=excluded.git_policy",
+            params![project.id.0.to_string(), project.name, project.root.to_string_lossy(), project.created_at.to_rfc3339(), project.archived_at.map(|v| v.to_rfc3339()), to_json(&project.git_policy)?],
+        )?;
+        Ok(())
+    }
+
+    pub fn upsert_agent(
+        &mut self,
+        run: &AgentRun,
+        terminal_failure: Option<&str>,
+        codex_home: Option<&str>,
+    ) -> Result<(), StoreError> {
+        self.connection.execute(
+            "INSERT INTO agents(id,provider,state,launch_mode,project_id,native_session_id,current_prompt,last_visible_action,state_confidence,state_evidence,started_at,updated_at,run_json,terminal_failure,codex_home)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)
+             ON CONFLICT(id) DO UPDATE SET state=excluded.state,native_session_id=excluded.native_session_id,current_prompt=excluded.current_prompt,last_visible_action=excluded.last_visible_action,state_confidence=excluded.state_confidence,state_evidence=excluded.state_evidence,updated_at=excluded.updated_at,run_json=excluded.run_json,terminal_failure=excluded.terminal_failure,codex_home=COALESCE(agents.codex_home,excluded.codex_home)",
+            params![run.id.0.to_string(), to_json(&run.provider)?, to_json(&run.state)?, to_json(&run.launch_mode)?, run.project_id.0.to_string(), run.native_session_id, run.current_prompt, run.last_visible_action, run.state_confidence, run.state_evidence, run.started_at.to_rfc3339(), run.updated_at.to_rfc3339(), to_json(run)?, terminal_failure, codex_home],
+        )?;
+        Ok(())
+    }
+
+    pub fn append_message(&mut self, message: &AgentChatMessage) -> Result<(), StoreError> {
+        let sequence: i64 = self.connection.query_row(
+            "SELECT COALESCE(MAX(sequence),0)+1 FROM agent_messages WHERE agent_id=?1",
+            params![message.agent_id.0.to_string()],
+            |r| r.get(0),
+        )?;
+        self.connection.execute(
+            "INSERT INTO agent_messages(agent_id,sequence,message_json,created_at) VALUES(?1,?2,?3,?4)",
+            params![message.agent_id.0.to_string(), sequence, to_json(message)?, message.created_at.to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    pub fn persist_new_agent(
+        &mut self,
+        run: &AgentRun,
+        message: &AgentChatMessage,
+        codex_home: Option<&str>,
+    ) -> Result<(), StoreError> {
+        let tx = self.connection.transaction()?;
+        upsert_agent_tx(&tx, run, None, codex_home)?;
+        tx.execute("INSERT INTO agent_messages(agent_id,sequence,message_json,created_at) VALUES(?1,1,?2,?3)", params![run.id.0.to_string(), to_json(message)?, message.created_at.to_rfc3339()])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn persist_failed_agent(
+        &mut self,
+        run: &AgentRun,
+        user_message: &AgentChatMessage,
+        system_message: &AgentChatMessage,
+        attention: &RuntimeAttention,
+        codex_home: Option<&str>,
+    ) -> Result<(), StoreError> {
+        let tx = self.connection.transaction()?;
+        upsert_agent_tx(&tx, run, Some(&system_message.text), codex_home)?;
+        for (sequence, message) in [(1_i64, user_message), (2_i64, system_message)] {
+            tx.execute(
+                "INSERT INTO agent_messages(agent_id,sequence,message_json,created_at) VALUES(?1,?2,?3,?4)",
+                params![run.id.0.to_string(), sequence, to_json(message)?, message.created_at.to_rfc3339()],
+            )?;
+        }
+        tx.execute(
+            "INSERT INTO attention_events(id,project_id,agent_id,attention_json,created_at,dismissed_at) VALUES(?1,?2,?3,?4,?5,NULL)",
+            params![attention.id.to_string(), attention.project_id.map(|v| v.0.to_string()), attention.agent_id.map(|v| v.0.to_string()), to_json(attention)?, attention.created_at.to_rfc3339()],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn upsert_attention(&mut self, attention: &RuntimeAttention) -> Result<(), StoreError> {
+        self.connection.execute(
+            "INSERT INTO attention_events(id,project_id,agent_id,attention_json,created_at,dismissed_at) VALUES(?1,?2,?3,?4,?5,NULL)
+             ON CONFLICT(id) DO UPDATE SET attention_json=excluded.attention_json,dismissed_at=NULL",
+            params![attention.id.to_string(), attention.project_id.map(|v| v.0.to_string()), attention.agent_id.map(|v| v.0.to_string()), to_json(attention)?, attention.created_at.to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    pub fn dismiss_attention(&mut self, id: uuid::Uuid) -> Result<(), StoreError> {
+        self.connection.execute(
+            "UPDATE attention_events SET dismissed_at=?2 WHERE id=?1",
+            params![id.to_string(), Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    pub fn reconcile_active_agents(&mut self) -> Result<usize, StoreError> {
+        let state = self.load()?;
+        let mut count = 0;
+        for mut agent in state.agents {
+            if matches!(
+                agent.run.state,
+                AgentState::Starting
+                    | AgentState::Working
+                    | AgentState::AwaitingApproval
+                    | AgentState::Blocked
+            ) {
+                agent.run.state = AgentState::Stale;
+                agent.run.updated_at = Utc::now();
+                agent.run.last_visible_action = Some(
+                    "Runtime restarted; the Codex process can no longer be controlled".to_owned(),
+                );
+                self.upsert_agent(
+                    &agent.run,
+                    agent.terminal_failure.as_deref(),
+                    agent.codex_home.as_deref(),
+                )?;
+                self.append_message(&AgentChatMessage { agent_id: agent.run.id, role: ditch_protocol::AgentChatRole::System, text: "The Ditch Runtime restarted while this session was active. Start a new prompt to resume it safely.".to_owned(), created_at: Utc::now() })?;
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+}
+
+fn upsert_agent_tx(
+    tx: &Transaction<'_>,
+    run: &AgentRun,
+    terminal_failure: Option<&str>,
+    codex_home: Option<&str>,
+) -> Result<(), StoreError> {
+    tx.execute("INSERT INTO agents(id,provider,state,launch_mode,project_id,native_session_id,current_prompt,last_visible_action,state_confidence,state_evidence,started_at,updated_at,run_json,terminal_failure,codex_home) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)", params![run.id.0.to_string(),to_json(&run.provider)?,to_json(&run.state)?,to_json(&run.launch_mode)?,run.project_id.0.to_string(),run.native_session_id,run.current_prompt,run.last_visible_action,run.state_confidence,run.state_evidence,run.started_at.to_rfc3339(),run.updated_at.to_rfc3339(),to_json(run)?,terminal_failure,codex_home])?;
+    Ok(())
+}
+
+fn to_json<T: serde::Serialize>(value: &T) -> Result<String, StoreError> {
+    serde_json::to_string(value).map_err(|e| StoreError::InvalidData(e.to_string()))
+}
+fn from_json<T: serde::de::DeserializeOwned>(value: &str) -> rusqlite::Result<T> {
+    serde_json::from_str(value).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+    })
+}
+fn parse_uuid(value: String) -> rusqlite::Result<uuid::Uuid> {
+    uuid::Uuid::parse_str(&value).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+    })
+}
+fn parse_time(value: String) -> rusqlite::Result<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(&value)
+        .map(|v| v.with_timezone(&Utc))
+        .map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+        })
+}
+fn ensure_column(
+    connection: &Connection,
+    table: &str,
+    column: &str,
+    declaration: &str,
+) -> Result<(), StoreError> {
+    let mut stmt = connection.prepare(&format!("PRAGMA table_info({table})"))?;
+    let exists = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .any(|name| name.as_deref() == Ok(column));
+    if !exists {
+        connection.execute_batch(&format!(
+            "ALTER TABLE {table} ADD COLUMN {column} {declaration}"
+        ))?;
+    }
+    Ok(())
 }
 
 pub const PROJECT_METADATA_DIR: &str = ".ditch";
@@ -183,15 +464,73 @@ mod tests {
         assert_eq!(discovered[0].root, root);
         fs::remove_dir_all(root).expect("temporary project root should be removed");
     }
+
+    #[test]
+    fn persists_and_reconciles_agent_history() {
+        let root =
+            std::env::temp_dir().join(format!("ditch-store-persistence-{}", uuid::Uuid::new_v4()));
+        let paths = AppPaths {
+            data_dir: root.clone(),
+            database_path: root.join("ditch.sqlite3"),
+            socket_path: root.join("ditchd.sock"),
+            logs_dir: root.join("logs"),
+            scrollback_dir: root.join("scrollback"),
+        };
+        ensure_app_dirs(&paths).unwrap();
+        let project = Project::new("Persistent", root.join("project"));
+        let now = Utc::now();
+        let run = AgentRun {
+            id: ditch_core::AgentId::new(),
+            provider: ditch_core::AgentProvider::Codex,
+            state: AgentState::Working,
+            launch_mode: ditch_core::CodexLaunchMode::Exec,
+            project_id: project.id,
+            task_id: None,
+            pane_id: None,
+            native_session_id: Some("thread-1".into()),
+            origin_codex_home: Some("/tmp/codex-home".into()),
+            current_prompt: Some("hello".into()),
+            last_visible_action: Some("Working".into()),
+            state_confidence: 1.0,
+            state_evidence: "test".into(),
+            started_at: now,
+            updated_at: now,
+        };
+        let message = AgentChatMessage {
+            agent_id: run.id,
+            role: ditch_protocol::AgentChatRole::User,
+            text: "hello".into(),
+            created_at: now,
+        };
+        {
+            let mut store = DitchStore::open(&paths).unwrap();
+            store.upsert_project(&project).unwrap();
+            store
+                .persist_new_agent(&run, &message, Some("/tmp/codex-home"))
+                .unwrap();
+        }
+        {
+            let mut store = DitchStore::open(&paths).unwrap();
+            assert_eq!(store.reconcile_active_agents().unwrap(), 1);
+            let restored = store.load().unwrap();
+            assert_eq!(restored.projects, vec![project]);
+            assert_eq!(restored.agents.len(), 1);
+            assert_eq!(restored.agents[0].run.state, AgentState::Stale);
+            assert_eq!(restored.agents[0].messages.len(), 2);
+            assert!(restored.agents[0].messages[1].text.contains("restarted"));
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
 }
 
-pub const INITIAL_SCHEMA: &str = r#"
+pub const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS projects (
   id TEXT PRIMARY KEY,
   name TEXT NOT NULL,
   root TEXT NOT NULL UNIQUE,
   created_at TEXT NOT NULL,
-  archived_at TEXT
+  archived_at TEXT,
+  git_policy TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS tasks (
@@ -219,6 +558,26 @@ CREATE TABLE IF NOT EXISTS agents (
   state_evidence TEXT NOT NULL,
   started_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
+  ,run_json TEXT NOT NULL
+  ,terminal_failure TEXT
+  ,codex_home TEXT
+);
+
+CREATE TABLE IF NOT EXISTS agent_messages (
+  agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+  sequence INTEGER NOT NULL,
+  message_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY(agent_id, sequence)
+);
+
+CREATE TABLE IF NOT EXISTS attention_events (
+  id TEXT PRIMARY KEY,
+  project_id TEXT REFERENCES projects(id),
+  agent_id TEXT REFERENCES agents(id),
+  attention_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  dismissed_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS permission_requests (
