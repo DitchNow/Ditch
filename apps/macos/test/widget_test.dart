@@ -1,16 +1,38 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:the_ditch/main.dart';
 
 void main() {
-  test('classifies stderr chunks as hidden diagnostics', () {
+  test('runtime parser accepts unit Accepted responses', () {
+    final parsed = parseRuntimeResponseLine(
+      '{"protocol_version":1,"id":"00000000-0000-4000-8000-000000000000","sent_at":"2026-01-01T00:00:00Z","body":"Accepted"}',
+    );
+
+    expect(parsed, {'Accepted': true});
+  });
+
+  test('runtime project parser restores path and Git policy', () {
+    final project = parseRuntimeProject({
+      'name': 'Recovered',
+      'root': '/tmp/recovered',
+      'git_policy': 'AllowOutsideGit',
+    });
+
+    expect(project, isNotNull);
+    expect(project!.name, 'Recovered');
+    expect(project.path, '/tmp/recovered');
+    expect(project.gitPolicy, ProjectGitPolicy.allowOutsideGit);
+  });
+
+  test('classifies stderr chunks as visible diagnostics', () {
     final diagnostic = codexStderrDiagnosticFromChunk(
       'ERROR codex_models_manager::cache: failed to load models cache',
     );
 
     expect(diagnostic, isNotNull);
     expect(diagnostic!.kind, CodexProcessEventKind.diagnostic);
-    expect(diagnostic.isVisibleInChat, isFalse);
+    expect(diagnostic.isVisibleInChat, isTrue);
     expect(diagnostic.text, contains('models cache'));
   });
 
@@ -18,8 +40,54 @@ void main() {
     expect(codexStderrDiagnosticFromChunk('   \n'), isNull);
   });
 
+  test('sessions and attention are scoped to their project', () {
+    final sessions = [
+      AgentSession(
+        localId: 'agent-a',
+        projectId: 'project-a',
+        provider: AgentProvider.codex,
+        status: AgentStatus.failed,
+        messages: const [],
+      ),
+      AgentSession(
+        localId: 'agent-b',
+        projectId: 'project-b',
+        provider: AgentProvider.codex,
+        status: AgentStatus.failed,
+        messages: const [],
+      ),
+    ];
+    final attention = [
+      AttentionEvent(
+        id: 'global',
+        kind: AttentionKind.failed,
+        icon: Icons.error_outline,
+        title: 'Runtime',
+        body: 'Global failure',
+        createdAt: DateTime(2026),
+      ),
+      AttentionEvent(
+        id: 'project-a-alert',
+        projectId: 'project-a',
+        kind: AttentionKind.failed,
+        icon: Icons.error_outline,
+        title: 'Codex',
+        body: 'Project failure',
+        createdAt: DateTime(2026),
+      ),
+    ];
+
+    expect(
+      sessionsForProject(sessions, 'project-a').map((item) => item.localId),
+      ['agent-a'],
+    );
+    expect(attentionForProject(attention, 'project-b').map((item) => item.id), [
+      'global',
+    ]);
+  });
+
   testWidgets('renders command center shell', (tester) async {
-    await tester.pumpWidget(const TheDitchApp());
+    await tester.pumpWidget(const TheDitchApp(connectRuntimeOnStart: false));
 
     expect(find.text('The Ditch'), findsWidgets);
     expect(find.text('Projects'), findsOneWidget);
@@ -31,7 +99,7 @@ void main() {
   testWidgets('attention starts empty instead of showing activity feed noise', (
     tester,
   ) async {
-    await tester.pumpWidget(const TheDitchApp());
+    await tester.pumpWidget(const TheDitchApp(connectRuntimeOnStart: false));
 
     expect(find.text('No agent sessions need attention.'), findsOneWidget);
     expect(find.text('Bells enabled'), findsNothing);
@@ -82,18 +150,52 @@ void main() {
   });
 
   testWidgets('opens add project dialog', (tester) async {
-    await tester.pumpWidget(const TheDitchApp());
+    await tester.pumpWidget(const TheDitchApp(connectRuntimeOnStart: false));
 
     await tester.tap(find.text('Add Project'));
     await tester.pumpAndSettle();
 
     expect(find.widgetWithText(AlertDialog, 'Add Project'), findsOneWidget);
+    expect(find.text('Browse Folder…'), findsOneWidget);
     expect(find.text('Project name'), findsOneWidget);
-    expect(find.text('Project path'), findsOneWidget);
+    expect(find.text('Selected folder'), findsOneWidget);
+    expect(find.text('Add & Configure'), findsOneWidget);
+    expect(find.textContaining('.ditch/hooks'), findsOneWidget);
+  });
+
+  testWidgets('folder picker fills the project path and inferred name', (
+    tester,
+  ) async {
+    const channel = MethodChannel('the_ditch/project_picker');
+    tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+      channel,
+      (call) async => '/tmp/My Project',
+    );
+    addTearDown(
+      () => tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+        channel,
+        null,
+      ),
+    );
+
+    await tester.pumpWidget(const TheDitchApp(connectRuntimeOnStart: false));
+    await tester.tap(find.text('Add Project'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Browse Folder…'));
+    await tester.pumpAndSettle();
+
+    expect(find.text('/tmp/My Project'), findsOneWidget);
+    expect(find.text('My Project'), findsOneWidget);
+    expect(find.text('Choose how Codex should run'), findsOneWidget);
+    await tester.tap(find.byType(DropdownButtonFormField<ProjectGitPolicy>));
+    await tester.pumpAndSettle();
+    expect(find.text('Initialize Git Repository'), findsOneWidget);
+    expect(find.text('Allow Codex Outside Git'), findsOneWidget);
+    expect(find.textContaining('--skip-git-repo-check'), findsOneWidget);
   });
 
   testWidgets('start codex opens an initial prompt dialog', (tester) async {
-    await tester.pumpWidget(const TheDitchApp());
+    await tester.pumpWidget(const TheDitchApp(connectRuntimeOnStart: false));
 
     await tester.tap(find.text('Start Codex'));
     await tester.pumpAndSettle();
@@ -182,7 +284,7 @@ void main() {
   });
 
   testWidgets('expanded agent has persistent prompt composer', (tester) async {
-    await tester.pumpWidget(const TheDitchApp());
+    await tester.pumpWidget(const TheDitchApp(connectRuntimeOnStart: false));
 
     expect(find.byType(AgentComposer), findsOneWidget);
     expect(find.byType(ThinkingStatusStrip), findsOneWidget);
@@ -198,7 +300,7 @@ void main() {
   });
 
   testWidgets('composer accepts typed replacement text', (tester) async {
-    await tester.pumpWidget(const TheDitchApp());
+    await tester.pumpWidget(const TheDitchApp(connectRuntimeOnStart: false));
 
     await tester.enterText(find.byType(TextField), 'hello');
     await tester.pumpAndSettle();
@@ -207,7 +309,7 @@ void main() {
   });
 
   testWidgets('stop is disabled without active agent', (tester) async {
-    await tester.pumpWidget(const TheDitchApp());
+    await tester.pumpWidget(const TheDitchApp(connectRuntimeOnStart: false));
 
     final stopButton = tester.widget<OutlinedButton>(
       find.widgetWithText(OutlinedButton, 'Stop'),
@@ -219,7 +321,7 @@ void main() {
   testWidgets('conversation uses native chat surface instead of terminal', (
     tester,
   ) async {
-    await tester.pumpWidget(const TheDitchApp());
+    await tester.pumpWidget(const TheDitchApp(connectRuntimeOnStart: false));
 
     expect(find.byType(AgentChatPanel), findsOneWidget);
     expect(find.textContaining('[39m'), findsNothing);
@@ -229,7 +331,7 @@ void main() {
   testWidgets('clicking an agent collapses and expands its chat', (
     tester,
   ) async {
-    await tester.pumpWidget(const TheDitchApp());
+    await tester.pumpWidget(const TheDitchApp(connectRuntimeOnStart: false));
 
     expect(find.byType(AgentChatPanel), findsOneWidget);
 

@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
@@ -11,7 +12,9 @@ void main() {
 }
 
 class TheDitchApp extends StatelessWidget {
-  const TheDitchApp({super.key});
+  const TheDitchApp({this.connectRuntimeOnStart = true, super.key});
+
+  final bool connectRuntimeOnStart;
 
   @override
   Widget build(BuildContext context) {
@@ -34,16 +37,44 @@ class TheDitchApp extends StatelessWidget {
         useMaterial3: true,
         visualDensity: VisualDensity.compact,
       ),
-      home: const CommandCenterScreen(),
+      home: CommandCenterScreen(connectRuntimeOnStart: connectRuntimeOnStart),
     );
   }
 }
 
 class DitchProject {
-  const DitchProject({required this.name, required this.path});
+  const DitchProject({
+    this.id,
+    required this.name,
+    required this.path,
+    this.gitPolicy = ProjectGitPolicy.requireRepository,
+  });
 
+  final String? id;
   final String name;
   final String path;
+  final ProjectGitPolicy gitPolicy;
+}
+
+enum ProjectGitPolicy {
+  requireRepository,
+  initializeRepository,
+  allowOutsideGit,
+}
+
+bool isInsideGitWorkTree(String path) {
+  var directory = Directory(path).absolute;
+  while (true) {
+    if (FileSystemEntity.typeSync('${directory.path}/.git') !=
+        FileSystemEntityType.notFound) {
+      return true;
+    }
+    final parent = directory.parent;
+    if (parent.path == directory.path) {
+      return false;
+    }
+    directory = parent;
+  }
 }
 
 enum AgentProvider { codex }
@@ -54,19 +85,23 @@ class AgentSession {
     required this.provider,
     required this.status,
     required this.messages,
+    this.projectId,
     this.codexThreadId,
     this.currentPrompt,
+    this.lastVisibleAction,
     DateTime? createdAt,
     DateTime? updatedAt,
   }) : createdAt = createdAt ?? DateTime.now(),
        updatedAt = updatedAt ?? DateTime.now();
 
   final String localId;
+  final String? projectId;
   final AgentProvider provider;
   final DateTime createdAt;
   AgentStatus status;
   String? codexThreadId;
   String? currentPrompt;
+  String? lastVisibleAction;
   DateTime updatedAt;
   final List<AgentChatMessage> messages;
 
@@ -94,6 +129,7 @@ class AttentionEvent {
     required this.body,
     required this.createdAt,
     this.sessionLocalId,
+    this.projectId,
   });
 
   final String id;
@@ -103,6 +139,7 @@ class AttentionEvent {
   final String body;
   final DateTime createdAt;
   final String? sessionLocalId;
+  final String? projectId;
 
   bool get canOpenSession => sessionLocalId != null;
 }
@@ -124,7 +161,7 @@ class CodexProcessDiagnostic {
   final String text;
   final DateTime createdAt;
 
-  bool get isVisibleInChat => false;
+  bool get isVisibleInChat => true;
 }
 
 CodexProcessDiagnostic? codexStderrDiagnosticFromChunk(String chunk) {
@@ -152,8 +189,248 @@ class AgentChatMessage {
   final DateTime createdAt;
 }
 
+List<AgentSession> sessionsForProject(
+  Iterable<AgentSession> sessions,
+  String? projectId,
+) {
+  return sessions.where((session) => session.projectId == projectId).toList();
+}
+
+List<AttentionEvent> attentionForProject(
+  Iterable<AttentionEvent> events,
+  String? projectId,
+) {
+  return events
+      .where((event) => event.projectId == null || event.projectId == projectId)
+      .toList();
+}
+
+class DitchRuntimeClient {
+  DitchRuntimeClient({String? socketPath})
+    : socketPath = socketPath ?? _defaultSocketPath();
+
+  final String socketPath;
+  final _random = Random.secure();
+
+  static String _defaultSocketPath() {
+    final home = Platform.environment['HOME'] ?? '.';
+    return '$home/Library/Application Support/The Ditch/ditchd.sock';
+  }
+
+  Future<Map<String, dynamic>> request(Object body) async {
+    final socket = await Socket.connect(
+      InternetAddress(socketPath, type: InternetAddressType.unix),
+      0,
+      timeout: const Duration(seconds: 2),
+    );
+    final requestId = _newRequestUuid();
+    final envelope = <String, dynamic>{
+      'protocol_version': 1,
+      'id': requestId,
+      'sent_at': DateTime.now().toUtc().toIso8601String(),
+      'body': body,
+    };
+    socket.writeln(jsonEncode(envelope));
+    await socket.flush();
+    final line = await utf8.decoder
+        .bind(socket)
+        .transform(const LineSplitter())
+        .first;
+    socket.destroy();
+    return parseRuntimeResponseLine(line);
+  }
+
+  Future<Stream<Map<String, dynamic>>> subscribeEvents() async {
+    final socket = await Socket.connect(
+      InternetAddress(socketPath, type: InternetAddressType.unix),
+      0,
+      timeout: const Duration(seconds: 2),
+    );
+    final requestId = _newRequestUuid();
+    socket.writeln(
+      jsonEncode({
+        'protocol_version': 1,
+        'id': requestId,
+        'sent_at': DateTime.now().toUtc().toIso8601String(),
+        'body': {
+          'SubscribeEvents': {'since_sequence': 0},
+        },
+      }),
+    );
+    await socket.flush();
+    return utf8.decoder.bind(socket).transform(const LineSplitter()).map((
+      line,
+    ) {
+      final decoded = jsonDecode(line);
+      if (decoded is! Map<String, dynamic>) {
+        throw const FormatException('runtime event envelope was not an object');
+      }
+      final body = decoded['body'];
+      if (body is! Map<String, dynamic>) {
+        throw const FormatException('runtime event body was not an object');
+      }
+      return body;
+    });
+  }
+
+  Future<Map<String, dynamic>> runtimeStatus() {
+    return request('RuntimeStatus');
+  }
+
+  Future<Map<String, dynamic>> shutdownRuntime() {
+    return request('Shutdown');
+  }
+
+  Future<Map<String, dynamic>> snapshot() {
+    return request('Snapshot');
+  }
+
+  Future<Map<String, dynamic>> createProject({
+    required String name,
+    required String root,
+    required ProjectGitPolicy gitPolicy,
+  }) {
+    return request({
+      'CreateProject': {
+        'name': name,
+        'root': root,
+        'git_policy': switch (gitPolicy) {
+          ProjectGitPolicy.requireRepository => 'RequireRepository',
+          ProjectGitPolicy.initializeRepository => 'InitializeRepository',
+          ProjectGitPolicy.allowOutsideGit => 'AllowOutsideGit',
+        },
+      },
+    });
+  }
+
+  Future<Map<String, dynamic>> discoverProjects(String searchRoot) {
+    return request({
+      'DiscoverProjects': {'search_root': searchRoot},
+    });
+  }
+
+  Future<Map<String, dynamic>> startCodexSession({
+    required String projectName,
+    required String projectRoot,
+    required String prompt,
+  }) {
+    return request({
+      'StartCodexSession': {
+        'project_name': projectName,
+        'project_root': projectRoot,
+        'prompt': prompt,
+        'mode': 'Exec',
+      },
+    });
+  }
+
+  Future<Map<String, dynamic>> resumeCodexSession({
+    required String projectName,
+    required String projectRoot,
+    required String threadId,
+    required String prompt,
+  }) {
+    return request({
+      'ResumeCodexSession': {
+        'project_name': projectName,
+        'project_root': projectRoot,
+        'thread_id': threadId,
+        'prompt': prompt,
+      },
+    });
+  }
+
+  Future<Map<String, dynamic>> promptAgent({
+    required String agentId,
+    required String prompt,
+  }) {
+    return request({
+      'PromptAgent': {'agent_id': agentId, 'prompt': prompt},
+    });
+  }
+
+  Future<Map<String, dynamic>> stopAgent(String agentId) {
+    return request({
+      'StopAgent': {'agent_id': agentId},
+    });
+  }
+
+  Future<Map<String, dynamic>> dismissAttention(String attentionId) {
+    return request({
+      'DismissAttention': {'attention_id': attentionId},
+    });
+  }
+
+  String _newRequestUuid() {
+    final bytes = List<int>.generate(16, (_) => _random.nextInt(256));
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    final hex = bytes
+        .map((byte) => byte.toRadixString(16).padLeft(2, '0'))
+        .join();
+    return '${hex.substring(0, 8)}-${hex.substring(8, 12)}-${hex.substring(12, 16)}-${hex.substring(16, 20)}-${hex.substring(20)}';
+  }
+}
+
+class DitchRuntimeException implements Exception {
+  const DitchRuntimeException(this.code, this.message);
+
+  final String code;
+  final String message;
+
+  @override
+  String toString() => '$code: $message';
+}
+
+Map<String, dynamic> parseRuntimeResponseLine(String line) {
+  final decoded = jsonDecode(line);
+  if (decoded is! Map<String, dynamic>) {
+    throw const FormatException('runtime response was not an object');
+  }
+
+  final responseBody = decoded['body'];
+  if (responseBody == 'Accepted') {
+    return const {'Accepted': true};
+  }
+  if (responseBody is! Map<String, dynamic>) {
+    throw const FormatException('runtime response body was not an object');
+  }
+
+  final error = responseBody['Error'];
+  if (error is Map<String, dynamic>) {
+    final code = error['code']?.toString() ?? 'runtime_error';
+    final message = error['message']?.toString() ?? 'Unknown runtime error';
+    throw DitchRuntimeException(code, message);
+  }
+  return responseBody;
+}
+
+DitchProject? parseRuntimeProject(Object? value) {
+  if (value is! Map<String, dynamic>) {
+    return null;
+  }
+  final name = value['name']?.toString();
+  final root = value['root']?.toString();
+  if (name == null || name.isEmpty || root == null || root.isEmpty) {
+    return null;
+  }
+  final gitPolicy = switch (value['git_policy']?.toString()) {
+    'AllowOutsideGit' => ProjectGitPolicy.allowOutsideGit,
+    'InitializeRepository' => ProjectGitPolicy.initializeRepository,
+    _ => ProjectGitPolicy.requireRepository,
+  };
+  return DitchProject(
+    id: value['id']?.toString(),
+    name: name,
+    path: root,
+    gitPolicy: gitPolicy,
+  );
+}
+
 class CommandCenterScreen extends StatefulWidget {
-  const CommandCenterScreen({super.key});
+  const CommandCenterScreen({this.connectRuntimeOnStart = true, super.key});
+
+  final bool connectRuntimeOnStart;
 
   @override
   State<CommandCenterScreen> createState() => _CommandCenterScreenState();
@@ -162,24 +439,28 @@ class CommandCenterScreen extends StatefulWidget {
 class _CommandCenterScreenState extends State<CommandCenterScreen> {
   static const _defaultStartPrompt =
       'Inspect this project and tell me the next useful engineering step.';
+  static const _bootstrapProject = DitchProject(
+    name: 'The Ditch',
+    path: '/Users/tester/Documents/Personal/The Ditch v2',
+  );
+  static const _statusBarChannel = MethodChannel('the_ditch/status_bar');
 
   final _chatController = ScrollController();
   final _composerKey = GlobalKey<AgentComposerState>();
+  final _runtimeClient = DitchRuntimeClient();
   int _nextAgentSessionId = 1;
   int _nextAttentionId = 1;
-  final _projects = <DitchProject>[
-    const DitchProject(
-      name: 'The Ditch',
-      path: '/Users/tester/Documents/Personal/The Ditch v2',
-    ),
-  ];
+  final _projects = <DitchProject>[_bootstrapProject];
   final _attention = <AttentionEvent>[];
 
-  final _codexProcesses = <String, Process>{};
+  StreamSubscription<Map<String, dynamic>>? _runtimeEvents;
+  String? _runtimeInstanceId;
+  bool _runtimeReconnectScheduled = false;
+  bool _runtimeHomeMismatchReported = false;
+  bool _runtimeCodexHomeMatches = true;
+  bool _legacyRecoveryChecked = false;
   int _selectedProjectIndex = 0;
-  String? _codexBinary;
   String? _expandedAgentLocalId = 'agent-0';
-  final _codexDiagnostics = <CodexProcessDiagnostic>[];
   late final List<AgentSession> _agentSessions = [
     AgentSession(
       localId: 'agent-0',
@@ -198,12 +479,74 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
 
   DitchProject get _selectedProject => _projects[_selectedProjectIndex];
 
+  List<AgentSession> get _visibleSessions {
+    return sessionsForProject(_agentSessions, _selectedProject.id);
+  }
+
+  List<AttentionEvent> get _visibleAttention {
+    return attentionForProject(_attention, _selectedProject.id);
+  }
+
+  void _selectProject(int index) {
+    setState(() {
+      _selectedProjectIndex = index;
+      final sessions = _visibleSessions;
+      _expandedAgentLocalId = sessions.isEmpty ? null : sessions.first.localId;
+    });
+  }
+
+  void _scheduleStatusBarUpdate() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) {
+        return;
+      }
+      unawaited(_updateStatusBar());
+    });
+  }
+
+  Future<void> _updateStatusBar() async {
+    final activeSessions = _agentSessions
+        .where((session) => session.isWorking)
+        .length;
+    final hasFailedSession = _agentSessions.any(
+      (session) => session.status == AgentStatus.failed,
+    );
+    final state = _attention.isNotEmpty
+        ? 'attention'
+        : hasFailedSession
+        ? 'failed'
+        : activeSessions > 0
+        ? 'working'
+        : 'idle';
+
+    try {
+      await _statusBarChannel.invokeMethod<void>('update', {
+        'state': state,
+        'activeSessions': activeSessions,
+        'attentionCount': _attention.length,
+      });
+    } on MissingPluginException {
+      // Widget tests and non-macOS targets do not install the native channel.
+    } on Object {
+      // The menu bar item is a status mirror; failures should not affect chat.
+    }
+  }
+
+  Future<void> _shutdownRuntimeForQuit() async {
+    try {
+      await _runtimeClient.shutdownRuntime();
+    } on Object {
+      // Quit should still close the control surface if the runtime is absent.
+    }
+  }
+
   AgentSession? get _expandedSession {
     final expandedId = _expandedAgentLocalId;
     if (expandedId == null) {
       return null;
     }
-    return _agentSessionByLocalId(expandedId);
+    final session = _agentSessionByLocalId(expandedId);
+    return _visibleSessions.contains(session) ? session : null;
   }
 
   AgentSession? _agentSessionByLocalId(String localId) {
@@ -218,6 +561,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
   AgentSession _createAgentSession({required bool expand}) {
     final session = AgentSession(
       localId: 'agent-${_nextAgentSessionId++}',
+      projectId: _selectedProject.id,
       provider: AgentProvider.codex,
       status: AgentStatus.idle,
       messages: [
@@ -236,16 +580,308 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
     return session;
   }
 
+  Future<void> _connectRuntime() async {
+    try {
+      await _ensureRuntimeStarted();
+      final status = await _runtimeClient.runtimeStatus();
+      final statusBody = status['RuntimeStatus'];
+      final instanceId = statusBody is Map<String, dynamic>
+          ? statusBody['instance_id']?.toString()
+          : null;
+      var snapshot = await _runtimeClient.snapshot();
+      final snapshotBody = snapshot['Snapshot'];
+      final registeredProjects = snapshotBody is Map<String, dynamic>
+          ? snapshotBody['projects']
+          : null;
+      if (registeredProjects is List && registeredProjects.isEmpty) {
+        final bootstrap = _projects.first;
+        await _runtimeClient.createProject(
+          name: bootstrap.name,
+          root: bootstrap.path,
+          gitPolicy: bootstrap.gitPolicy,
+        );
+        snapshot = await _runtimeClient.snapshot();
+      }
+      _hydrateRuntimeSnapshot(snapshot);
+      if (statusBody is Map<String, dynamic>) {
+        _checkRuntimeCodexHome(statusBody);
+      }
+      final events = await _runtimeClient.subscribeEvents();
+      await _runtimeEvents?.cancel();
+      _runtimeInstanceId = instanceId;
+      _runtimeEvents = events.listen(
+        _handleRuntimeEvent,
+        onError: (Object error) {
+          _addAttentionRequired(
+            kind: AttentionKind.failed,
+            icon: Icons.error_outline,
+            title: 'Runtime event stream failed',
+            body: '$error',
+          );
+          _scheduleRuntimeReconnect();
+        },
+        onDone: _scheduleRuntimeReconnect,
+      );
+      final confirmed = await _runtimeClient.runtimeStatus();
+      final confirmedBody = confirmed['RuntimeStatus'];
+      final confirmedInstanceId = confirmedBody is Map<String, dynamic>
+          ? confirmedBody['instance_id']?.toString()
+          : null;
+      if (_runtimeInstanceId != confirmedInstanceId) {
+        await _runtimeEvents?.cancel();
+        _scheduleRuntimeReconnect();
+      } else if (!_legacyRecoveryChecked) {
+        _legacyRecoveryChecked = true;
+        unawaited(_offerLegacyProjectRecovery());
+      }
+    } on Object catch (error) {
+      _addChatMessage(
+        _expandedSession ?? _agentSessions.first,
+        ChatMessageRole.system,
+        'The Ditch Runtime is not connected: $error',
+      );
+    }
+  }
+
+  void _checkRuntimeCodexHome(Map<String, dynamic> status) {
+    final requested = Platform.environment['CODEX_HOME'];
+    final effective = status['codex_home']?.toString();
+    if (requested == null || requested.isEmpty || effective == requested) {
+      _runtimeHomeMismatchReported = false;
+      _runtimeCodexHomeMatches = true;
+      return;
+    }
+    _runtimeCodexHomeMatches = false;
+    if (_runtimeHomeMismatchReported) {
+      return;
+    }
+    _runtimeHomeMismatchReported = true;
+    _addAttentionRequired(
+      kind: AttentionKind.failed,
+      icon: Icons.sync_problem_outlined,
+      title: 'Codex home mismatch',
+      body:
+          'The running Ditch Runtime uses ${effective ?? "an unknown/default Codex home"}, but this app was launched with $requested. Stop and restart the runtime before starting Codex.',
+      global: true,
+    );
+  }
+
+  Future<void> _offerLegacyProjectRecovery() async {
+    if (_projects.isEmpty) {
+      return;
+    }
+    final searchRoot = Directory(_bootstrapProject.path).parent.path;
+    try {
+      final response = await _runtimeClient.discoverProjects(searchRoot);
+      final raw = response['Projects'];
+      if (raw is! List || !mounted) {
+        return;
+      }
+      final existingPaths = _projects.map((project) => project.path).toSet();
+      final discovered = raw
+          .map(_projectFromRuntime)
+          .whereType<DitchProject>()
+          .where((project) => !existingPaths.contains(project.path))
+          .toList();
+      if (discovered.isEmpty) {
+        return;
+      }
+      final shouldRecover = await showDialog<bool>(
+        context: context,
+        builder: (context) => AlertDialog(
+          title: const Text('Recover existing projects?'),
+          content: SizedBox(
+            width: 560,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text(
+                  'The Ditch found project folders created by an earlier version:',
+                ),
+                const SizedBox(height: 12),
+                for (final project in discovered)
+                  Padding(
+                    padding: const EdgeInsets.only(bottom: 8),
+                    child: Text('• ${project.name}\n  ${project.path}'),
+                  ),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(false),
+              child: const Text('Not Now'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.of(context).pop(true),
+              child: const Text('Recover Projects'),
+            ),
+          ],
+        ),
+      );
+      if (shouldRecover != true) {
+        return;
+      }
+      for (final project in discovered) {
+        await _runtimeClient.createProject(
+          name: project.name,
+          root: project.path,
+          gitPolicy: project.gitPolicy,
+        );
+      }
+      _hydrateRuntimeSnapshot(await _runtimeClient.snapshot());
+    } on Object catch (error) {
+      _addAttentionRequired(
+        kind: AttentionKind.failed,
+        icon: Icons.error_outline,
+        title: 'Project recovery failed',
+        body: '$error',
+      );
+    }
+  }
+
+  void _scheduleRuntimeReconnect() {
+    if (_runtimeReconnectScheduled || !mounted) {
+      return;
+    }
+    _runtimeReconnectScheduled = true;
+    Future<void>.delayed(const Duration(milliseconds: 500), () async {
+      if (!mounted) {
+        return;
+      }
+      _runtimeReconnectScheduled = false;
+      await _connectRuntime();
+    });
+  }
+
+  Future<void> _ensureRuntimeStarted() async {
+    try {
+      final ready = await _statusBarChannel.invokeMethod<bool>('ensureRuntime');
+      if (ready == false) {
+        throw StateError('The bundled runtime could not be started.');
+      }
+      await _runtimeClient.runtimeStatus();
+      return;
+    } on Object catch (error) {
+      throw StateError(
+        'The Ditch Runtime is unavailable. Use the status menu to restart it, then retry. $error',
+      );
+    }
+  }
+
+  void _hydrateRuntimeSnapshot(Map<String, dynamic> responseBody) {
+    final snapshot = responseBody['Snapshot'];
+    if (snapshot is! Map<String, dynamic>) {
+      return;
+    }
+    final agentsJson = snapshot['agents'];
+    final messagesJson = snapshot['messages'];
+    if (agentsJson is! List) {
+      return;
+    }
+
+    final messagesByAgent = <String, List<AgentChatMessage>>{};
+    if (messagesJson is List) {
+      for (final messageJson in messagesJson) {
+        final message = _agentChatMessageFromRuntime(messageJson);
+        final agentId = _agentIdFromRuntimeMessage(messageJson);
+        if (message != null && agentId != null) {
+          messagesByAgent.putIfAbsent(agentId, () => []).add(message);
+        }
+      }
+    }
+
+    final sessions = <AgentSession>[];
+    for (final agentJson in agentsJson) {
+      final session = _agentSessionFromRuntime(
+        agentJson,
+        messagesByAgent[_agentIdFromRuntimeAgent(agentJson)] ?? const [],
+      );
+      if (session != null) {
+        sessions.add(session);
+      }
+    }
+    sessions.sort((a, b) => b.updatedAt.compareTo(a.updatedAt));
+    final attentionJson = snapshot['attention'];
+    final attention = <AttentionEvent>[];
+    if (attentionJson is List) {
+      for (final item in attentionJson) {
+        final event = _attentionFromRuntime(item);
+        if (event != null) {
+          attention.add(event);
+        }
+      }
+    }
+    final projectsJson = snapshot['projects'];
+    final projects = <DitchProject>[];
+    if (projectsJson is List) {
+      for (final item in projectsJson) {
+        final project = _projectFromRuntime(item);
+        if (project != null) {
+          projects.add(project);
+        }
+      }
+    }
+    setState(() {
+      final selectedPath = _projects.isEmpty ? null : _selectedProject.path;
+      if (projects.isNotEmpty) {
+        projects.sort((a, b) => a.name.compareTo(b.name));
+        _projects
+          ..clear()
+          ..addAll(projects);
+        final restoredIndex = selectedPath == null
+            ? -1
+            : _projects.indexWhere((project) => project.path == selectedPath);
+        _selectedProjectIndex = restoredIndex >= 0 ? restoredIndex : 0;
+      }
+      _agentSessions
+        ..clear()
+        ..addAll(sessions);
+      _attention
+        ..clear()
+        ..addAll(attention);
+      final visibleSessions = _visibleSessions;
+      if (visibleSessions.isNotEmpty) {
+        _expandedAgentLocalId =
+            visibleSessions.any(
+              (session) => session.localId == _expandedAgentLocalId,
+            )
+            ? _expandedAgentLocalId
+            : visibleSessions.first.localId;
+      } else {
+        _expandedAgentLocalId = null;
+      }
+    });
+    _scheduleStatusBarUpdate();
+  }
+
+  DitchProject? _projectFromRuntime(Object? value) {
+    return parseRuntimeProject(value);
+  }
+
   @override
   void initState() {
     super.initState();
+    _statusBarChannel.setMethodCallHandler((call) async {
+      switch (call.method) {
+        case 'quitRuntimeAndApp':
+          await _shutdownRuntimeForQuit();
+          return true;
+        default:
+          throw MissingPluginException();
+      }
+    });
+    _scheduleStatusBarUpdate();
+    if (widget.connectRuntimeOnStart) {
+      unawaited(_connectRuntime());
+    }
   }
 
   @override
   void dispose() {
-    for (final process in _codexProcesses.values) {
-      process.kill();
-    }
+    _statusBarChannel.setMethodCallHandler(null);
+    _runtimeEvents?.cancel();
     _chatController.dispose();
     super.dispose();
   }
@@ -262,15 +898,106 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
       return;
     }
 
-    await _ensureProjectMetadata(project.path);
-    setState(() {
-      _projects.add(project);
-      _selectedProjectIndex = _projects.length - 1;
-    });
-    _addChatMessage(
-      _expandedSession ?? _agentSessions.first,
-      ChatMessageRole.system,
-      'Added project: ${project.name}',
+    final normalizedPath = Directory(project.path).absolute.path;
+    if (_projects.any(
+      (existing) => Directory(existing.path).absolute.path == normalizedPath,
+    )) {
+      _showProjectSetupResult(
+        title: 'Project already added',
+        message: normalizedPath,
+        isError: true,
+      );
+      return;
+    }
+
+    _showProjectSetupProgress();
+    try {
+      await _ensureRuntimeStarted();
+      final response = await _runtimeClient.createProject(
+        name: project.name,
+        root: normalizedPath,
+        gitPolicy: project.gitPolicy,
+      );
+      if (!mounted) {
+        return;
+      }
+      Navigator.of(context, rootNavigator: true).pop();
+      final configuredProject =
+          _projectFromRuntime(response['ProjectCreated']) ??
+          DitchProject(
+            name: project.name,
+            path: normalizedPath,
+            gitPolicy:
+                project.gitPolicy == ProjectGitPolicy.initializeRepository
+                ? ProjectGitPolicy.requireRepository
+                : project.gitPolicy,
+          );
+      late final AgentSession projectSession;
+      setState(() {
+        _projects.add(configuredProject);
+        _selectedProjectIndex = _projects.length - 1;
+        projectSession = _createAgentSession(expand: true);
+      });
+      _addChatMessage(
+        projectSession,
+        ChatMessageRole.system,
+        'Project ready: ${project.name}. Verified .ditch/agents, .ditch/hooks, and .ditch/mcp.',
+      );
+      _showProjectSetupResult(
+        title: 'Project ready',
+        message:
+            'The Ditch verified agents, hooks, and MCP directories in ${configuredProject.path}/.ditch.',
+      );
+    } on Object catch (error) {
+      if (!mounted) {
+        return;
+      }
+      Navigator.of(context, rootNavigator: true).pop();
+      _showProjectSetupResult(
+        title: 'Setup incomplete',
+        message: '$error',
+        isError: true,
+      );
+    }
+  }
+
+  void _showProjectSetupProgress() {
+    showDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (context) => const AlertDialog(
+        content: Row(
+          children: [
+            CircularProgressIndicator(),
+            SizedBox(width: 20),
+            Text('Configuring project…'),
+          ],
+        ),
+      ),
+    );
+  }
+
+  void _showProjectSetupResult({
+    required String title,
+    required String message,
+    bool isError = false,
+  }) {
+    if (!mounted) {
+      return;
+    }
+    showDialog<void>(
+      context: context,
+      builder: (context) => AlertDialog(
+        icon: Icon(isError ? Icons.error_outline : Icons.check_circle_outline),
+        title: Text(title),
+        content: Text(message),
+        actions: [
+          FilledButton(
+            onPressed: () => Navigator.of(context).pop(),
+            child: const Text('Done'),
+          ),
+        ],
+      ),
     );
   }
 
@@ -290,44 +1017,109 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
       return;
     }
 
-    late final AgentSession session;
-    setState(() {
-      session = _createAgentSession(expand: true);
-    });
-    await _beginCodexSession(session, prompt.trim());
+    await _startCodexRuntime(prompt.trim());
   }
 
-  Future<void> _beginCodexSession(AgentSession session, String prompt) async {
-    final binary = _codexBinary ?? await _discoverCodexBinary();
-    if (binary == null) {
+  Future<void> _startCodexRuntime(String prompt) async {
+    if (!await _prepareSelectedProjectForCodex()) {
+      return;
+    }
+    try {
+      final response = await _runtimeClient.startCodexSession(
+        projectName: _selectedProject.name,
+        projectRoot: _selectedProject.path,
+        prompt: prompt,
+      );
+      final run = response['AgentStarted'];
+      final session = _agentSessionFromRuntime(run, [
+        AgentChatMessage(
+          role: ChatMessageRole.user,
+          text: prompt,
+          createdAt: DateTime.now(),
+        ),
+      ]);
+      if (session != null) {
+        final existing = _agentSessionByLocalId(session.localId);
+        setState(() {
+          if (existing == null) {
+            _agentSessions.insert(0, session);
+          }
+          _expandedAgentLocalId = session.localId;
+        });
+        _scheduleStatusBarUpdate();
+      }
+    } on Object catch (error) {
+      late final AgentSession session;
       setState(() {
+        session = _createAgentSession(expand: true);
         session.status = AgentStatus.failed;
+        session.currentPrompt = prompt;
         session.updatedAt = DateTime.now();
       });
+      _scheduleStatusBarUpdate();
       _addChatMessage(
         session,
         ChatMessageRole.system,
-        'Codex not found. Checked GUI PATH, login shell PATH, Homebrew paths, and NVM Node versions.',
+        'Failed to start Codex through The Ditch Runtime: $error',
       );
       _addAttentionRequired(
         kind: AttentionKind.failed,
         sessionLocalId: session.localId,
         icon: Icons.error_outline,
-        title: 'Codex not found',
-        body:
-            'The app could not find the codex binary from the macOS app environment.',
+        title: 'Codex failed to start',
+        body: '$error',
       );
-      return;
     }
-    _codexBinary = binary;
+  }
 
-    setState(() {
-      session.codexThreadId = null;
-      session.status = AgentStatus.starting;
-      session.currentPrompt = prompt;
-      session.updatedAt = DateTime.now();
-    });
-    await _runCodexTurn(session, prompt, resume: false);
+  Future<bool> _prepareSelectedProjectForCodex() async {
+    if (!_runtimeCodexHomeMatches) {
+      return false;
+    }
+    final project = _selectedProject;
+    if (project.gitPolicy != ProjectGitPolicy.requireRepository ||
+        isInsideGitWorkTree(project.path)) {
+      return true;
+    }
+    final policy = await showDialog<ProjectGitPolicy>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Choose how Codex should run'),
+        content: Text(
+          '${project.name} is not inside a Git repository. You can initialize Git or explicitly allow Codex to run outside Git for this project.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(),
+            child: const Text('Cancel'),
+          ),
+          OutlinedButton(
+            onPressed: () => Navigator.of(
+              context,
+            ).pop(ProjectGitPolicy.initializeRepository),
+            child: const Text('Initialize Git Repository'),
+          ),
+          FilledButton(
+            onPressed: () =>
+                Navigator.of(context).pop(ProjectGitPolicy.allowOutsideGit),
+            child: const Text('Allow Codex Outside Git'),
+          ),
+        ],
+      ),
+    );
+    if (policy == null) {
+      return false;
+    }
+    final response = await _runtimeClient.createProject(
+      name: project.name,
+      root: project.path,
+      gitPolicy: policy,
+    );
+    final created = _projectFromRuntime(response['ProjectCreated']);
+    if (created != null && mounted) {
+      setState(() => _projects[_selectedProjectIndex] = created);
+    }
+    return true;
   }
 
   Future<void> _submitComposer(AgentSession session, String prompt) async {
@@ -341,7 +1133,13 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
     }
 
     if (session.codexThreadId == null) {
-      await _beginCodexSession(session, cleanPrompt);
+      await _startCodexRuntime(cleanPrompt);
+      return;
+    }
+
+    if (session.status == AgentStatus.failed ||
+        session.status == AgentStatus.stopped) {
+      await _resumeCodexRuntime(session, cleanPrompt);
       return;
     }
 
@@ -349,247 +1147,110 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
       session.currentPrompt = cleanPrompt;
       session.updatedAt = DateTime.now();
     });
-    await _runCodexTurn(session, cleanPrompt, resume: true);
-  }
-
-  Future<void> _stopCodex(AgentSession session) async {
-    final process = _codexProcesses[session.localId];
-    if (process == null) {
+    _scheduleStatusBarUpdate();
+    try {
+      await _runtimeClient.promptAgent(
+        agentId: session.localId,
+        prompt: cleanPrompt,
+      );
+    } on Object catch (error) {
       _addChatMessage(
         session,
         ChatMessageRole.system,
-        'No active Codex process to stop.',
+        'Failed to send prompt through The Ditch Runtime: $error',
       );
-      return;
+      _addAttentionRequired(
+        kind: AttentionKind.failed,
+        sessionLocalId: session.localId,
+        icon: Icons.error_outline,
+        title: 'Codex prompt failed',
+        body: '$error',
+      );
     }
-
-    process.kill();
-    _codexProcesses.remove(session.localId);
-    _addChatMessage(session, ChatMessageRole.system, 'Stopping Codex...');
-    setState(() {
-      session.status = AgentStatus.stopped;
-      session.updatedAt = DateTime.now();
-    });
   }
 
-  Future<void> _runCodexTurn(
-    AgentSession session,
-    String prompt, {
-    required bool resume,
-  }) async {
-    final binary = _codexBinary ?? await _discoverCodexBinary();
-    if (binary == null) {
-      _addChatMessage(
-        session,
-        ChatMessageRole.system,
-        'Codex binary was not found.',
-      );
-      setState(() {
-        session.status = AgentStatus.failed;
-        session.updatedAt = DateTime.now();
-      });
+  Future<void> _resumeCodexRuntime(AgentSession session, String prompt) async {
+    if (!await _prepareSelectedProjectForCodex()) {
       return;
     }
-    _codexBinary = binary;
+    final threadId = session.codexThreadId;
+    if (threadId == null) {
+      await _startCodexRuntime(prompt);
+      return;
+    }
 
-    final args = resume
-        ? <String>['exec', 'resume', '--json', session.codexThreadId!, '-']
-        : <String>[
-            'exec',
-            '--json',
-            '--color',
-            'never',
-            '--cd',
-            _selectedProject.path,
-            '-',
-          ];
-
-    _addChatMessage(session, ChatMessageRole.user, prompt);
     setState(() {
-      session.status = AgentStatus.working;
+      session.status = AgentStatus.starting;
       session.currentPrompt = prompt;
       session.updatedAt = DateTime.now();
     });
-    final turnDiagnostics = <CodexProcessDiagnostic>[];
+    _scheduleStatusBarUpdate();
 
     try {
-      final process = await Process.start(
-        binary,
-        args,
-        workingDirectory: _selectedProject.path,
-        environment: _agentEnvironment(binary),
-        mode: ProcessStartMode.normal,
+      final response = await _runtimeClient.resumeCodexSession(
+        projectName: _selectedProject.name,
+        projectRoot: _selectedProject.path,
+        threadId: threadId,
+        prompt: prompt,
       );
-      _codexProcesses[session.localId] = process;
-      process.stdin.write(prompt);
-      await process.stdin.close();
-
-      process.stdout
-          .transform(utf8.decoder)
-          .transform(const LineSplitter())
-          .listen((line) => _handleCodexJsonEvent(session, line));
-      process.stderr.transform(utf8.decoder).listen((text) {
-        final diagnostic = codexStderrDiagnosticFromChunk(text);
-        if (diagnostic == null) {
-          return;
-        }
-        turnDiagnostics.add(diagnostic);
-        _recordCodexDiagnostic(diagnostic);
-      });
-
-      final code = await process.exitCode;
-      if (!mounted || _codexProcesses[session.localId] != process) {
+      final run = response['AgentStarted'];
+      final revived = _agentSessionFromRuntime(run, [
+        ...session.messages,
+        AgentChatMessage(
+          role: ChatMessageRole.user,
+          text: prompt,
+          createdAt: DateTime.now(),
+        ),
+      ]);
+      if (revived == null) {
         return;
       }
-      _codexProcesses.remove(session.localId);
       setState(() {
-        session.status = code == 0 ? AgentStatus.completed : AgentStatus.failed;
-        session.updatedAt = DateTime.now();
+        final index = _agentSessions.indexOf(session);
+        if (index >= 0) {
+          _agentSessions[index] = revived;
+        } else {
+          _agentSessions.insert(0, revived);
+        }
+        _expandedAgentLocalId = revived.localId;
       });
-      if (code != 0) {
-        final diagnosticCount = turnDiagnostics.length;
-        final details = diagnosticCount == 0
-            ? 'Exit code: $code.'
-            : 'Exit code: $code. $diagnosticCount diagnostic message(s) captured.';
-        _ring(
-          'Codex failed',
-          details,
-          kind: AttentionKind.failed,
-          sessionLocalId: session.localId,
-        );
-        _addChatMessage(
-          session,
-          ChatMessageRole.system,
-          'Codex exited with code $code.',
-        );
-      }
+      _scheduleStatusBarUpdate();
     } on Object catch (error) {
-      _codexProcesses.remove(session.localId);
       setState(() {
         session.status = AgentStatus.failed;
         session.updatedAt = DateTime.now();
       });
-      _ring(
-        'Codex failed to start',
-        '$error',
-        kind: AttentionKind.failed,
-        sessionLocalId: session.localId,
-      );
+      _scheduleStatusBarUpdate();
       _addChatMessage(
         session,
         ChatMessageRole.system,
-        'Failed to start Codex: $error',
+        'Failed to revive Codex through The Ditch Runtime: $error',
+      );
+      _addAttentionRequired(
+        kind: AttentionKind.failed,
+        sessionLocalId: session.localId,
+        icon: Icons.error_outline,
+        title: 'Codex revive failed',
+        body: '$error',
       );
     }
   }
 
-  Future<String?> _discoverCodexBinary() async {
-    final home = Platform.environment['HOME'];
-    final staticCandidates = <String>[
-      if (home != null) '$home/.nvm/current/bin/codex',
-      if (home != null) '$home/.npm-global/bin/codex',
-      if (home != null) '$home/.local/bin/codex',
-      '/opt/homebrew/bin/codex',
-      '/usr/local/bin/codex',
-    ];
-
-    for (final candidate in staticCandidates) {
-      if (await File(candidate).exists()) {
-        return candidate;
-      }
-    }
-
-    if (home != null) {
-      final nvmRoot = Directory('$home/.nvm/versions/node');
-      if (await nvmRoot.exists()) {
-        final versions = await nvmRoot
-            .list()
-            .where((entity) => entity is Directory)
-            .cast<Directory>()
-            .toList();
-        versions.sort((a, b) => b.path.compareTo(a.path));
-        for (final version in versions) {
-          final candidate = '${version.path}/bin/codex';
-          if (await File(candidate).exists()) {
-            return candidate;
-          }
-        }
-      }
-    }
-
-    final shell = Platform.environment['SHELL'] ?? '/bin/zsh';
-    final shellResult = await Process.run(shell, ['-lc', 'command -v codex']);
-    if (shellResult.exitCode == 0) {
-      final path = shellResult.stdout.toString().trim();
-      if (path.isNotEmpty && await File(path).exists()) {
-        return path;
-      }
-    }
-
-    final pathResult = await Process.run('/usr/bin/env', ['which', 'codex']);
-    if (pathResult.exitCode == 0) {
-      final path = pathResult.stdout.toString().trim();
-      if (path.isNotEmpty && await File(path).exists()) {
-        return path;
-      }
-    }
-
-    return null;
-  }
-
-  Map<String, String> _agentEnvironment(String binary) {
-    final currentPath = Platform.environment['PATH'] ?? '';
-    final binaryDir = File(binary).parent.path;
-    final pathParts = <String>[
-      binaryDir,
-      '/opt/homebrew/bin',
-      '/usr/local/bin',
-      '/usr/bin',
-      '/bin',
-      '/usr/sbin',
-      '/sbin',
-      if (currentPath.isNotEmpty) currentPath,
-    ];
-
-    final home = Platform.environment['HOME'];
-    final shell = Platform.environment['SHELL'];
-
-    final environment = {'PATH': pathParts.toSet().join(':')};
-    if (home != null) {
-      environment['HOME'] = home;
-    }
-    if (shell != null) {
-      environment['SHELL'] = shell;
-    }
-    return environment;
-  }
-
-  Future<void> _ensureProjectMetadata(String projectPath) async {
-    for (final child in ['agents', 'hooks', 'mcp']) {
-      await Directory('$projectPath/.ditch/$child').create(recursive: true);
-    }
-  }
-
-  void _ring(
-    String title,
-    String body, {
-    required AttentionKind kind,
-    String? sessionLocalId,
-  }) {
-    SystemSound.play(SystemSoundType.alert);
-    _addAttentionRequired(
-      kind: kind,
-      sessionLocalId: sessionLocalId,
-      icon: Icons.notifications_active_outlined,
-      title: title,
-      body: body,
-    );
-  }
-
-  void _recordCodexDiagnostic(CodexProcessDiagnostic diagnostic) {
-    _codexDiagnostics.add(diagnostic);
-    if (_codexDiagnostics.length > 200) {
-      _codexDiagnostics.removeRange(0, _codexDiagnostics.length - 200);
+  Future<void> _stopCodex(AgentSession session) async {
+    _addChatMessage(session, ChatMessageRole.system, 'Stopping Codex...');
+    try {
+      await _runtimeClient.stopAgent(session.localId);
+      setState(() {
+        session.status = AgentStatus.stopped;
+        session.updatedAt = DateTime.now();
+      });
+      _scheduleStatusBarUpdate();
+    } on Object catch (error) {
+      _addChatMessage(
+        session,
+        ChatMessageRole.system,
+        'Failed to stop Codex through The Ditch Runtime: $error',
+      );
     }
   }
 
@@ -599,6 +1260,8 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
     required String title,
     required String body,
     String? sessionLocalId,
+    String? projectId,
+    bool global = false,
   }) {
     if (!mounted) {
       return;
@@ -613,10 +1276,12 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
           title: title,
           body: body,
           sessionLocalId: sessionLocalId,
+          projectId: global ? null : (projectId ?? _selectedProject.id),
           createdAt: DateTime.now(),
         ),
       );
     });
+    _scheduleStatusBarUpdate();
   }
 
   void _openAttentionSession(AttentionEvent event) {
@@ -627,6 +1292,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
     }
 
     setState(() => _expandedAgentLocalId = sessionLocalId);
+    _scheduleStatusBarUpdate();
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!_chatController.hasClients) {
         return;
@@ -639,6 +1305,8 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
     setState(() {
       _attention.removeWhere((candidate) => candidate.id == event.id);
     });
+    _scheduleStatusBarUpdate();
+    unawaited(_runtimeClient.dismissAttention(event.id));
   }
 
   bool _canStopAttentionSession(AttentionEvent event) {
@@ -646,75 +1314,240 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
     if (sessionLocalId == null) {
       return false;
     }
-    return _codexProcesses.containsKey(sessionLocalId) &&
-        (_agentSessionByLocalId(sessionLocalId)?.isWorking ?? false);
+    return _agentSessionByLocalId(sessionLocalId)?.isWorking ?? false;
   }
 
-  void _handleCodexJsonEvent(AgentSession session, String line) {
-    if (line.trim().isEmpty) {
-      return;
-    }
-    Object? decoded;
-    try {
-      decoded = jsonDecode(line);
-    } on FormatException {
-      return;
-    }
-    if (decoded is! Map<String, dynamic>) {
+  void _handleRuntimeEvent(Map<String, dynamic> envelopeBody) {
+    final eventBody = envelopeBody['event'];
+    if (eventBody is! Map<String, dynamic>) {
       return;
     }
 
-    switch (decoded['type']) {
-      case 'thread.started':
-        final threadId = decoded['thread_id'];
-        if (threadId is String && threadId.isNotEmpty) {
-          setState(() {
-            session.codexThreadId = threadId;
-            session.updatedAt = DateTime.now();
-          });
-        }
-        break;
-      case 'item.completed':
-        final item = decoded['item'];
-        if (item is! Map<String, dynamic>) {
-          return;
-        }
-        switch (item['type']) {
-          case 'agent_message':
-            final text = item['text'];
-            if (text is String && text.trim().isNotEmpty) {
-              _addChatMessage(session, ChatMessageRole.assistant, text.trim());
-            }
-            break;
-          case 'error':
-            final message = item['message'];
-            if (message is String && message.trim().isNotEmpty) {
-              final cleanMessage = message.trim();
-              _addChatMessage(session, ChatMessageRole.system, cleanMessage);
-              _addAttentionRequired(
-                kind: AttentionKind.failed,
-                sessionLocalId: session.localId,
-                icon: Icons.error_outline,
-                title: '${session.displayName} needs attention',
-                body: cleanMessage,
-              );
-            }
-            break;
-          case 'command_execution':
-            final command = item['command'];
-            if (command is String && command.trim().isNotEmpty) {
-              _addChatMessage(session, ChatMessageRole.tool, command.trim());
-            }
-            break;
-        }
-        break;
-      case 'turn.completed':
-        setState(() {
-          session.status = AgentStatus.completed;
-          session.updatedAt = DateTime.now();
-        });
-        break;
+    final snapshotReplaced = eventBody['SnapshotReplaced'];
+    if (snapshotReplaced is Map<String, dynamic>) {
+      _hydrateRuntimeSnapshot({'Snapshot': snapshotReplaced});
+      return;
     }
+
+    final projectChanged = eventBody['ProjectChanged'];
+    if (projectChanged != null) {
+      final project = _projectFromRuntime(projectChanged);
+      if (project == null) {
+        return;
+      }
+      setState(() {
+        final index = _projects.indexWhere(
+          (existing) => existing.path == project.path,
+        );
+        if (index >= 0) {
+          _projects[index] = project;
+        } else {
+          _projects.add(project);
+        }
+      });
+      return;
+    }
+
+    final agentChanged = eventBody['AgentChanged'];
+    if (agentChanged != null) {
+      final incoming = _agentSessionFromRuntime(agentChanged, const []);
+      if (incoming == null) {
+        return;
+      }
+      setState(() {
+        final existing = _agentSessionByLocalId(incoming.localId);
+        if (existing == null) {
+          _agentSessions.insert(0, incoming);
+          _expandedAgentLocalId ??= incoming.localId;
+        } else {
+          existing.status = incoming.status;
+          existing.codexThreadId = incoming.codexThreadId;
+          existing.currentPrompt = incoming.currentPrompt;
+          existing.lastVisibleAction = incoming.lastVisibleAction;
+          existing.updatedAt = incoming.updatedAt;
+        }
+      });
+      _scheduleStatusBarUpdate();
+      return;
+    }
+
+    final messageAppended = eventBody['AgentMessageAppended'];
+    if (messageAppended != null) {
+      final agentId = _agentIdFromRuntimeMessage(messageAppended);
+      final message = _agentChatMessageFromRuntime(messageAppended);
+      if (agentId == null || message == null) {
+        return;
+      }
+      final session = _agentSessionByLocalId(agentId);
+      if (session == null) {
+        return;
+      }
+      _addChatMessage(session, message.role, message.text);
+      return;
+    }
+
+    final attentionRaised = eventBody['AttentionRaised'];
+    if (attentionRaised != null) {
+      final attention = _attentionFromRuntime(attentionRaised);
+      if (attention == null ||
+          _attention.any((existing) => existing.id == attention.id)) {
+        return;
+      }
+      setState(() => _attention.insert(0, attention));
+      _scheduleStatusBarUpdate();
+      return;
+    }
+
+    final attentionDismissed = eventBody['AttentionDismissed'];
+    if (attentionDismissed is Map<String, dynamic>) {
+      final id = attentionDismissed['attention_id']?.toString();
+      if (id != null) {
+        setState(() => _attention.removeWhere((item) => item.id == id));
+        _scheduleStatusBarUpdate();
+      }
+      return;
+    }
+
+    final bell = eventBody['Bell'];
+    if (bell is Map<String, dynamic>) {
+      _addAttentionRequired(
+        kind: AttentionKind.needsInput,
+        icon: Icons.notifications_active_outlined,
+        title: 'Codex needs attention',
+        body: bell['reason']?.toString() ?? 'Agent session needs attention.',
+        sessionLocalId: _agentIdToString(bell['agent_id']),
+      );
+    }
+  }
+
+  AgentSession? _agentSessionFromRuntime(
+    Object? agentJson,
+    List<AgentChatMessage> messages,
+  ) {
+    if (agentJson is! Map<String, dynamic>) {
+      return null;
+    }
+    final agentId = _agentIdFromRuntimeAgent(agentJson);
+    if (agentId == null) {
+      return null;
+    }
+    final state = agentJson['state']?.toString();
+    return AgentSession(
+      localId: agentId,
+      projectId: agentJson['project_id']?.toString(),
+      provider: AgentProvider.codex,
+      status: _agentStatusFromRuntime(state),
+      messages: messages.isEmpty
+          ? [
+              AgentChatMessage(
+                role: ChatMessageRole.system,
+                text: 'Runtime session connected.',
+                createdAt: DateTime.now(),
+              ),
+            ]
+          : List<AgentChatMessage>.from(messages),
+      codexThreadId: agentJson['native_session_id']?.toString(),
+      currentPrompt: agentJson['current_prompt']?.toString(),
+      lastVisibleAction: agentJson['last_visible_action']?.toString(),
+      createdAt: _dateTimeFromRuntime(agentJson['started_at']),
+      updatedAt: _dateTimeFromRuntime(agentJson['updated_at']),
+    );
+  }
+
+  AttentionEvent? _attentionFromRuntime(Object? value) {
+    if (value is! Map<String, dynamic>) {
+      return null;
+    }
+    final id = value['id']?.toString();
+    final title = value['title']?.toString();
+    final body = value['body']?.toString();
+    if (id == null || title == null || body == null) {
+      return null;
+    }
+    final kind = switch (value['kind']?.toString()) {
+      'ApprovalRequired' => AttentionKind.approvalRequired,
+      'Blocked' => AttentionKind.blocked,
+      'Failed' => AttentionKind.failed,
+      _ => AttentionKind.needsInput,
+    };
+    return AttentionEvent(
+      id: id,
+      kind: kind,
+      icon: kind == AttentionKind.failed
+          ? Icons.error_outline
+          : Icons.notifications_active_outlined,
+      title: title,
+      body: body,
+      sessionLocalId: _agentIdToString(value['agent_id']),
+      projectId: value['project_id']?.toString(),
+      createdAt: _dateTimeFromRuntime(value['created_at']),
+    );
+  }
+
+  AgentChatMessage? _agentChatMessageFromRuntime(Object? messageJson) {
+    if (messageJson is! Map<String, dynamic>) {
+      return null;
+    }
+    final text = messageJson['text']?.toString();
+    if (text == null || text.trim().isEmpty) {
+      return null;
+    }
+    return AgentChatMessage(
+      role: _chatRoleFromRuntime(messageJson['role']?.toString()),
+      text: text,
+      createdAt: _dateTimeFromRuntime(messageJson['created_at']),
+    );
+  }
+
+  String? _agentIdFromRuntimeAgent(Object? agentJson) {
+    if (agentJson is! Map<String, dynamic>) {
+      return null;
+    }
+    return _agentIdToString(agentJson['id']);
+  }
+
+  String? _agentIdFromRuntimeMessage(Object? messageJson) {
+    if (messageJson is! Map<String, dynamic>) {
+      return null;
+    }
+    return _agentIdToString(messageJson['agent_id']);
+  }
+
+  String? _agentIdToString(Object? value) {
+    if (value is String && value.isNotEmpty) {
+      return value;
+    }
+    if (value is Map && value['0'] is String) {
+      return value['0'] as String;
+    }
+    return null;
+  }
+
+  AgentStatus _agentStatusFromRuntime(String? state) {
+    return switch (state) {
+      'Starting' => AgentStatus.starting,
+      'Working' || 'AwaitingApproval' || 'Blocked' => AgentStatus.working,
+      'Completed' => AgentStatus.completed,
+      'Failed' || 'Stale' || 'Unknown' => AgentStatus.failed,
+      'Interrupted' => AgentStatus.stopped,
+      _ => AgentStatus.idle,
+    };
+  }
+
+  ChatMessageRole _chatRoleFromRuntime(String? role) {
+    return switch (role) {
+      'User' => ChatMessageRole.user,
+      'Assistant' => ChatMessageRole.assistant,
+      'Tool' => ChatMessageRole.tool,
+      _ => ChatMessageRole.system,
+    };
+  }
+
+  DateTime _dateTimeFromRuntime(Object? value) {
+    if (value is String) {
+      return DateTime.tryParse(value)?.toLocal() ?? DateTime.now();
+    }
+    return DateTime.now();
   }
 
   void _addChatMessage(
@@ -726,11 +1559,18 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
       return;
     }
     setState(() {
+      if (session.messages.isNotEmpty) {
+        final lastMessage = session.messages.last;
+        if (lastMessage.role == role && lastMessage.text == text) {
+          return;
+        }
+      }
       session.messages.add(
         AgentChatMessage(role: role, text: text, createdAt: DateTime.now()),
       );
       session.updatedAt = DateTime.now();
     });
+    _scheduleStatusBarUpdate();
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!_chatController.hasClients) {
         return;
@@ -753,13 +1593,12 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
               projects: _projects,
               selectedIndex: _selectedProjectIndex,
               onAddProject: _addProject,
-              onSelectProject: (index) =>
-                  setState(() => _selectedProjectIndex = index),
+              onSelectProject: _selectProject,
             ),
             const VerticalDivider(width: 1),
             Expanded(
               child: AgentsSurface(
-                sessions: _agentSessions,
+                sessions: _visibleSessions,
                 expandedAgentLocalId: _expandedAgentLocalId,
                 chatController: _chatController,
                 composerKey: _composerKey,
@@ -788,7 +1627,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
                   height: 240,
                   child: AttentionPanel(
                     width: double.infinity,
-                    events: _attention,
+                    events: _visibleAttention,
                     canStopSession: _canStopAttentionSession,
                     onOpenSession: _openAttentionSession,
                     onStopSession: (event) {
@@ -813,7 +1652,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
               const VerticalDivider(width: 1),
               AttentionPanel(
                 width: 300,
-                events: _attention,
+                events: _visibleAttention,
                 canStopSession: _canStopAttentionSession,
                 onOpenSession: _openAttentionSession,
                 onStopSession: (event) {
@@ -1099,6 +1938,15 @@ class ExpandableAgentPanel extends StatelessWidget {
                   Text(session.displayName),
                   const SizedBox(height: 2),
                   Text(_statusLabel(session.status)),
+                  if (session.lastVisibleAction != null) ...[
+                    const SizedBox(height: 2),
+                    Text(
+                      session.lastVisibleAction!,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: Theme.of(context).textTheme.bodySmall,
+                    ),
+                  ],
                   if (session.currentPrompt != null) ...[
                     const SizedBox(height: 2),
                     Text(
@@ -1914,8 +2762,45 @@ class AddProjectDialog extends StatefulWidget {
 }
 
 class _AddProjectDialogState extends State<AddProjectDialog> {
+  static const _projectPickerChannel = MethodChannel(
+    'the_ditch/project_picker',
+  );
   final _name = TextEditingController();
   final _path = TextEditingController();
+  bool _checkingGit = false;
+  bool? _isGitRepository;
+  ProjectGitPolicy? _gitPolicy;
+
+  Future<void> _browseForFolder() async {
+    final path = await _projectPickerChannel.invokeMethod<String>(
+      'chooseDirectory',
+    );
+    if (path == null || path.trim().isEmpty || !mounted) {
+      return;
+    }
+    final normalized = path.trim();
+    final segments = Uri.directory(
+      normalized,
+    ).pathSegments.where((segment) => segment.isNotEmpty).toList();
+    setState(() {
+      _path.text = normalized;
+      _checkingGit = true;
+      _isGitRepository = null;
+      _gitPolicy = null;
+      if (_name.text.trim().isEmpty && segments.isNotEmpty) {
+        _name.text = segments.last;
+      }
+    });
+    final isGitRepository = isInsideGitWorkTree(normalized);
+    if (!mounted || _path.text != normalized) {
+      return;
+    }
+    setState(() {
+      _checkingGit = false;
+      _isGitRepository = isGitRepository;
+      _gitPolicy = isGitRepository ? ProjectGitPolicy.requireRepository : null;
+    });
+  }
 
   @override
   void dispose() {
@@ -1933,15 +2818,62 @@ class _AddProjectDialogState extends State<AddProjectDialog> {
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            TextField(
-              controller: _name,
-              decoration: const InputDecoration(labelText: 'Project name'),
-              autofocus: true,
+            Align(
+              alignment: Alignment.centerLeft,
+              child: FilledButton.tonalIcon(
+                onPressed: _browseForFolder,
+                icon: const Icon(Icons.folder_open),
+                label: const Text('Browse Folder…'),
+              ),
             ),
             const SizedBox(height: 12),
             TextField(
               controller: _path,
-              decoration: const InputDecoration(labelText: 'Project path'),
+              decoration: const InputDecoration(labelText: 'Selected folder'),
+              readOnly: true,
+            ),
+            if (_checkingGit) ...[
+              const SizedBox(height: 12),
+              const LinearProgressIndicator(),
+            ] else if (_isGitRepository == false) ...[
+              const SizedBox(height: 12),
+              DropdownButtonFormField<ProjectGitPolicy>(
+                initialValue: _gitPolicy,
+                decoration: const InputDecoration(
+                  labelText: 'This folder is not a Git repository',
+                ),
+                hint: const Text('Choose how Codex should run'),
+                items: const [
+                  DropdownMenuItem(
+                    value: ProjectGitPolicy.initializeRepository,
+                    child: Text('Initialize Git Repository'),
+                  ),
+                  DropdownMenuItem(
+                    value: ProjectGitPolicy.allowOutsideGit,
+                    child: Text('Allow Codex Outside Git'),
+                  ),
+                ],
+                onChanged: (value) => setState(() => _gitPolicy = value),
+              ),
+              const SizedBox(height: 8),
+              const Align(
+                alignment: Alignment.centerLeft,
+                child: Text(
+                  'Allowing outside Git applies --skip-git-repo-check only to this project.',
+                ),
+              ),
+            ],
+            const SizedBox(height: 12),
+            TextField(
+              controller: _name,
+              decoration: const InputDecoration(labelText: 'Project name'),
+            ),
+            const SizedBox(height: 16),
+            const Align(
+              alignment: Alignment.centerLeft,
+              child: Text(
+                'The Ditch will create and verify:\n.ditch/agents  •  .ditch/hooks  •  .ditch/mcp',
+              ),
             ),
           ],
         ),
@@ -1955,12 +2887,18 @@ class _AddProjectDialogState extends State<AddProjectDialog> {
           onPressed: () {
             final name = _name.text.trim();
             final path = _path.text.trim();
-            if (name.isEmpty || path.isEmpty) {
+            final gitPolicy = _gitPolicy;
+            if (name.isEmpty ||
+                path.isEmpty ||
+                _checkingGit ||
+                gitPolicy == null) {
               return;
             }
-            Navigator.of(context).pop(DitchProject(name: name, path: path));
+            Navigator.of(
+              context,
+            ).pop(DitchProject(name: name, path: path, gitPolicy: gitPolicy));
           },
-          child: const Text('Add'),
+          child: const Text('Add & Configure'),
         ),
       ],
     );

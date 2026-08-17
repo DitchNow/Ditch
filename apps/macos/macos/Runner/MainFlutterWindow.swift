@@ -13,6 +13,8 @@ class MainFlutterWindow: NSWindow {
     registrar.register(
       NativeComposerTextViewFactory(messenger: registrar.messenger),
       withId: "the_ditch/composer_text_view")
+    (NSApp.delegate as? AppDelegate)?.configureStatusBarChannel(messenger: registrar.messenger)
+    (NSApp.delegate as? AppDelegate)?.configureProjectPickerChannel(messenger: registrar.messenger)
 
     super.awakeFromNib()
   }
@@ -45,7 +47,7 @@ class NativeComposerTextViewFactory: NSObject, FlutterPlatformViewFactory {
 class NativeComposerTextView: NSView, NSTextViewDelegate {
   private let channel: FlutterMethodChannel
   private let scrollView = NSScrollView()
-  private let textView = NSTextView()
+  private let textView = ComposerTextView()
   private var isApplyingFlutterText = false
 
   init(
@@ -150,5 +152,42 @@ class NativeComposerTextView: NSView, NSTextViewDelegate {
       return
     }
     channel.invokeMethod("textChanged", arguments: textView.string)
+  }
+}
+
+final class ComposerTextView: NSTextView {
+  override func performKeyEquivalent(with event: NSEvent) -> Bool {
+    guard event.modifierFlags.intersection(.deviceIndependentFlagsMask).contains(.command),
+      let characters = event.charactersIgnoringModifiers?.lowercased()
+    else {
+      return super.performKeyEquivalent(with: event)
+    }
+
+    switch characters {
+    case "x":
+      cut(nil)
+      return true
+    case "c":
+      copy(nil)
+      return true
+    case "v":
+      paste(nil)
+      return true
+    case "a":
+      selectAll(nil)
+      return true
+    case "z":
+      if event.modifierFlags.intersection(.deviceIndependentFlagsMask).contains(.shift) {
+        undoManager?.redo()
+      } else {
+        undoManager?.undo()
+      }
+      return true
+    case "q":
+      NSApp.terminate(nil)
+      return true
+    default:
+      return super.performKeyEquivalent(with: event)
+    }
   }
 }

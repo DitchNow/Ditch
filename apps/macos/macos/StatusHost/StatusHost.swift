@@ -1,0 +1,342 @@
+import Cocoa
+import Foundation
+
+@main
+final class StatusHost: NSObject, NSApplicationDelegate {
+  private var statusItem: NSStatusItem?
+  private let menu = NSMenu()
+  private let stateItem = NSMenuItem(title: "Runtime: Starting", action: nil, keyEquivalent: "")
+  private let sessionsItem = NSMenuItem(title: "0 active sessions", action: nil, keyEquivalent: "")
+  private let attentionItem = NSMenuItem(title: "0 alerts", action: nil, keyEquivalent: "")
+  private let codexHomeItem = NSMenuItem(title: "Codex home: Unknown", action: nil, keyEquivalent: "")
+  private var timer: Timer?
+  private var refreshInFlight = false
+  private var appPath = ""
+  private var helperDirectory = ""
+  private var pidFilePath = ""
+  private var logFilePath = ""
+
+  static func main() {
+    let app = NSApplication.shared
+    let delegate = StatusHost()
+    app.delegate = delegate
+    app.setActivationPolicy(.accessory)
+    app.run()
+  }
+
+  func applicationDidFinishLaunching(_ notification: Notification) {
+    logFilePath = StatusHost.defaultLogFilePath()
+    appPath = StatusHost.parentAppPath()
+    helperDirectory = Bundle.main.executableURL?
+      .deletingLastPathComponent()
+      .path ?? URL(fileURLWithPath: CommandLine.arguments[0]).deletingLastPathComponent().path
+    pidFilePath = StatusHost.defaultPidFilePath()
+    log("launch appPath=\(appPath) helperDirectory=\(helperDirectory)")
+    writePidFile()
+    configureStatusItem()
+    // The main application owns runtime startup so its CODEX_HOME is the
+    // single source of truth. The login-item helper only mirrors status.
+    refreshRuntimeStatus()
+    timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
+      self?.refreshRuntimeStatus()
+    }
+  }
+
+  func applicationWillTerminate(_ notification: Notification) {
+    timer?.invalidate()
+    if !pidFilePath.isEmpty {
+      try? FileManager.default.removeItem(atPath: pidFilePath)
+    }
+  }
+
+  private static func defaultPidFilePath() -> String {
+    let support = FileManager.default.homeDirectoryForCurrentUser
+      .appendingPathComponent("Library/Application Support/The Ditch", isDirectory: true)
+    try? FileManager.default.createDirectory(at: support, withIntermediateDirectories: true)
+    return support.appendingPathComponent("ditch-status-host.pid").path
+  }
+
+  private static func defaultLogFilePath() -> String {
+    let logs = FileManager.default.homeDirectoryForCurrentUser
+      .appendingPathComponent("Library/Application Support/The Ditch/logs", isDirectory: true)
+    try? FileManager.default.createDirectory(at: logs, withIntermediateDirectories: true)
+    return logs.appendingPathComponent("status-host.log").path
+  }
+
+  private static func parentAppPath() -> String {
+    let helperBundle = Bundle.main.bundleURL
+    return helperBundle
+      .deletingLastPathComponent()
+      .deletingLastPathComponent()
+      .deletingLastPathComponent()
+      .deletingLastPathComponent()
+      .path
+  }
+
+  private func log(_ message: String) {
+    guard !logFilePath.isEmpty else {
+      return
+    }
+    let line = "\(Date()) \(message)\n"
+    guard let data = line.data(using: .utf8) else {
+      return
+    }
+    if FileManager.default.fileExists(atPath: logFilePath),
+      let handle = try? FileHandle(forWritingTo: URL(fileURLWithPath: logFilePath))
+    {
+      handle.seekToEndOfFile()
+      handle.write(data)
+      try? handle.close()
+    } else {
+      try? data.write(to: URL(fileURLWithPath: logFilePath))
+    }
+  }
+
+  private func writePidFile() {
+    guard !pidFilePath.isEmpty else {
+      return
+    }
+    try? "\(ProcessInfo.processInfo.processIdentifier)\n".write(
+      toFile: pidFilePath,
+      atomically: true,
+      encoding: .utf8)
+  }
+
+  private func configureStatusItem() {
+    let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+    statusItem = item
+    if let button = item.button {
+      button.image = statusImage()
+      button.imagePosition = .imageLeft
+      button.title = ""
+      button.contentTintColor = NSColor.labelColor
+      button.toolTip = "The Ditch Runtime"
+    }
+
+    menu.autoenablesItems = false
+
+    let showItem = NSMenuItem(
+      title: "Show The Ditch",
+      action: #selector(showTheDitch),
+      keyEquivalent: "")
+    showItem.target = self
+    menu.addItem(showItem)
+    menu.addItem(NSMenuItem.separator())
+
+    stateItem.isEnabled = false
+    sessionsItem.isEnabled = false
+    attentionItem.isEnabled = false
+    codexHomeItem.isEnabled = false
+    menu.addItem(stateItem)
+    menu.addItem(sessionsItem)
+    menu.addItem(attentionItem)
+    menu.addItem(codexHomeItem)
+    menu.addItem(NSMenuItem.separator())
+
+    let quitItem = NSMenuItem(
+      title: "Quit The Ditch Runtime",
+      action: #selector(quitRuntime),
+      keyEquivalent: "q")
+    quitItem.target = self
+    menu.addItem(quitItem)
+
+    item.menu = menu
+  }
+
+  private func refreshRuntimeStatus() {
+    guard !refreshInFlight else {
+      return
+    }
+    refreshInFlight = true
+    DispatchQueue.global(qos: .utility).async { [weak self] in
+      guard let self else {
+        return
+      }
+      let status = self.runtimeStatus()
+      DispatchQueue.main.async {
+        self.refreshInFlight = false
+        self.applyRuntimeStatus(status)
+      }
+    }
+  }
+
+  private func applyRuntimeStatus(_ status: RuntimeStatus?) {
+    guard let status else {
+      stateItem.title = "Runtime: Offline"
+      sessionsItem.title = "0 active sessions"
+      attentionItem.title = "0 alerts"
+      codexHomeItem.title = "Codex home: Unknown"
+      updateStatusButton(activeSessionCount: 0, attentionCount: 0)
+      statusItem?.button?.toolTip = "The Ditch Runtime • Offline"
+      return
+    }
+
+    stateItem.title = "Runtime: Running"
+    sessionsItem.title = status.activeSessionCount == 1
+      ? "1 active session"
+      : "\(status.activeSessionCount) active sessions"
+    attentionItem.title = status.attentionCount == 1
+      ? "1 alert"
+      : "\(status.attentionCount) alerts"
+    codexHomeItem.title = "Codex home: \(status.codexHome ?? "Default (~/.codex)")"
+    updateStatusButton(
+      activeSessionCount: status.activeSessionCount,
+      attentionCount: status.attentionCount)
+    statusItem?.button?.toolTip =
+      "The Ditch Runtime • \(status.activeSessionCount) active"
+  }
+
+  private func updateStatusButton(activeSessionCount: Int, attentionCount: Int) {
+    guard let button = statusItem?.button else {
+      return
+    }
+
+    if activeSessionCount > 0 {
+      button.title = " \(activeSessionCount)"
+      statusItem?.length = NSStatusItem.variableLength
+    } else if attentionCount > 0 {
+      button.title = " !\(attentionCount)"
+      statusItem?.length = NSStatusItem.variableLength
+    } else {
+      button.title = ""
+      statusItem?.length = NSStatusItem.squareLength
+    }
+  }
+
+  private func runtimeStatus() -> RuntimeStatus? {
+    let output = runDitchCli(arguments: ["runtime", "status"])
+    guard output.exitCode == 0,
+      let data = output.stdout.data(using: .utf8),
+      let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+      let status = root["RuntimeStatus"] as? [String: Any],
+      let pid = status["pid"] as? Int,
+      let activeSessionCount = status["active_session_count"] as? Int,
+      let attentionCount = status["attention_count"] as? Int,
+      let instanceId = status["instance_id"] as? String
+    else {
+      return nil
+    }
+    return RuntimeStatus(
+      pid: Int32(pid),
+      activeSessionCount: activeSessionCount,
+      attentionCount: attentionCount,
+      instanceId: instanceId,
+      codexHome: status["codex_home"] as? String)
+  }
+
+  private func runDitchCli(arguments: [String]) -> CommandOutput {
+    let cliPath = URL(fileURLWithPath: helperDirectory).appendingPathComponent("ditch_cli").path
+    guard FileManager.default.isExecutableFile(atPath: cliPath) else {
+      log("ditch_cli not executable at \(cliPath)")
+      return CommandOutput(exitCode: 127, stdout: "", stderr: "ditch_cli not found")
+    }
+
+    let process = Process()
+    let stdout = Pipe()
+    let stderr = Pipe()
+    process.executableURL = URL(fileURLWithPath: cliPath)
+    process.arguments = arguments
+    process.standardOutput = stdout
+    process.standardError = stderr
+
+    do {
+      try process.run()
+      process.waitUntilExit()
+    } catch {
+      log("ditch_cli \(arguments.joined(separator: " ")) failed to run: \(error)")
+      return CommandOutput(exitCode: 1, stdout: "", stderr: "\(error)")
+    }
+
+    let stdoutText = String(
+      data: stdout.fileHandleForReading.readDataToEndOfFile(),
+      encoding: .utf8) ?? ""
+    let stderrText = String(
+      data: stderr.fileHandleForReading.readDataToEndOfFile(),
+      encoding: .utf8) ?? ""
+    return CommandOutput(exitCode: process.terminationStatus, stdout: stdoutText, stderr: stderrText)
+  }
+
+  @objc private func showTheDitch() {
+    if let app = NSRunningApplication.runningApplications(withBundleIdentifier: "ai.theditch.app").first {
+      app.activate(options: [.activateAllWindows])
+      return
+    }
+
+    guard !appPath.isEmpty else {
+      return
+    }
+    let configuration = NSWorkspace.OpenConfiguration()
+    configuration.activates = true
+    NSWorkspace.shared.openApplication(
+      at: URL(fileURLWithPath: appPath),
+      configuration: configuration)
+  }
+
+  @objc private func quitRuntime() {
+    _ = runDitchCli(arguments: ["runtime", "stop"])
+    terminateMainApp()
+    NSApp.terminate(nil)
+  }
+
+  private func terminateMainApp() {
+    for app in NSRunningApplication.runningApplications(withBundleIdentifier: "ai.theditch.app") {
+      app.terminate()
+    }
+  }
+
+  private func statusImage() -> NSImage {
+    if let image = NSImage(systemSymbolName: "cpu", accessibilityDescription: "The Ditch Runtime") {
+      image.isTemplate = true
+      return image
+    }
+
+    let image = NSImage(size: NSSize(width: 18, height: 18))
+    image.lockFocus()
+
+    NSColor.black.setStroke()
+    NSColor.black.setFill()
+
+    let body = NSBezierPath(
+      roundedRect: NSRect(x: 4.5, y: 4.5, width: 9, height: 9),
+      xRadius: 2,
+      yRadius: 2)
+    body.lineWidth = 2
+    body.stroke()
+
+    NSBezierPath(rect: NSRect(x: 7.25, y: 14, width: 1.5, height: 3)).fill()
+    NSBezierPath(rect: NSRect(x: 9.25, y: 14, width: 1.5, height: 3)).fill()
+    NSBezierPath(rect: NSRect(x: 7.25, y: 1, width: 1.5, height: 3)).fill()
+    NSBezierPath(rect: NSRect(x: 9.25, y: 1, width: 1.5, height: 3)).fill()
+    NSBezierPath(rect: NSRect(x: 1, y: 7.25, width: 3, height: 1.5)).fill()
+    NSBezierPath(rect: NSRect(x: 1, y: 9.25, width: 3, height: 1.5)).fill()
+    NSBezierPath(rect: NSRect(x: 14, y: 7.25, width: 3, height: 1.5)).fill()
+    NSBezierPath(rect: NSRect(x: 14, y: 9.25, width: 3, height: 1.5)).fill()
+
+    NSBezierPath(
+      roundedRect: NSRect(x: 7, y: 7, width: 1.75, height: 1.75),
+      xRadius: 0.5,
+      yRadius: 0.5).fill()
+    NSBezierPath(
+      roundedRect: NSRect(x: 9.25, y: 9.25, width: 1.75, height: 1.75),
+      xRadius: 0.5,
+      yRadius: 0.5).fill()
+
+    image.unlockFocus()
+    image.isTemplate = true
+    return image
+  }
+}
+
+private struct RuntimeStatus {
+  let pid: Int32
+  let activeSessionCount: Int
+  let attentionCount: Int
+  let instanceId: String
+  let codexHome: String?
+}
+
+private struct CommandOutput {
+  let exitCode: Int32
+  let stdout: String
+  let stderr: String
+}

@@ -103,12 +103,27 @@ pub enum CodexLaunchMode {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ProjectGitPolicy {
+    RequireRepository,
+    InitializeRepository,
+    AllowOutsideGit,
+}
+
+impl Default for ProjectGitPolicy {
+    fn default() -> Self {
+        Self::RequireRepository
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Project {
     pub id: ProjectId,
     pub name: String,
     pub root: PathBuf,
     pub created_at: DateTime<Utc>,
     pub archived_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub git_policy: ProjectGitPolicy,
 }
 
 impl Project {
@@ -119,6 +134,7 @@ impl Project {
             root: root.into(),
             created_at: Utc::now(),
             archived_at: None,
+            git_policy: ProjectGitPolicy::RequireRepository,
         }
     }
 

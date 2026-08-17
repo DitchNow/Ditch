@@ -97,10 +97,12 @@ dependencies = [
 name = "ditch_cli"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "ditch_core",
  "ditch_protocol",
  "ditch_store",
  "serde_json",
+ "uuid",
 ]
 
 [[package]]
@@ -152,6 +154,7 @@ version = "0.1.0"
 dependencies = [
  "ditch_core",
  "serde",
+ "serde_json",
  "thiserror 2.0.20",
 ]
 
@@ -159,12 +162,14 @@ dependencies = [
 name = "ditchd"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "ditch_core",
  "ditch_protocol",
  "ditch_store",
  "portable-pty",
  "serde",
  "serde_json",
+ "uuid",
 ]
 
 [[package]]
