@@ -96,7 +96,8 @@ class NativeComposerTextView: NSView, NSTextViewDelegate {
     textView.textContainer?.widthTracksTextView = true
     textView.drawsBackground = false
     textView.font = NSFont.systemFont(ofSize: fontSize)
-    textView.textContainerInset = NSSize(width: 2, height: 6)
+    let textContainerInset = NSSize(width: 2, height: 6)
+    textView.textContainerInset = textContainerInset
     textView.textColor = NSColor.labelColor
     textView.insertionPointColor = NSColor.labelColor
     textView.allowsUndo = true
@@ -129,13 +130,23 @@ class NativeComposerTextView: NSView, NSTextViewDelegate {
     placeholderLabel.isHidden = !initialText.isEmpty
     addSubview(placeholderLabel)
 
+    // Match the placeholder to TextKit's real text origin. NSTextView adds its
+    // text-container inset and line-fragment padding before drawing the caret;
+    // using unrelated constants puts the caret through the first glyph.
+    let lineFragmentPadding = textView.textContainer?.lineFragmentPadding ?? 0
+    let placeholderLeading = textContainerInset.width + lineFragmentPadding
+
     NSLayoutConstraint.activate([
       scrollView.leadingAnchor.constraint(equalTo: leadingAnchor),
       scrollView.trailingAnchor.constraint(equalTo: trailingAnchor),
       scrollView.topAnchor.constraint(equalTo: topAnchor),
       scrollView.bottomAnchor.constraint(equalTo: bottomAnchor),
-      placeholderLabel.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 4),
-      placeholderLabel.topAnchor.constraint(equalTo: topAnchor, constant: 7),
+      placeholderLabel.leadingAnchor.constraint(
+        equalTo: leadingAnchor,
+        constant: placeholderLeading),
+      placeholderLabel.topAnchor.constraint(
+        equalTo: topAnchor,
+        constant: textContainerInset.height),
     ])
 
     channel.setMethodCallHandler { [weak self] call, result in

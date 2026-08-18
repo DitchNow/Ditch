@@ -409,8 +409,7 @@ class CommandCenterScreen extends StatefulWidget {
 }
 
 class _CommandCenterScreenState extends State<CommandCenterScreen> {
-  static const _defaultStartPrompt =
-      'Inspect this project and tell me the next useful engineering step.';
+  static const _defaultStartPrompt = '';
   static const _bootstrapProject = DitchProject(
     name: 'The Ditch',
     path: '/Users/tester/Documents/Personal/The Ditch v2',
@@ -2280,6 +2279,93 @@ class AgentSessionList extends StatelessWidget {
         ),
       );
     }
+    AgentSession? expandedSession;
+    var expandedIndex = -1;
+    if (expandedAgentLocalId != null) {
+      expandedIndex = sessions.indexWhere(
+        (session) => session.localId == expandedAgentLocalId,
+      );
+      if (expandedIndex >= 0) expandedSession = sessions[expandedIndex];
+    }
+    if (expandedSession != null) {
+      final session = expandedSession;
+      return Scrollbar(
+        controller: agentListController,
+        interactive: true,
+        child: CustomScrollView(
+          key: const PageStorageKey<String>('expanded-agent-session-list'),
+          controller: agentListController,
+          slivers: [
+            for (var index = 0; index < expandedIndex; index++) ...[
+              SliverToBoxAdapter(
+                child: ExpandableAgentPanel(
+                  key: ValueKey(sessions[index].localId),
+                  session: sessions[index],
+                  expanded: false,
+                  enlarged: false,
+                  chatController: null,
+                  agentListController: agentListController,
+                  composerKey: null,
+                  initialPrompt: initialPrompt,
+                  effectiveCodexHome: effectiveCodexHome,
+                  onTap: () => onToggleExpanded(sessions[index]),
+                  onEnlarge: () => onFocusAgent(sessions[index]),
+                  onDelete: () => onDeleteAgent(sessions[index]),
+                  onRename: (title) => onRenameAgent(sessions[index], title),
+                  onSubmitPrompt: (prompt) =>
+                      onSubmitPrompt(sessions[index], prompt),
+                  onStopCodex: () => onStopCodex(sessions[index]),
+                ),
+              ),
+              const SliverToBoxAdapter(child: SizedBox(height: 10)),
+            ],
+            PinnedHeaderSliver(
+              child: ColoredBox(
+                color: context.ditch.workspace,
+                child: ExpandableAgentPanel(
+                  key: ValueKey(session.localId),
+                  session: session,
+                  expanded: true,
+                  enlarged: false,
+                  headerOnly: true,
+                  chatController: null,
+                  agentListController: agentListController,
+                  composerKey: null,
+                  initialPrompt: initialPrompt,
+                  effectiveCodexHome: effectiveCodexHome,
+                  onTap: () => onToggleExpanded(session),
+                  onEnlarge: () => onFocusAgent(session),
+                  onDelete: () => onDeleteAgent(session),
+                  onRename: (title) => onRenameAgent(session, title),
+                  onSubmitPrompt: (prompt) => onSubmitPrompt(session, prompt),
+                  onStopCodex: () => onStopCodex(session),
+                ),
+              ),
+            ),
+            SliverFillRemaining(
+              child: AgentChatPanel(
+                messages: session.messages,
+                controller: chatController,
+                agentListController: agentListController,
+                enlarged: false,
+                composerKey: composerKey,
+                initialPrompt: session.hasCodexThread ? '' : initialPrompt,
+                hasSession: session.hasCodexThread,
+                isWorking: session.isWorking,
+                enabled: _canResumeSession(session, effectiveCodexHome),
+                disabledMessage: _resumeBlockedMessage(
+                  session,
+                  effectiveCodexHome,
+                ),
+                onSubmitPrompt: (prompt) => onSubmitPrompt(session, prompt),
+                onStopCodex: () => onStopCodex(session),
+                onEnlarge: () => onFocusAgent(session),
+              ),
+            ),
+          ],
+        ),
+      );
+    }
     return LayoutBuilder(
       builder: (context, constraints) => Scrollbar(
         controller: agentListController,
@@ -2287,9 +2373,7 @@ class AgentSessionList extends StatelessWidget {
         child: ListView.separated(
           key: const PageStorageKey<String>('agent-session-list'),
           controller: agentListController,
-          physics: expandedAgentLocalId == null
-              ? null
-              : const NeverScrollableScrollPhysics(),
+          physics: null,
           itemCount: sessions.length,
           separatorBuilder: (_, _) => const SizedBox(height: 10),
           itemBuilder: (context, index) {
@@ -2401,12 +2485,44 @@ class _EditableAgentTitleState extends State<EditableAgentTitle> {
   }
 }
 
+bool _canResumeSession(AgentSession session, String? effectiveCodexHome) {
+  final homeMismatch =
+      session.hasCodexThread &&
+      session.originCodexHome != null &&
+      effectiveCodexHome != null &&
+      session.originCodexHome != effectiveCodexHome;
+  final noThread =
+      session.cannotResumeWithoutThread ||
+      session.resumeBlockReason == 'NoCodexThread';
+  return !(noThread || homeMismatch);
+}
+
+String? _resumeBlockedMessage(
+  AgentSession session,
+  String? effectiveCodexHome,
+) {
+  final noThread =
+      session.cannotResumeWithoutThread ||
+      session.resumeBlockReason == 'NoCodexThread';
+  if (noThread) {
+    return 'This session cannot be resumed because Codex never created a thread. Start a new agent to continue.';
+  }
+  if (session.hasCodexThread &&
+      session.originCodexHome != null &&
+      effectiveCodexHome != null &&
+      session.originCodexHome != effectiveCodexHome) {
+    return 'This session used ${session.originCodexHome}. Switch the runtime to that CODEX_HOME to resume it, or start a new agent.';
+  }
+  return null;
+}
+
 class ExpandableAgentPanel extends StatelessWidget {
   const ExpandableAgentPanel({
     required this.session,
     required this.expanded,
     required this.enlarged,
     this.fillAvailable = false,
+    this.headerOnly = false,
     required this.chatController,
     required this.agentListController,
     required this.composerKey,
@@ -2425,6 +2541,7 @@ class ExpandableAgentPanel extends StatelessWidget {
   final bool expanded;
   final bool enlarged;
   final bool fillAvailable;
+  final bool headerOnly;
   final ScrollController? chatController;
   final ScrollController agentListController;
   final GlobalKey<AgentComposerState>? composerKey;
@@ -2439,20 +2556,11 @@ class ExpandableAgentPanel extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final homeMismatch =
-        session.hasCodexThread &&
-        session.originCodexHome != null &&
-        effectiveCodexHome != null &&
-        session.originCodexHome != effectiveCodexHome;
-    final noThread =
-        session.cannotResumeWithoutThread ||
-        session.resumeBlockReason == 'NoCodexThread';
-    final resumeBlocked = noThread || homeMismatch;
-    final resumeBlockedMessage = noThread
-        ? 'This session cannot be resumed because Codex never created a thread. Start a new agent to continue.'
-        : homeMismatch
-        ? 'This session used ${session.originCodexHome}. Switch the runtime to that CODEX_HOME to resume it, or start a new agent.'
-        : null;
+    final resumeBlocked = !_canResumeSession(session, effectiveCodexHome);
+    final resumeBlockedMessage = _resumeBlockedMessage(
+      session,
+      effectiveCodexHome,
+    );
 
     return LayoutBuilder(
       builder: (context, constraints) {
@@ -2584,14 +2692,14 @@ class ExpandableAgentPanel extends StatelessWidget {
                             ),
                     ),
                   ),
-                  if (expanded && (enlarged || fillAvailable))
+                  if (!headerOnly && expanded && (enlarged || fillAvailable))
                     Expanded(
                       child: Padding(
                         padding: const EdgeInsets.only(top: 12),
                         child: buildChatPanel(),
                       ),
                     )
-                  else if (expanded)
+                  else if (!headerOnly && expanded)
                     Padding(
                       padding: const EdgeInsets.only(top: 12),
                       child: buildChatPanel(),

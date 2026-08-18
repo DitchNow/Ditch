@@ -583,13 +583,13 @@ void main() {
     expect(find.text('Initial prompt'), findsOneWidget);
     final dialog = find.byType(StartCodexSessionDialog);
     expect(
-      find.descendant(
-        of: dialog,
-        matching: find.text(
-          'Inspect this project and tell me the next useful engineering step.',
-        ),
-      ),
-      findsOneWidget,
+      tester
+          .widget<TextField>(
+            find.descendant(of: dialog, matching: find.byType(TextField)),
+          )
+          .controller
+          ?.text,
+      isEmpty,
     );
 
     await tester.enterText(
@@ -642,10 +642,8 @@ void main() {
     expect(find.textContaining('Thinking'), findsNothing);
     expect(find.byType(TextField), findsOneWidget);
     expect(
-      find.text(
-        'Inspect this project and tell me the next useful engineering step.',
-      ),
-      findsOneWidget,
+      tester.widget<TextField>(find.byType(TextField)).controller?.text,
+      isEmpty,
     );
     expect(find.text('Start'), findsOneWidget);
     expect(
@@ -802,7 +800,74 @@ void main() {
       ),
       findsOneWidget,
     );
-    expect(find.byType(ListView), findsNWidgets(2));
+    expect(find.byType(CustomScrollView), findsOneWidget);
+    expect(find.byType(ListView), findsOneWidget);
+  });
+
+  testWidgets('later expanded agent scrolls to a pinned visible composer', (
+    tester,
+  ) async {
+    tester.view.physicalSize = const Size(900, 600);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    final sessions = List.generate(
+      3,
+      (index) => AgentSession(
+        localId: 'agent-$index',
+        provider: AgentProvider.codex,
+        status: AgentStatus.completed,
+        messages: const [],
+      ),
+    );
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: AgentsSurface(
+            sessions: sessions,
+            expandedAgentLocalId: 'agent-2',
+            focusedAgentLocalId: null,
+            chatController: ScrollController(),
+            agentListController: ScrollController(),
+            composerKey: GlobalKey<AgentComposerState>(),
+            initialPrompt: '',
+            onStartCodex: () {},
+            onSubmitPrompt: (_, _) {},
+            onStopCodex: (_) {},
+            onDeleteAgent: (_) {},
+            onRenameAgent: (_, _) {},
+            onFocusAgent: (_) {},
+            onToggleExpanded: (_) {},
+          ),
+        ),
+      ),
+    );
+
+    final outerScroll = find.byType(CustomScrollView);
+    final header = find
+        .descendant(
+          of: find.byKey(const ValueKey('agent-2')),
+          matching: find.byType(InkWell),
+        )
+        .first;
+    final composer = find.byType(AgentComposer);
+    await tester.drag(outerScroll, const Offset(0, -1000));
+    await tester.pumpAndSettle();
+
+    final viewportTop = tester.getTopLeft(outerScroll).dy;
+    final viewportBottom = tester.getBottomRight(outerScroll).dy;
+    final pinnedHeaderTop = tester.getTopLeft(header).dy;
+    expect(pinnedHeaderTop, lessThan(viewportTop + 20));
+    expect(tester.getTopLeft(composer).dy, greaterThanOrEqualTo(viewportTop));
+    expect(
+      tester.getBottomRight(composer).dy,
+      lessThanOrEqualTo(viewportBottom),
+    );
+
+    await tester.drag(find.byType(ListView), const Offset(0, -200));
+    await tester.pumpAndSettle();
+    expect(tester.getTopLeft(header).dy, moreOrLessEquals(pinnedHeaderTop));
   });
 
   testWidgets('chat messages alternate clearly between left and right', (
