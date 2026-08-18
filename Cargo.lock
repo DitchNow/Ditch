@@ -171,6 +171,7 @@ dependencies = [
  "ditch_protocol",
  "ditch_store",
  "portable-pty",
+ "rusqlite",
  "serde",
  "serde_json",
  "uuid",

@@ -1,11 +1,17 @@
 import 'dart:async';
-import 'dart:convert';
 import 'dart:io';
-import 'dart:math';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+
+import 'application/command_center_controller.dart';
+import 'data/runtime_models.dart';
+import 'data/runtime_transport.dart';
+import 'design_system/ditch_theme.dart';
+
+export 'data/runtime_transport.dart'
+    show DitchRuntimeException, parseRuntimeResponseLine;
 
 void main() {
   runApp(const TheDitchApp());
@@ -21,22 +27,9 @@ class TheDitchApp extends StatelessWidget {
     return MaterialApp(
       title: 'The Ditch',
       debugShowCheckedModeBanner: false,
-      theme: ThemeData(
-        colorScheme: ColorScheme.fromSeed(
-          seedColor: const Color(0xff2563eb),
-          brightness: Brightness.light,
-        ),
-        useMaterial3: true,
-        visualDensity: VisualDensity.compact,
-      ),
-      darkTheme: ThemeData(
-        colorScheme: ColorScheme.fromSeed(
-          seedColor: const Color(0xff38bdf8),
-          brightness: Brightness.dark,
-        ),
-        useMaterial3: true,
-        visualDensity: VisualDensity.compact,
-      ),
+      theme: DitchTheme.light(),
+      darkTheme: DitchTheme.dark(),
+      themeMode: ThemeMode.system,
       home: CommandCenterScreen(connectRuntimeOnStart: connectRuntimeOnStart),
     );
   }
@@ -110,6 +103,8 @@ class AgentSession {
     required this.messages,
     this.projectId,
     this.codexThreadId,
+    this.codexTitle,
+    this.userTitle,
     this.originCodexHome,
     this.currentPrompt,
     this.lastVisibleAction,
@@ -127,6 +122,8 @@ class AgentSession {
   final DateTime createdAt;
   AgentStatus status;
   String? codexThreadId;
+  String? codexTitle;
+  String? userTitle;
   final String? originCodexHome;
   String? currentPrompt;
   String? lastVisibleAction;
@@ -137,9 +134,11 @@ class AgentSession {
   final List<AgentChatMessage> messages;
 
   String get displayName {
-    return switch (provider) {
-      AgentProvider.codex => 'Codex',
-    };
+    final override = userTitle?.trim();
+    if (override != null && override.isNotEmpty) return override;
+    final native = codexTitle?.trim();
+    if (native != null && native.isNotEmpty) return native;
+    return 'Codex';
   }
 
   bool get hasCodexThread => codexThreadId != null;
@@ -166,6 +165,8 @@ void reconcileAgentSession(List<AgentSession> sessions, AgentSession incoming) {
   final existing = matches.first;
   existing.status = incoming.status;
   existing.codexThreadId = incoming.codexThreadId;
+  existing.codexTitle = incoming.codexTitle;
+  existing.userTitle = incoming.userTitle;
   existing.currentPrompt = incoming.currentPrompt;
   existing.lastVisibleAction = incoming.lastVisibleAction;
   existing.updatedAt = incoming.updatedAt;
@@ -264,74 +265,19 @@ List<AttentionEvent> attentionForProject(
 
 class DitchRuntimeClient {
   DitchRuntimeClient({String? socketPath})
-    : socketPath = socketPath ?? _defaultSocketPath();
+    : _transport = RuntimeTransport(socketPath: socketPath);
 
-  final String socketPath;
-  final _random = Random.secure();
+  final RuntimeTransport _transport;
 
-  static String _defaultSocketPath() {
-    final home = Platform.environment['HOME'] ?? '.';
-    return '$home/Library/Application Support/The Ditch/ditchd.sock';
-  }
+  String get socketPath => _transport.socketPath;
 
-  Future<Map<String, dynamic>> request(Object body) async {
-    final socket = await Socket.connect(
-      InternetAddress(socketPath, type: InternetAddressType.unix),
-      0,
-      timeout: const Duration(seconds: 2),
-    );
-    final requestId = _newRequestUuid();
-    final envelope = <String, dynamic>{
-      'protocol_version': 1,
-      'id': requestId,
-      'sent_at': DateTime.now().toUtc().toIso8601String(),
-      'body': body,
-    };
-    socket.writeln(jsonEncode(envelope));
-    await socket.flush();
-    final line = await utf8.decoder
-        .bind(socket)
-        .transform(const LineSplitter())
-        .first;
-    socket.destroy();
-    return parseRuntimeResponseLine(line);
-  }
+  Future<Map<String, dynamic>> request(Object body) => _transport.request(body);
 
-  Future<Stream<Map<String, dynamic>>> subscribeEvents() async {
-    final socket = await Socket.connect(
-      InternetAddress(socketPath, type: InternetAddressType.unix),
-      0,
-      timeout: const Duration(seconds: 2),
-    );
-    final requestId = _newRequestUuid();
-    socket.writeln(
-      jsonEncode({
-        'protocol_version': 1,
-        'id': requestId,
-        'sent_at': DateTime.now().toUtc().toIso8601String(),
-        'body': {
-          'SubscribeEvents': {'since_sequence': 0},
-        },
-      }),
-    );
-    await socket.flush();
-    return utf8.decoder.bind(socket).transform(const LineSplitter()).map((
-      line,
-    ) {
-      final decoded = jsonDecode(line);
-      if (decoded is! Map<String, dynamic>) {
-        throw const FormatException('runtime event envelope was not an object');
-      }
-      final body = decoded['body'];
-      if (body is! Map<String, dynamic>) {
-        throw const FormatException('runtime event body was not an object');
-      }
-      return body;
-    });
-  }
+  Future<Stream<Map<String, dynamic>>> subscribeEvents() =>
+      _transport.subscribeEvents();
 
-  Future<Map<String, dynamic>> runtimeStatus() {
-    return request('RuntimeStatus');
+  Future<RuntimeStatusDto> runtimeStatus() async {
+    return RuntimeStatusDto.fromResponse(await request('RuntimeStatus'));
   }
 
   Future<Map<String, dynamic>> shutdownRuntime() {
@@ -418,54 +364,17 @@ class DitchRuntimeClient {
     });
   }
 
+  Future<Map<String, dynamic>> renameAgent(String agentId, String? title) {
+    return request({
+      'RenameAgent': {'agent_id': agentId, 'title': title},
+    });
+  }
+
   Future<Map<String, dynamic>> dismissAttention(String attentionId) {
     return request({
       'DismissAttention': {'attention_id': attentionId},
     });
   }
-
-  String _newRequestUuid() {
-    final bytes = List<int>.generate(16, (_) => _random.nextInt(256));
-    bytes[6] = (bytes[6] & 0x0f) | 0x40;
-    bytes[8] = (bytes[8] & 0x3f) | 0x80;
-    final hex = bytes
-        .map((byte) => byte.toRadixString(16).padLeft(2, '0'))
-        .join();
-    return '${hex.substring(0, 8)}-${hex.substring(8, 12)}-${hex.substring(12, 16)}-${hex.substring(16, 20)}-${hex.substring(20)}';
-  }
-}
-
-class DitchRuntimeException implements Exception {
-  const DitchRuntimeException(this.code, this.message);
-
-  final String code;
-  final String message;
-
-  @override
-  String toString() => '$code: $message';
-}
-
-Map<String, dynamic> parseRuntimeResponseLine(String line) {
-  final decoded = jsonDecode(line);
-  if (decoded is! Map<String, dynamic>) {
-    throw const FormatException('runtime response was not an object');
-  }
-
-  final responseBody = decoded['body'];
-  if (responseBody == 'Accepted') {
-    return const {'Accepted': true};
-  }
-  if (responseBody is! Map<String, dynamic>) {
-    throw const FormatException('runtime response body was not an object');
-  }
-
-  final error = responseBody['Error'];
-  if (error is Map<String, dynamic>) {
-    final code = error['code']?.toString() ?? 'runtime_error';
-    final message = error['message']?.toString() ?? 'Unknown runtime error';
-    throw DitchRuntimeException(code, message);
-  }
-  return responseBody;
 }
 
 DitchProject? parseRuntimeProject(Object? value) {
@@ -506,12 +415,13 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
     name: 'The Ditch',
     path: '/Users/tester/Documents/Personal/The Ditch v2',
   );
-  static const _statusBarChannel = MethodChannel('the_ditch/status_bar');
+  static const _applicationChannel = MethodChannel('the_ditch/application');
 
   final _chatController = ScrollController();
   final _agentListController = ScrollController();
   final _composerKey = GlobalKey<AgentComposerState>();
   final _runtimeClient = DitchRuntimeClient();
+  final _presentation = CommandCenterController();
   int _nextAgentSessionId = 1;
   int _nextAttentionId = 1;
   final _projects = <DitchProject>[_bootstrapProject];
@@ -526,24 +436,20 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
   bool _runtimeCompatibilityReported = false;
   String? _effectiveRuntimeCodexHome;
   bool _legacyRecoveryChecked = false;
-  int _selectedProjectIndex = 0;
-  String? _expandedAgentLocalId = 'agent-0';
+  String _selectedProjectKey = canonicalProjectPath(_bootstrapProject.path);
+  String? _expandedAgentLocalId;
   String? _focusedAgentLocalId;
-  late final List<AgentSession> _agentSessions = [
-    AgentSession(
-      localId: 'agent-0',
-      provider: AgentProvider.codex,
-      status: AgentStatus.idle,
-      messages: [
-        AgentChatMessage(
-          role: ChatMessageRole.system,
-          text:
-              'Ready. Start Codex to attach an agent to the selected project.',
-          createdAt: DateTime.now(),
-        ),
-      ],
-    ),
-  ];
+  final List<AgentSession> _agentSessions = [];
+
+  String _projectKey(DitchProject project) =>
+      project.id ?? canonicalProjectPath(project.path);
+
+  int get _selectedProjectIndex {
+    final index = _projects.indexWhere(
+      (project) => _projectKey(project) == _selectedProjectKey,
+    );
+    return index < 0 ? 0 : index;
+  }
 
   DitchProject get _selectedProject => _projects[_selectedProjectIndex];
 
@@ -557,55 +463,15 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
 
   void _selectProject(int index) {
     setState(() {
-      _selectedProjectIndex = index;
+      _selectedProjectKey = _projectKey(_projects[index]);
       final sessions = _visibleSessions;
       _expandedAgentLocalId = sessions.isEmpty ? null : sessions.first.localId;
     });
   }
 
   void _scheduleStatusBarUpdate() {
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (!mounted) {
-        return;
-      }
-      unawaited(_updateStatusBar());
-    });
-  }
-
-  Future<void> _updateStatusBar() async {
-    final activeSessions = _agentSessions
-        .where((session) => session.isWorking)
-        .length;
-    final hasFailedSession = _agentSessions.any(
-      (session) => session.status == AgentStatus.failed,
-    );
-    final state = _attention.isNotEmpty
-        ? 'attention'
-        : hasFailedSession
-        ? 'failed'
-        : activeSessions > 0
-        ? 'working'
-        : 'idle';
-
-    try {
-      await _statusBarChannel.invokeMethod<void>('update', {
-        'state': state,
-        'activeSessions': activeSessions,
-        'attentionCount': _attention.length,
-      });
-    } on MissingPluginException {
-      // Widget tests and non-macOS targets do not install the native channel.
-    } on Object {
-      // The menu bar item is a status mirror; failures should not affect chat.
-    }
-  }
-
-  Future<void> _shutdownRuntimeForQuit() async {
-    try {
-      await _runtimeClient.shutdownRuntime();
-    } on Object {
-      // Quit should still close the control surface if the runtime is absent.
-    }
+    // The integrated ditchd process owns both authoritative runtime state and
+    // the menu-bar item. The foreground UI never pushes lifecycle state.
   }
 
   AgentSession? _agentSessionByLocalId(String localId) {
@@ -640,13 +506,11 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
   }
 
   Future<void> _connectRuntime() async {
+    _presentation.connecting(reconnecting: _runtimeInstanceId != null);
     try {
       await _ensureRuntimeStarted();
       final status = await _runtimeClient.runtimeStatus();
-      final statusBody = status['RuntimeStatus'];
-      final instanceId = statusBody is Map<String, dynamic>
-          ? statusBody['instance_id']?.toString()
-          : null;
+      final instanceId = status.instanceId;
       var snapshot = await _runtimeClient.snapshot();
       final snapshotBody = snapshot['Snapshot'];
       final registeredProjects = snapshotBody is Map<String, dynamic>
@@ -662,10 +526,8 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
         snapshot = await _runtimeClient.snapshot();
       }
       _hydrateRuntimeSnapshot(snapshot);
-      if (statusBody is Map<String, dynamic>) {
-        _checkRuntimeCapabilities(statusBody);
-        _checkRuntimeCodexHome(statusBody);
-      }
+      _checkRuntimeCapabilities(status);
+      _checkRuntimeCodexHome(status);
       final events = await _runtimeClient.subscribeEvents();
       await _runtimeEvents?.cancel();
       _runtimeInstanceId = instanceId;
@@ -683,10 +545,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
         onDone: _scheduleRuntimeReconnect,
       );
       final confirmed = await _runtimeClient.runtimeStatus();
-      final confirmedBody = confirmed['RuntimeStatus'];
-      final confirmedInstanceId = confirmedBody is Map<String, dynamic>
-          ? confirmedBody['instance_id']?.toString()
-          : null;
+      final confirmedInstanceId = confirmed.instanceId;
       if (_runtimeInstanceId != confirmedInstanceId) {
         await _runtimeEvents?.cancel();
         _scheduleRuntimeReconnect();
@@ -694,7 +553,9 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
         _legacyRecoveryChecked = true;
         unawaited(_offerLegacyProjectRecovery());
       }
+      _presentation.connected();
     } on Object catch (error) {
+      _presentation.unavailable(error);
       _addAttentionRequired(
         kind: AttentionKind.failed,
         icon: Icons.cloud_off_outlined,
@@ -705,9 +566,9 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
     }
   }
 
-  void _checkRuntimeCodexHome(Map<String, dynamic> status) {
+  void _checkRuntimeCodexHome(RuntimeStatusDto status) {
     final requested = Platform.environment['CODEX_HOME'];
-    final effective = status['codex_home']?.toString();
+    final effective = status.codexHome;
     _effectiveRuntimeCodexHome = effective;
     if (requested == null || requested.isEmpty || effective == requested) {
       _runtimeHomeMismatchReported = false;
@@ -729,10 +590,8 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
     );
   }
 
-  void _checkRuntimeCapabilities(Map<String, dynamic> status) {
-    final capabilities = status['capabilities'];
-    _runtimeSupportsPersistence =
-        capabilities is List && capabilities.contains('persistent_sessions_v1');
+  void _checkRuntimeCapabilities(RuntimeStatusDto status) {
+    _runtimeSupportsPersistence = status.supportsPersistentSessions;
     if (_runtimeSupportsPersistence) {
       _runtimeCompatibilityReported = false;
       return;
@@ -842,9 +701,11 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
 
   Future<void> _ensureRuntimeStarted() async {
     try {
-      final ready = await _statusBarChannel.invokeMethod<bool>('ensureRuntime');
+      final ready = await _applicationChannel.invokeMethod<bool>(
+        'runtimeAvailable',
+      );
       if (ready == false) {
-        throw StateError('The bundled runtime could not be started.');
+        throw StateError('The supervised runtime is not available.');
       }
       await _runtimeClient.runtimeStatus();
       return;
@@ -919,7 +780,9 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
         final restoredIndex = selectedPath == null
             ? -1
             : _projects.indexWhere((project) => project.path == selectedPath);
-        _selectedProjectIndex = restoredIndex >= 0 ? restoredIndex : 0;
+        _selectedProjectKey = _projectKey(
+          _projects[restoredIndex >= 0 ? restoredIndex : 0],
+        );
       }
       _agentSessions
         ..clear()
@@ -949,15 +812,6 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
   @override
   void initState() {
     super.initState();
-    _statusBarChannel.setMethodCallHandler((call) async {
-      switch (call.method) {
-        case 'quitRuntimeAndApp':
-          await _shutdownRuntimeForQuit();
-          return true;
-        default:
-          throw MissingPluginException();
-      }
-    });
     _scheduleStatusBarUpdate();
     if (widget.connectRuntimeOnStart) {
       unawaited(_connectRuntime());
@@ -966,7 +820,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
 
   @override
   void dispose() {
-    _statusBarChannel.setMethodCallHandler(null);
+    _presentation.dispose();
     _runtimeEvents?.cancel();
     _chatController.dispose();
     _agentListController.dispose();
@@ -1022,13 +876,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
       late final AgentSession projectSession;
       setState(() {
         upsertProject(_projects, configuredProject);
-        _selectedProjectIndex = _projects.indexWhere(
-          (existing) =>
-              (configuredProject.id != null &&
-                  existing.id == configuredProject.id) ||
-              canonicalProjectPath(existing.path) ==
-                  canonicalProjectPath(configuredProject.path),
-        );
+        _selectedProjectKey = _projectKey(configuredProject);
         projectSession = _createAgentSession(expand: true);
       });
       _addChatMessage(
@@ -1225,7 +1073,10 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
     );
     final created = _projectFromRuntime(response['ProjectCreated']);
     if (created != null && mounted) {
-      setState(() => _projects[_selectedProjectIndex] = created);
+      setState(() {
+        _projects[_selectedProjectIndex] = created;
+        _selectedProjectKey = _projectKey(created);
+      });
     }
     return true;
   }
@@ -1351,6 +1202,29 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
         sessionLocalId: session.localId,
         icon: Icons.delete_forever_outlined,
         title: 'Agent deletion failed',
+        body: '$error',
+      );
+    }
+  }
+
+  Future<void> _renameAgent(AgentSession session, String? title) async {
+    final cleanTitle = title?.trim();
+    final previous = session.userTitle;
+    setState(() {
+      session.userTitle = cleanTitle == null || cleanTitle.isEmpty
+          ? null
+          : cleanTitle;
+    });
+    try {
+      await _runtimeClient.renameAgent(session.localId, session.userTitle);
+    } on Object catch (error) {
+      if (!mounted) return;
+      setState(() => session.userTitle = previous);
+      _addAttentionRequired(
+        kind: AttentionKind.failed,
+        sessionLocalId: session.localId,
+        icon: Icons.drive_file_rename_outline,
+        title: 'Agent rename failed',
         body: '$error',
       );
     }
@@ -1580,6 +1454,8 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
             ]
           : List<AgentChatMessage>.from(messages),
       codexThreadId: agentJson['native_session_id']?.toString(),
+      codexTitle: agentJson['codex_title']?.toString(),
+      userTitle: agentJson['user_title']?.toString(),
       originCodexHome: agentJson['origin_codex_home']?.toString(),
       currentPrompt: agentJson['current_prompt']?.toString(),
       lastVisibleAction: agentJson['last_visible_action']?.toString(),
@@ -1699,11 +1575,6 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
     if (!mounted) {
       return;
     }
-    final shouldFollowLatest =
-        !_chatController.hasClients ||
-        _chatController.position.maxScrollExtent -
-                _chatController.position.pixels <
-            72;
     setState(() {
       if (session.messages.isNotEmpty) {
         final lastMessage = session.messages.last;
@@ -1717,119 +1588,380 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
       session.updatedAt = DateTime.now();
     });
     _scheduleStatusBarUpdate();
-    if (!shouldFollowLatest) return;
+  }
+
+  void _focusComposerAfterLayout() {
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (!_chatController.hasClients) {
-        return;
+      if (mounted) _composerKey.currentState?.focus();
+    });
+  }
+
+  void _toggleExpandedAgent(AgentSession session) {
+    final collapsing = _expandedAgentLocalId == session.localId;
+    setState(() {
+      _expandedAgentLocalId = collapsing ? null : session.localId;
+    });
+    if (collapsing) return;
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
+      if (!mounted) return;
+      final headerContext = GlobalObjectKey(
+        'agent-header-${session.localId}',
+      ).currentContext;
+      if (headerContext != null) {
+        await Scrollable.ensureVisible(
+          headerContext,
+          alignment: 0,
+          duration: const Duration(milliseconds: 180),
+          curve: Curves.easeOut,
+        );
       }
-      _chatController.animateTo(
-        _chatController.position.maxScrollExtent,
-        duration: const Duration(milliseconds: 180),
-        curve: Curves.easeOut,
-      );
+      if (mounted) _composerKey.currentState?.focus();
     });
   }
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      body: LayoutBuilder(
-        builder: (context, constraints) {
-          final agentsSurface = AgentsSurface(
-            sessions: _visibleSessions,
-            expandedAgentLocalId: _expandedAgentLocalId,
-            focusedAgentLocalId: _focusedAgentLocalId,
-            chatController: _chatController,
-            agentListController: _agentListController,
-            composerKey: _composerKey,
-            initialPrompt: _defaultStartPrompt,
-            effectiveCodexHome: _effectiveRuntimeCodexHome,
-            onStartCodex: _startCodex,
-            onStartPrompt: _startCodexRuntime,
-            onSubmitPrompt: _submitComposer,
-            onStopCodex: _stopCodex,
-            onDeleteAgent: _deleteAgent,
-            onFocusAgent: (session) {
-              setState(() {
-                _focusedAgentLocalId = session?.localId;
-                if (session != null) {
-                  _expandedAgentLocalId = session.localId;
-                }
-              });
-            },
-            onToggleExpanded: (session) {
-              setState(() {
-                _expandedAgentLocalId = _expandedAgentLocalId == session.localId
-                    ? null
-                    : session.localId;
-              });
-            },
-          );
-          if (_focusedAgentLocalId != null) {
-            return agentsSurface;
-          }
-          final content = [
-            ProjectSidebar(
-              projects: _projects,
-              selectedIndex: _selectedProjectIndex,
-              onAddProject: _addProject,
-              onSelectProject: _selectProject,
-            ),
-            const VerticalDivider(width: 1),
-            Expanded(child: agentsSurface),
-          ];
-
-          if (constraints.maxWidth < 1000) {
-            return Column(
-              children: [
-                Expanded(child: Row(children: content)),
-                const Divider(height: 1),
-                SizedBox(
-                  height: 240,
-                  child: AttentionPanel(
-                    width: double.infinity,
-                    events: _visibleAttention,
-                    canStopSession: _canStopAttentionSession,
-                    onOpenSession: _openAttentionSession,
-                    onStopSession: (event) {
-                      final sessionLocalId = event.sessionLocalId;
-                      final session = sessionLocalId == null
-                          ? null
-                          : _agentSessionByLocalId(sessionLocalId);
-                      if (session != null) {
-                        _stopCodex(session);
-                      }
-                    },
-                    onDismiss: _dismissAttention,
-                  ),
-                ),
-              ],
-            );
-          }
-
-          return Row(
-            children: [
-              ...content,
-              const VerticalDivider(width: 1),
-              AttentionPanel(
-                width: 300,
+    return ValueListenableBuilder<CommandCenterPresentationState>(
+      valueListenable: _presentation,
+      builder: (context, presentation, _) {
+        return Scaffold(
+          body: LayoutBuilder(
+            builder: (context, constraints) {
+              final compact = constraints.maxWidth < 760;
+              final showSidebar =
+                  presentation.sidebarVisible && _focusedAgentLocalId == null;
+              final showInspector =
+                  presentation.inspectorVisible &&
+                  !compact &&
+                  _focusedAgentLocalId == null;
+              final agentsSurface = AgentsSurface(
+                sessions: _visibleSessions,
+                expandedAgentLocalId: _expandedAgentLocalId,
+                focusedAgentLocalId: _focusedAgentLocalId,
+                chatController: _chatController,
+                agentListController: _agentListController,
+                composerKey: _composerKey,
+                initialPrompt: _defaultStartPrompt,
+                effectiveCodexHome: _effectiveRuntimeCodexHome,
+                onStartCodex: _startCodex,
+                onStartPrompt: _startCodexRuntime,
+                onSubmitPrompt: _submitComposer,
+                onStopCodex: _stopCodex,
+                onDeleteAgent: _deleteAgent,
+                onRenameAgent: _renameAgent,
+                onFocusAgent: (session) {
+                  setState(() {
+                    _focusedAgentLocalId = session?.localId;
+                    if (session != null) {
+                      _expandedAgentLocalId = session.localId;
+                    }
+                  });
+                  if (session != null) _focusComposerAfterLayout();
+                },
+                onToggleExpanded: _toggleExpandedAgent,
+              );
+              final attentionPanel = AttentionPanel(
+                width: 320,
                 events: _visibleAttention,
                 canStopSession: _canStopAttentionSession,
                 onOpenSession: _openAttentionSession,
                 onStopSession: (event) {
-                  final sessionLocalId = event.sessionLocalId;
-                  final session = sessionLocalId == null
+                  final id = event.sessionLocalId;
+                  final session = id == null
                       ? null
-                      : _agentSessionByLocalId(sessionLocalId);
-                  if (session != null) {
-                    _stopCodex(session);
-                  }
+                      : _agentSessionByLocalId(id);
+                  if (session != null) _stopCodex(session);
                 },
                 onDismiss: _dismissAttention,
+              );
+
+              return ColoredBox(
+                color: context.ditch.workspace,
+                child: Column(
+                  children: [
+                    DitchToolbar(
+                      projectName: _selectedProject.name,
+                      connection: presentation.connection,
+                      attentionCount: _visibleAttention.length,
+                      sidebarVisible: showSidebar,
+                      inspectorVisible: showInspector,
+                      onToggleSidebar: _presentation.toggleSidebar,
+                      onToggleInspector: _presentation.toggleInspector,
+                      onNewAgent: _startCodex,
+                    ),
+                    const Divider(height: 1),
+                    Expanded(
+                      child:
+                          presentation.connection ==
+                              RuntimeConnectionPhase.unavailable
+                          ? RuntimeRecoveryView(
+                              socketPath: _runtimeClient.socketPath,
+                              error: presentation.connectionError,
+                              onRetry: _connectRuntime,
+                              onOpenActivityMonitor: () => _applicationChannel
+                                  .invokeMethod<bool>('openActivityMonitor'),
+                              onQuit: () => _applicationChannel
+                                  .invokeMethod<bool>('quitUI'),
+                            )
+                          : Row(
+                              children: [
+                                if (showSidebar) ...[
+                                  ProjectSidebar(
+                                    projects: _projects,
+                                    selectedIndex: _selectedProjectIndex,
+                                    onAddProject: _addProject,
+                                    onSelectProject: _selectProject,
+                                  ),
+                                  const VerticalDivider(width: 1),
+                                ],
+                                Expanded(child: agentsSurface),
+                                if (showInspector) ...[
+                                  const VerticalDivider(width: 1),
+                                  attentionPanel,
+                                ],
+                              ],
+                            ),
+                    ),
+                  ],
+                ),
+              );
+            },
+          ),
+        );
+      },
+    );
+  }
+}
+
+class DitchToolbar extends StatelessWidget {
+  const DitchToolbar({
+    required this.projectName,
+    required this.connection,
+    required this.attentionCount,
+    required this.sidebarVisible,
+    required this.inspectorVisible,
+    required this.onToggleSidebar,
+    required this.onToggleInspector,
+    required this.onNewAgent,
+    super.key,
+  });
+
+  final String projectName;
+  final RuntimeConnectionPhase connection;
+  final int attentionCount;
+  final bool sidebarVisible;
+  final bool inspectorVisible;
+  final VoidCallback onToggleSidebar;
+  final VoidCallback onToggleInspector;
+  final VoidCallback onNewAgent;
+
+  @override
+  Widget build(BuildContext context) {
+    final tokens = context.ditch;
+    final (label, color) = switch (connection) {
+      RuntimeConnectionPhase.connected => (
+        'Connected',
+        const Color(0xff34c759),
+      ),
+      RuntimeConnectionPhase.connecting => (
+        'Connecting',
+        const Color(0xffff9f0a),
+      ),
+      RuntimeConnectionPhase.reconnecting => (
+        'Reconnecting',
+        const Color(0xffff9f0a),
+      ),
+      RuntimeConnectionPhase.unavailable => (
+        'Runtime unavailable',
+        Theme.of(context).colorScheme.error,
+      ),
+    };
+    return SizedBox(
+      height: tokens.toolbarHeight,
+      child: Padding(
+        padding: const EdgeInsets.only(left: 78, right: 10),
+        child: Row(
+          children: [
+            IconButton(
+              tooltip: sidebarVisible ? 'Hide sidebar' : 'Show sidebar',
+              onPressed: onToggleSidebar,
+              icon: Icon(
+                sidebarVisible
+                    ? Icons.view_sidebar
+                    : Icons.view_sidebar_outlined,
               ),
-            ],
-          );
-        },
+            ),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Text(
+                projectName,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: Theme.of(context).textTheme.titleMedium,
+              ),
+            ),
+            Container(
+              width: 7,
+              height: 7,
+              decoration: BoxDecoration(color: color, shape: BoxShape.circle),
+            ),
+            const SizedBox(width: 7),
+            Text(label, style: Theme.of(context).textTheme.bodySmall),
+            const SizedBox(width: 12),
+            FilledButton.icon(
+              onPressed: onNewAgent,
+              icon: const Icon(Icons.add, size: 16),
+              label: const Text('New Agent'),
+            ),
+            const SizedBox(width: 6),
+            Badge(
+              isLabelVisible: attentionCount > 0,
+              label: Text('$attentionCount'),
+              child: IconButton(
+                tooltip: inspectorVisible ? 'Hide attention' : 'Show attention',
+                onPressed: onToggleInspector,
+                icon: Icon(
+                  inspectorVisible
+                      ? Icons.vertical_split
+                      : Icons.vertical_split_outlined,
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class RuntimeConnectionBanner extends StatelessWidget {
+  const RuntimeConnectionBanner({
+    this.message,
+    required this.onRetry,
+    super.key,
+  });
+
+  final String? message;
+  final VoidCallback onRetry;
+
+  @override
+  Widget build(BuildContext context) {
+    return ColoredBox(
+      color: Theme.of(context).colorScheme.error.withValues(alpha: 0.08),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 9),
+        child: Row(
+          children: [
+            Icon(
+              Icons.warning_amber_rounded,
+              color: Theme.of(context).colorScheme.error,
+            ),
+            const SizedBox(width: 9),
+            Expanded(
+              child: Text(
+                message == null
+                    ? 'The Ditch Runtime is not responding. Agents may still be running.'
+                    : 'The Ditch Runtime is not responding. Agents may still be running. $message',
+                maxLines: 2,
+                overflow: TextOverflow.ellipsis,
+              ),
+            ),
+            TextButton(onPressed: onRetry, child: const Text('Retry')),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class RuntimeRecoveryView extends StatelessWidget {
+  const RuntimeRecoveryView({
+    required this.socketPath,
+    required this.error,
+    required this.onRetry,
+    required this.onOpenActivityMonitor,
+    required this.onQuit,
+    super.key,
+  });
+
+  final String socketPath;
+  final String? error;
+  final VoidCallback onRetry;
+  final Future<bool?> Function() onOpenActivityMonitor;
+  final Future<bool?> Function() onQuit;
+
+  @override
+  Widget build(BuildContext context) {
+    return Center(
+      child: SingleChildScrollView(
+        padding: const EdgeInsets.all(32),
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 620),
+          child: DitchSurface(
+            padding: const EdgeInsets.all(24),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Icon(
+                  Icons.sync_problem_rounded,
+                  size: 30,
+                  color: Theme.of(context).colorScheme.error,
+                ),
+                const SizedBox(height: 16),
+                Text(
+                  'The Ditch Runtime is not responding',
+                  style: Theme.of(context).textTheme.headlineSmall,
+                ),
+                const SizedBox(height: 8),
+                const Text(
+                  'Agent processes may still be running. The Ditch could not reconnect to its local runtime service.',
+                ),
+                const SizedBox(height: 20),
+                Text(
+                  'Expected process',
+                  style: Theme.of(context).textTheme.labelLarge,
+                ),
+                const SizedBox(height: 4),
+                const SelectableText('The Ditch Runtime'),
+                const SizedBox(height: 12),
+                Text('Socket', style: Theme.of(context).textTheme.labelLarge),
+                const SizedBox(height: 4),
+                SelectableText(socketPath),
+                if (error != null) ...[
+                  const SizedBox(height: 12),
+                  Text(
+                    'Last error',
+                    style: Theme.of(context).textTheme.labelLarge,
+                  ),
+                  const SizedBox(height: 4),
+                  SelectableText(error!),
+                ],
+                const SizedBox(height: 20),
+                const Text(
+                  'Search for “The Ditch Runtime” in Activity Monitor. Force Quit Applications does not list macOS background services.',
+                ),
+                const SizedBox(height: 20),
+                Wrap(
+                  spacing: 8,
+                  runSpacing: 8,
+                  children: [
+                    FilledButton.icon(
+                      onPressed: onRetry,
+                      icon: const Icon(Icons.refresh, size: 16),
+                      label: const Text('Retry Connection'),
+                    ),
+                    OutlinedButton.icon(
+                      onPressed: onOpenActivityMonitor,
+                      icon: const Icon(Icons.monitor_heart_outlined, size: 16),
+                      label: const Text('Open Activity Monitor'),
+                    ),
+                    TextButton(onPressed: onQuit, child: const Text('Quit UI')),
+                  ],
+                ),
+              ],
+            ),
+          ),
+        ),
       ),
     );
   }
@@ -1853,40 +1985,49 @@ class ProjectSidebar extends StatelessWidget {
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
 
-    return SizedBox(
-      width: 220,
-      child: SafeArea(
-        child: Padding(
-          padding: const EdgeInsets.all(12),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text('The Ditch', style: theme.textTheme.titleLarge),
-              const SizedBox(height: 16),
-              FilledButton.icon(
-                onPressed: onAddProject,
-                icon: const Icon(Icons.add),
-                label: const Text('Add Project'),
-              ),
-              const SizedBox(height: 16),
-              Text('Projects', style: theme.textTheme.labelLarge),
-              const SizedBox(height: 8),
-              Expanded(
-                child: ListView.separated(
-                  itemCount: projects.length,
-                  separatorBuilder: (_, _) => const SizedBox(height: 8),
-                  itemBuilder: (context, index) {
-                    final project = projects[index];
-                    return ProjectTile(
-                      name: project.name,
-                      path: project.path,
-                      selected: index == selectedIndex,
-                      onTap: () => onSelectProject(index),
-                    );
-                  },
+    return ColoredBox(
+      color: context.ditch.sidebar,
+      child: SizedBox(
+        width: 240,
+        child: SafeArea(
+          top: false,
+          child: Padding(
+            padding: const EdgeInsets.all(12),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  'PROJECTS',
+                  style: theme.textTheme.labelSmall?.copyWith(
+                    color: context.ditch.mutedText,
+                    fontWeight: FontWeight.w600,
+                    letterSpacing: 0.6,
+                  ),
                 ),
-              ),
-            ],
+                const SizedBox(height: 8),
+                Expanded(
+                  child: ListView.separated(
+                    itemCount: projects.length,
+                    separatorBuilder: (_, _) => const SizedBox(height: 8),
+                    itemBuilder: (context, index) {
+                      final project = projects[index];
+                      return ProjectTile(
+                        name: project.name,
+                        path: project.path,
+                        selected: index == selectedIndex,
+                        onTap: () => onSelectProject(index),
+                      );
+                    },
+                  ),
+                ),
+                const SizedBox(height: 8),
+                TextButton.icon(
+                  onPressed: onAddProject,
+                  icon: const Icon(Icons.add, size: 16),
+                  label: const Text('Add Project'),
+                ),
+              ],
+            ),
           ),
         ),
       ),
@@ -1910,15 +2051,15 @@ class ProjectTile extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final colors = Theme.of(context).colorScheme;
+    final tokens = context.ditch;
 
     return InkWell(
-      borderRadius: BorderRadius.circular(8),
+      borderRadius: BorderRadius.circular(tokens.radiusSmall),
       onTap: onTap,
       child: DecoratedBox(
         decoration: BoxDecoration(
-          color: selected ? colors.secondaryContainer : Colors.transparent,
-          borderRadius: BorderRadius.circular(8),
+          color: selected ? tokens.selection : Colors.transparent,
+          borderRadius: BorderRadius.circular(tokens.radiusSmall),
         ),
         child: Padding(
           padding: const EdgeInsets.all(10),
@@ -1963,6 +2104,7 @@ class AgentsSurface extends StatelessWidget {
     required this.onSubmitPrompt,
     required this.onStopCodex,
     required this.onDeleteAgent,
+    required this.onRenameAgent,
     required this.onFocusAgent,
     required this.onToggleExpanded,
     super.key,
@@ -1981,34 +2123,22 @@ class AgentsSurface extends StatelessWidget {
   final void Function(AgentSession session, String prompt) onSubmitPrompt;
   final ValueChanged<AgentSession> onStopCodex;
   final ValueChanged<AgentSession> onDeleteAgent;
+  final void Function(AgentSession session, String? title) onRenameAgent;
   final ValueChanged<AgentSession?> onFocusAgent;
   final ValueChanged<AgentSession> onToggleExpanded;
 
   @override
   Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-
     return SafeArea(
+      top: false,
       child: Padding(
-        padding: const EdgeInsets.all(16),
+        padding: const EdgeInsets.fromLTRB(18, 14, 18, 18),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             if (focusedAgentLocalId == null) ...[
-              Wrap(
-                spacing: 12,
-                runSpacing: 8,
-                crossAxisAlignment: WrapCrossAlignment.center,
-                children: [
-                  Text('Agents', style: theme.textTheme.headlineSmall),
-                  FilledButton.icon(
-                    onPressed: onStartCodex,
-                    icon: const Icon(Icons.smart_toy_outlined),
-                    label: const Text('Start Codex'),
-                  ),
-                ],
-              ),
-              const SizedBox(height: 16),
+              Text('Agents', style: Theme.of(context).textTheme.headlineSmall),
+              const SizedBox(height: 12),
             ],
             Expanded(
               child: AgentSessionList(
@@ -2025,6 +2155,7 @@ class AgentsSurface extends StatelessWidget {
                 onSubmitPrompt: onSubmitPrompt,
                 onStopCodex: onStopCodex,
                 onDeleteAgent: onDeleteAgent,
+                onRenameAgent: onRenameAgent,
                 onFocusAgent: onFocusAgent,
               ),
             ),
@@ -2050,6 +2181,7 @@ class AgentSessionList extends StatelessWidget {
     required this.onSubmitPrompt,
     required this.onStopCodex,
     required this.onDeleteAgent,
+    required this.onRenameAgent,
     required this.onFocusAgent,
     super.key,
   });
@@ -2067,52 +2199,46 @@ class AgentSessionList extends StatelessWidget {
   final void Function(AgentSession session, String prompt) onSubmitPrompt;
   final ValueChanged<AgentSession> onStopCodex;
   final ValueChanged<AgentSession> onDeleteAgent;
+  final void Function(AgentSession session, String? title) onRenameAgent;
   final ValueChanged<AgentSession?> onFocusAgent;
 
   @override
   Widget build(BuildContext context) {
     if (sessions.isEmpty) {
-      final colors = Theme.of(context).colorScheme;
-      return DecoratedBox(
+      return DitchSurface(
         key: const Key('ready-agent-card'),
-        decoration: BoxDecoration(
-          border: Border.all(color: colors.outlineVariant),
-          borderRadius: BorderRadius.circular(8),
-        ),
-        child: Padding(
-          padding: const EdgeInsets.all(12),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              const Row(
-                children: [
-                  Icon(Icons.memory, size: 24),
-                  SizedBox(width: 12),
-                  Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [Text('Codex'), Text('Ready for a new prompt')],
-                    ),
+        padding: const EdgeInsets.all(14),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Row(
+              children: [
+                Icon(Icons.memory, size: 24),
+                SizedBox(width: 12),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [Text('Codex'), Text('Ready for a new prompt')],
                   ),
-                ],
-              ),
-              const SizedBox(height: 12),
-              Expanded(
-                child: AgentChatPanel(
-                  messages: const [],
-                  controller: chatController,
-                  agentListController: agentListController,
-                  enlarged: false,
-                  composerKey: composerKey,
-                  initialPrompt: initialPrompt,
-                  hasSession: false,
-                  isWorking: false,
-                  onSubmitPrompt: onStartPrompt,
-                  onStopCodex: () {},
                 ),
+              ],
+            ),
+            const SizedBox(height: 12),
+            Expanded(
+              child: AgentChatPanel(
+                messages: const [],
+                controller: chatController,
+                agentListController: agentListController,
+                enlarged: false,
+                composerKey: composerKey,
+                initialPrompt: initialPrompt,
+                hasSession: false,
+                isWorking: false,
+                onSubmitPrompt: onStartPrompt,
+                onStopCodex: () {},
               ),
-            ],
-          ),
+            ),
+          ],
         ),
       );
     }
@@ -2145,6 +2271,7 @@ class AgentSessionList extends StatelessWidget {
               onTap: () {},
               onEnlarge: () => onFocusAgent(null),
               onDelete: () => onDeleteAgent(focusedSession),
+              onRename: (title) => onRenameAgent(focusedSession, title),
               onSubmitPrompt: (prompt) =>
                   onSubmitPrompt(focusedSession, prompt),
               onStopCodex: () => onStopCodex(focusedSession),
@@ -2153,31 +2280,123 @@ class AgentSessionList extends StatelessWidget {
         ),
       );
     }
-    return ListView.separated(
-      key: const PageStorageKey<String>('agent-session-list'),
-      controller: agentListController,
-      itemCount: sessions.length,
-      separatorBuilder: (_, _) => const SizedBox(height: 12),
-      itemBuilder: (context, index) {
-        final session = sessions[index];
-        final expanded = session.localId == expandedAgentLocalId;
-        return ExpandableAgentPanel(
-          key: ValueKey(session.localId),
-          session: session,
-          expanded: expanded,
-          enlarged: false,
-          chatController: expanded ? chatController : null,
-          agentListController: agentListController,
-          composerKey: expanded ? composerKey : null,
-          initialPrompt: initialPrompt,
-          effectiveCodexHome: effectiveCodexHome,
-          onTap: () => onToggleExpanded(session),
-          onEnlarge: () => onFocusAgent(session),
-          onDelete: () => onDeleteAgent(session),
-          onSubmitPrompt: (prompt) => onSubmitPrompt(session, prompt),
-          onStopCodex: () => onStopCodex(session),
-        );
-      },
+    return LayoutBuilder(
+      builder: (context, constraints) => Scrollbar(
+        controller: agentListController,
+        interactive: true,
+        child: ListView.separated(
+          key: const PageStorageKey<String>('agent-session-list'),
+          controller: agentListController,
+          physics: expandedAgentLocalId == null
+              ? null
+              : const NeverScrollableScrollPhysics(),
+          itemCount: sessions.length,
+          separatorBuilder: (_, _) => const SizedBox(height: 10),
+          itemBuilder: (context, index) {
+            final session = sessions[index];
+            final expanded = expandedAgentLocalId == session.localId;
+            final panel = ExpandableAgentPanel(
+              key: ValueKey(session.localId),
+              session: session,
+              expanded: expanded,
+              enlarged: false,
+              fillAvailable: expanded,
+              chatController: expanded ? chatController : null,
+              agentListController: agentListController,
+              composerKey: expanded ? composerKey : null,
+              initialPrompt: initialPrompt,
+              effectiveCodexHome: effectiveCodexHome,
+              onTap: () => onToggleExpanded(session),
+              onEnlarge: () => onFocusAgent(session),
+              onDelete: () => onDeleteAgent(session),
+              onRename: (title) => onRenameAgent(session, title),
+              onSubmitPrompt: (prompt) => onSubmitPrompt(session, prompt),
+              onStopCodex: () => onStopCodex(session),
+            );
+            if (!expanded) return panel;
+            return SizedBox(height: constraints.maxHeight, child: panel);
+          },
+        ),
+      ),
+    );
+  }
+}
+
+class EditableAgentTitle extends StatefulWidget {
+  const EditableAgentTitle({
+    required this.title,
+    required this.hasOverride,
+    required this.onRename,
+    super.key,
+  });
+
+  final String title;
+  final bool hasOverride;
+  final ValueChanged<String?> onRename;
+
+  @override
+  State<EditableAgentTitle> createState() => _EditableAgentTitleState();
+}
+
+class _EditableAgentTitleState extends State<EditableAgentTitle> {
+  late final TextEditingController _controller;
+  bool _editing = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = TextEditingController(text: widget.title);
+  }
+
+  @override
+  void didUpdateWidget(EditableAgentTitle oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (!_editing && oldWidget.title != widget.title) {
+      _controller.text = widget.title;
+    }
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  void _save() {
+    final value = _controller.text.trim();
+    setState(() => _editing = false);
+    widget.onRename(value.isEmpty ? null : value);
+  }
+
+  void _cancel() {
+    _controller.text = widget.title;
+    setState(() => _editing = false);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (_editing) {
+      return CallbackShortcuts(
+        bindings: {const SingleActivator(LogicalKeyboardKey.escape): _cancel},
+        child: TextField(
+          key: const Key('agent-title-editor'),
+          controller: _controller,
+          autofocus: true,
+          maxLines: 1,
+          onSubmitted: (_) => _save(),
+          decoration: const InputDecoration(isDense: true),
+        ),
+      );
+    }
+    return Tooltip(
+      message: widget.hasOverride
+          ? 'Click to rename. Clear to restore the Codex title.'
+          : 'Click to rename',
+      child: GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onTap: () => setState(() => _editing = true),
+        child: Text(widget.title),
+      ),
     );
   }
 }
@@ -2187,6 +2406,7 @@ class ExpandableAgentPanel extends StatelessWidget {
     required this.session,
     required this.expanded,
     required this.enlarged,
+    this.fillAvailable = false,
     required this.chatController,
     required this.agentListController,
     required this.composerKey,
@@ -2195,6 +2415,7 @@ class ExpandableAgentPanel extends StatelessWidget {
     required this.onTap,
     required this.onEnlarge,
     required this.onDelete,
+    required this.onRename,
     required this.onSubmitPrompt,
     required this.onStopCodex,
     super.key,
@@ -2203,6 +2424,7 @@ class ExpandableAgentPanel extends StatelessWidget {
   final AgentSession session;
   final bool expanded;
   final bool enlarged;
+  final bool fillAvailable;
   final ScrollController? chatController;
   final ScrollController agentListController;
   final GlobalKey<AgentComposerState>? composerKey;
@@ -2211,12 +2433,12 @@ class ExpandableAgentPanel extends StatelessWidget {
   final VoidCallback onTap;
   final VoidCallback onEnlarge;
   final VoidCallback onDelete;
+  final ValueChanged<String?> onRename;
   final ValueChanged<String> onSubmitPrompt;
   final VoidCallback onStopCodex;
 
   @override
   Widget build(BuildContext context) {
-    final colors = Theme.of(context).colorScheme;
     final homeMismatch =
         session.hasCodexThread &&
         session.originCodexHome != null &&
@@ -2242,7 +2464,11 @@ class ExpandableAgentPanel extends StatelessWidget {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Text(session.displayName),
+                  EditableAgentTitle(
+                    title: session.displayName,
+                    hasOverride: session.userTitle?.trim().isNotEmpty ?? false,
+                    onRename: onRename,
+                  ),
                   const SizedBox(height: 2),
                   Text(_statusLabel(session.status)),
                   if (session.lastVisibleAction != null) ...[
@@ -2276,7 +2502,7 @@ class ExpandableAgentPanel extends StatelessWidget {
               onPressed: onEnlarge,
               tooltip: enlarged
                   ? 'Return to agents (Esc)'
-                  : 'Enlarge agent (⌘F)',
+                  : 'Focus agent (⇧⌘F)',
               icon: Icon(
                 enlarged ? Icons.close_fullscreen : Icons.open_in_full,
               ),
@@ -2305,6 +2531,7 @@ class ExpandableAgentPanel extends StatelessWidget {
           controller: chatController!,
           agentListController: agentListController,
           enlarged: enlarged,
+          embedded: !(enlarged || fillAvailable),
           composerKey: composerKey!,
           initialPrompt: session.hasCodexThread ? '' : initialPrompt,
           hasSession: session.hasCodexThread,
@@ -2318,59 +2545,58 @@ class ExpandableAgentPanel extends StatelessWidget {
 
         return CallbackShortcuts(
           bindings: {
-            const SingleActivator(LogicalKeyboardKey.keyF, meta: true):
-                onEnlarge,
+            const SingleActivator(
+              LogicalKeyboardKey.keyF,
+              meta: true,
+              shift: true,
+            ): onEnlarge,
             if (enlarged)
               const SingleActivator(LogicalKeyboardKey.escape): onEnlarge,
           },
           child: Focus(
             autofocus: enlarged,
-            child: DecoratedBox(
-              decoration: BoxDecoration(
-                border: Border.all(color: colors.outlineVariant),
-                borderRadius: BorderRadius.circular(8),
-              ),
-              child: Padding(
-                padding: const EdgeInsets.all(12),
-                child: Column(
-                  children: [
-                    InkWell(
-                      onTap: onTap,
-                      borderRadius: BorderRadius.circular(8),
-                      child: Padding(
-                        padding: const EdgeInsets.all(4),
-                        child: constraints.maxWidth < 500
-                            ? Column(
-                                crossAxisAlignment: CrossAxisAlignment.start,
-                                children: [
-                                  details,
-                                  const SizedBox(height: 12),
-                                  actions,
-                                ],
-                              )
-                            : Row(
-                                children: [
-                                  Expanded(child: details),
-                                  const SizedBox(width: 12),
-                                  actions,
-                                ],
-                              ),
-                      ),
+            child: DitchSurface(
+              padding: const EdgeInsets.all(12),
+              bordered: false,
+              child: Column(
+                children: [
+                  InkWell(
+                    key: GlobalObjectKey('agent-header-${session.localId}'),
+                    onTap: onTap,
+                    borderRadius: BorderRadius.circular(8),
+                    child: Padding(
+                      padding: const EdgeInsets.all(4),
+                      child: constraints.maxWidth < 500
+                          ? Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                details,
+                                const SizedBox(height: 12),
+                                actions,
+                              ],
+                            )
+                          : Row(
+                              children: [
+                                Expanded(child: details),
+                                const SizedBox(width: 12),
+                                actions,
+                              ],
+                            ),
                     ),
-                    if (expanded && enlarged)
-                      Expanded(
-                        child: Padding(
-                          padding: const EdgeInsets.only(top: 12),
-                          child: buildChatPanel(),
-                        ),
-                      )
-                    else if (expanded)
-                      Padding(
+                  ),
+                  if (expanded && (enlarged || fillAvailable))
+                    Expanded(
+                      child: Padding(
                         padding: const EdgeInsets.only(top: 12),
-                        child: SizedBox(height: 560, child: buildChatPanel()),
+                        child: buildChatPanel(),
                       ),
-                  ],
-                ),
+                    )
+                  else if (expanded)
+                    Padding(
+                      padding: const EdgeInsets.only(top: 12),
+                      child: buildChatPanel(),
+                    ),
+                ],
               ),
             ),
           ),
@@ -2403,6 +2629,7 @@ class AgentChatPanel extends StatelessWidget {
     required this.controller,
     required this.agentListController,
     required this.enlarged,
+    this.embedded = false,
     required this.composerKey,
     required this.initialPrompt,
     required this.hasSession,
@@ -2419,6 +2646,7 @@ class AgentChatPanel extends StatelessWidget {
   final ScrollController controller;
   final ScrollController agentListController;
   final bool enlarged;
+  final bool embedded;
   final GlobalKey<AgentComposerState> composerKey;
   final String initialPrompt;
   final bool hasSession;
@@ -2431,49 +2659,97 @@ class AgentChatPanel extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final colors = Theme.of(context).colorScheme;
-
-    return DecoratedBox(
-      decoration: BoxDecoration(
-        color: colors.surfaceContainerHighest,
-        borderRadius: BorderRadius.circular(8),
-      ),
-      child: Column(
+    final toolbar = SizedBox(
+      height: 36,
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.end,
         children: [
-          SizedBox(
-            height: 36,
-            child: Row(
-              mainAxisAlignment: MainAxisAlignment.end,
-              children: [
-                IconButton(
-                  tooltip: 'Copy conversation',
-                  icon: const Icon(Icons.copy_all_outlined, size: 18),
-                  onPressed: messages.isEmpty
-                      ? null
-                      : () => Clipboard.setData(
-                          ClipboardData(
-                            text: messages
-                                .map(
-                                  (message) =>
-                                      '${message.role.name}: ${message.text}',
-                                )
-                                .join('\n\n'),
-                          ),
-                        ),
-                ),
-              ],
-            ),
+          IconButton(
+            tooltip: 'Copy conversation',
+            icon: const Icon(Icons.copy_all_outlined, size: 18),
+            onPressed: messages.isEmpty
+                ? null
+                : () => Clipboard.setData(
+                    ClipboardData(
+                      text: messages
+                          .map(
+                            (message) =>
+                                '${message.role.name}: ${message.text}',
+                          )
+                          .join('\n\n'),
+                    ),
+                  ),
           ),
-          const Divider(height: 1),
-          Expanded(
-            child: ScrollHandoffRegion(
-              parentControllers: [agentListController],
+        ],
+      ),
+    );
+    final footer = <Widget>[
+      const Divider(height: 1),
+      ThinkingStatusStrip(visible: isWorking),
+      if (disabledMessage != null)
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
+          child: Text(disabledMessage!),
+        ),
+      AgentComposer(
+        key: composerKey,
+        initialText: initialPrompt,
+        hasSession: hasSession,
+        isWorking: isWorking,
+        enabled: enabled,
+        onSubmit: onSubmitPrompt,
+        onStop: onStopCodex,
+        onEnlarge: onEnlarge,
+        onEscape: enlarged ? onEnlarge : null,
+      ),
+    ];
+
+    if (embedded) {
+      return ColoredBox(
+        color: context.ditch.workspace,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            toolbar,
+            const Divider(height: 1),
+            Padding(
+              padding: const EdgeInsets.all(12),
+              child: Column(
+                children: [
+                  for (var index = 0; index < messages.length; index++) ...[
+                    if (index > 0) const SizedBox(height: 10),
+                    AgentChatBubble(
+                      message: messages[index],
+                      chatController: controller,
+                      agentListController: agentListController,
+                      embedded: true,
+                    ),
+                  ],
+                ],
+              ),
+            ),
+            ...footer,
+          ],
+        ),
+      );
+    }
+
+    return ConversationViewportLifecycle(
+      controller: controller,
+      composerKey: composerKey,
+      messageCount: messages.length,
+      child: ColoredBox(
+        color: context.ditch.workspace,
+        child: Column(
+          children: [
+            toolbar,
+            const Divider(height: 1),
+            Expanded(
               child: Scrollbar(
                 controller: controller,
-                thumbVisibility: true,
+                interactive: true,
                 child: ListView.separated(
                   controller: controller,
-                  physics: const ClampingScrollPhysics(),
                   padding: const EdgeInsets.all(12),
                   itemCount: messages.length,
                   separatorBuilder: (_, _) => const SizedBox(height: 10),
@@ -2482,67 +2758,85 @@ class AgentChatPanel extends StatelessWidget {
                       message: messages[index],
                       chatController: controller,
                       agentListController: agentListController,
+                      embedded: false,
                     );
                   },
                 ),
               ),
             ),
-          ),
-          const Divider(height: 1),
-          ThinkingStatusStrip(visible: isWorking),
-          if (disabledMessage != null)
-            Padding(
-              padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
-              child: Text(disabledMessage!),
-            ),
-          AgentComposer(
-            key: composerKey,
-            initialText: initialPrompt,
-            hasSession: hasSession,
-            isWorking: isWorking,
-            enabled: enabled,
-            onSubmit: onSubmitPrompt,
-            onStop: onStopCodex,
-            onEnlarge: onEnlarge,
-            onEscape: enlarged ? onEnlarge : null,
-          ),
-        ],
+            ...footer,
+          ],
+        ),
       ),
     );
   }
 }
 
-class ScrollHandoffRegion extends StatelessWidget {
-  const ScrollHandoffRegion({
-    required this.parentControllers,
+class ConversationViewportLifecycle extends StatefulWidget {
+  const ConversationViewportLifecycle({
+    required this.controller,
+    required this.composerKey,
+    required this.messageCount,
     required this.child,
     super.key,
   });
 
-  final List<ScrollController> parentControllers;
+  final ScrollController controller;
+  final GlobalKey<AgentComposerState> composerKey;
+  final int messageCount;
   final Widget child;
 
   @override
-  Widget build(BuildContext context) {
-    return NotificationListener<OverscrollNotification>(
-      onNotification: (notification) {
-        var remaining = notification.overscroll;
-        for (final controller in parentControllers) {
-          if (!controller.hasClients || remaining.abs() < 0.01) continue;
-          final position = controller.position;
-          final target = (position.pixels + remaining).clamp(
-            position.minScrollExtent,
-            position.maxScrollExtent,
-          );
-          final consumed = target - position.pixels;
-          if (consumed.abs() > 0.01) controller.jumpTo(target.toDouble());
-          remaining -= consumed;
-        }
-        return true;
-      },
-      child: child,
-    );
+  State<ConversationViewportLifecycle> createState() =>
+      _ConversationViewportLifecycleState();
+}
+
+class _ConversationViewportLifecycleState
+    extends State<ConversationViewportLifecycle> {
+  static const _nearBottomThreshold = 72.0;
+
+  @override
+  void initState() {
+    super.initState();
+    _scheduleBottom(focusComposer: true, animate: false);
   }
+
+  @override
+  void didUpdateWidget(ConversationViewportLifecycle oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (widget.messageCount == oldWidget.messageCount) return;
+
+    final shouldFollow =
+        !widget.controller.hasClients ||
+        widget.controller.position.maxScrollExtent -
+                widget.controller.position.pixels <=
+            _nearBottomThreshold;
+    if (shouldFollow) {
+      _scheduleBottom(focusComposer: false, animate: true);
+    }
+  }
+
+  void _scheduleBottom({required bool focusComposer, required bool animate}) {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      if (widget.controller.hasClients) {
+        final target = widget.controller.position.maxScrollExtent;
+        if (animate) {
+          widget.controller.animateTo(
+            target,
+            duration: const Duration(milliseconds: 180),
+            curve: Curves.easeOut,
+          );
+        } else {
+          widget.controller.jumpTo(target);
+        }
+      }
+      if (focusComposer) widget.composerKey.currentState?.focus();
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) => widget.child;
 }
 
 class ThinkingStatusStrip extends StatefulWidget {
@@ -2697,6 +2991,7 @@ class AgentComposerState extends State<AgentComposer> {
     setState(() => _draftText = '');
     await _nativeComposerKey.currentState?.clearText();
     widget.onSubmit(prompt);
+    focus();
   }
 
   void _handleChanged(String text) {
@@ -2708,7 +3003,6 @@ class AgentComposerState extends State<AgentComposer> {
 
   @override
   Widget build(BuildContext context) {
-    final colors = Theme.of(context).colorScheme;
     final hasText = _draftText.trim().isNotEmpty;
     final actionLabel = widget.hasSession ? 'Send' : 'Start';
     final actionIcon = widget.hasSession ? Icons.send : Icons.play_arrow;
@@ -2718,9 +3012,8 @@ class AgentComposerState extends State<AgentComposer> {
       padding: const EdgeInsets.all(12),
       child: DecoratedBox(
         decoration: BoxDecoration(
-          color: colors.surface,
-          border: Border.all(color: colors.outlineVariant),
-          borderRadius: BorderRadius.circular(8),
+          color: context.ditch.surfaceHover,
+          borderRadius: BorderRadius.circular(context.ditch.radiusMedium),
         ),
         child: Padding(
           padding: const EdgeInsets.all(10),
@@ -2738,6 +3031,7 @@ class AgentComposerState extends State<AgentComposer> {
                         ? 'Send a follow-up to Codex'
                         : 'Tell Codex what to do',
                     onChanged: _handleChanged,
+                    onSubmitRequested: submit,
                     onEnlarge: widget.onEnlarge,
                     onEscape: widget.onEscape,
                   ),
@@ -2770,6 +3064,7 @@ class NativeComposerTextView extends StatefulWidget {
     required this.enabled,
     required this.placeholder,
     required this.onChanged,
+    required this.onSubmitRequested,
     this.onEnlarge,
     this.onEscape,
     super.key,
@@ -2779,6 +3074,7 @@ class NativeComposerTextView extends StatefulWidget {
   final bool enabled;
   final String placeholder;
   final ValueChanged<String> onChanged;
+  final VoidCallback onSubmitRequested;
   final VoidCallback? onEnlarge;
   final VoidCallback? onEscape;
 
@@ -2789,6 +3085,7 @@ class NativeComposerTextView extends StatefulWidget {
 class NativeComposerTextViewState extends State<NativeComposerTextView> {
   MethodChannel? _channel;
   bool? _lastSentEnabled;
+  bool _focusRequested = false;
   late final TextEditingController _fallbackController;
   late final FocusNode _fallbackFocusNode;
 
@@ -2817,13 +3114,13 @@ class NativeComposerTextViewState extends State<NativeComposerTextView> {
   }
 
   Future<void> focus() async {
+    _focusRequested = true;
     final channel = _channel;
-    if (channel == null ||
-        kIsWeb ||
-        defaultTargetPlatform != TargetPlatform.macOS) {
+    if (kIsWeb || defaultTargetPlatform != TargetPlatform.macOS) {
       _fallbackFocusNode.requestFocus();
       return;
     }
+    if (channel == null) return;
 
     try {
       await channel.invokeMethod<void>('focus');
@@ -2833,6 +3130,7 @@ class NativeComposerTextViewState extends State<NativeComposerTextView> {
   }
 
   Future<void> blur() async {
+    _focusRequested = false;
     _fallbackFocusNode.unfocus();
     final channel = _channel;
     if (channel == null ||
@@ -2890,17 +3188,25 @@ class NativeComposerTextViewState extends State<NativeComposerTextView> {
   @override
   Widget build(BuildContext context) {
     if (kIsWeb || defaultTargetPlatform != TargetPlatform.macOS) {
-      return TextField(
-        controller: _fallbackController,
-        focusNode: _fallbackFocusNode,
-        enabled: widget.enabled,
-        minLines: 1,
-        maxLines: 5,
-        onChanged: widget.onChanged,
-        decoration: InputDecoration(
-          hintText: widget.placeholder,
-          border: InputBorder.none,
-          isDense: true,
+      return CallbackShortcuts(
+        bindings: {
+          const SingleActivator(LogicalKeyboardKey.enter):
+              widget.onSubmitRequested,
+          const SingleActivator(LogicalKeyboardKey.numpadEnter):
+              widget.onSubmitRequested,
+        },
+        child: TextField(
+          controller: _fallbackController,
+          focusNode: _fallbackFocusNode,
+          enabled: widget.enabled,
+          minLines: 1,
+          maxLines: 5,
+          onChanged: widget.onChanged,
+          decoration: InputDecoration(
+            hintText: widget.placeholder,
+            border: InputBorder.none,
+            isDense: true,
+          ),
         ),
       );
     }
@@ -2927,8 +3233,13 @@ class NativeComposerTextViewState extends State<NativeComposerTextView> {
             widget.onEnlarge?.call();
           } else if (call.method == 'escapePressed') {
             widget.onEscape?.call();
+          } else if (call.method == 'submitRequested') {
+            widget.onSubmitRequested();
           }
         });
+        if (_focusRequested) {
+          channel.invokeMethod<void>('focus');
+        }
       },
     );
   }
@@ -2939,12 +3250,14 @@ class AgentChatBubble extends StatelessWidget {
     required this.message,
     required this.chatController,
     required this.agentListController,
+    this.embedded = false,
     super.key,
   });
 
   final AgentChatMessage message;
   final ScrollController chatController;
   final ScrollController agentListController;
+  final bool embedded;
 
   @override
   Widget build(BuildContext context) {
@@ -2961,152 +3274,108 @@ class AgentChatBubble extends StatelessWidget {
         Icons.person_outline,
         colors.onPrimaryContainer,
         colors.primaryContainer,
-        CrossAxisAlignment.end,
+        Alignment.centerRight,
       ),
       ChatMessageRole.assistant => (
         'Codex',
         Icons.smart_toy_outlined,
         colors.onSurface,
-        colors.surface,
-        CrossAxisAlignment.start,
+        context.ditch.surfaceHover,
+        Alignment.centerLeft,
       ),
       ChatMessageRole.tool => (
         'Tool',
         Icons.terminal,
         colors.onTertiaryContainer,
         colors.tertiaryContainer,
-        CrossAxisAlignment.start,
+        Alignment.centerLeft,
       ),
       ChatMessageRole.system => (
         'The Ditch',
         Icons.info_outline,
         colors.onSecondaryContainer,
         colors.secondaryContainer,
-        CrossAxisAlignment.start,
+        Alignment.centerLeft,
       ),
     };
 
-    return Column(
-      crossAxisAlignment: alignment,
-      children: [
-        ConstrainedBox(
-          constraints: const BoxConstraints(maxWidth: 820),
-          child: DecoratedBox(
-            decoration: BoxDecoration(
-              color: background,
-              borderRadius: BorderRadius.circular(8),
-              border: Border.all(color: colors.outlineVariant),
-            ),
-            child: Padding(
-              padding: const EdgeInsets.all(12),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Row(
-                    children: [
-                      Icon(icon, size: 16, color: foreground),
-                      const SizedBox(width: 6),
-                      Text(
-                        label,
-                        style: Theme.of(context).textTheme.labelMedium
-                            ?.copyWith(
-                              color: foreground,
-                              fontWeight: FontWeight.w700,
-                            ),
-                      ),
-                      const Spacer(),
-                      IconButton(
-                        visualDensity: VisualDensity.compact,
-                        tooltip: 'Copy message',
-                        icon: const Icon(Icons.copy_outlined, size: 16),
-                        onPressed: () => Clipboard.setData(
-                          ClipboardData(text: message.text),
-                        ),
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: 8),
-                  if (message.role == ChatMessageRole.tool)
-                    ScrollableToolMessage(
-                      text: message.text,
-                      foreground: foreground,
-                      chatController: chatController,
-                      agentListController: agentListController,
-                    )
-                  else
-                    SelectionArea(
-                      child: Text(
-                        message.text,
-                        style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                          color: foreground,
-                          height: 1.45,
-                          fontSize: 14,
-                        ),
-                      ),
-                    ),
-                ],
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final availableWidth = constraints.maxWidth;
+        final maxBubbleWidth = availableWidth < 520
+            ? availableWidth * 0.86
+            : (availableWidth * 0.68).clamp(340.0, 720.0);
+        return Align(
+          alignment: alignment,
+          child: ConstrainedBox(
+            constraints: BoxConstraints(maxWidth: maxBubbleWidth),
+            child: DecoratedBox(
+              decoration: BoxDecoration(
+                color: background,
+                borderRadius: BorderRadius.circular(context.ditch.radiusMedium),
               ),
-            ),
-          ),
-        ),
-      ],
-    );
-  }
-}
-
-class ScrollableToolMessage extends StatefulWidget {
-  const ScrollableToolMessage({
-    required this.text,
-    required this.foreground,
-    required this.chatController,
-    required this.agentListController,
-    super.key,
-  });
-
-  final String text;
-  final Color foreground;
-  final ScrollController chatController;
-  final ScrollController agentListController;
-
-  @override
-  State<ScrollableToolMessage> createState() => _ScrollableToolMessageState();
-}
-
-class _ScrollableToolMessageState extends State<ScrollableToolMessage> {
-  final _controller = ScrollController();
-
-  @override
-  void dispose() {
-    _controller.dispose();
-    super.dispose();
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return ConstrainedBox(
-      constraints: const BoxConstraints(maxHeight: 190),
-      child: ScrollHandoffRegion(
-        parentControllers: [widget.chatController, widget.agentListController],
-        child: Scrollbar(
-          controller: _controller,
-          thumbVisibility: true,
-          child: SingleChildScrollView(
-            controller: _controller,
-            physics: const ClampingScrollPhysics(),
-            child: SelectionArea(
-              child: Text(
-                widget.text,
-                style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                  color: widget.foreground,
-                  height: 1.4,
-                  fontFamily: 'SF Mono',
-                  fontSize: 12.5,
+              child: Padding(
+                padding: const EdgeInsets.all(12),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Icon(icon, size: 16, color: foreground),
+                        const SizedBox(width: 6),
+                        Text(
+                          label,
+                          style: Theme.of(context).textTheme.labelMedium
+                              ?.copyWith(
+                                color: foreground,
+                                fontWeight: FontWeight.w700,
+                              ),
+                        ),
+                        const SizedBox(width: 10),
+                        IconButton(
+                          visualDensity: VisualDensity.compact,
+                          tooltip: 'Copy message',
+                          icon: const Icon(Icons.copy_outlined, size: 16),
+                          onPressed: () => Clipboard.setData(
+                            ClipboardData(text: message.text),
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 8),
+                    if (message.role == ChatMessageRole.tool)
+                      SelectionArea(
+                        child: Text(
+                          message.text,
+                          style: Theme.of(context).textTheme.bodySmall
+                              ?.copyWith(
+                                color: foreground,
+                                height: 1.4,
+                                fontFamily: 'SF Mono',
+                                fontSize: 12.5,
+                              ),
+                        ),
+                      )
+                    else
+                      SelectionArea(
+                        child: Text(
+                          message.text,
+                          style: Theme.of(context).textTheme.bodyMedium
+                              ?.copyWith(
+                                color: foreground,
+                                height: 1.45,
+                                fontSize: 14,
+                              ),
+                        ),
+                      ),
+                  ],
                 ),
               ),
             ),
           ),
-        ),
-      ),
+        );
+      },
     );
   }
 }
@@ -3133,34 +3402,38 @@ class AttentionPanel extends StatelessWidget {
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
 
-    return SizedBox(
-      width: width,
-      child: SafeArea(
-        child: SingleChildScrollView(
-          padding: const EdgeInsets.all(16),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text('Attention', style: theme.textTheme.titleLarge),
-              const SizedBox(height: 12),
-              if (events.isEmpty)
-                const AttentionEmptyState()
-              else
-                for (final event in events) ...[
-                  AttentionItem(
-                    event: event,
-                    canStop: canStopSession(event),
-                    onOpen: event.canOpenSession
-                        ? () => onOpenSession(event)
-                        : null,
-                    onStop: canStopSession(event)
-                        ? () => onStopSession(event)
-                        : null,
-                    onDismiss: () => onDismiss(event),
-                  ),
-                  const SizedBox(height: 12),
-                ],
-            ],
+    return ColoredBox(
+      color: context.ditch.inspector,
+      child: SizedBox(
+        width: width,
+        child: SafeArea(
+          top: false,
+          child: SingleChildScrollView(
+            padding: const EdgeInsets.all(16),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text('Attention', style: theme.textTheme.titleLarge),
+                const SizedBox(height: 12),
+                if (events.isEmpty)
+                  const AttentionEmptyState()
+                else
+                  for (final event in events) ...[
+                    AttentionItem(
+                      event: event,
+                      canStop: canStopSession(event),
+                      onOpen: event.canOpenSession
+                          ? () => onOpenSession(event)
+                          : null,
+                      onStop: canStopSession(event)
+                          ? () => onStopSession(event)
+                          : null,
+                      onDismiss: () => onDismiss(event),
+                    ),
+                    const SizedBox(height: 12),
+                  ],
+              ],
+            ),
           ),
         ),
       ),
@@ -3173,28 +3446,19 @@ class AttentionEmptyState extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final colors = Theme.of(context).colorScheme;
-
-    return DecoratedBox(
-      decoration: BoxDecoration(
-        border: Border.all(color: colors.outlineVariant),
-        borderRadius: BorderRadius.circular(8),
-      ),
-      child: Padding(
-        padding: const EdgeInsets.all(12),
-        child: Row(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            const Icon(Icons.check_circle_outline, size: 20),
-            const SizedBox(width: 10),
-            Expanded(
-              child: Text(
-                'No agent sessions need attention.',
-                style: Theme.of(context).textTheme.bodyMedium,
-              ),
+    return DitchSurface(
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Icon(Icons.check_circle_outline, size: 20),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Text(
+              'No agent sessions need attention.',
+              style: Theme.of(context).textTheme.bodyMedium,
             ),
-          ],
-        ),
+          ),
+        ],
       ),
     );
   }
@@ -3218,62 +3482,50 @@ class AttentionItem extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final colors = Theme.of(context).colorScheme;
-
-    return DecoratedBox(
-      decoration: BoxDecoration(
-        border: Border.all(color: colors.outlineVariant),
-        borderRadius: BorderRadius.circular(8),
-      ),
-      child: Padding(
-        padding: const EdgeInsets.all(12),
-        child: Row(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Icon(event.icon, size: 20),
-            const SizedBox(width: 10),
-            Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    event.title,
-                    style: Theme.of(context).textTheme.titleSmall,
-                  ),
-                  const SizedBox(height: 4),
-                  Text(event.body),
-                  const SizedBox(height: 10),
-                  Wrap(
-                    spacing: 8,
-                    runSpacing: 8,
-                    children: [
-                      if (onOpen != null)
-                        OutlinedButton.icon(
-                          onPressed: onOpen,
-                          icon: const Icon(Icons.open_in_full, size: 16),
-                          label: const Text('Open'),
-                        ),
-                      if (canStop && onStop != null)
-                        OutlinedButton.icon(
-                          onPressed: onStop,
-                          icon: const Icon(
-                            Icons.stop_circle_outlined,
-                            size: 16,
-                          ),
-                          label: const Text('Stop'),
-                        ),
-                      TextButton.icon(
-                        onPressed: onDismiss,
-                        icon: const Icon(Icons.done, size: 16),
-                        label: const Text('Dismiss'),
+    return DitchSurface(
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Icon(event.icon, size: 20),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  event.title,
+                  style: Theme.of(context).textTheme.titleSmall,
+                ),
+                const SizedBox(height: 4),
+                Text(event.body),
+                const SizedBox(height: 10),
+                Wrap(
+                  spacing: 8,
+                  runSpacing: 8,
+                  children: [
+                    if (onOpen != null)
+                      OutlinedButton.icon(
+                        onPressed: onOpen,
+                        icon: const Icon(Icons.open_in_full, size: 16),
+                        label: const Text('Open'),
                       ),
-                    ],
-                  ),
-                ],
-              ),
+                    if (canStop && onStop != null)
+                      OutlinedButton.icon(
+                        onPressed: onStop,
+                        icon: const Icon(Icons.stop_circle_outlined, size: 16),
+                        label: const Text('Stop'),
+                      ),
+                    TextButton.icon(
+                      onPressed: onDismiss,
+                      icon: const Icon(Icons.done, size: 16),
+                      label: const Text('Dismiss'),
+                    ),
+                  ],
+                ),
+              ],
             ),
-          ],
-        ),
+          ),
+        ],
       ),
     );
   }

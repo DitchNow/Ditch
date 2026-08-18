@@ -1,6 +1,9 @@
 import Cocoa
 import Foundation
 
+@_silgen_name("ditch_runtime_run")
+private func ditchRuntimeRun() -> Int32
+
 @main
 final class StatusHost: NSObject, NSApplicationDelegate {
   private var statusItem: NSStatusItem?
@@ -11,6 +14,11 @@ final class StatusHost: NSObject, NSApplicationDelegate {
   private let codexHomeItem = NSMenuItem(title: "Codex home: Unknown", action: nil, keyEquivalent: "")
   private var timer: Timer?
   private var refreshInFlight = false
+  private var runtimeStartInFlight = false
+  private var runtimeThreadStarted = false
+  private var shutdownRequested = false
+  private var lastRuntimeStatus: RuntimeStatus?
+  private var lastStartAttempt = Date.distantPast
   private var appPath = ""
   private var helperDirectory = ""
   private var pidFilePath = ""
@@ -25,18 +33,20 @@ final class StatusHost: NSObject, NSApplicationDelegate {
   }
 
   func applicationDidFinishLaunching(_ notification: Notification) {
+    restoreRuntimeEnvironment()
     logFilePath = StatusHost.defaultLogFilePath()
     appPath = StatusHost.parentAppPath()
     helperDirectory = Bundle.main.executableURL?
       .deletingLastPathComponent()
       .path ?? URL(fileURLWithPath: CommandLine.arguments[0]).deletingLastPathComponent().path
     pidFilePath = StatusHost.defaultPidFilePath()
-    log("launch appPath=\(appPath) helperDirectory=\(helperDirectory)")
+    let obsoletePid = FileManager.default.homeDirectoryForCurrentUser
+      .appendingPathComponent("Library/Application Support/The Ditch/ditch-status-host.pid").path
+    try? FileManager.default.removeItem(atPath: obsoletePid)
+    log("launch integrated ditchd appPath=\(appPath) helperDirectory=\(helperDirectory)")
     writePidFile()
     configureStatusItem()
-    // The main application owns runtime startup so its CODEX_HOME is the
-    // single source of truth. The login-item helper only mirrors status.
-    refreshRuntimeStatus()
+    ensureRuntimeAvailable()
     timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
       self?.refreshRuntimeStatus()
     }
@@ -53,24 +63,38 @@ final class StatusHost: NSObject, NSApplicationDelegate {
     let support = FileManager.default.homeDirectoryForCurrentUser
       .appendingPathComponent("Library/Application Support/The Ditch", isDirectory: true)
     try? FileManager.default.createDirectory(at: support, withIntermediateDirectories: true)
-    return support.appendingPathComponent("ditch-status-host.pid").path
+    return support.appendingPathComponent("ditchd.pid").path
   }
 
   private static func defaultLogFilePath() -> String {
     let logs = FileManager.default.homeDirectoryForCurrentUser
       .appendingPathComponent("Library/Application Support/The Ditch/logs", isDirectory: true)
     try? FileManager.default.createDirectory(at: logs, withIntermediateDirectories: true)
-    return logs.appendingPathComponent("status-host.log").path
+    return logs.appendingPathComponent("runtime.log").path
   }
 
   private static func parentAppPath() -> String {
-    let helperBundle = Bundle.main.bundleURL
-    return helperBundle
-      .deletingLastPathComponent()
-      .deletingLastPathComponent()
-      .deletingLastPathComponent()
-      .deletingLastPathComponent()
-      .path
+    var candidate = Bundle.main.bundleURL
+    while candidate.path != "/" {
+      if candidate.pathExtension == "app",
+        candidate.lastPathComponent == "The Ditch.app"
+      {
+        return candidate.path
+      }
+      candidate.deleteLastPathComponent()
+    }
+    return Bundle.main.bundleURL.path
+  }
+
+  private func restoreRuntimeEnvironment() {
+    let file = FileManager.default.homeDirectoryForCurrentUser
+      .appendingPathComponent("Library/Application Support/The Ditch/codex-home")
+    guard let value = try? String(contentsOf: file, encoding: .utf8)
+      .trimmingCharacters(in: .whitespacesAndNewlines),
+      !value.isEmpty,
+      value.hasPrefix("/")
+    else { return }
+    setenv("CODEX_HOME", value, 1)
   }
 
   private func log(_ message: String) {
@@ -156,11 +180,15 @@ final class StatusHost: NSObject, NSApplicationDelegate {
       DispatchQueue.main.async {
         self.refreshInFlight = false
         self.applyRuntimeStatus(status)
+        if status == nil && !self.shutdownRequested {
+          self.ensureRuntimeAvailable()
+        }
       }
     }
   }
 
   private func applyRuntimeStatus(_ status: RuntimeStatus?) {
+    lastRuntimeStatus = status
     guard let status else {
       stateItem.title = "Runtime: Offline"
       sessionsItem.title = "0 active sessions"
@@ -184,6 +212,50 @@ final class StatusHost: NSObject, NSApplicationDelegate {
       attentionCount: status.attentionCount)
     statusItem?.button?.toolTip =
       "The Ditch Runtime • \(status.activeSessionCount) active"
+  }
+
+  /// AppKit and the Rust runtime share this process. AppKit remains on the main
+  /// thread while the blocking Unix-socket server runs on a utility thread.
+  private func ensureRuntimeAvailable() {
+    guard !shutdownRequested, !runtimeStartInFlight else { return }
+    guard Date().timeIntervalSince(lastStartAttempt) >= 3 else { return }
+    runtimeStartInFlight = true
+    lastStartAttempt = Date()
+
+    DispatchQueue.global(qos: .utility).async { [weak self] in
+      guard let self else { return }
+      if let status = self.runtimeStatus() {
+        DispatchQueue.main.async {
+          self.runtimeStartInFlight = false
+          self.applyRuntimeStatus(status)
+        }
+        return
+      }
+
+      if !self.runtimeThreadStarted {
+        self.runtimeThreadStarted = true
+        self.log("starting integrated runtime pid=\(ProcessInfo.processInfo.processIdentifier)")
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+          let exitCode = ditchRuntimeRun()
+          self?.log("integrated runtime exited code=\(exitCode)")
+          DispatchQueue.main.async {
+            self?.runtimeThreadStarted = false
+            self?.applyRuntimeStatus(nil)
+          }
+        }
+      }
+
+      var status: RuntimeStatus?
+      for _ in 0..<20 {
+        Thread.sleep(forTimeInterval: 0.1)
+        status = self.runtimeStatus()
+        if status != nil { break }
+      }
+      DispatchQueue.main.async {
+        self.runtimeStartInFlight = false
+        self.applyRuntimeStatus(status)
+      }
+    }
   }
 
   private func updateStatusButton(activeSessionCount: Int, attentionCount: Int) {
@@ -273,15 +345,30 @@ final class StatusHost: NSObject, NSApplicationDelegate {
   }
 
   @objc private func quitRuntime() {
-    _ = runDitchCli(arguments: ["runtime", "stop"])
-    terminateMainApp()
-    NSApp.terminate(nil)
-  }
-
-  private func terminateMainApp() {
-    for app in NSRunningApplication.runningApplications(withBundleIdentifier: "ai.theditch.app") {
-      app.terminate()
+    if let status = lastRuntimeStatus, status.activeSessionCount > 0 {
+      let alert = NSAlert()
+      alert.messageText = "Quit The Ditch Runtime?"
+      alert.informativeText =
+        "This will stop \(status.activeSessionCount) active agent session(s). The Ditch window may remain open but will disconnect."
+      alert.addButton(withTitle: "Quit and Stop Agents")
+      alert.addButton(withTitle: "Cancel")
+      alert.alertStyle = .warning
+      guard alert.runModal() == .alertFirstButtonReturn else { return }
     }
+
+    shutdownRequested = true
+    let output = runDitchCli(arguments: ["runtime", "stop"])
+    if output.exitCode != 0 && lastRuntimeStatus != nil {
+      shutdownRequested = false
+      let alert = NSAlert()
+      alert.messageText = "The Ditch Runtime could not be stopped"
+      alert.informativeText = output.stderr.isEmpty
+        ? "The runtime may still be running."
+        : output.stderr
+      alert.runModal()
+      return
+    }
+    NSApp.terminate(nil)
   }
 
   private func statusImage() -> NSImage {

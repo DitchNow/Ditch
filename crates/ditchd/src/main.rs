@@ -24,15 +24,19 @@ use std::thread;
 
 const RUNTIME_IDENTITY: &str = "The Ditch Runtime";
 
+#[allow(dead_code)]
 fn main() {
-    let paths = AppPaths::for_current_user();
-    if let Err(error) = validate_codex_home()
-        .and_then(|_| ensure_app_dirs(&paths).map_err(io::Error::other))
-        .and_then(|_| serve(paths))
-    {
+    if let Err(error) = run_runtime() {
         eprintln!("{RUNTIME_IDENTITY} failed: {error}");
         std::process::exit(1);
     }
+}
+
+fn run_runtime() -> io::Result<()> {
+    let paths = AppPaths::for_current_user();
+    validate_codex_home()
+        .and_then(|_| ensure_app_dirs(&paths).map_err(io::Error::other))
+        .and_then(|_| serve(paths))
 }
 
 fn validate_codex_home() -> io::Result<()> {
@@ -416,6 +420,7 @@ fn handle_request(request: ClientRequest, state: Arc<Mutex<RuntimeState>>) -> Se
         ClientRequest::PromptAgent { agent_id, prompt } => prompt_agent(state, agent_id, prompt),
         ClientRequest::StopAgent { agent_id } => stop_agent(state, agent_id),
         ClientRequest::DeleteAgent { agent_id } => delete_agent(state, agent_id),
+        ClientRequest::RenameAgent { agent_id, title } => rename_agent(state, agent_id, title),
         ClientRequest::DismissAttention { attention_id } => {
             let mut state = state
                 .lock()
@@ -501,6 +506,8 @@ fn start_codex_session(
         task_id: None,
         pane_id: None,
         native_session_id: None,
+        codex_title: None,
+        user_title: None,
         origin_codex_home: std::env::var("CODEX_HOME").ok(),
         current_prompt: Some(prompt.clone()),
         last_visible_action: Some("Starting Codex".to_owned()),
@@ -731,6 +738,8 @@ fn resume_codex_session(
         task_id: None,
         pane_id: None,
         native_session_id: Some(thread_id.clone()),
+        codex_title: None,
+        user_title: None,
         origin_codex_home: std::env::var("CODEX_HOME").ok(),
         current_prompt: Some(prompt.clone()),
         last_visible_action: Some("Resuming Codex".to_owned()),
@@ -1024,6 +1033,28 @@ fn delete_agent(state: Arc<Mutex<RuntimeState>>, agent_id: AgentId) -> ServerRes
     ServerResponse::Accepted
 }
 
+fn rename_agent(
+    state: Arc<Mutex<RuntimeState>>,
+    agent_id: AgentId,
+    title: Option<String>,
+) -> ServerResponse {
+    let title = title
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
+    let mut state = state
+        .lock()
+        .expect("runtime state lock should not be poisoned");
+    let Some(record) = state.agents.get_mut(&agent_id) else {
+        return protocol_error("agent_not_found", "agent session was not found");
+    };
+    record.run.user_title = title;
+    record.run.updated_at = Utc::now();
+    let run = record.run.clone();
+    state.persist_agent(agent_id);
+    state.broadcast(ServerEvent::AgentChanged(run));
+    ServerResponse::Accepted
+}
+
 fn attach_codex_io(state: Arc<Mutex<RuntimeState>>, agent_id: AgentId, child: Arc<Mutex<Child>>) {
     let stdout = child
         .lock()
@@ -1130,6 +1161,8 @@ fn handle_codex_stdout_line(state: &Arc<Mutex<RuntimeState>>, agent_id: AgentId,
         "turn.started" => update_agent_action(state, agent_id, "Codex is working"),
         "thread.started" => {
             if let Some(thread_id) = value.get("thread_id").and_then(Value::as_str) {
+                let codex_title =
+                    codex_session_title(&value).or_else(|| codex_title_from_state(thread_id));
                 let mut state = state
                     .lock()
                     .expect("runtime state lock should not be poisoned");
@@ -1137,8 +1170,26 @@ fn handle_codex_stdout_line(state: &Arc<Mutex<RuntimeState>>, agent_id: AgentId,
                     return;
                 };
                 record.run.native_session_id = Some(thread_id.to_owned());
+                if let Some(title) = codex_title {
+                    record.run.codex_title = Some(title);
+                }
                 record.run.updated_at = Utc::now();
                 record.run.resume_block_reason = None;
+                let run = record.run.clone();
+                state.persist_agent(agent_id);
+                state.broadcast(ServerEvent::AgentChanged(run));
+            }
+        }
+        "thread.updated" | "thread.renamed" | "session.updated" => {
+            if let Some(title) = codex_session_title(&value) {
+                let mut state = state
+                    .lock()
+                    .expect("runtime state lock should not be poisoned");
+                let Some(record) = state.agents.get_mut(&agent_id) else {
+                    return;
+                };
+                record.run.codex_title = Some(title);
+                record.run.updated_at = Utc::now();
                 let run = record.run.clone();
                 state.persist_agent(agent_id);
                 state.broadcast(ServerEvent::AgentChanged(run));
@@ -1191,6 +1242,16 @@ fn handle_codex_stdout_line(state: &Arc<Mutex<RuntimeState>>, agent_id: AgentId,
             }
         }
         "turn.completed" => {
+            let codex_title = {
+                let state = state
+                    .lock()
+                    .expect("runtime state lock should not be poisoned");
+                state
+                    .agents
+                    .get(&agent_id)
+                    .and_then(|record| record.run.native_session_id.as_deref())
+                    .and_then(codex_title_from_state)
+            };
             let mut state = state
                 .lock()
                 .expect("runtime state lock should not be poisoned");
@@ -1199,6 +1260,9 @@ fn handle_codex_stdout_line(state: &Arc<Mutex<RuntimeState>>, agent_id: AgentId,
             };
             record.run.state = AgentState::Completed;
             record.run.last_visible_action = Some("Turn completed".to_owned());
+            if let Some(title) = codex_title {
+                record.run.codex_title = Some(title);
+            }
             record.run.updated_at = Utc::now();
             let run = record.run.clone();
             state.persist_agent(agent_id);
@@ -1219,6 +1283,44 @@ fn handle_codex_stdout_line(state: &Arc<Mutex<RuntimeState>>, agent_id: AgentId,
             }
         }
     }
+}
+
+fn codex_session_title(value: &Value) -> Option<String> {
+    [
+        value.get("title"),
+        value.get("name"),
+        value.pointer("/thread/title"),
+        value.pointer("/thread/name"),
+        value.pointer("/session/title"),
+        value.pointer("/session/name"),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(Value::as_str)
+    .map(str::trim)
+    .find(|title| !title.is_empty())
+    .map(str::to_owned)
+}
+
+fn codex_title_from_state(thread_id: &str) -> Option<String> {
+    let codex_home = std::env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))?;
+    let connection = rusqlite::Connection::open_with_flags(
+        codex_home.join("state_5.sqlite"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .ok()?;
+    connection
+        .query_row(
+            "SELECT COALESCE(NULLIF(name, ''), NULLIF(title, '')) FROM threads WHERE id = ?1",
+            [thread_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .ok()
+        .flatten()
+        .map(|title| title.trim().to_owned())
+        .filter(|title| !title.is_empty())
 }
 
 fn looks_like_diagnostic(text: &str) -> bool {
@@ -1723,6 +1825,8 @@ mod tests {
                     task_id: None,
                     pane_id: None,
                     native_session_id: None,
+                    codex_title: None,
+                    user_title: None,
                     origin_codex_home: None,
                     current_prompt: Some("test".to_owned()),
                     last_visible_action: None,
@@ -1796,6 +1900,8 @@ mod tests {
                     task_id: None,
                     pane_id: None,
                     native_session_id: Some("thread-quota".to_owned()),
+                    codex_title: None,
+                    user_title: None,
                     origin_codex_home: None,
                     current_prompt: Some("test".to_owned()),
                     last_visible_action: None,
@@ -1854,6 +1960,8 @@ mod tests {
                     task_id: None,
                     pane_id: None,
                     native_session_id: Some("thread-123".to_owned()),
+                    codex_title: None,
+                    user_title: None,
                     origin_codex_home: None,
                     current_prompt: None,
                     last_visible_action: None,

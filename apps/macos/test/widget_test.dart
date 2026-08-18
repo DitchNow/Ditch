@@ -2,14 +2,66 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:the_ditch/main.dart';
+import 'package:the_ditch/application/command_center_controller.dart';
+import 'package:the_ditch/data/runtime_models.dart';
 
 void main() {
+  test('presentation controller publishes immutable connection states', () {
+    final controller = CommandCenterController();
+    addTearDown(controller.dispose);
+    final observed = <RuntimeConnectionPhase>[];
+    controller.addListener(() => observed.add(controller.value.connection));
+
+    controller.connected();
+    controller.connecting(reconnecting: true);
+    controller.unavailable('fixture offline');
+
+    expect(observed, [
+      RuntimeConnectionPhase.connected,
+      RuntimeConnectionPhase.reconnecting,
+      RuntimeConnectionPhase.unavailable,
+    ]);
+    expect(controller.value.connectionError, contains('fixture offline'));
+  });
+
+  test('presentation controller keeps panel state independent of runtime', () {
+    final controller = CommandCenterController();
+    addTearDown(controller.dispose);
+
+    controller.toggleSidebar();
+    controller.toggleInspector();
+
+    expect(controller.value.sidebarVisible, isFalse);
+    expect(controller.value.inspectorVisible, isFalse);
+    expect(controller.value.connection, RuntimeConnectionPhase.connecting);
+  });
+
   test('runtime parser accepts unit Accepted responses', () {
     final parsed = parseRuntimeResponseLine(
       '{"protocol_version":1,"id":"00000000-0000-4000-8000-000000000000","sent_at":"2026-01-01T00:00:00Z","body":"Accepted"}',
     );
 
     expect(parsed, {'Accepted': true});
+  });
+
+  test('runtime status DTO validates and types protocol fields', () {
+    final status = RuntimeStatusDto.fromResponse({
+      'RuntimeStatus': {
+        'identity': 'The Ditch Runtime',
+        'pid': 42,
+        'socket_path': '/tmp/ditchd.sock',
+        'active_session_count': 2,
+        'attention_count': 1,
+        'instance_id': 'instance-1',
+        'codex_home': '/tmp/codex',
+        'build_version': '1.0.0',
+        'capabilities': ['persistent_sessions_v1'],
+      },
+    });
+
+    expect(status.pid, 42);
+    expect(status.activeSessionCount, 2);
+    expect(status.supportsPersistentSessions, isTrue);
   });
 
   test('runtime project parser restores path and Git policy', () {
@@ -141,10 +193,32 @@ void main() {
     await tester.pumpWidget(const TheDitchApp(connectRuntimeOnStart: false));
 
     expect(find.text('The Ditch'), findsWidgets);
-    expect(find.text('Projects'), findsOneWidget);
+    expect(find.text('PROJECTS'), findsOneWidget);
     expect(find.text('Agents'), findsOneWidget);
     expect(find.text('Attention'), findsOneWidget);
-    expect(find.text('Start Codex'), findsOneWidget);
+    expect(find.text('New Agent'), findsOneWidget);
+  });
+
+  testWidgets('runtime failure has a dedicated recovery surface', (
+    tester,
+  ) async {
+    await tester.pumpWidget(
+      MaterialApp(
+        home: RuntimeRecoveryView(
+          socketPath: '/tmp/ditchd.sock',
+          error: 'connection refused',
+          onRetry: () {},
+          onOpenActivityMonitor: () async => true,
+          onQuit: () async => true,
+        ),
+      ),
+    );
+
+    expect(find.text('The Ditch Runtime is not responding'), findsOneWidget);
+    expect(find.text('Retry Connection'), findsOneWidget);
+    expect(find.text('Open Activity Monitor'), findsOneWidget);
+    expect(find.text('Quit UI'), findsOneWidget);
+    expect(find.text('/tmp/ditchd.sock'), findsOneWidget);
   });
 
   testWidgets('attention starts empty instead of showing activity feed noise', (
@@ -177,6 +251,7 @@ void main() {
             onSubmitPrompt: (_, _) {},
             onStopCodex: (_) {},
             onDeleteAgent: (_) {},
+            onRenameAgent: (_, _) {},
             onFocusAgent: (_) {},
             onToggleExpanded: (_) {},
           ),
@@ -228,6 +303,7 @@ void main() {
             onSubmitPrompt: (_, _) => submitted = true,
             onStopCodex: (_) {},
             onDeleteAgent: (_) {},
+            onRenameAgent: (_, _) {},
             onFocusAgent: (_) {},
             onToggleExpanded: (_) {},
           ),
@@ -316,6 +392,7 @@ void main() {
             onSubmitPrompt: (_, _) {},
             onStopCodex: (_) {},
             onDeleteAgent: (_) {},
+            onRenameAgent: (_, _) {},
             onFocusAgent: (_) {},
             onToggleExpanded: (_) {},
           ),
@@ -352,6 +429,7 @@ void main() {
             onSubmitPrompt: (_, _) {},
             onStopCodex: (_) {},
             onDeleteAgent: (_) {},
+            onRenameAgent: (_, _) {},
             onFocusAgent: (_) {},
             onToggleExpanded: (_) {},
           ),
@@ -369,6 +447,7 @@ void main() {
     addTearDown(tester.view.resetPhysicalSize);
     addTearDown(tester.view.resetDevicePixelRatio);
     final chatController = ScrollController();
+    final agentListController = ScrollController();
     final session = AgentSession(
       localId: 'scroll-agent',
       provider: AgentProvider.codex,
@@ -388,15 +467,16 @@ void main() {
           body: AgentsSurface(
             sessions: [session],
             expandedAgentLocalId: session.localId,
-            focusedAgentLocalId: session.localId,
+            focusedAgentLocalId: null,
             chatController: chatController,
-            agentListController: ScrollController(),
+            agentListController: agentListController,
             composerKey: GlobalKey<AgentComposerState>(),
             initialPrompt: '',
             onStartCodex: () {},
             onSubmitPrompt: (_, _) {},
             onStopCodex: (_) {},
             onDeleteAgent: (_) {},
+            onRenameAgent: (_, _) {},
             onFocusAgent: (_) {},
             onToggleExpanded: (_) {},
           ),
@@ -405,55 +485,22 @@ void main() {
     );
 
     expect(chatController.position.maxScrollExtent, greaterThan(0));
+    expect(
+      chatController.offset,
+      moreOrLessEquals(chatController.position.maxScrollExtent),
+    );
+    chatController.jumpTo(0);
+    await tester.pump();
+    final header = find.byType(InkWell).first;
+    final composer = find.byType(AgentComposer);
+    final headerTop = tester.getTopLeft(header);
+    final composerTop = tester.getTopLeft(composer);
     await tester.drag(find.byType(ListView).last, const Offset(0, -300));
     await tester.pumpAndSettle();
     expect(chatController.offset, greaterThan(0));
-  });
-
-  testWidgets('inner overscroll advances its parent scroll view', (
-    tester,
-  ) async {
-    tester.view.physicalSize = const Size(900, 650);
-    tester.view.devicePixelRatio = 1;
-    addTearDown(tester.view.resetPhysicalSize);
-    addTearDown(tester.view.resetDevicePixelRatio);
-    final outer = ScrollController();
-    final inner = ScrollController();
-    await tester.pumpWidget(
-      MaterialApp(
-        home: Scaffold(
-          body: ListView(
-            controller: outer,
-            children: [
-              const SizedBox(height: 120),
-              SizedBox(
-                height: 360,
-                child: ScrollHandoffRegion(
-                  parentControllers: [outer],
-                  child: ListView.builder(
-                    key: const Key('inner-scroll'),
-                    controller: inner,
-                    physics: const ClampingScrollPhysics(),
-                    itemCount: 30,
-                    itemBuilder: (_, index) =>
-                        SizedBox(height: 50, child: Text('Inner row $index')),
-                  ),
-                ),
-              ),
-              const SizedBox(height: 900),
-            ],
-          ),
-        ),
-      ),
-    );
-
-    await tester.drag(
-      find.byKey(const Key('inner-scroll')),
-      const Offset(0, -1800),
-    );
-    await tester.pumpAndSettle();
-    expect(inner.offset, inner.position.maxScrollExtent);
-    expect(outer.offset, greaterThan(0));
+    expect(agentListController.offset, 0);
+    expect(tester.getTopLeft(header), headerTop);
+    expect(tester.getTopLeft(composer), composerTop);
   });
 
   testWidgets('opens add project dialog', (tester) async {
@@ -526,7 +573,7 @@ void main() {
   testWidgets('start codex opens an initial prompt dialog', (tester) async {
     await tester.pumpWidget(const TheDitchApp(connectRuntimeOnStart: false));
 
-    await tester.tap(find.text('Start Codex'));
+    await tester.tap(find.text('New Agent'));
     await tester.pumpAndSettle();
 
     expect(
@@ -557,56 +604,27 @@ void main() {
     );
   });
 
-  testWidgets('start codex remains enabled while another agent is working', (
+  testWidgets('new agent toolbar action remains enabled while agents work', (
     tester,
   ) async {
-    tester.view.physicalSize = const Size(1400, 900);
-    tester.view.devicePixelRatio = 1;
-    addTearDown(tester.view.resetPhysicalSize);
-    addTearDown(tester.view.resetDevicePixelRatio);
-
-    final sessions = [
-      AgentSession(
-        localId: 'agent-1',
-        provider: AgentProvider.codex,
-        status: AgentStatus.working,
-        currentPrompt: 'Existing run',
-        messages: [
-          AgentChatMessage(
-            role: ChatMessageRole.user,
-            text: 'Existing run',
-            createdAt: DateTime(2026),
-          ),
-        ],
-      ),
-    ];
-
     await tester.pumpWidget(
       MaterialApp(
-        home: Scaffold(
-          body: AgentsSurface(
-            sessions: sessions,
-            expandedAgentLocalId: 'agent-1',
-            focusedAgentLocalId: null,
-            chatController: ScrollController(),
-            agentListController: ScrollController(),
-            composerKey: GlobalKey<AgentComposerState>(),
-            initialPrompt:
-                'Inspect this project and tell me the next useful engineering step.',
-            onStartCodex: () {},
-            onSubmitPrompt: (_, _) {},
-            onStopCodex: (_) {},
-            onDeleteAgent: (_) {},
-            onFocusAgent: (_) {},
-            onToggleExpanded: (_) {},
-          ),
+        home: DitchToolbar(
+          projectName: 'Fixture',
+          connection: RuntimeConnectionPhase.connected,
+          attentionCount: 0,
+          sidebarVisible: true,
+          inspectorVisible: true,
+          onToggleSidebar: () {},
+          onToggleInspector: () {},
+          onNewAgent: () {},
         ),
       ),
     );
 
     final startButton = tester.widget<ButtonStyleButton>(
       find.ancestor(
-        of: find.text('Start Codex'),
+        of: find.text('New Agent'),
         matching: find.byWidgetPredicate(
           (widget) => widget is ButtonStyleButton,
         ),
@@ -630,6 +648,10 @@ void main() {
       findsOneWidget,
     );
     expect(find.text('Start'), findsOneWidget);
+    expect(
+      tester.widget<TextField>(find.byType(TextField)).focusNode?.hasFocus,
+      isTrue,
+    );
   });
 
   testWidgets('composer accepts typed replacement text', (tester) async {
@@ -641,14 +663,63 @@ void main() {
     expect(find.text('hello'), findsOneWidget);
   });
 
-  testWidgets('stop is disabled without active agent', (tester) async {
-    await tester.pumpWidget(const TheDitchApp(connectRuntimeOnStart: false));
-
-    final stopButton = tester.widget<OutlinedButton>(
-      find.widgetWithText(OutlinedButton, 'Stop'),
+  testWidgets('composer sends with Enter and keeps focus', (tester) async {
+    String? submitted;
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: AgentComposer(
+            initialText: '',
+            hasSession: true,
+            isWorking: false,
+            onSubmit: (value) => submitted = value,
+            onStop: () {},
+          ),
+        ),
+      ),
     );
 
-    expect(stopButton.onPressed, isNull);
+    await tester.enterText(find.byType(TextField), 'hello');
+    await tester.sendKeyEvent(LogicalKeyboardKey.enter);
+    await tester.pump();
+
+    expect(submitted, 'hello');
+    expect(find.text('hello'), findsNothing);
+    expect(
+      tester.widget<TextField>(find.byType(TextField)).focusNode?.hasFocus,
+      isTrue,
+    );
+  });
+
+  testWidgets('agent title supports inline rename', (tester) async {
+    String? renamed;
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: EditableAgentTitle(
+            title: 'Codex session title',
+            hasOverride: false,
+            onRename: (value) => renamed = value,
+          ),
+        ),
+      ),
+    );
+
+    await tester.tap(find.text('Codex session title'));
+    await tester.pump();
+    await tester.enterText(find.byKey(const Key('agent-title-editor')), 'Plan');
+    await tester.testTextInput.receiveAction(TextInputAction.done);
+    await tester.pump();
+
+    expect(renamed, 'Plan');
+  });
+
+  testWidgets('empty state does not expose a meaningless stop action', (
+    tester,
+  ) async {
+    await tester.pumpWidget(const TheDitchApp(connectRuntimeOnStart: false));
+
+    expect(find.widgetWithText(OutlinedButton, 'Stop'), findsNothing);
   });
 
   testWidgets('conversation uses native chat surface instead of terminal', (
@@ -661,21 +732,123 @@ void main() {
     expect(find.textContaining('[?2026h'), findsNothing);
   });
 
-  testWidgets('clicking an agent collapses and expands its chat', (
+  testWidgets('empty project does not create a synthetic agent session', (
     tester,
   ) async {
     await tester.pumpWidget(const TheDitchApp(connectRuntimeOnStart: false));
 
     expect(find.byType(AgentChatPanel), findsOneWidget);
+    expect(find.byType(ExpandableAgentPanel), findsNothing);
+    expect(find.byKey(const Key('ready-agent-card')), findsOneWidget);
+  });
 
-    await tester.tap(find.text('Codex').first);
-    await tester.pumpAndSettle();
+  testWidgets('expanded agent stays in list with a bounded conversation', (
+    tester,
+  ) async {
+    tester.view.physicalSize = const Size(1200, 1400);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    final sessions = [
+      AgentSession(
+        localId: 'agent-a',
+        provider: AgentProvider.codex,
+        status: AgentStatus.completed,
+        messages: const [],
+      ),
+      AgentSession(
+        localId: 'agent-b',
+        provider: AgentProvider.codex,
+        status: AgentStatus.completed,
+        messages: const [],
+      ),
+    ];
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: AgentsSurface(
+            sessions: sessions,
+            expandedAgentLocalId: 'agent-a',
+            focusedAgentLocalId: null,
+            chatController: ScrollController(),
+            agentListController: ScrollController(),
+            composerKey: GlobalKey<AgentComposerState>(),
+            initialPrompt: 'Start here',
+            onStartCodex: () {},
+            onSubmitPrompt: (_, _) {},
+            onStopCodex: (_) {},
+            onDeleteAgent: (_) {},
+            onRenameAgent: (_, _) {},
+            onFocusAgent: (_) {},
+            onToggleExpanded: (_) {},
+          ),
+        ),
+      ),
+    );
 
-    expect(find.byType(AgentChatPanel), findsNothing);
-
-    await tester.tap(find.text('Codex').first);
-    await tester.pumpAndSettle();
-
+    expect(find.byType(DropdownButton<String>), findsNothing);
+    // The second row remains in the lazily built outer list below the
+    // viewport-sized expanded row.
+    expect(find.byType(ExpandableAgentPanel), findsOneWidget);
     expect(find.byType(AgentChatPanel), findsOneWidget);
+    final embeddedChat = tester.widget<AgentChatPanel>(
+      find.byType(AgentChatPanel),
+    );
+    expect(embeddedChat.embedded, isFalse);
+    expect(
+      find.descendant(
+        of: find.byType(AgentChatPanel),
+        matching: find.byType(ListView),
+      ),
+      findsOneWidget,
+    );
+    expect(find.byType(ListView), findsNWidgets(2));
+  });
+
+  testWidgets('chat messages alternate clearly between left and right', (
+    tester,
+  ) async {
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: Column(
+            children: [
+              AgentChatBubble(
+                message: AgentChatMessage(
+                  role: ChatMessageRole.user,
+                  text: 'User message',
+                  createdAt: DateTime(2026),
+                ),
+                chatController: ScrollController(),
+                agentListController: ScrollController(),
+              ),
+              AgentChatBubble(
+                message: AgentChatMessage(
+                  role: ChatMessageRole.assistant,
+                  text: 'Assistant message',
+                  createdAt: DateTime(2026),
+                ),
+                chatController: ScrollController(),
+                agentListController: ScrollController(),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+
+    expect(
+      find.byWidgetPredicate(
+        (widget) =>
+            widget is Align && widget.alignment == Alignment.centerRight,
+      ),
+      findsOneWidget,
+    );
+    expect(
+      find.byWidgetPredicate(
+        (widget) => widget is Align && widget.alignment == Alignment.centerLeft,
+      ),
+      findsOneWidget,
+    );
   });
 }

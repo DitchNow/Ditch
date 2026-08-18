@@ -72,6 +72,10 @@ pub enum ClientRequest {
     DeleteAgent {
         agent_id: AgentId,
     },
+    RenameAgent {
+        agent_id: AgentId,
+        title: Option<String>,
+    },
     DismissAttention {
         attention_id: Uuid,
     },

@@ -7,13 +7,23 @@ class MainFlutterWindow: NSWindow {
     let windowFrame = self.frame
     self.contentViewController = flutterViewController
     self.setFrame(windowFrame, display: true)
+    self.titleVisibility = .hidden
+    self.titlebarAppearsTransparent = true
+    self.styleMask.insert(.fullSizeContentView)
+    self.isMovableByWindowBackground = false
+    self.minSize = NSSize(width: 860, height: 620)
+    self.backgroundColor = .windowBackgroundColor
+    if #available(macOS 11.0, *) {
+      self.toolbarStyle = .unified
+      self.titlebarSeparatorStyle = .none
+    }
 
     RegisterGeneratedPlugins(registry: flutterViewController)
     let registrar = flutterViewController.registrar(forPlugin: "NativeComposerTextView")
     registrar.register(
       NativeComposerTextViewFactory(messenger: registrar.messenger),
       withId: "the_ditch/composer_text_view")
-    (NSApp.delegate as? AppDelegate)?.configureStatusBarChannel(messenger: registrar.messenger)
+    (NSApp.delegate as? AppDelegate)?.configureApplicationChannel(messenger: registrar.messenger)
     (NSApp.delegate as? AppDelegate)?.configureProjectPickerChannel(messenger: registrar.messenger)
 
     super.awakeFromNib()
@@ -48,6 +58,7 @@ class NativeComposerTextView: NSView, NSTextViewDelegate {
   private let channel: FlutterMethodChannel
   private let scrollView = NSScrollView()
   private let textView = ComposerTextView()
+  private let placeholderLabel = NSTextField(labelWithString: "")
   private var isApplyingFlutterText = false
 
   init(
@@ -66,6 +77,7 @@ class NativeComposerTextView: NSView, NSTextViewDelegate {
     let enabled = arguments?["enabled"] as? Bool ?? true
     let fontSize = arguments?["fontSize"] as? Double ?? 14
     let escapeEnabled = arguments?["escapeEnabled"] as? Bool ?? false
+    let placeholder = arguments?["placeholder"] as? String ?? ""
 
     wantsLayer = true
     layer?.backgroundColor = NSColor.clear.cgColor
@@ -94,8 +106,12 @@ class NativeComposerTextView: NSView, NSTextViewDelegate {
     textView.isEditable = enabled
     textView.isSelectable = true
     textView.delegate = self
+    textView.setAccessibilityLabel("Agent prompt")
     textView.onEnlarge = { [weak self] in
       self?.channel.invokeMethod("enlargeRequested", arguments: nil)
+    }
+    textView.onSubmit = { [weak self] in
+      self?.channel.invokeMethod("submitRequested", arguments: nil)
     }
     if escapeEnabled {
       textView.onEscape = { [weak self] in
@@ -106,11 +122,20 @@ class NativeComposerTextView: NSView, NSTextViewDelegate {
     scrollView.documentView = textView
     addSubview(scrollView)
 
+    placeholderLabel.stringValue = placeholder
+    placeholderLabel.textColor = .placeholderTextColor
+    placeholderLabel.font = NSFont.systemFont(ofSize: fontSize)
+    placeholderLabel.translatesAutoresizingMaskIntoConstraints = false
+    placeholderLabel.isHidden = !initialText.isEmpty
+    addSubview(placeholderLabel)
+
     NSLayoutConstraint.activate([
       scrollView.leadingAnchor.constraint(equalTo: leadingAnchor),
       scrollView.trailingAnchor.constraint(equalTo: trailingAnchor),
       scrollView.topAnchor.constraint(equalTo: topAnchor),
       scrollView.bottomAnchor.constraint(equalTo: bottomAnchor),
+      placeholderLabel.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 4),
+      placeholderLabel.topAnchor.constraint(equalTo: topAnchor, constant: 7),
     ])
 
     channel.setMethodCallHandler { [weak self] call, result in
@@ -126,6 +151,7 @@ class NativeComposerTextView: NSView, NSTextViewDelegate {
           self.isApplyingFlutterText = true
           self.textView.string = text
           self.isApplyingFlutterText = false
+          self.placeholderLabel.isHidden = !text.isEmpty
         }
         result(nil)
       case "getText":
@@ -135,6 +161,7 @@ class NativeComposerTextView: NSView, NSTextViewDelegate {
           self.isApplyingFlutterText = true
           self.textView.string = ""
           self.isApplyingFlutterText = false
+          self.placeholderLabel.isHidden = false
         }
         result(nil)
       case "setEnabled":
@@ -159,6 +186,7 @@ class NativeComposerTextView: NSView, NSTextViewDelegate {
   }
 
   func textDidChange(_ notification: Notification) {
+    placeholderLabel.isHidden = !textView.string.isEmpty
     if isApplyingFlutterText {
       return
     }
@@ -169,10 +197,24 @@ class NativeComposerTextView: NSView, NSTextViewDelegate {
 final class ComposerTextView: NSTextView {
   var onEnlarge: (() -> Void)?
   var onEscape: (() -> Void)?
+  var onSubmit: (() -> Void)?
+
+  override func doCommand(by selector: Selector) {
+    if selector == #selector(insertNewline(_:)) {
+      let modifiers = NSApp.currentEvent?.modifierFlags.intersection(.deviceIndependentFlagsMask)
+      if modifiers?.contains(.shift) == true {
+        super.doCommand(by: selector)
+      } else {
+        onSubmit?()
+      }
+      return
+    }
+    super.doCommand(by: selector)
+  }
 
   override func performKeyEquivalent(with event: NSEvent) -> Bool {
     let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
-    if modifiers == .command,
+    if modifiers == [.command, .shift],
       event.charactersIgnoringModifiers?.lowercased() == "f"
     {
       onEnlarge?()

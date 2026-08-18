@@ -171,6 +171,10 @@ pub struct AgentRun {
     pub pane_id: Option<RuntimePaneId>,
     pub native_session_id: Option<String>,
     #[serde(default)]
+    pub codex_title: Option<String>,
+    #[serde(default)]
+    pub user_title: Option<String>,
+    #[serde(default)]
     pub origin_codex_home: Option<String>,
     pub current_prompt: Option<String>,
     pub last_visible_action: Option<String>,
