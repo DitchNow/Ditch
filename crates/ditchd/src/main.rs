@@ -356,7 +356,7 @@ fn handle_request(request: ClientRequest, state: Arc<Mutex<RuntimeState>>) -> Se
             root,
             git_policy,
         } => {
-            let root = PathBuf::from(root);
+            let root = canonical_project_root(Path::new(&root));
             let existing = state
                 .lock()
                 .expect("runtime state lock should not be poisoned")
@@ -673,7 +673,7 @@ fn project_for_launch(
     project_name: String,
     project_root: String,
 ) -> Project {
-    let root = PathBuf::from(project_root);
+    let root = canonical_project_root(Path::new(&project_root));
     let root_key = root.to_string_lossy();
     state
         .lock()
@@ -1039,12 +1039,16 @@ fn attach_codex_io(state: Arc<Mutex<RuntimeState>>, agent_id: AgentId, child: Ar
                     Ok(line) => {
                         let text = line.trim();
                         if !text.is_empty() {
-                            append_message(
-                                &state,
-                                agent_id,
-                                AgentChatRole::System,
-                                text.to_owned(),
-                            );
+                            if is_workspace_permission_denial(text) {
+                                record_terminal_failure(&state, agent_id, text.to_owned());
+                            } else {
+                                append_message(
+                                    &state,
+                                    agent_id,
+                                    AgentChatRole::System,
+                                    text.to_owned(),
+                                );
+                            }
                         }
                     }
                     Err(error) => {
@@ -1090,6 +1094,10 @@ fn handle_codex_stdout_line(state: &Arc<Mutex<RuntimeState>>, agent_id: AgentId,
     let Some(event_type) = value.get("type").and_then(Value::as_str) else {
         return;
     };
+
+    if let Some(message) = find_workspace_permission_denial(&value) {
+        record_terminal_failure(state, agent_id, message);
+    }
 
     match event_type {
         "turn.started" => update_agent_action(state, agent_id, "Codex is working"),
@@ -1172,7 +1180,11 @@ fn handle_codex_stdout_line(state: &Arc<Mutex<RuntimeState>>, agent_id: AgentId,
         "turn.failed" | "error" => {
             let message = extract_diagnostic_message(&value)
                 .unwrap_or_else(|| format!("Codex reported {event_type}"));
-            record_terminal_failure(state, agent_id, message);
+            if is_transient_reconnect(&message) {
+                append_message(state, agent_id, AgentChatRole::System, message);
+            } else {
+                record_terminal_failure(state, agent_id, message);
+            }
         }
         _ => {
             if let Some(message) = extract_explicit_error(&value) {
@@ -1188,6 +1200,11 @@ fn looks_like_diagnostic(text: &str) -> bool {
         || lower.starts_with("warning")
         || lower.contains("failed")
         || lower.contains("usage limit")
+}
+
+fn is_transient_reconnect(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("reconnecting...") && lower.contains("stream disconnected before completion")
 }
 
 fn extract_diagnostic_message(value: &Value) -> Option<String> {
@@ -1261,7 +1278,61 @@ fn record_terminal_failure(state: &Arc<Mutex<RuntimeState>>, agent_id: AgentId, 
         };
         record.terminal_failure = Some(message.clone());
     }
-    append_message(state, agent_id, AgentChatRole::System, message);
+    append_message(state, agent_id, AgentChatRole::System, message.clone());
+    if is_workspace_permission_denial(&message) {
+        raise_workspace_permission_attention(state, agent_id, message);
+    }
+}
+
+fn is_workspace_permission_denial(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    (lower.contains("read-only sandbox")
+        || lower.contains("read-only permission profile")
+        || lower.contains("writing is blocked")
+        || lower.contains("workspace write access"))
+        && (lower.contains("reject") || lower.contains("block") || lower.contains("disabled"))
+}
+
+fn find_workspace_permission_denial(value: &Value) -> Option<String> {
+    match value {
+        Value::String(message) if is_workspace_permission_denial(message) => Some(message.clone()),
+        Value::Array(items) => items.iter().find_map(find_workspace_permission_denial),
+        Value::Object(items) => items.values().find_map(find_workspace_permission_denial),
+        _ => None,
+    }
+}
+
+fn raise_workspace_permission_attention(
+    state: &Arc<Mutex<RuntimeState>>,
+    agent_id: AgentId,
+    body: String,
+) {
+    let mut state = state
+        .lock()
+        .expect("runtime state lock should not be poisoned");
+    if state.attention.iter().any(|item| {
+        item.agent_id == Some(agent_id) && item.title == "Codex cannot write this project"
+    }) {
+        return;
+    }
+    let project_id = state
+        .agents
+        .get(&agent_id)
+        .map(|record| record.run.project_id);
+    let attention = RuntimeAttention {
+        id: uuid::Uuid::new_v4(),
+        kind: AttentionKind::Blocked,
+        agent_id: Some(agent_id),
+        project_id,
+        title: "Codex cannot write this project".to_owned(),
+        body,
+        created_at: Utc::now(),
+    };
+    if let Err(error) = state.store.upsert_attention(&attention) {
+        eprintln!("{RUNTIME_IDENTITY} failed to persist attention: {error}");
+    }
+    state.attention.push(attention.clone());
+    state.broadcast(ServerEvent::AttentionRaised(attention));
 }
 
 fn update_agent_action(state: &Arc<Mutex<RuntimeState>>, agent_id: AgentId, action: &str) {
@@ -1414,9 +1485,10 @@ fn codex_child_args(
     allow_non_git: bool,
 ) -> Vec<String> {
     let mut args = match (resume_thread, mode) {
-        (Some(_), _) => vec!["exec".to_owned()],
+        (Some(_), _) => vec!["exec".to_owned(), "--approve-for-me".to_owned()],
         (None, CodexLaunchMode::Exec) | (None, CodexLaunchMode::InteractiveTui) => vec![
             "exec".to_owned(),
+            "--approve-for-me".to_owned(),
             "--json".to_owned(),
             "--color".to_owned(),
             "never".to_owned(),
@@ -1437,6 +1509,10 @@ fn codex_child_args(
         ]);
     }
     args
+}
+
+fn canonical_project_root(root: &Path) -> PathBuf {
+    root.canonicalize().unwrap_or_else(|_| root.to_path_buf())
 }
 
 fn find_binary(name: &str) -> Option<String> {
@@ -1531,6 +1607,7 @@ mod tests {
             args,
             vec![
                 "exec",
+                "--approve-for-me",
                 "--json",
                 "--color",
                 "never",
@@ -1550,7 +1627,17 @@ mod tests {
             false,
         );
 
-        assert_eq!(args, vec!["exec", "resume", "--json", "thread-123", "-"]);
+        assert_eq!(
+            args,
+            vec![
+                "exec",
+                "--approve-for-me",
+                "resume",
+                "--json",
+                "thread-123",
+                "-"
+            ]
+        );
         assert!(!args.iter().any(|arg| arg == "--color"));
     }
 
@@ -1571,6 +1658,22 @@ mod tests {
 
         assert_eq!(fresh[1], "--skip-git-repo-check");
         assert_eq!(resumed[1], "--skip-git-repo-check");
+    }
+
+    #[test]
+    fn workspace_permission_denials_are_recognized() {
+        assert!(is_workspace_permission_denial(
+            "patch rejected: writing is blocked by read-only sandbox; rejected by user approval settings"
+        ));
+        assert!(!is_workspace_permission_denial("Codex exited with code 1"));
+    }
+
+    #[test]
+    fn reconnect_retries_are_not_terminal_failures() {
+        assert!(is_transient_reconnect(
+            "Reconnecting... 2/5 (stream disconnected before completion: Broken pipe)"
+        ));
+        assert!(!is_transient_reconnect("stream disconnected permanently"));
     }
 
     #[test]

@@ -77,6 +77,29 @@ bool isInsideGitWorkTree(String path) {
   }
 }
 
+String canonicalProjectPath(String path) {
+  final directory = Directory(path).absolute;
+  try {
+    return directory.resolveSymbolicLinksSync();
+  } on FileSystemException {
+    return directory.path;
+  }
+}
+
+void upsertProject(List<DitchProject> projects, DitchProject incoming) {
+  final incomingPath = canonicalProjectPath(incoming.path);
+  final index = projects.indexWhere(
+    (existing) =>
+        (incoming.id != null && existing.id == incoming.id) ||
+        canonicalProjectPath(existing.path) == incomingPath,
+  );
+  if (index >= 0) {
+    projects[index] = incoming;
+  } else {
+    projects.add(incoming);
+  }
+}
+
 enum AgentProvider { codex }
 
 class AgentSession {
@@ -129,6 +152,27 @@ class AgentSession {
   bool get isWorking {
     return status == AgentStatus.starting || status == AgentStatus.working;
   }
+}
+
+void reconcileAgentSession(List<AgentSession> sessions, AgentSession incoming) {
+  final matches = sessions
+      .where((session) => session.localId == incoming.localId)
+      .toList();
+  if (matches.isEmpty) {
+    sessions.insert(0, incoming);
+    return;
+  }
+
+  final existing = matches.first;
+  existing.status = incoming.status;
+  existing.codexThreadId = incoming.codexThreadId;
+  existing.currentPrompt = incoming.currentPrompt;
+  existing.lastVisibleAction = incoming.lastVisibleAction;
+  existing.updatedAt = incoming.updatedAt;
+  sessions.removeWhere(
+    (session) =>
+        session.localId == incoming.localId && !identical(session, existing),
+  );
 }
 
 enum AttentionKind { approvalRequired, blocked, failed, needsInput }
@@ -825,16 +869,17 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
       }
     }
 
-    final sessions = <AgentSession>[];
+    final sessionsById = <String, AgentSession>{};
     for (final agentJson in agentsJson) {
       final session = _agentSessionFromRuntime(
         agentJson,
         messagesByAgent[_agentIdFromRuntimeAgent(agentJson)] ?? const [],
       );
       if (session != null) {
-        sessions.add(session);
+        sessionsById[session.localId] = session;
       }
     }
+    final sessions = sessionsById.values.toList();
     sessions.sort((a, b) => b.updatedAt.compareTo(a.updatedAt));
     final attentionJson = snapshot['attention'];
     final attention = <AttentionEvent>[];
@@ -931,9 +976,9 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
       return;
     }
 
-    final normalizedPath = Directory(project.path).absolute.path;
+    final normalizedPath = canonicalProjectPath(project.path);
     if (_projects.any(
-      (existing) => Directory(existing.path).absolute.path == normalizedPath,
+      (existing) => canonicalProjectPath(existing.path) == normalizedPath,
     )) {
       _showProjectSetupResult(
         title: 'Project already added',
@@ -967,8 +1012,14 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
           );
       late final AgentSession projectSession;
       setState(() {
-        _projects.add(configuredProject);
-        _selectedProjectIndex = _projects.length - 1;
+        upsertProject(_projects, configuredProject);
+        _selectedProjectIndex = _projects.indexWhere(
+          (existing) =>
+              (configuredProject.id != null &&
+                  existing.id == configuredProject.id) ||
+              canonicalProjectPath(existing.path) ==
+                  canonicalProjectPath(configuredProject.path),
+        );
         projectSession = _createAgentSession(expand: true);
       });
       _addChatMessage(
@@ -1211,13 +1262,8 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
       return;
     }
 
-    if (session.status == AgentStatus.failed ||
-        session.status == AgentStatus.stopped) {
-      await _resumeCodexRuntime(session, cleanPrompt);
-      return;
-    }
-
     setState(() {
+      session.status = AgentStatus.starting;
       session.currentPrompt = cleanPrompt;
       session.updatedAt = DateTime.now();
     });
@@ -1227,7 +1273,12 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
         agentId: session.localId,
         prompt: cleanPrompt,
       );
+      _resolveAttentionForSession(session);
     } on Object catch (error) {
+      setState(() {
+        session.status = AgentStatus.failed;
+        session.updatedAt = DateTime.now();
+      });
       _addChatMessage(
         session,
         ChatMessageRole.system,
@@ -1238,73 +1289,6 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
         sessionLocalId: session.localId,
         icon: Icons.error_outline,
         title: 'Codex prompt failed',
-        body: '$error',
-      );
-    }
-  }
-
-  Future<void> _resumeCodexRuntime(AgentSession session, String prompt) async {
-    if (!await _prepareSelectedProjectForCodex()) {
-      return;
-    }
-    final threadId = session.codexThreadId;
-    if (threadId == null) {
-      await _startCodexRuntime(prompt);
-      return;
-    }
-
-    setState(() {
-      session.status = AgentStatus.starting;
-      session.currentPrompt = prompt;
-      session.updatedAt = DateTime.now();
-    });
-    _scheduleStatusBarUpdate();
-
-    try {
-      final response = await _runtimeClient.resumeCodexSession(
-        projectName: _selectedProject.name,
-        projectRoot: _selectedProject.path,
-        threadId: threadId,
-        prompt: prompt,
-      );
-      final run = response['AgentStarted'];
-      final revived = _agentSessionFromRuntime(run, [
-        ...session.messages,
-        AgentChatMessage(
-          role: ChatMessageRole.user,
-          text: prompt,
-          createdAt: DateTime.now(),
-        ),
-      ]);
-      if (revived == null) {
-        return;
-      }
-      setState(() {
-        final index = _agentSessions.indexOf(session);
-        if (index >= 0) {
-          _agentSessions[index] = revived;
-        } else {
-          _agentSessions.insert(0, revived);
-        }
-        _expandedAgentLocalId = revived.localId;
-      });
-      _scheduleStatusBarUpdate();
-    } on Object catch (error) {
-      setState(() {
-        session.status = AgentStatus.failed;
-        session.updatedAt = DateTime.now();
-      });
-      _scheduleStatusBarUpdate();
-      _addChatMessage(
-        session,
-        ChatMessageRole.system,
-        'Failed to revive Codex through The Ditch Runtime: $error',
-      );
-      _addAttentionRequired(
-        kind: AttentionKind.failed,
-        sessionLocalId: session.localId,
-        icon: Icons.error_outline,
-        title: 'Codex revive failed',
         body: '$error',
       );
     }
@@ -1383,6 +1367,35 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
     unawaited(_runtimeClient.dismissAttention(event.id));
   }
 
+  void _resolveAttentionForSession(AgentSession resumedSession) {
+    final relatedSessionIds = _agentSessions
+        .where(
+          (session) =>
+              session.localId == resumedSession.localId ||
+              (resumedSession.codexThreadId != null &&
+                  session.codexThreadId == resumedSession.codexThreadId),
+        )
+        .map((session) => session.localId)
+        .toSet();
+    final resolved = _attention
+        .where((event) => relatedSessionIds.contains(event.sessionLocalId))
+        .toList();
+    if (resolved.isEmpty) {
+      return;
+    }
+    setState(() {
+      _attention.removeWhere(
+        (event) => relatedSessionIds.contains(event.sessionLocalId),
+      );
+    });
+    for (final event in resolved) {
+      if (!event.id.startsWith('attention-')) {
+        unawaited(_runtimeClient.dismissAttention(event.id));
+      }
+    }
+    _scheduleStatusBarUpdate();
+  }
+
   bool _canStopAttentionSession(AttentionEvent event) {
     final sessionLocalId = event.sessionLocalId;
     if (sessionLocalId == null) {
@@ -1410,14 +1423,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
         return;
       }
       setState(() {
-        final index = _projects.indexWhere(
-          (existing) => existing.path == project.path,
-        );
-        if (index >= 0) {
-          _projects[index] = project;
-        } else {
-          _projects.add(project);
-        }
+        upsertProject(_projects, project);
       });
       return;
     }
@@ -1429,16 +1435,10 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
         return;
       }
       setState(() {
-        final existing = _agentSessionByLocalId(incoming.localId);
-        if (existing == null) {
-          _agentSessions.insert(0, incoming);
+        final existed = _agentSessionByLocalId(incoming.localId) != null;
+        reconcileAgentSession(_agentSessions, incoming);
+        if (!existed) {
           _expandedAgentLocalId ??= incoming.localId;
-        } else {
-          existing.status = incoming.status;
-          existing.codexThreadId = incoming.codexThreadId;
-          existing.currentPrompt = incoming.currentPrompt;
-          existing.lastVisibleAction = incoming.lastVisibleAction;
-          existing.updatedAt = incoming.updatedAt;
         }
       });
       _scheduleStatusBarUpdate();
@@ -2016,12 +2016,14 @@ class AgentSessionList extends StatelessWidget {
       );
     }
     return ListView.separated(
+      key: const PageStorageKey<String>('agent-session-list'),
       itemCount: sessions.length,
       separatorBuilder: (_, _) => const SizedBox(height: 12),
       itemBuilder: (context, index) {
         final session = sessions[index];
         final expanded = session.localId == expandedAgentLocalId;
         return ExpandableAgentPanel(
+          key: ValueKey(session.localId),
           session: session,
           expanded: expanded,
           chatController: expanded ? chatController : null,
@@ -2938,6 +2940,7 @@ class _AddProjectDialogState extends State<AddProjectDialog> {
   bool _checkingGit = false;
   bool? _isGitRepository;
   ProjectGitPolicy? _gitPolicy;
+  bool _showValidation = false;
 
   Future<void> _browseForFolder() async {
     final path = await _projectPickerChannel.invokeMethod<String>(
@@ -2967,6 +2970,7 @@ class _AddProjectDialogState extends State<AddProjectDialog> {
       _checkingGit = false;
       _isGitRepository = isGitRepository;
       _gitPolicy = isGitRepository ? ProjectGitPolicy.requireRepository : null;
+      _showValidation = !isGitRepository;
     });
   }
 
@@ -2979,6 +2983,11 @@ class _AddProjectDialogState extends State<AddProjectDialog> {
 
   @override
   Widget build(BuildContext context) {
+    final canSubmit =
+        !_checkingGit &&
+        _name.text.trim().isNotEmpty &&
+        _path.text.trim().isNotEmpty &&
+        _gitPolicy != null;
     return AlertDialog(
       title: const Text('Add Project'),
       content: SizedBox(
@@ -3007,8 +3016,11 @@ class _AddProjectDialogState extends State<AddProjectDialog> {
               const SizedBox(height: 12),
               DropdownButtonFormField<ProjectGitPolicy>(
                 initialValue: _gitPolicy,
-                decoration: const InputDecoration(
+                decoration: InputDecoration(
                   labelText: 'This folder is not a Git repository',
+                  errorText: _showValidation && _gitPolicy == null
+                      ? 'Choose how this project should handle Git.'
+                      : null,
                 ),
                 hint: const Text('Choose how Codex should run'),
                 items: const [
@@ -3021,7 +3033,10 @@ class _AddProjectDialogState extends State<AddProjectDialog> {
                     child: Text('Allow Codex Outside Git'),
                   ),
                 ],
-                onChanged: (value) => setState(() => _gitPolicy = value),
+                onChanged: (value) => setState(() {
+                  _gitPolicy = value;
+                  _showValidation = false;
+                }),
               ),
               const SizedBox(height: 8),
               const Align(
@@ -3035,6 +3050,7 @@ class _AddProjectDialogState extends State<AddProjectDialog> {
             TextField(
               controller: _name,
               decoration: const InputDecoration(labelText: 'Project name'),
+              onChanged: (_) => setState(() {}),
             ),
             const SizedBox(height: 16),
             const Align(
@@ -3052,20 +3068,17 @@ class _AddProjectDialogState extends State<AddProjectDialog> {
           child: const Text('Cancel'),
         ),
         FilledButton(
-          onPressed: () {
-            final name = _name.text.trim();
-            final path = _path.text.trim();
-            final gitPolicy = _gitPolicy;
-            if (name.isEmpty ||
-                path.isEmpty ||
-                _checkingGit ||
-                gitPolicy == null) {
-              return;
-            }
-            Navigator.of(
-              context,
-            ).pop(DitchProject(name: name, path: path, gitPolicy: gitPolicy));
-          },
+          onPressed: !canSubmit
+              ? null
+              : () {
+                  final name = _name.text.trim();
+                  final path = _path.text.trim();
+                  final gitPolicy = _gitPolicy;
+                  if (gitPolicy == null) return;
+                  Navigator.of(context).pop(
+                    DitchProject(name: name, path: path, gitPolicy: gitPolicy),
+                  );
+                },
           child: const Text('Add & Configure'),
         ),
       ],

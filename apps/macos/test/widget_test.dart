@@ -25,6 +25,57 @@ void main() {
     expect(project.gitPolicy, ProjectGitPolicy.allowOutsideGit);
   });
 
+  test('project reconciliation replaces duplicate ids and paths', () {
+    final projects = <DitchProject>[
+      const DitchProject(
+        id: 'project-11',
+        name: 'Old',
+        path: '/tmp/project-11',
+      ),
+    ];
+
+    upsertProject(
+      projects,
+      const DitchProject(
+        id: 'project-11',
+        name: 'Project#11',
+        path: '/tmp/project-11',
+      ),
+    );
+
+    expect(projects, hasLength(1));
+    expect(projects.single.name, 'Project#11');
+  });
+
+  test('agent reconciliation removes duplicate runtime ids', () {
+    final first = AgentSession(
+      localId: 'agent-1',
+      provider: AgentProvider.codex,
+      status: AgentStatus.failed,
+      messages: const [],
+    );
+    final duplicate = AgentSession(
+      localId: 'agent-1',
+      provider: AgentProvider.codex,
+      status: AgentStatus.starting,
+      messages: const [],
+    );
+    final sessions = [first, duplicate];
+    final incoming = AgentSession(
+      localId: 'agent-1',
+      provider: AgentProvider.codex,
+      status: AgentStatus.working,
+      messages: const [],
+      currentPrompt: 'try again',
+    );
+
+    reconcileAgentSession(sessions, incoming);
+
+    expect(sessions, hasLength(1));
+    expect(sessions.single.status, AgentStatus.working);
+    expect(sessions.single.currentPrompt, 'try again');
+  });
+
   test('classifies stderr chunks as visible diagnostics', () {
     final diagnostic = codexStderrDiagnosticFromChunk(
       'ERROR codex_models_manager::cache: failed to load models cache',
@@ -267,11 +318,33 @@ void main() {
     expect(find.text('/tmp/My Project'), findsOneWidget);
     expect(find.text('My Project'), findsOneWidget);
     expect(find.text('Choose how Codex should run'), findsOneWidget);
+    expect(
+      find.text('Choose how this project should handle Git.'),
+      findsOneWidget,
+    );
+    expect(
+      tester
+          .widget<FilledButton>(
+            find.widgetWithText(FilledButton, 'Add & Configure'),
+          )
+          .onPressed,
+      isNull,
+    );
     await tester.tap(find.byType(DropdownButtonFormField<ProjectGitPolicy>));
     await tester.pumpAndSettle();
     expect(find.text('Initialize Git Repository'), findsOneWidget);
     expect(find.text('Allow Codex Outside Git'), findsOneWidget);
     expect(find.textContaining('--skip-git-repo-check'), findsOneWidget);
+    await tester.tap(find.text('Initialize Git Repository'));
+    await tester.pumpAndSettle();
+    expect(
+      tester
+          .widget<FilledButton>(
+            find.widgetWithText(FilledButton, 'Add & Configure'),
+          )
+          .onPressed,
+      isNotNull,
+    );
   });
 
   testWidgets('start codex opens an initial prompt dialog', (tester) async {
