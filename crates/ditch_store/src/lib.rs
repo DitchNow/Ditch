@@ -214,6 +214,22 @@ impl DitchStore {
         Ok(())
     }
 
+    pub fn delete_agent(&mut self, agent_id: ditch_core::AgentId) -> Result<(), StoreError> {
+        let tx = self.connection.transaction()?;
+        let id = agent_id.0.to_string();
+        tx.execute(
+            "DELETE FROM permission_requests WHERE agent_id=?1",
+            params![id],
+        )?;
+        tx.execute(
+            "DELETE FROM attention_events WHERE agent_id=?1",
+            params![id],
+        )?;
+        tx.execute("DELETE FROM agents WHERE id=?1", params![id])?;
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn reconcile_active_agents(&mut self) -> Result<usize, StoreError> {
         let state = self.load()?;
         let mut count = 0;
@@ -527,6 +543,10 @@ mod tests {
             assert_eq!(restored.agents[0].run.state, AgentState::Stale);
             assert_eq!(restored.agents[0].messages.len(), 2);
             assert!(restored.agents[0].messages[1].text.contains("restarted"));
+            store.delete_agent(run.id).unwrap();
+            let deleted = store.load().unwrap();
+            assert!(deleted.agents.is_empty());
+            assert!(deleted.attention.is_empty());
         }
         fs::remove_dir_all(root).unwrap();
     }

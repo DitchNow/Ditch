@@ -69,6 +69,9 @@ pub enum ClientRequest {
     StopAgent {
         agent_id: AgentId,
     },
+    DeleteAgent {
+        agent_id: AgentId,
+    },
     DismissAttention {
         attention_id: Uuid,
     },
@@ -167,6 +170,9 @@ pub enum ServerEvent {
     ProjectChanged(Project),
     TaskChanged(Task),
     AgentChanged(AgentRun),
+    AgentDeleted {
+        agent_id: AgentId,
+    },
     AgentMessageAppended(AgentChatMessage),
     AttentionRaised(RuntimeAttention),
     AttentionDismissed {

@@ -167,13 +167,17 @@ void main() {
           body: AgentsSurface(
             sessions: const [],
             expandedAgentLocalId: null,
+            focusedAgentLocalId: null,
             chatController: ScrollController(),
+            agentListController: ScrollController(),
             composerKey: GlobalKey<AgentComposerState>(),
             initialPrompt: 'Start here',
             onStartCodex: () {},
             onStartPrompt: (_) {},
             onSubmitPrompt: (_, _) {},
             onStopCodex: (_) {},
+            onDeleteAgent: (_) {},
+            onFocusAgent: (_) {},
             onToggleExpanded: (_) {},
           ),
         ),
@@ -215,12 +219,16 @@ void main() {
           body: AgentsSurface(
             sessions: [session],
             expandedAgentLocalId: session.localId,
+            focusedAgentLocalId: null,
             chatController: ScrollController(),
+            agentListController: ScrollController(),
             composerKey: GlobalKey<AgentComposerState>(),
             initialPrompt: 'Retry',
             onStartCodex: () {},
             onSubmitPrompt: (_, _) => submitted = true,
             onStopCodex: (_) {},
+            onDeleteAgent: (_) {},
+            onFocusAgent: (_) {},
             onToggleExpanded: (_) {},
           ),
         ),
@@ -278,6 +286,174 @@ void main() {
     await tester.tap(find.text('Dismiss'));
     await tester.pump();
     expect(dismissed, isTrue);
+  });
+
+  testWidgets('chat messages expose copy actions', (tester) async {
+    final session = AgentSession(
+      localId: 'copy-agent',
+      provider: AgentProvider.codex,
+      status: AgentStatus.completed,
+      messages: [
+        AgentChatMessage(
+          role: ChatMessageRole.assistant,
+          text: 'Copy this response',
+          createdAt: DateTime(2026),
+        ),
+      ],
+    );
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: AgentsSurface(
+            sessions: [session],
+            expandedAgentLocalId: session.localId,
+            focusedAgentLocalId: null,
+            chatController: ScrollController(),
+            agentListController: ScrollController(),
+            composerKey: GlobalKey<AgentComposerState>(),
+            initialPrompt: '',
+            onStartCodex: () {},
+            onSubmitPrompt: (_, _) {},
+            onStopCodex: (_) {},
+            onDeleteAgent: (_) {},
+            onFocusAgent: (_) {},
+            onToggleExpanded: (_) {},
+          ),
+        ),
+      ),
+    );
+
+    expect(find.byTooltip('Copy message'), findsOneWidget);
+    expect(find.byTooltip('Copy conversation'), findsOneWidget);
+    expect(find.byType(SelectionArea), findsWidgets);
+  });
+
+  testWidgets('focused agent view exposes return and delete controls', (
+    tester,
+  ) async {
+    final session = AgentSession(
+      localId: 'focus-agent',
+      provider: AgentProvider.codex,
+      status: AgentStatus.completed,
+      messages: const [],
+    );
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: AgentsSurface(
+            sessions: [session],
+            expandedAgentLocalId: session.localId,
+            focusedAgentLocalId: session.localId,
+            chatController: ScrollController(),
+            agentListController: ScrollController(),
+            composerKey: GlobalKey<AgentComposerState>(),
+            initialPrompt: '',
+            onStartCodex: () {},
+            onSubmitPrompt: (_, _) {},
+            onStopCodex: (_) {},
+            onDeleteAgent: (_) {},
+            onFocusAgent: (_) {},
+            onToggleExpanded: (_) {},
+          ),
+        ),
+      ),
+    );
+
+    expect(find.byTooltip('Return to agents (Esc)'), findsOneWidget);
+    expect(find.byTooltip('Delete agent permanently'), findsOneWidget);
+  });
+
+  testWidgets('long conversation retains native scrolling', (tester) async {
+    tester.view.physicalSize = const Size(1200, 800);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    final chatController = ScrollController();
+    final session = AgentSession(
+      localId: 'scroll-agent',
+      provider: AgentProvider.codex,
+      status: AgentStatus.completed,
+      messages: List.generate(
+        30,
+        (index) => AgentChatMessage(
+          role: ChatMessageRole.assistant,
+          text: 'Message $index with enough text to occupy a chat row.',
+          createdAt: DateTime(2026),
+        ),
+      ),
+    );
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: AgentsSurface(
+            sessions: [session],
+            expandedAgentLocalId: session.localId,
+            focusedAgentLocalId: session.localId,
+            chatController: chatController,
+            agentListController: ScrollController(),
+            composerKey: GlobalKey<AgentComposerState>(),
+            initialPrompt: '',
+            onStartCodex: () {},
+            onSubmitPrompt: (_, _) {},
+            onStopCodex: (_) {},
+            onDeleteAgent: (_) {},
+            onFocusAgent: (_) {},
+            onToggleExpanded: (_) {},
+          ),
+        ),
+      ),
+    );
+
+    expect(chatController.position.maxScrollExtent, greaterThan(0));
+    await tester.drag(find.byType(ListView).last, const Offset(0, -300));
+    await tester.pumpAndSettle();
+    expect(chatController.offset, greaterThan(0));
+  });
+
+  testWidgets('inner overscroll advances its parent scroll view', (
+    tester,
+  ) async {
+    tester.view.physicalSize = const Size(900, 650);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    final outer = ScrollController();
+    final inner = ScrollController();
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: ListView(
+            controller: outer,
+            children: [
+              const SizedBox(height: 120),
+              SizedBox(
+                height: 360,
+                child: ScrollHandoffRegion(
+                  parentControllers: [outer],
+                  child: ListView.builder(
+                    key: const Key('inner-scroll'),
+                    controller: inner,
+                    physics: const ClampingScrollPhysics(),
+                    itemCount: 30,
+                    itemBuilder: (_, index) =>
+                        SizedBox(height: 50, child: Text('Inner row $index')),
+                  ),
+                ),
+              ),
+              const SizedBox(height: 900),
+            ],
+          ),
+        ),
+      ),
+    );
+
+    await tester.drag(
+      find.byKey(const Key('inner-scroll')),
+      const Offset(0, -1800),
+    );
+    await tester.pumpAndSettle();
+    expect(inner.offset, inner.position.maxScrollExtent);
+    expect(outer.offset, greaterThan(0));
   });
 
   testWidgets('opens add project dialog', (tester) async {
@@ -411,13 +587,17 @@ void main() {
           body: AgentsSurface(
             sessions: sessions,
             expandedAgentLocalId: 'agent-1',
+            focusedAgentLocalId: null,
             chatController: ScrollController(),
+            agentListController: ScrollController(),
             composerKey: GlobalKey<AgentComposerState>(),
             initialPrompt:
                 'Inspect this project and tell me the next useful engineering step.',
             onStartCodex: () {},
             onSubmitPrompt: (_, _) {},
             onStopCodex: (_) {},
+            onDeleteAgent: (_) {},
+            onFocusAgent: (_) {},
             onToggleExpanded: (_) {},
           ),
         ),

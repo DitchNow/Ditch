@@ -412,6 +412,12 @@ class DitchRuntimeClient {
     });
   }
 
+  Future<Map<String, dynamic>> deleteAgent(String agentId) {
+    return request({
+      'DeleteAgent': {'agent_id': agentId},
+    });
+  }
+
   Future<Map<String, dynamic>> dismissAttention(String attentionId) {
     return request({
       'DismissAttention': {'attention_id': attentionId},
@@ -503,6 +509,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
   static const _statusBarChannel = MethodChannel('the_ditch/status_bar');
 
   final _chatController = ScrollController();
+  final _agentListController = ScrollController();
   final _composerKey = GlobalKey<AgentComposerState>();
   final _runtimeClient = DitchRuntimeClient();
   int _nextAgentSessionId = 1;
@@ -521,6 +528,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
   bool _legacyRecoveryChecked = false;
   int _selectedProjectIndex = 0;
   String? _expandedAgentLocalId = 'agent-0';
+  String? _focusedAgentLocalId;
   late final List<AgentSession> _agentSessions = [
     AgentSession(
       localId: 'agent-0',
@@ -961,6 +969,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
     _statusBarChannel.setMethodCallHandler(null);
     _runtimeEvents?.cancel();
     _chatController.dispose();
+    _agentListController.dispose();
     super.dispose();
   }
 
@@ -1312,6 +1321,41 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
     }
   }
 
+  Future<void> _deleteAgent(AgentSession session) async {
+    if (session.isWorking || !mounted) return;
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Delete this agent?'),
+        content: const Text(
+          'This permanently removes the agent, its chat history, and its alerts from The Ditch. Project files are not deleted.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(context).pop(true),
+            child: const Text('Delete Agent'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+    try {
+      await _runtimeClient.deleteAgent(session.localId);
+    } on Object catch (error) {
+      _addAttentionRequired(
+        kind: AttentionKind.failed,
+        sessionLocalId: session.localId,
+        icon: Icons.delete_forever_outlined,
+        title: 'Agent deletion failed',
+        body: '$error',
+      );
+    }
+  }
+
   void _addAttentionRequired({
     required AttentionKind kind,
     required IconData icon,
@@ -1442,6 +1486,21 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
         }
       });
       _scheduleStatusBarUpdate();
+      return;
+    }
+
+    final agentDeleted = eventBody['AgentDeleted'];
+    if (agentDeleted is Map<String, dynamic>) {
+      final id = _agentIdToString(agentDeleted['agent_id']);
+      if (id != null) {
+        setState(() {
+          _agentSessions.removeWhere((session) => session.localId == id);
+          _attention.removeWhere((event) => event.sessionLocalId == id);
+          if (_expandedAgentLocalId == id) _expandedAgentLocalId = null;
+          if (_focusedAgentLocalId == id) _focusedAgentLocalId = null;
+        });
+        _scheduleStatusBarUpdate();
+      }
       return;
     }
 
@@ -1640,6 +1699,11 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
     if (!mounted) {
       return;
     }
+    final shouldFollowLatest =
+        !_chatController.hasClients ||
+        _chatController.position.maxScrollExtent -
+                _chatController.position.pixels <
+            72;
     setState(() {
       if (session.messages.isNotEmpty) {
         final lastMessage = session.messages.last;
@@ -1653,6 +1717,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
       session.updatedAt = DateTime.now();
     });
     _scheduleStatusBarUpdate();
+    if (!shouldFollowLatest) return;
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!_chatController.hasClients) {
         return;
@@ -1670,6 +1735,39 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
     return Scaffold(
       body: LayoutBuilder(
         builder: (context, constraints) {
+          final agentsSurface = AgentsSurface(
+            sessions: _visibleSessions,
+            expandedAgentLocalId: _expandedAgentLocalId,
+            focusedAgentLocalId: _focusedAgentLocalId,
+            chatController: _chatController,
+            agentListController: _agentListController,
+            composerKey: _composerKey,
+            initialPrompt: _defaultStartPrompt,
+            effectiveCodexHome: _effectiveRuntimeCodexHome,
+            onStartCodex: _startCodex,
+            onStartPrompt: _startCodexRuntime,
+            onSubmitPrompt: _submitComposer,
+            onStopCodex: _stopCodex,
+            onDeleteAgent: _deleteAgent,
+            onFocusAgent: (session) {
+              setState(() {
+                _focusedAgentLocalId = session?.localId;
+                if (session != null) {
+                  _expandedAgentLocalId = session.localId;
+                }
+              });
+            },
+            onToggleExpanded: (session) {
+              setState(() {
+                _expandedAgentLocalId = _expandedAgentLocalId == session.localId
+                    ? null
+                    : session.localId;
+              });
+            },
+          );
+          if (_focusedAgentLocalId != null) {
+            return agentsSurface;
+          }
           final content = [
             ProjectSidebar(
               projects: _projects,
@@ -1678,28 +1776,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
               onSelectProject: _selectProject,
             ),
             const VerticalDivider(width: 1),
-            Expanded(
-              child: AgentsSurface(
-                sessions: _visibleSessions,
-                expandedAgentLocalId: _expandedAgentLocalId,
-                chatController: _chatController,
-                composerKey: _composerKey,
-                initialPrompt: _defaultStartPrompt,
-                effectiveCodexHome: _effectiveRuntimeCodexHome,
-                onStartCodex: _startCodex,
-                onStartPrompt: _startCodexRuntime,
-                onSubmitPrompt: _submitComposer,
-                onStopCodex: _stopCodex,
-                onToggleExpanded: (session) {
-                  setState(() {
-                    _expandedAgentLocalId =
-                        _expandedAgentLocalId == session.localId
-                        ? null
-                        : session.localId;
-                  });
-                },
-              ),
-            ),
+            Expanded(child: agentsSurface),
           ];
 
           if (constraints.maxWidth < 1000) {
@@ -1875,7 +1952,9 @@ class AgentsSurface extends StatelessWidget {
   const AgentsSurface({
     required this.sessions,
     required this.expandedAgentLocalId,
+    required this.focusedAgentLocalId,
     required this.chatController,
+    required this.agentListController,
     required this.composerKey,
     required this.initialPrompt,
     this.effectiveCodexHome,
@@ -1883,13 +1962,17 @@ class AgentsSurface extends StatelessWidget {
     this.onStartPrompt,
     required this.onSubmitPrompt,
     required this.onStopCodex,
+    required this.onDeleteAgent,
+    required this.onFocusAgent,
     required this.onToggleExpanded,
     super.key,
   });
 
   final List<AgentSession> sessions;
   final String? expandedAgentLocalId;
+  final String? focusedAgentLocalId;
   final ScrollController chatController;
+  final ScrollController agentListController;
   final GlobalKey<AgentComposerState> composerKey;
   final String initialPrompt;
   final String? effectiveCodexHome;
@@ -1897,6 +1980,8 @@ class AgentsSurface extends StatelessWidget {
   final ValueChanged<String>? onStartPrompt;
   final void Function(AgentSession session, String prompt) onSubmitPrompt;
   final ValueChanged<AgentSession> onStopCodex;
+  final ValueChanged<AgentSession> onDeleteAgent;
+  final ValueChanged<AgentSession?> onFocusAgent;
   final ValueChanged<AgentSession> onToggleExpanded;
 
   @override
@@ -1909,25 +1994,29 @@ class AgentsSurface extends StatelessWidget {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Wrap(
-              spacing: 12,
-              runSpacing: 8,
-              crossAxisAlignment: WrapCrossAlignment.center,
-              children: [
-                Text('Agents', style: theme.textTheme.headlineSmall),
-                FilledButton.icon(
-                  onPressed: onStartCodex,
-                  icon: const Icon(Icons.smart_toy_outlined),
-                  label: const Text('Start Codex'),
-                ),
-              ],
-            ),
-            const SizedBox(height: 16),
+            if (focusedAgentLocalId == null) ...[
+              Wrap(
+                spacing: 12,
+                runSpacing: 8,
+                crossAxisAlignment: WrapCrossAlignment.center,
+                children: [
+                  Text('Agents', style: theme.textTheme.headlineSmall),
+                  FilledButton.icon(
+                    onPressed: onStartCodex,
+                    icon: const Icon(Icons.smart_toy_outlined),
+                    label: const Text('Start Codex'),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 16),
+            ],
             Expanded(
               child: AgentSessionList(
                 sessions: sessions,
                 expandedAgentLocalId: expandedAgentLocalId,
+                focusedAgentLocalId: focusedAgentLocalId,
                 chatController: chatController,
+                agentListController: agentListController,
                 composerKey: composerKey,
                 initialPrompt: initialPrompt,
                 effectiveCodexHome: effectiveCodexHome,
@@ -1935,6 +2024,8 @@ class AgentsSurface extends StatelessWidget {
                 onToggleExpanded: onToggleExpanded,
                 onSubmitPrompt: onSubmitPrompt,
                 onStopCodex: onStopCodex,
+                onDeleteAgent: onDeleteAgent,
+                onFocusAgent: onFocusAgent,
               ),
             ),
           ],
@@ -1948,7 +2039,9 @@ class AgentSessionList extends StatelessWidget {
   const AgentSessionList({
     required this.sessions,
     required this.expandedAgentLocalId,
+    required this.focusedAgentLocalId,
     required this.chatController,
+    required this.agentListController,
     required this.composerKey,
     required this.initialPrompt,
     this.effectiveCodexHome,
@@ -1956,12 +2049,16 @@ class AgentSessionList extends StatelessWidget {
     required this.onToggleExpanded,
     required this.onSubmitPrompt,
     required this.onStopCodex,
+    required this.onDeleteAgent,
+    required this.onFocusAgent,
     super.key,
   });
 
   final List<AgentSession> sessions;
   final String? expandedAgentLocalId;
+  final String? focusedAgentLocalId;
   final ScrollController chatController;
+  final ScrollController agentListController;
   final GlobalKey<AgentComposerState> composerKey;
   final String initialPrompt;
   final String? effectiveCodexHome;
@@ -1969,6 +2066,8 @@ class AgentSessionList extends StatelessWidget {
   final ValueChanged<AgentSession> onToggleExpanded;
   final void Function(AgentSession session, String prompt) onSubmitPrompt;
   final ValueChanged<AgentSession> onStopCodex;
+  final ValueChanged<AgentSession> onDeleteAgent;
+  final ValueChanged<AgentSession?> onFocusAgent;
 
   @override
   Widget build(BuildContext context) {
@@ -2002,6 +2101,8 @@ class AgentSessionList extends StatelessWidget {
                 child: AgentChatPanel(
                   messages: const [],
                   controller: chatController,
+                  agentListController: agentListController,
+                  enlarged: false,
                   composerKey: composerKey,
                   initialPrompt: initialPrompt,
                   hasSession: false,
@@ -2015,8 +2116,46 @@ class AgentSessionList extends StatelessWidget {
         ),
       );
     }
+    AgentSession? focused;
+    if (focusedAgentLocalId != null) {
+      for (final item in sessions) {
+        if (item.localId == focusedAgentLocalId) {
+          focused = item;
+          break;
+        }
+      }
+    }
+    if (focused != null) {
+      final focusedSession = focused;
+      return Center(
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 1180),
+          child: Padding(
+            padding: const EdgeInsets.all(12),
+            child: ExpandableAgentPanel(
+              key: ValueKey('focused-${focusedSession.localId}'),
+              session: focusedSession,
+              expanded: true,
+              enlarged: true,
+              chatController: chatController,
+              agentListController: agentListController,
+              composerKey: composerKey,
+              initialPrompt: initialPrompt,
+              effectiveCodexHome: effectiveCodexHome,
+              onTap: () {},
+              onEnlarge: () => onFocusAgent(null),
+              onDelete: () => onDeleteAgent(focusedSession),
+              onSubmitPrompt: (prompt) =>
+                  onSubmitPrompt(focusedSession, prompt),
+              onStopCodex: () => onStopCodex(focusedSession),
+            ),
+          ),
+        ),
+      );
+    }
     return ListView.separated(
       key: const PageStorageKey<String>('agent-session-list'),
+      controller: agentListController,
       itemCount: sessions.length,
       separatorBuilder: (_, _) => const SizedBox(height: 12),
       itemBuilder: (context, index) {
@@ -2026,11 +2165,15 @@ class AgentSessionList extends StatelessWidget {
           key: ValueKey(session.localId),
           session: session,
           expanded: expanded,
+          enlarged: false,
           chatController: expanded ? chatController : null,
+          agentListController: agentListController,
           composerKey: expanded ? composerKey : null,
           initialPrompt: initialPrompt,
           effectiveCodexHome: effectiveCodexHome,
           onTap: () => onToggleExpanded(session),
+          onEnlarge: () => onFocusAgent(session),
+          onDelete: () => onDeleteAgent(session),
           onSubmitPrompt: (prompt) => onSubmitPrompt(session, prompt),
           onStopCodex: () => onStopCodex(session),
         );
@@ -2043,11 +2186,15 @@ class ExpandableAgentPanel extends StatelessWidget {
   const ExpandableAgentPanel({
     required this.session,
     required this.expanded,
+    required this.enlarged,
     required this.chatController,
+    required this.agentListController,
     required this.composerKey,
     required this.initialPrompt,
     this.effectiveCodexHome,
     required this.onTap,
+    required this.onEnlarge,
+    required this.onDelete,
     required this.onSubmitPrompt,
     required this.onStopCodex,
     super.key,
@@ -2055,11 +2202,15 @@ class ExpandableAgentPanel extends StatelessWidget {
 
   final AgentSession session;
   final bool expanded;
+  final bool enlarged;
   final ScrollController? chatController;
+  final ScrollController agentListController;
   final GlobalKey<AgentComposerState>? composerKey;
   final String initialPrompt;
   final String? effectiveCodexHome;
   final VoidCallback onTap;
+  final VoidCallback onEnlarge;
+  final VoidCallback onDelete;
   final ValueChanged<String> onSubmitPrompt;
   final VoidCallback onStopCodex;
 
@@ -2122,6 +2273,15 @@ class ExpandableAgentPanel extends StatelessWidget {
           runSpacing: 8,
           children: [
             IconButton(
+              onPressed: onEnlarge,
+              tooltip: enlarged
+                  ? 'Return to agents (Esc)'
+                  : 'Enlarge agent (⌘F)',
+              icon: Icon(
+                enlarged ? Icons.close_fullscreen : Icons.open_in_full,
+              ),
+            ),
+            IconButton(
               onPressed: onTap,
               tooltip: expanded ? 'Collapse agent' : 'Expand agent',
               icon: Icon(
@@ -2133,63 +2293,85 @@ class ExpandableAgentPanel extends StatelessWidget {
               icon: const Icon(Icons.stop_circle_outlined),
               label: const Text('Stop'),
             ),
+            IconButton(
+              onPressed: session.isWorking ? null : onDelete,
+              tooltip: 'Delete agent permanently',
+              icon: const Icon(Icons.delete_outline),
+            ),
           ],
         );
+        Widget buildChatPanel() => AgentChatPanel(
+          messages: session.messages,
+          controller: chatController!,
+          agentListController: agentListController,
+          enlarged: enlarged,
+          composerKey: composerKey!,
+          initialPrompt: session.hasCodexThread ? '' : initialPrompt,
+          hasSession: session.hasCodexThread,
+          isWorking: session.isWorking,
+          enabled: !resumeBlocked,
+          disabledMessage: resumeBlockedMessage,
+          onSubmitPrompt: onSubmitPrompt,
+          onStopCodex: onStopCodex,
+          onEnlarge: onEnlarge,
+        );
 
-        return DecoratedBox(
-          decoration: BoxDecoration(
-            border: Border.all(color: colors.outlineVariant),
-            borderRadius: BorderRadius.circular(8),
-          ),
-          child: Padding(
-            padding: const EdgeInsets.all(12),
-            child: Column(
-              children: [
-                InkWell(
-                  onTap: onTap,
-                  borderRadius: BorderRadius.circular(8),
-                  child: Padding(
-                    padding: const EdgeInsets.all(4),
-                    child: constraints.maxWidth < 500
-                        ? Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              details,
-                              const SizedBox(height: 12),
-                              actions,
-                            ],
-                          )
-                        : Row(
-                            children: [
-                              Expanded(child: details),
-                              const SizedBox(width: 12),
-                              actions,
-                            ],
-                          ),
-                  ),
-                ),
-                if (expanded)
-                  Padding(
-                    padding: const EdgeInsets.only(top: 12),
-                    child: SizedBox(
-                      height: 560,
-                      child: AgentChatPanel(
-                        messages: session.messages,
-                        controller: chatController!,
-                        composerKey: composerKey!,
-                        initialPrompt: session.hasCodexThread
-                            ? ''
-                            : initialPrompt,
-                        hasSession: session.hasCodexThread,
-                        isWorking: session.isWorking,
-                        enabled: !resumeBlocked,
-                        disabledMessage: resumeBlockedMessage,
-                        onSubmitPrompt: onSubmitPrompt,
-                        onStopCodex: onStopCodex,
+        return CallbackShortcuts(
+          bindings: {
+            const SingleActivator(LogicalKeyboardKey.keyF, meta: true):
+                onEnlarge,
+            if (enlarged)
+              const SingleActivator(LogicalKeyboardKey.escape): onEnlarge,
+          },
+          child: Focus(
+            autofocus: enlarged,
+            child: DecoratedBox(
+              decoration: BoxDecoration(
+                border: Border.all(color: colors.outlineVariant),
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: Padding(
+                padding: const EdgeInsets.all(12),
+                child: Column(
+                  children: [
+                    InkWell(
+                      onTap: onTap,
+                      borderRadius: BorderRadius.circular(8),
+                      child: Padding(
+                        padding: const EdgeInsets.all(4),
+                        child: constraints.maxWidth < 500
+                            ? Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  details,
+                                  const SizedBox(height: 12),
+                                  actions,
+                                ],
+                              )
+                            : Row(
+                                children: [
+                                  Expanded(child: details),
+                                  const SizedBox(width: 12),
+                                  actions,
+                                ],
+                              ),
                       ),
                     ),
-                  ),
-              ],
+                    if (expanded && enlarged)
+                      Expanded(
+                        child: Padding(
+                          padding: const EdgeInsets.only(top: 12),
+                          child: buildChatPanel(),
+                        ),
+                      )
+                    else if (expanded)
+                      Padding(
+                        padding: const EdgeInsets.only(top: 12),
+                        child: SizedBox(height: 560, child: buildChatPanel()),
+                      ),
+                  ],
+                ),
+              ),
             ),
           ),
         );
@@ -2219,6 +2401,8 @@ class AgentChatPanel extends StatelessWidget {
   const AgentChatPanel({
     required this.messages,
     required this.controller,
+    required this.agentListController,
+    required this.enlarged,
     required this.composerKey,
     required this.initialPrompt,
     required this.hasSession,
@@ -2227,11 +2411,14 @@ class AgentChatPanel extends StatelessWidget {
     this.disabledMessage,
     required this.onSubmitPrompt,
     required this.onStopCodex,
+    this.onEnlarge,
     super.key,
   });
 
   final List<AgentChatMessage> messages;
   final ScrollController controller;
+  final ScrollController agentListController;
+  final bool enlarged;
   final GlobalKey<AgentComposerState> composerKey;
   final String initialPrompt;
   final bool hasSession;
@@ -2240,6 +2427,7 @@ class AgentChatPanel extends StatelessWidget {
   final String? disabledMessage;
   final ValueChanged<String> onSubmitPrompt;
   final VoidCallback onStopCodex;
+  final VoidCallback? onEnlarge;
 
   @override
   Widget build(BuildContext context) {
@@ -2252,18 +2440,51 @@ class AgentChatPanel extends StatelessWidget {
       ),
       child: Column(
         children: [
+          SizedBox(
+            height: 36,
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.end,
+              children: [
+                IconButton(
+                  tooltip: 'Copy conversation',
+                  icon: const Icon(Icons.copy_all_outlined, size: 18),
+                  onPressed: messages.isEmpty
+                      ? null
+                      : () => Clipboard.setData(
+                          ClipboardData(
+                            text: messages
+                                .map(
+                                  (message) =>
+                                      '${message.role.name}: ${message.text}',
+                                )
+                                .join('\n\n'),
+                          ),
+                        ),
+                ),
+              ],
+            ),
+          ),
+          const Divider(height: 1),
           Expanded(
-            child: Scrollbar(
-              controller: controller,
-              thumbVisibility: true,
-              child: ListView.separated(
+            child: ScrollHandoffRegion(
+              parentControllers: [agentListController],
+              child: Scrollbar(
                 controller: controller,
-                padding: const EdgeInsets.all(12),
-                itemCount: messages.length,
-                separatorBuilder: (_, _) => const SizedBox(height: 10),
-                itemBuilder: (context, index) {
-                  return AgentChatBubble(message: messages[index]);
-                },
+                thumbVisibility: true,
+                child: ListView.separated(
+                  controller: controller,
+                  physics: const ClampingScrollPhysics(),
+                  padding: const EdgeInsets.all(12),
+                  itemCount: messages.length,
+                  separatorBuilder: (_, _) => const SizedBox(height: 10),
+                  itemBuilder: (context, index) {
+                    return AgentChatBubble(
+                      message: messages[index],
+                      chatController: controller,
+                      agentListController: agentListController,
+                    );
+                  },
+                ),
               ),
             ),
           ),
@@ -2282,9 +2503,44 @@ class AgentChatPanel extends StatelessWidget {
             enabled: enabled,
             onSubmit: onSubmitPrompt,
             onStop: onStopCodex,
+            onEnlarge: onEnlarge,
+            onEscape: enlarged ? onEnlarge : null,
           ),
         ],
       ),
+    );
+  }
+}
+
+class ScrollHandoffRegion extends StatelessWidget {
+  const ScrollHandoffRegion({
+    required this.parentControllers,
+    required this.child,
+    super.key,
+  });
+
+  final List<ScrollController> parentControllers;
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) {
+    return NotificationListener<OverscrollNotification>(
+      onNotification: (notification) {
+        var remaining = notification.overscroll;
+        for (final controller in parentControllers) {
+          if (!controller.hasClients || remaining.abs() < 0.01) continue;
+          final position = controller.position;
+          final target = (position.pixels + remaining).clamp(
+            position.minScrollExtent,
+            position.maxScrollExtent,
+          );
+          final consumed = target - position.pixels;
+          if (consumed.abs() > 0.01) controller.jumpTo(target.toDouble());
+          remaining -= consumed;
+        }
+        return true;
+      },
+      child: child,
     );
   }
 }
@@ -2381,6 +2637,8 @@ class AgentComposer extends StatefulWidget {
     this.enabled = true,
     required this.onSubmit,
     required this.onStop,
+    this.onEnlarge,
+    this.onEscape,
     super.key,
   });
 
@@ -2390,6 +2648,8 @@ class AgentComposer extends StatefulWidget {
   final bool enabled;
   final ValueChanged<String> onSubmit;
   final VoidCallback onStop;
+  final VoidCallback? onEnlarge;
+  final VoidCallback? onEscape;
 
   @override
   State<AgentComposer> createState() => AgentComposerState();
@@ -2478,6 +2738,8 @@ class AgentComposerState extends State<AgentComposer> {
                         ? 'Send a follow-up to Codex'
                         : 'Tell Codex what to do',
                     onChanged: _handleChanged,
+                    onEnlarge: widget.onEnlarge,
+                    onEscape: widget.onEscape,
                   ),
                 ),
               ),
@@ -2508,6 +2770,8 @@ class NativeComposerTextView extends StatefulWidget {
     required this.enabled,
     required this.placeholder,
     required this.onChanged,
+    this.onEnlarge,
+    this.onEscape,
     super.key,
   });
 
@@ -2515,6 +2779,8 @@ class NativeComposerTextView extends StatefulWidget {
   final bool enabled;
   final String placeholder;
   final ValueChanged<String> onChanged;
+  final VoidCallback? onEnlarge;
+  final VoidCallback? onEscape;
 
   @override
   State<NativeComposerTextView> createState() => NativeComposerTextViewState();
@@ -2645,6 +2911,8 @@ class NativeComposerTextViewState extends State<NativeComposerTextView> {
         'text': widget.initialText,
         'enabled': widget.enabled,
         'placeholder': widget.placeholder,
+        'fontSize': 14.0,
+        'escapeEnabled': widget.onEscape != null,
       },
       creationParamsCodec: const StandardMessageCodec(),
       onPlatformViewCreated: (id) {
@@ -2655,6 +2923,10 @@ class NativeComposerTextViewState extends State<NativeComposerTextView> {
           if (call.method == 'textChanged') {
             final text = call.arguments as String? ?? '';
             widget.onChanged(text);
+          } else if (call.method == 'enlargeRequested') {
+            widget.onEnlarge?.call();
+          } else if (call.method == 'escapePressed') {
+            widget.onEscape?.call();
           }
         });
       },
@@ -2663,9 +2935,16 @@ class NativeComposerTextViewState extends State<NativeComposerTextView> {
 }
 
 class AgentChatBubble extends StatelessWidget {
-  const AgentChatBubble({required this.message, super.key});
+  const AgentChatBubble({
+    required this.message,
+    required this.chatController,
+    required this.agentListController,
+    super.key,
+  });
 
   final AgentChatMessage message;
+  final ScrollController chatController;
+  final ScrollController agentListController;
 
   @override
   Widget build(BuildContext context) {
@@ -2724,7 +3003,6 @@ class AgentChatBubble extends StatelessWidget {
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   Row(
-                    mainAxisSize: MainAxisSize.min,
                     children: [
                       Icon(icon, size: 16, color: foreground),
                       const SizedBox(width: 6),
@@ -2736,22 +3014,99 @@ class AgentChatBubble extends StatelessWidget {
                               fontWeight: FontWeight.w700,
                             ),
                       ),
+                      const Spacer(),
+                      IconButton(
+                        visualDensity: VisualDensity.compact,
+                        tooltip: 'Copy message',
+                        icon: const Icon(Icons.copy_outlined, size: 16),
+                        onPressed: () => Clipboard.setData(
+                          ClipboardData(text: message.text),
+                        ),
+                      ),
                     ],
                   ),
                   const SizedBox(height: 8),
-                  SelectableText(
-                    message.text,
-                    style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                      color: foreground,
-                      height: 1.35,
+                  if (message.role == ChatMessageRole.tool)
+                    ScrollableToolMessage(
+                      text: message.text,
+                      foreground: foreground,
+                      chatController: chatController,
+                      agentListController: agentListController,
+                    )
+                  else
+                    SelectionArea(
+                      child: Text(
+                        message.text,
+                        style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                          color: foreground,
+                          height: 1.45,
+                          fontSize: 14,
+                        ),
+                      ),
                     ),
-                  ),
                 ],
               ),
             ),
           ),
         ),
       ],
+    );
+  }
+}
+
+class ScrollableToolMessage extends StatefulWidget {
+  const ScrollableToolMessage({
+    required this.text,
+    required this.foreground,
+    required this.chatController,
+    required this.agentListController,
+    super.key,
+  });
+
+  final String text;
+  final Color foreground;
+  final ScrollController chatController;
+  final ScrollController agentListController;
+
+  @override
+  State<ScrollableToolMessage> createState() => _ScrollableToolMessageState();
+}
+
+class _ScrollableToolMessageState extends State<ScrollableToolMessage> {
+  final _controller = ScrollController();
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return ConstrainedBox(
+      constraints: const BoxConstraints(maxHeight: 190),
+      child: ScrollHandoffRegion(
+        parentControllers: [widget.chatController, widget.agentListController],
+        child: Scrollbar(
+          controller: _controller,
+          thumbVisibility: true,
+          child: SingleChildScrollView(
+            controller: _controller,
+            physics: const ClampingScrollPhysics(),
+            child: SelectionArea(
+              child: Text(
+                widget.text,
+                style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                  color: widget.foreground,
+                  height: 1.4,
+                  fontFamily: 'SF Mono',
+                  fontSize: 12.5,
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
     );
   }
 }

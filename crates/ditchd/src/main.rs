@@ -415,6 +415,7 @@ fn handle_request(request: ClientRequest, state: Arc<Mutex<RuntimeState>>) -> Se
         } => resume_codex_session(state, project_name, project_root, thread_id, prompt),
         ClientRequest::PromptAgent { agent_id, prompt } => prompt_agent(state, agent_id, prompt),
         ClientRequest::StopAgent { agent_id } => stop_agent(state, agent_id),
+        ClientRequest::DeleteAgent { agent_id } => delete_agent(state, agent_id),
         ClientRequest::DismissAttention { attention_id } => {
             let mut state = state
                 .lock()
@@ -994,6 +995,32 @@ fn stop_agent(state: Arc<Mutex<RuntimeState>>, agent_id: AgentId) -> ServerRespo
     let run = record.run.clone();
     state.persist_agent(agent_id);
     state.broadcast(ServerEvent::AgentChanged(run));
+    ServerResponse::Accepted
+}
+
+fn delete_agent(state: Arc<Mutex<RuntimeState>>, agent_id: AgentId) -> ServerResponse {
+    let mut state = state
+        .lock()
+        .expect("runtime state lock should not be poisoned");
+    let Some(record) = state.agents.get(&agent_id) else {
+        return protocol_error("agent_not_found", "agent session was not found");
+    };
+    if matches!(record.run.state, AgentState::Starting | AgentState::Working)
+        || state.children.contains_key(&agent_id)
+    {
+        return protocol_error(
+            "agent_active",
+            "Stop this agent before deleting it permanently.",
+        );
+    }
+    if let Err(error) = state.store.delete_agent(agent_id) {
+        return protocol_error("agent_delete_failed", error.to_string());
+    }
+    state.agents.remove(&agent_id);
+    state
+        .attention
+        .retain(|item| item.agent_id != Some(agent_id));
+    state.broadcast(ServerEvent::AgentDeleted { agent_id });
     ServerResponse::Accepted
 }
 

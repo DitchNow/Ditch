@@ -64,6 +64,8 @@ class NativeComposerTextView: NSView, NSTextViewDelegate {
     let arguments = args as? [String: Any]
     let initialText = arguments?["text"] as? String ?? ""
     let enabled = arguments?["enabled"] as? Bool ?? true
+    let fontSize = arguments?["fontSize"] as? Double ?? 14
+    let escapeEnabled = arguments?["escapeEnabled"] as? Bool ?? false
 
     wantsLayer = true
     layer?.backgroundColor = NSColor.clear.cgColor
@@ -81,7 +83,8 @@ class NativeComposerTextView: NSView, NSTextViewDelegate {
     textView.textContainer?.containerSize = NSSize(width: frame.width, height: CGFloat.greatestFiniteMagnitude)
     textView.textContainer?.widthTracksTextView = true
     textView.drawsBackground = false
-    textView.font = NSFont.systemFont(ofSize: 18)
+    textView.font = NSFont.systemFont(ofSize: fontSize)
+    textView.textContainerInset = NSSize(width: 2, height: 6)
     textView.textColor = NSColor.labelColor
     textView.insertionPointColor = NSColor.labelColor
     textView.allowsUndo = true
@@ -91,6 +94,14 @@ class NativeComposerTextView: NSView, NSTextViewDelegate {
     textView.isEditable = enabled
     textView.isSelectable = true
     textView.delegate = self
+    textView.onEnlarge = { [weak self] in
+      self?.channel.invokeMethod("enlargeRequested", arguments: nil)
+    }
+    if escapeEnabled {
+      textView.onEscape = { [weak self] in
+        self?.channel.invokeMethod("escapePressed", arguments: nil)
+      }
+    }
 
     scrollView.documentView = textView
     addSubview(scrollView)
@@ -156,38 +167,21 @@ class NativeComposerTextView: NSView, NSTextViewDelegate {
 }
 
 final class ComposerTextView: NSTextView {
-  override func performKeyEquivalent(with event: NSEvent) -> Bool {
-    guard event.modifierFlags.intersection(.deviceIndependentFlagsMask).contains(.command),
-      let characters = event.charactersIgnoringModifiers?.lowercased()
-    else {
-      return super.performKeyEquivalent(with: event)
-    }
+  var onEnlarge: (() -> Void)?
+  var onEscape: (() -> Void)?
 
-    switch characters {
-    case "x":
-      cut(nil)
+  override func performKeyEquivalent(with event: NSEvent) -> Bool {
+    let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+    if modifiers == .command,
+      event.charactersIgnoringModifiers?.lowercased() == "f"
+    {
+      onEnlarge?()
       return true
-    case "c":
-      copy(nil)
-      return true
-    case "v":
-      paste(nil)
-      return true
-    case "a":
-      selectAll(nil)
-      return true
-    case "z":
-      if event.modifierFlags.intersection(.deviceIndependentFlagsMask).contains(.shift) {
-        undoManager?.redo()
-      } else {
-        undoManager?.undo()
-      }
-      return true
-    case "q":
-      NSApp.terminate(nil)
-      return true
-    default:
-      return super.performKeyEquivalent(with: event)
     }
+    if event.keyCode == 53, let onEscape {
+      onEscape()
+      return true
+    }
+    return super.performKeyEquivalent(with: event)
   }
 }
