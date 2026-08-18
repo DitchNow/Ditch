@@ -1,9 +1,11 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:xterm/xterm.dart';
 
 import 'application/command_center_controller.dart';
 import 'data/runtime_models.dart';
@@ -94,6 +96,73 @@ void upsertProject(List<DitchProject> projects, DitchProject incoming) {
 }
 
 enum AgentProvider { codex }
+
+enum AgentApprovalPreset { ask, approveForMe, fullAccess }
+
+class AgentModelOption {
+  const AgentModelOption({
+    required this.id,
+    required this.displayName,
+    this.isDefault = false,
+    this.contextWindowTokens,
+  });
+  final String id;
+  final String displayName;
+  final bool isDefault;
+  final int? contextWindowTokens;
+}
+
+class AgentExecutionSettings extends ChangeNotifier {
+  AgentApprovalPreset approval = AgentApprovalPreset.approveForMe;
+  String? model;
+  List<AgentModelOption> models = const [];
+
+  Map<String, dynamic> get protocolValue => {
+    'model': model,
+    'reasoning_effort': null,
+    'approval': switch (approval) {
+      AgentApprovalPreset.ask => 'Ask',
+      AgentApprovalPreset.approveForMe => 'ApproveForMe',
+      AgentApprovalPreset.fullAccess => 'FullAccess',
+    },
+  };
+
+  void setApproval(AgentApprovalPreset value) {
+    approval = value;
+    notifyListeners();
+  }
+
+  void setModel(String? value) {
+    model = value;
+    notifyListeners();
+  }
+
+  AgentModelOption? get selectedModel => models.where((item) => item.id == model).firstOrNull;
+
+  void setModels(List<AgentModelOption> value) {
+    models = value;
+    if (model == null) {
+      for (final item in value) {
+        if (item.isDefault) {
+          model = item.id;
+          break;
+        }
+      }
+    }
+    notifyListeners();
+  }
+}
+
+final agentExecutionSettings = AgentExecutionSettings();
+
+class ProjectTerminalSession {
+  ProjectTerminalSession({required this.id, required this.projectId, required this.shell});
+
+  final String id;
+  final String projectId;
+  final String shell;
+  final Terminal terminal = Terminal(maxLines: 10000, platform: TerminalTargetPlatform.macos);
+}
 
 class AgentSession {
   AgentSession({
@@ -323,6 +392,7 @@ class DitchRuntimeClient {
         'project_root': projectRoot,
         'prompt': prompt,
         'mode': 'Exec',
+        'execution_profile': agentExecutionSettings.protocolValue,
       },
     });
   }
@@ -339,6 +409,7 @@ class DitchRuntimeClient {
         'project_root': projectRoot,
         'thread_id': threadId,
         'prompt': prompt,
+        'execution_profile': agentExecutionSettings.protocolValue,
       },
     });
   }
@@ -348,8 +419,55 @@ class DitchRuntimeClient {
     required String prompt,
   }) {
     return request({
-      'PromptAgent': {'agent_id': agentId, 'prompt': prompt},
+      'PromptAgent': {
+        'agent_id': agentId,
+        'prompt': prompt,
+        'execution_profile': agentExecutionSettings.protocolValue,
+      },
     });
+  }
+
+  Future<List<AgentModelOption>> listCodexModels() async {
+    final response = await request({
+      'ListAgentModels': {'provider': 'Codex'},
+    });
+    final values = response['AgentModels'];
+    if (values is! List) return const [];
+    return values.whereType<Map>().map((value) {
+      return AgentModelOption(
+        id: value['id'].toString(),
+        displayName:
+            value['display_name']?.toString() ?? value['id'].toString(),
+        isDefault: value['is_default'] == true,
+        contextWindowTokens: value['context_window_tokens'] is int
+            ? value['context_window_tokens'] as int
+            : int.tryParse(value['context_window_tokens']?.toString() ?? ''),
+      );
+    }).toList();
+  }
+
+  Future<Map<String, dynamic>> openProjectTerminal({
+    required String projectId,
+    required int columns,
+    required int rows,
+  }) => request({
+    'OpenProjectTerminal': {
+      'project_id': projectId,
+      'columns': columns,
+      'rows': rows,
+    },
+  });
+
+  Future<void> writeProjectTerminal(String terminalId, List<int> data) async {
+    await request({'WriteProjectTerminal': {'terminal_id': terminalId, 'data': data}});
+  }
+
+  Future<void> resizeProjectTerminal(String terminalId, int columns, int rows) async {
+    await request({'ResizeProjectTerminal': {'terminal_id': terminalId, 'columns': columns, 'rows': rows}});
+  }
+
+  Future<void> closeProjectTerminal(String terminalId) async {
+    await request({'CloseProjectTerminal': {'terminal_id': terminalId}});
   }
 
   Future<Map<String, dynamic>> stopAgent(String agentId) {
@@ -425,6 +543,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
   int _nextAttentionId = 1;
   final _projects = <DitchProject>[_bootstrapProject];
   final _attention = <AttentionEvent>[];
+  final Map<String, ProjectTerminalSession> _projectTerminals = {};
 
   StreamSubscription<Map<String, dynamic>>? _runtimeEvents;
   String? _runtimeInstanceId;
@@ -466,6 +585,38 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
       final sessions = _visibleSessions;
       _expandedAgentLocalId = sessions.isEmpty ? null : sessions.first.localId;
     });
+    unawaited(_ensureSelectedProjectTerminal());
+  }
+
+  Future<void> _ensureSelectedProjectTerminal() async {
+    final project = _selectedProject;
+    final projectId = project.id;
+    if (projectId == null || _projectTerminals.containsKey(projectId)) return;
+    try {
+      final response = await _runtimeClient.openProjectTerminal(
+        projectId: projectId,
+        columns: 90,
+        rows: 24,
+      );
+      final value = response['ProjectTerminal'];
+      if (value is! Map || !mounted) return;
+      final id = value['id']?.toString();
+      if (id == null || id.isEmpty) return;
+      final terminal = ProjectTerminalSession(
+        id: id,
+        projectId: projectId,
+        shell: value['shell']?.toString() ?? 'shell',
+      );
+      terminal.terminal.onOutput = (data) {
+        unawaited(_runtimeClient.writeProjectTerminal(id, utf8.encode(data)));
+      };
+      terminal.terminal.onResize = (columns, rows, _, _) {
+        unawaited(_runtimeClient.resizeProjectTerminal(id, columns, rows));
+      };
+      setState(() => _projectTerminals[projectId] = terminal);
+    } on Object catch (_) {
+      // Runtime connection failures already surface through its recovery UI.
+    }
   }
 
   void _scheduleStatusBarUpdate() {
@@ -553,6 +704,13 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
         unawaited(_offerLegacyProjectRecovery());
       }
       _presentation.connected();
+      unawaited(_ensureSelectedProjectTerminal());
+      unawaited(
+        _runtimeClient
+            .listCodexModels()
+            .then(agentExecutionSettings.setModels)
+            .onError((_, _) {}),
+      );
     } on Object catch (error) {
       _presentation.unavailable(error);
       _addAttentionRequired(
@@ -1333,6 +1491,33 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
       return;
     }
 
+    final terminalOutput = eventBody['ProjectTerminalOutput'];
+    if (terminalOutput is Map) {
+      final id = terminalOutput['terminal_id']?.toString();
+      final raw = terminalOutput['data'];
+      final session = id == null
+          ? null
+          : _projectTerminals.values.where((item) => item.id == id).firstOrNull;
+      if (session != null && raw is List) {
+        final bytes = raw.whereType<num>().map((byte) => byte.toInt()).toList();
+        session.terminal.write(utf8.decode(bytes, allowMalformed: true));
+      }
+      return;
+    }
+
+    final terminalExited = eventBody['ProjectTerminalExited'];
+    if (terminalExited is Map) {
+      final id = terminalExited['terminal_id']?.toString();
+      if (id != null) {
+        final keys = _projectTerminals.entries
+            .where((entry) => entry.value.id == id)
+            .map((entry) => entry.key)
+            .toList();
+        if (keys.isNotEmpty) setState(() => keys.forEach(_projectTerminals.remove));
+      }
+      return;
+    }
+
     final projectChanged = eventBody['ProjectChanged'];
     if (projectChanged != null) {
       final project = _projectFromRuntime(projectChanged);
@@ -1659,8 +1844,12 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
                 },
                 onToggleExpanded: _toggleExpandedAgent,
               );
-              final attentionPanel = AttentionPanel(
+              final attentionPanel = ProjectToolsPanel(
                 width: 320,
+                terminal: _selectedProject.id == null
+                    ? null
+                    : _projectTerminals[_selectedProject.id],
+                onEnsureTerminal: _ensureSelectedProjectTerminal,
                 events: _visibleAttention,
                 canStopSession: _canStopAttentionSession,
                 onOpenSession: _openAttentionSession,
@@ -3109,6 +3298,33 @@ class AgentComposerState extends State<AgentComposer> {
     setState(() => _draftText = text);
   }
 
+  Future<void> _selectApproval(AgentApprovalPreset value) async {
+    if (value == AgentApprovalPreset.fullAccess) {
+      final confirmed = await showDialog<bool>(
+        context: context,
+        builder: (context) => AlertDialog(
+          icon: const Icon(Icons.warning_amber_rounded),
+          title: const Text('Enable Full Access?'),
+          content: const Text(
+            'Codex will run without approval prompts or sandbox restrictions and can access the internet and files on this Mac.',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(false),
+              child: const Text('Cancel'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.of(context).pop(true),
+              child: const Text('Enable Full Access'),
+            ),
+          ],
+        ),
+      );
+      if (confirmed != true) return;
+    }
+    agentExecutionSettings.setApproval(value);
+  }
+
   @override
   Widget build(BuildContext context) {
     final hasText = _draftText.trim().isNotEmpty;
@@ -3125,45 +3341,170 @@ class AgentComposerState extends State<AgentComposer> {
         ),
         child: Padding(
           padding: const EdgeInsets.all(10),
-          child: Row(
-            crossAxisAlignment: CrossAxisAlignment.end,
-            children: [
-              Expanded(
-                child: SizedBox(
-                  height: 72,
-                  child: NativeComposerTextView(
-                    key: _nativeComposerKey,
-                    initialText: widget.initialText,
-                    enabled: enabled,
-                    placeholder: widget.hasSession
-                        ? 'Send a follow-up to Codex'
-                        : 'Tell Codex what to do',
-                    onChanged: _handleChanged,
-                    onSubmitRequested: submit,
-                    onEnlarge: widget.onEnlarge,
-                    onEscape: widget.onEscape,
-                  ),
+          child: ListenableBuilder(
+            listenable: agentExecutionSettings,
+            builder: (context, _) => Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                LayoutBuilder(
+                  builder: (context, constraints) {
+                    final controlWidth = constraints.maxWidth < 220
+                        ? constraints.maxWidth
+                        : 220.0;
+                    return Wrap(
+                      spacing: 16,
+                      runSpacing: 8,
+                      crossAxisAlignment: WrapCrossAlignment.center,
+                      children: [
+                        SizedBox(
+                          width: controlWidth,
+                          child: DropdownButtonHideUnderline(
+                            child: DropdownButton<AgentApprovalPreset>(
+                              value: agentExecutionSettings.approval,
+                              isDense: true,
+                              isExpanded: true,
+                              onChanged: (value) {
+                                if (value != null) {
+                                  unawaited(_selectApproval(value));
+                                }
+                              },
+                              items: const [
+                              DropdownMenuItem(
+                                value: AgentApprovalPreset.ask,
+                                enabled: false,
+                                child: Text('Ask for approval — unavailable'),
+                                ),
+                                DropdownMenuItem(
+                                  value: AgentApprovalPreset.approveForMe,
+                                  child: Text('Approve for me'),
+                                ),
+                                DropdownMenuItem(
+                                  value: AgentApprovalPreset.fullAccess,
+                                  child: Text('Full Access'),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ),
+                        SizedBox(
+                          width: controlWidth,
+                          child: Row(
+                            children: [
+                              Expanded(
+                                child: DropdownButtonHideUnderline(
+                                  child: DropdownButton<String?>(
+                                    value: agentExecutionSettings.model,
+                                    hint: const Text('Default model'),
+                                    isDense: true,
+                                    isExpanded: true,
+                                    onChanged: agentExecutionSettings.setModel,
+                                    items: agentExecutionSettings.models
+                                        .map(
+                                          (model) => DropdownMenuItem<String?>(
+                                            value: model.id,
+                                            child: Text(model.displayName),
+                                          ),
+                                        )
+                                        .toList(),
+                                  ),
+                                ),
+                              ),
+                              const SizedBox(width: 6),
+                              ContextWindowIndicator(
+                                model: agentExecutionSettings.selectedModel,
+                              ),
+                            ],
+                          ),
+                        ),
+                        if (widget.isWorking) const Text('Applies next turn'),
+                      ],
+                    );
+                  },
                 ),
-              ),
-              const SizedBox(width: 10),
-              if (widget.isWorking)
-                IconButton.filledTonal(
-                  onPressed: widget.onStop,
-                  tooltip: 'Stop Codex',
-                  icon: const Icon(Icons.stop_circle_outlined),
-                )
-              else
-                FilledButton.icon(
-                  onPressed: hasText && enabled ? submit : null,
-                  icon: Icon(actionIcon),
-                  label: Text(actionLabel),
+                const SizedBox(height: 8),
+                Row(
+                  crossAxisAlignment: CrossAxisAlignment.end,
+                  children: [
+                    Expanded(
+                      child: SizedBox(
+                        height: 72,
+                        child: NativeComposerTextView(
+                          key: _nativeComposerKey,
+                          initialText: widget.initialText,
+                          enabled: enabled,
+                          placeholder: widget.hasSession
+                              ? 'Send a follow-up to Codex'
+                              : 'Tell Codex what to do',
+                          onChanged: _handleChanged,
+                          onSubmitRequested: submit,
+                          onEnlarge: widget.onEnlarge,
+                          onEscape: widget.onEscape,
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 10),
+                    if (widget.isWorking)
+                      IconButton.filledTonal(
+                        onPressed: widget.onStop,
+                        tooltip: 'Stop Codex',
+                        icon: const Icon(Icons.stop_circle_outlined),
+                      )
+                    else
+                      FilledButton.icon(
+                        onPressed: hasText && enabled ? submit : null,
+                        icon: Icon(actionIcon),
+                        label: Text(actionLabel),
+                      ),
+                  ],
                 ),
-            ],
+              ],
+            ),
           ),
         ),
       ),
     );
   }
+}
+
+class ContextWindowIndicator extends StatelessWidget {
+  const ContextWindowIndicator({required this.model, super.key});
+
+  final AgentModelOption? model;
+
+  @override
+  Widget build(BuildContext context) {
+    final limit = model?.contextWindowTokens;
+    final label = limit == null
+        ? 'Context size unavailable'
+        : '${_formatTokens(limit)} context window; live usage is unavailable';
+    return Tooltip(
+      message: label,
+      child: Semantics(
+        label: label,
+        child: DecoratedBox(
+          decoration: BoxDecoration(
+            color: context.ditch.surface,
+            borderRadius: BorderRadius.circular(8),
+          ),
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(Icons.data_usage_outlined, size: 14, color: limit == null ? Theme.of(context).disabledColor : null),
+                if (limit != null) ...[
+                  const SizedBox(width: 3),
+                  Text(_formatTokens(limit), style: Theme.of(context).textTheme.labelSmall),
+                ],
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  static String _formatTokens(int tokens) => tokens >= 1000 ? '${(tokens / 1000).round()}k' : '$tokens';
 }
 
 class NativeComposerTextView extends StatefulWidget {
@@ -3484,6 +3825,107 @@ class AgentChatBubble extends StatelessWidget {
           ),
         );
       },
+    );
+  }
+}
+
+class ProjectToolsPanel extends StatefulWidget {
+  const ProjectToolsPanel({
+    required this.width,
+    required this.terminal,
+    required this.onEnsureTerminal,
+    required this.events,
+    required this.canStopSession,
+    required this.onOpenSession,
+    required this.onStopSession,
+    required this.onDismiss,
+    super.key,
+  });
+
+  final double width;
+  final ProjectTerminalSession? terminal;
+  final Future<void> Function() onEnsureTerminal;
+  final List<AttentionEvent> events;
+  final bool Function(AttentionEvent event) canStopSession;
+  final ValueChanged<AttentionEvent> onOpenSession;
+  final ValueChanged<AttentionEvent> onStopSession;
+  final ValueChanged<AttentionEvent> onDismiss;
+
+  @override
+  State<ProjectToolsPanel> createState() => _ProjectToolsPanelState();
+}
+
+class _ProjectToolsPanelState extends State<ProjectToolsPanel> {
+  bool _terminalExpanded = true;
+
+  @override
+  void initState() {
+    super.initState();
+    if (widget.terminal == null) {
+      WidgetsBinding.instance.addPostFrameCallback((_) => widget.onEnsureTerminal());
+    }
+  }
+
+  @override
+  void didUpdateWidget(ProjectToolsPanel oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (widget.terminal == null && oldWidget.terminal?.projectId != widget.terminal?.projectId) {
+      WidgetsBinding.instance.addPostFrameCallback((_) => widget.onEnsureTerminal());
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final terminal = widget.terminal;
+    return SizedBox(
+      width: widget.width,
+      child: Column(
+        children: [
+          Material(
+            color: context.ditch.inspector,
+            child: InkWell(
+              onTap: () => setState(() => _terminalExpanded = !_terminalExpanded),
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(16, 12, 10, 12),
+                child: Row(
+                  children: [
+                    Icon(_terminalExpanded ? Icons.expand_more : Icons.chevron_right),
+                    const SizedBox(width: 6),
+                    const Icon(Icons.terminal, size: 17),
+                    const SizedBox(width: 8),
+                    const Expanded(child: Text('Terminal')),
+                    if (terminal == null)
+                      const Icon(Icons.more_horiz, size: 18),
+                  ],
+                ),
+              ),
+            ),
+          ),
+          if (_terminalExpanded)
+            SizedBox(
+              height: 250,
+              child: terminal == null
+                  ? const Center(child: Text('Starting project shell…'))
+                  : TerminalView(
+                      terminal.terminal,
+                      autofocus: false,
+                      theme: TerminalThemes.defaultTheme,
+                      padding: const EdgeInsets.all(8),
+                    ),
+            ),
+          const Divider(height: 1),
+          Expanded(
+            child: AttentionPanel(
+              width: widget.width,
+              events: widget.events,
+              canStopSession: widget.canStopSession,
+              onOpenSession: widget.onOpenSession,
+              onStopSession: widget.onStopSession,
+              onDismiss: widget.onDismiss,
+            ),
+          ),
+        ],
+      ),
     );
   }
 }

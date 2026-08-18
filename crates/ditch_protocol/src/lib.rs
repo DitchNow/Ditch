@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use ditch_core::{
-    AgentId, AgentRun, AppPaths, AttentionKind, CodexLaunchMode, PermissionRequest, Project,
-    ProjectGitPolicy, ProjectId, Task,
+    AgentExecutionProfile, AgentId, AgentRun, AppPaths, AttentionKind, CodexLaunchMode,
+    PermissionRequest, Project, ProjectGitPolicy, ProjectId, Task,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -50,12 +50,16 @@ pub enum ClientRequest {
         project_root: String,
         prompt: String,
         mode: CodexLaunchMode,
+        #[serde(default)]
+        execution_profile: AgentExecutionProfile,
     },
     ResumeCodexSession {
         project_name: String,
         project_root: String,
         thread_id: String,
         prompt: String,
+        #[serde(default)]
+        execution_profile: AgentExecutionProfile,
     },
     StartCodex {
         project_id: ProjectId,
@@ -65,6 +69,28 @@ pub enum ClientRequest {
     PromptAgent {
         agent_id: AgentId,
         prompt: String,
+        #[serde(default)]
+        execution_profile: AgentExecutionProfile,
+    },
+    ListAgentModels {
+        provider: ditch_core::AgentProvider,
+    },
+    OpenProjectTerminal {
+        project_id: ProjectId,
+        columns: u16,
+        rows: u16,
+    },
+    WriteProjectTerminal {
+        terminal_id: Uuid,
+        data: Vec<u8>,
+    },
+    ResizeProjectTerminal {
+        terminal_id: Uuid,
+        columns: u16,
+        rows: u16,
+    },
+    CloseProjectTerminal {
+        terminal_id: Uuid,
     },
     StopAgent {
         agent_id: AgentId,
@@ -94,10 +120,36 @@ pub enum ServerResponse {
     RuntimeStatus(RuntimeStatus),
     Snapshot(Snapshot),
     Projects(Vec<Project>),
+    AgentModels(Vec<AgentModel>),
+    ProjectTerminal(ProjectTerminal),
     ProjectCreated(Project),
     AgentStarted(AgentRun),
     Accepted,
     Error(ProtocolError),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AgentModel {
+    pub id: String,
+    pub display_name: String,
+    #[serde(default)]
+    pub is_default: bool,
+    #[serde(default)]
+    pub default_reasoning_effort: Option<String>,
+    #[serde(default)]
+    pub supported_reasoning_efforts: Vec<String>,
+    /// The maximum prompt context accepted by this model, when the provider
+    /// publishes it.  It is deliberately optional: model discovery is the
+    /// authority and Ditch must not invent a limit when it has none.
+    #[serde(default)]
+    pub context_window_tokens: Option<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProjectTerminal {
+    pub id: Uuid,
+    pub project_id: ProjectId,
+    pub shell: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -190,6 +242,15 @@ pub enum ServerEvent {
     ScrollbackAppended {
         agent_id: AgentId,
         bytes: usize,
+    },
+    ProjectTerminalOutput {
+        terminal_id: Uuid,
+        /// Raw PTY bytes. JSON serializes this as an array, preserving ANSI
+        /// control sequences and avoiding lossy text conversion in the daemon.
+        data: Vec<u8>,
+    },
+    ProjectTerminalExited {
+        terminal_id: Uuid,
     },
 }
 

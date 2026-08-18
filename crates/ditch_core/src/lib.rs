@@ -109,6 +109,27 @@ pub enum CodexLaunchMode {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum AgentApprovalPreset {
+    Ask,
+    ApproveForMe,
+    FullAccess,
+}
+
+impl Default for AgentApprovalPreset {
+    fn default() -> Self {
+        Self::ApproveForMe
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Default)]
+pub struct AgentExecutionProfile {
+    pub model: Option<String>,
+    pub reasoning_effort: Option<String>,
+    #[serde(default)]
+    pub approval: AgentApprovalPreset,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ProjectGitPolicy {
     RequireRepository,
     InitializeRepository,
@@ -166,6 +187,8 @@ pub struct AgentRun {
     pub provider: AgentProvider,
     pub state: AgentState,
     pub launch_mode: CodexLaunchMode,
+    #[serde(default)]
+    pub execution_profile: AgentExecutionProfile,
     pub project_id: ProjectId,
     pub task_id: Option<TaskId>,
     pub pane_id: Option<RuntimePaneId>,

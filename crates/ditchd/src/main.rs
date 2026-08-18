@@ -1,12 +1,14 @@
 use chrono::{DateTime, Utc};
 use ditch_core::{
-    AgentId, AgentProvider, AgentResumeBlockReason, AgentRun, AgentState, AppPaths, AttentionKind,
-    CodexLaunchMode, Project, ProjectGitPolicy,
+    AgentApprovalPreset, AgentExecutionProfile, AgentId, AgentProvider, AgentResumeBlockReason,
+    AgentRun, AgentState, AppPaths, AttentionKind, CodexLaunchMode, Project, ProjectGitPolicy,
 };
 use ditch_protocol::{
-    AgentChatMessage, AgentChatRole, ClientRequest, Envelope, HealthResponse, ProtocolError,
-    RuntimeAttention, RuntimeStatus, ServerEvent, ServerResponse, Snapshot,
+    AgentChatMessage, AgentChatRole, AgentModel, ClientRequest, Envelope, HealthResponse,
+    ProjectTerminal, ProtocolError, RuntimeAttention, RuntimeStatus, ServerEvent, ServerResponse,
+    Snapshot,
 };
+use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 use ditch_store::{
     DitchStore, discover_legacy_projects, ensure_app_dirs, ensure_project_metadata,
     load_project_config, save_project_config,
@@ -62,6 +64,8 @@ struct RuntimeState {
     projects: HashMap<String, Project>,
     agents: HashMap<AgentId, AgentRecord>,
     children: HashMap<AgentId, Arc<Mutex<Child>>>,
+    terminals: HashMap<uuid::Uuid, ProjectTerminalRecord>,
+    terminal_by_project: HashMap<ditch_core::ProjectId, uuid::Uuid>,
     subscribers: Vec<Sender<String>>,
     next_sequence: u64,
     instance_id: uuid::Uuid,
@@ -69,6 +73,13 @@ struct RuntimeState {
     started_at: DateTime<Utc>,
     codex_home: Option<PathBuf>,
     codex_binary: Option<String>,
+}
+
+struct ProjectTerminalRecord {
+    descriptor: ProjectTerminal,
+    master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
+    child: Box<dyn portable_pty::Child + Send>,
 }
 
 struct AgentRecord {
@@ -116,6 +127,8 @@ impl RuntimeState {
             projects,
             agents,
             children: HashMap::new(),
+            terminals: HashMap::new(),
+            terminal_by_project: HashMap::new(),
             subscribers: Vec::new(),
             next_sequence: 1,
             instance_id: uuid::Uuid::new_v4(),
@@ -410,14 +423,51 @@ fn handle_request(request: ClientRequest, state: Arc<Mutex<RuntimeState>>) -> Se
             project_root,
             prompt,
             mode,
-        } => start_codex_session(state, project_name, project_root, prompt, mode),
+            execution_profile,
+        } => start_codex_session(
+            state,
+            project_name,
+            project_root,
+            prompt,
+            mode,
+            execution_profile,
+        ),
         ClientRequest::ResumeCodexSession {
             project_name,
             project_root,
             thread_id,
             prompt,
-        } => resume_codex_session(state, project_name, project_root, thread_id, prompt),
-        ClientRequest::PromptAgent { agent_id, prompt } => prompt_agent(state, agent_id, prompt),
+            execution_profile,
+        } => resume_codex_session(
+            state,
+            project_name,
+            project_root,
+            thread_id,
+            prompt,
+            execution_profile,
+        ),
+        ClientRequest::PromptAgent {
+            agent_id,
+            prompt,
+            execution_profile,
+        } => prompt_agent(state, agent_id, prompt, execution_profile),
+        ClientRequest::ListAgentModels { provider } => list_agent_models(state, provider),
+        ClientRequest::OpenProjectTerminal {
+            project_id,
+            columns,
+            rows,
+        } => open_project_terminal(state, project_id, columns, rows),
+        ClientRequest::WriteProjectTerminal { terminal_id, data } => {
+            write_project_terminal(state, terminal_id, data)
+        }
+        ClientRequest::ResizeProjectTerminal {
+            terminal_id,
+            columns,
+            rows,
+        } => resize_project_terminal(state, terminal_id, columns, rows),
+        ClientRequest::CloseProjectTerminal { terminal_id } => {
+            close_project_terminal(state, terminal_id)
+        }
         ClientRequest::StopAgent { agent_id } => stop_agent(state, agent_id),
         ClientRequest::DeleteAgent { agent_id } => delete_agent(state, agent_id),
         ClientRequest::RenameAgent { agent_id, title } => rename_agent(state, agent_id, title),
@@ -484,12 +534,295 @@ fn shutdown_runtime(state: Arc<Mutex<RuntimeState>>) -> ServerResponse {
     ServerResponse::Accepted
 }
 
+fn list_agent_models(state: Arc<Mutex<RuntimeState>>, provider: AgentProvider) -> ServerResponse {
+    if provider != AgentProvider::Codex {
+        return ServerResponse::AgentModels(Vec::new());
+    }
+    let binary = state
+        .lock()
+        .expect("runtime state lock should not be poisoned")
+        .codex_binary
+        .clone();
+    let Some(binary) = binary else {
+        return protocol_error("codex_not_found", "Codex binary was not found on PATH");
+    };
+    match discover_codex_models(&binary) {
+        Ok(models) => ServerResponse::AgentModels(models),
+        Err(error) => protocol_error("codex_models_failed", error.to_string()),
+    }
+}
+
+fn terminal_size(columns: u16, rows: u16) -> PtySize {
+    PtySize {
+        cols: columns.clamp(2, 500),
+        rows: rows.clamp(2, 300),
+        pixel_width: 0,
+        pixel_height: 0,
+    }
+}
+
+fn open_project_terminal(
+    state: Arc<Mutex<RuntimeState>>,
+    project_id: ditch_core::ProjectId,
+    columns: u16,
+    rows: u16,
+) -> ServerResponse {
+    let (project_root, existing) = {
+        let state = state
+            .lock()
+            .expect("runtime state lock should not be poisoned");
+        let project = state.projects.values().find(|project| project.id == project_id);
+        let Some(project) = project else {
+            return protocol_error("project_not_found", "The selected project no longer exists");
+        };
+        let existing = state
+            .terminal_by_project
+            .get(&project_id)
+            .and_then(|id| state.terminals.get(id))
+            .map(|record| record.descriptor.clone());
+        (project.root.clone(), existing)
+    };
+    if let Some(existing) = existing {
+        return ServerResponse::ProjectTerminal(existing);
+    }
+
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_owned());
+    let pty_system = native_pty_system();
+    let pair = match pty_system.openpty(terminal_size(columns, rows)) {
+        Ok(pair) => pair,
+        Err(error) => return protocol_error("terminal_open_failed", error.to_string()),
+    };
+    let mut command = CommandBuilder::new(&shell);
+    command.arg("-l");
+    command.cwd(&project_root);
+    command.env("TERM", "xterm-256color");
+    command.env("COLORTERM", "truecolor");
+    let mut child = match pair.slave.spawn_command(command) {
+        Ok(child) => child,
+        Err(error) => return protocol_error("terminal_spawn_failed", error.to_string()),
+    };
+    drop(pair.slave);
+    let writer = match pair.master.take_writer() {
+        Ok(writer) => writer,
+        Err(error) => return protocol_error("terminal_writer_failed", error.to_string()),
+    };
+    let reader = match pair.master.try_clone_reader() {
+        Ok(reader) => reader,
+        Err(error) => return protocol_error("terminal_reader_failed", error.to_string()),
+    };
+    let terminal = ProjectTerminal {
+        id: uuid::Uuid::new_v4(),
+        project_id,
+        shell: shell.clone(),
+    };
+    let terminal_id = terminal.id;
+    let output_state = Arc::clone(&state);
+    thread::spawn(move || {
+        let mut reader = reader;
+        let mut buffer = [0_u8; 8192];
+        loop {
+            match std::io::Read::read(&mut reader, &mut buffer) {
+                Ok(0) | Err(_) => break,
+                Ok(bytes) => {
+                    let mut state = output_state
+                        .lock()
+                        .expect("runtime state lock should not be poisoned");
+                    state.broadcast(ServerEvent::ProjectTerminalOutput {
+                        terminal_id,
+                        data: buffer[..bytes].to_vec(),
+                    });
+                }
+            }
+        }
+        let mut state = output_state
+            .lock()
+            .expect("runtime state lock should not be poisoned");
+        state.broadcast(ServerEvent::ProjectTerminalExited { terminal_id });
+    });
+
+    let mut state = state
+        .lock()
+        .expect("runtime state lock should not be poisoned");
+    // A request can race with another UI connection. Keep the first terminal
+    // for the project and terminate this just-created duplicate safely.
+    if let Some(existing_id) = state.terminal_by_project.get(&project_id).copied() {
+        if let Some(existing) = state.terminals.get(&existing_id) {
+            let _ = child.kill();
+            return ServerResponse::ProjectTerminal(existing.descriptor.clone());
+        }
+    }
+    state.terminal_by_project.insert(project_id, terminal_id);
+    state.terminals.insert(
+        terminal_id,
+        ProjectTerminalRecord {
+            descriptor: terminal.clone(),
+            master: Arc::new(Mutex::new(pair.master)),
+            writer: Arc::new(Mutex::new(writer)),
+            child,
+        },
+    );
+    ServerResponse::ProjectTerminal(terminal)
+}
+
+fn write_project_terminal(
+    state: Arc<Mutex<RuntimeState>>,
+    terminal_id: uuid::Uuid,
+    data: Vec<u8>,
+) -> ServerResponse {
+    let writer = {
+        let state = state
+            .lock()
+            .expect("runtime state lock should not be poisoned");
+        state.terminals.get(&terminal_id).map(|record| Arc::clone(&record.writer))
+    };
+    let Some(writer) = writer else {
+        return protocol_error("terminal_not_found", "The terminal session is no longer active");
+    };
+    match writer.lock().expect("terminal writer lock should not be poisoned").write_all(&data) {
+        Ok(()) => ServerResponse::Accepted,
+        Err(error) => protocol_error("terminal_write_failed", error.to_string()),
+    }
+}
+
+fn resize_project_terminal(
+    state: Arc<Mutex<RuntimeState>>,
+    terminal_id: uuid::Uuid,
+    columns: u16,
+    rows: u16,
+) -> ServerResponse {
+    let master = {
+        let state = state
+            .lock()
+            .expect("runtime state lock should not be poisoned");
+        state.terminals.get(&terminal_id).map(|record| Arc::clone(&record.master))
+    };
+    let Some(master) = master else {
+        return protocol_error("terminal_not_found", "The terminal session is no longer active");
+    };
+    match master
+        .lock()
+        .expect("terminal master lock should not be poisoned")
+        .resize(terminal_size(columns, rows))
+    {
+        Ok(()) => ServerResponse::Accepted,
+        Err(error) => protocol_error("terminal_resize_failed", error.to_string()),
+    }
+}
+
+fn close_project_terminal(state: Arc<Mutex<RuntimeState>>, terminal_id: uuid::Uuid) -> ServerResponse {
+    let mut terminal = {
+        let mut state = state
+            .lock()
+            .expect("runtime state lock should not be poisoned");
+        let Some(terminal) = state.terminals.remove(&terminal_id) else {
+            return ServerResponse::Accepted;
+        };
+        state.terminal_by_project.remove(&terminal.descriptor.project_id);
+        terminal
+    };
+    let _ = terminal.child.kill();
+    ServerResponse::Accepted
+}
+
+fn discover_codex_models(binary: &str) -> io::Result<Vec<AgentModel>> {
+    let mut child = Command::new(binary)
+        .args(["app-server", "--stdio"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| io::Error::other("missing app-server stdin"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::other("missing app-server stdout"))?;
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::json!({"id":1,"method":"initialize","params":{"clientInfo":{"name":"the_ditch","title":"The Ditch","version":env!("CARGO_PKG_VERSION")}}})
+    )?;
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::json!({"method":"initialized","params":{}})
+    )?;
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::json!({"id":2,"method":"model/list","params":{"limit":100,"includeHidden":false}})
+    )?;
+    stdin.flush()?;
+    let mut models = Vec::new();
+    for line in BufReader::new(stdout).lines() {
+        let value: Value = serde_json::from_str(&line?)?;
+        if value.get("id").and_then(Value::as_i64) != Some(2) {
+            continue;
+        }
+        if let Some(error) = value.get("error") {
+            let _ = child.kill();
+            return Err(io::Error::other(error.to_string()));
+        }
+        for item in value
+            .pointer("/result/data")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let Some(id) = item.get("id").and_then(Value::as_str) else {
+                continue;
+            };
+            let efforts = item
+                .get("supportedReasoningEfforts")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|entry| entry.get("reasoningEffort").and_then(Value::as_str))
+                .map(str::to_owned)
+                .collect();
+            models.push(AgentModel {
+                id: id.to_owned(),
+                display_name: item
+                    .get("displayName")
+                    .and_then(Value::as_str)
+                    .unwrap_or(id)
+                    .to_owned(),
+                is_default: item
+                    .get("isDefault")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                default_reasoning_effort: item
+                    .get("defaultReasoningEffort")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                supported_reasoning_efforts: efforts,
+                context_window_tokens: item
+                    .get("contextWindowTokens")
+                    .or_else(|| item.get("contextWindow"))
+                    .or_else(|| item.get("context_window_tokens"))
+                    .and_then(|value| {
+                        value
+                            .as_u64()
+                            .or_else(|| value.as_str().and_then(|text| text.parse().ok()))
+                    }),
+            });
+        }
+        break;
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    Ok(models)
+}
+
 fn start_codex_session(
     state: Arc<Mutex<RuntimeState>>,
     project_name: String,
     project_root: String,
     prompt: String,
     mode: CodexLaunchMode,
+    execution_profile: ditch_core::AgentExecutionProfile,
 ) -> ServerResponse {
     let project = project_for_launch(&state, project_name, project_root);
     if let Err(error) = ensure_project_metadata(&project) {
@@ -502,6 +835,7 @@ fn start_codex_session(
         provider: AgentProvider::Codex,
         state: AgentState::Starting,
         launch_mode: mode.clone(),
+        execution_profile: execution_profile.clone(),
         project_id: project.id,
         task_id: None,
         pane_id: None,
@@ -540,8 +874,15 @@ fn start_codex_session(
             "Codex binary was not found on PATH".to_owned(),
         );
     };
-    let child = match spawn_codex_child(&binary, &project.root, &prompt, &mode, None, allow_non_git)
-    {
+    let child = match spawn_codex_child(
+        &binary,
+        &project.root,
+        &prompt,
+        &mode,
+        None,
+        allow_non_git,
+        &execution_profile,
+    ) {
         Ok(child) => Arc::new(Mutex::new(child)),
         Err(error) => {
             return persist_launch_failure(
@@ -719,6 +1060,7 @@ fn resume_codex_session(
     project_root: String,
     thread_id: String,
     prompt: String,
+    execution_profile: ditch_core::AgentExecutionProfile,
 ) -> ServerResponse {
     let project = project_for_launch(&state, project_name, project_root);
     if let Err(message) = validate_thread_project(&state, &thread_id, &project.root) {
@@ -734,6 +1076,7 @@ fn resume_codex_session(
         provider: AgentProvider::Codex,
         state: AgentState::Starting,
         launch_mode: CodexLaunchMode::Exec,
+        execution_profile: execution_profile.clone(),
         project_id: project.id,
         task_id: None,
         pane_id: None,
@@ -779,6 +1122,7 @@ fn resume_codex_session(
         &CodexLaunchMode::Exec,
         Some(&thread_id),
         allow_non_git,
+        &execution_profile,
     ) {
         Ok(child) => Arc::new(Mutex::new(child)),
         Err(error) => {
@@ -872,6 +1216,7 @@ fn prompt_agent(
     state: Arc<Mutex<RuntimeState>>,
     agent_id: AgentId,
     prompt: String,
+    execution_profile: ditch_core::AgentExecutionProfile,
 ) -> ServerResponse {
     let (project_root, thread_id, allow_non_git) = {
         let state = state
@@ -925,6 +1270,7 @@ fn prompt_agent(
         &CodexLaunchMode::Exec,
         thread_id.as_deref(),
         allow_non_git,
+        &execution_profile,
     ) {
         Ok(child) => Arc::new(Mutex::new(child)),
         Err(error) => {
@@ -950,6 +1296,7 @@ fn prompt_agent(
             return protocol_error("agent_not_found", "agent session was not found");
         };
         record.run.state = AgentState::Working;
+        record.run.execution_profile = execution_profile;
         record.run.current_prompt = Some(prompt);
         record.run.last_visible_action = Some("Prompt sent to Codex".to_owned());
         record.run.updated_at = Utc::now();
@@ -1586,9 +1933,16 @@ fn spawn_codex_child(
     mode: &CodexLaunchMode,
     resume_thread: Option<&str>,
     allow_non_git: bool,
+    execution_profile: &AgentExecutionProfile,
 ) -> io::Result<Child> {
     let mut command = Command::new(binary);
-    command.args(codex_child_args(cwd, mode, resume_thread, allow_non_git));
+    command.args(codex_child_args(
+        cwd,
+        mode,
+        resume_thread,
+        allow_non_git,
+        execution_profile,
+    ));
     command.current_dir(cwd);
     command.env("TERM", "xterm-256color");
     if let Some(codex_home) = std::env::var_os("CODEX_HOME") {
@@ -1612,12 +1966,12 @@ fn codex_child_args(
     mode: &CodexLaunchMode,
     resume_thread: Option<&str>,
     allow_non_git: bool,
+    execution_profile: &AgentExecutionProfile,
 ) -> Vec<String> {
     let mut args = match (resume_thread, mode) {
-        (Some(_), _) => vec!["exec".to_owned(), "--approve-for-me".to_owned()],
+        (Some(_), _) => vec!["exec".to_owned()],
         (None, CodexLaunchMode::Exec) | (None, CodexLaunchMode::InteractiveTui) => vec![
             "exec".to_owned(),
-            "--approve-for-me".to_owned(),
             "--json".to_owned(),
             "--color".to_owned(),
             "never".to_owned(),
@@ -1626,6 +1980,29 @@ fn codex_child_args(
             "-".to_owned(),
         ],
     };
+    let mut profile_args = Vec::new();
+    match execution_profile.approval {
+        AgentApprovalPreset::Ask => profile_args.extend([
+            "--sandbox".to_owned(),
+            "workspace-write".to_owned(),
+            "--ask-for-approval".to_owned(),
+            "on-request".to_owned(),
+        ]),
+        AgentApprovalPreset::ApproveForMe => profile_args.push("--approve-for-me".to_owned()),
+        AgentApprovalPreset::FullAccess => {
+            profile_args.push("--dangerously-bypass-approvals-and-sandbox".to_owned())
+        }
+    }
+    if let Some(model) = execution_profile.model.as_deref() {
+        profile_args.extend(["--model".to_owned(), model.to_owned()]);
+    }
+    if let Some(effort) = execution_profile.reasoning_effort.as_deref() {
+        profile_args.extend([
+            "--config".to_owned(),
+            format!("model_reasoning_effort=\"{effort}\""),
+        ]);
+    }
+    args.splice(1..1, profile_args);
     if allow_non_git {
         args.insert(1, "--skip-git-repo-check".to_owned());
     }
@@ -1730,6 +2107,7 @@ mod tests {
             &CodexLaunchMode::Exec,
             None,
             false,
+            &AgentExecutionProfile::default(),
         );
 
         assert_eq!(
@@ -1754,6 +2132,7 @@ mod tests {
             &CodexLaunchMode::Exec,
             Some("thread-123"),
             false,
+            &AgentExecutionProfile::default(),
         );
 
         assert_eq!(
@@ -1777,16 +2156,67 @@ mod tests {
             &CodexLaunchMode::Exec,
             None,
             true,
+            &AgentExecutionProfile::default(),
         );
         let resumed = codex_child_args(
             Path::new("/tmp/project"),
             &CodexLaunchMode::Exec,
             Some("thread-123"),
             true,
+            &AgentExecutionProfile::default(),
         );
 
         assert_eq!(fresh[1], "--skip-git-repo-check");
         assert_eq!(resumed[1], "--skip-git-repo-check");
+    }
+
+    #[test]
+    fn codex_execution_profile_maps_approval_and_model_flags() {
+        let ask = AgentExecutionProfile {
+            model: Some("gpt-test".to_owned()),
+            reasoning_effort: Some("high".to_owned()),
+            approval: AgentApprovalPreset::Ask,
+        };
+        let ask_args = codex_child_args(
+            Path::new("/tmp/project"),
+            &CodexLaunchMode::Exec,
+            None,
+            false,
+            &ask,
+        );
+        assert!(
+            ask_args
+                .windows(2)
+                .any(|args| args == ["--model", "gpt-test"])
+        );
+        assert!(
+            ask_args
+                .windows(2)
+                .any(|args| args == ["--sandbox", "workspace-write"])
+        );
+        assert!(
+            ask_args
+                .windows(2)
+                .any(|args| args == ["--ask-for-approval", "on-request"])
+        );
+
+        let full_access = AgentExecutionProfile {
+            approval: AgentApprovalPreset::FullAccess,
+            ..Default::default()
+        };
+        let full_access_args = codex_child_args(
+            Path::new("/tmp/project"),
+            &CodexLaunchMode::Exec,
+            Some("thread-123"),
+            false,
+            &full_access,
+        );
+        assert!(
+            full_access_args
+                .iter()
+                .any(|arg| arg == "--dangerously-bypass-approvals-and-sandbox")
+        );
+        assert!(!full_access_args.iter().any(|arg| arg == "--approve-for-me"));
     }
 
     #[test]
@@ -1821,6 +2251,7 @@ mod tests {
                     provider: AgentProvider::Codex,
                     state: AgentState::Working,
                     launch_mode: CodexLaunchMode::Exec,
+                    execution_profile: AgentExecutionProfile::default(),
                     project_id: project.id,
                     task_id: None,
                     pane_id: None,
@@ -1853,7 +2284,12 @@ mod tests {
 
         finish_agent(&state, agent_id, Some(1));
 
-        let response = prompt_agent(Arc::clone(&state), agent_id, "retry".to_owned());
+        let response = prompt_agent(
+            Arc::clone(&state),
+            agent_id,
+            "retry".to_owned(),
+            AgentExecutionProfile::default(),
+        );
         assert!(matches!(
             response,
             ServerResponse::Error(ProtocolError { ref code, .. }) if code == "agent_not_resumable"
@@ -1896,6 +2332,7 @@ mod tests {
                     provider: AgentProvider::Codex,
                     state: AgentState::Working,
                     launch_mode: CodexLaunchMode::Exec,
+                    execution_profile: AgentExecutionProfile::default(),
                     project_id: project.id,
                     task_id: None,
                     pane_id: None,
@@ -1956,6 +2393,7 @@ mod tests {
                     provider: AgentProvider::Codex,
                     state: AgentState::Failed,
                     launch_mode: CodexLaunchMode::Exec,
+                    execution_profile: AgentExecutionProfile::default(),
                     project_id: project.id,
                     task_id: None,
                     pane_id: None,

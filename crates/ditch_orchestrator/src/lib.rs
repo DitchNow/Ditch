@@ -48,6 +48,7 @@ where
             provider: AgentProvider::Codex,
             state: AgentState::Starting,
             launch_mode: request.mode,
+            execution_profile: Default::default(),
             project_id: request.project.id,
             task_id: request.task_id,
             pane_id: Some(pane.id),

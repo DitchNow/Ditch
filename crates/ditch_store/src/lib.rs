@@ -506,6 +506,7 @@ mod tests {
             provider: ditch_core::AgentProvider::Codex,
             state: AgentState::Working,
             launch_mode: ditch_core::CodexLaunchMode::Exec,
+            execution_profile: Default::default(),
             project_id: project.id,
             task_id: None,
             pane_id: None,
