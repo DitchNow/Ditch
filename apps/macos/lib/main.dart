@@ -19,21 +19,72 @@ void main() {
   runApp(const TheDitchApp());
 }
 
-class TheDitchApp extends StatelessWidget {
+final ditchThemeMode = ValueNotifier<ThemeMode>(ThemeMode.system);
+
+class TheDitchApp extends StatefulWidget {
   const TheDitchApp({this.connectRuntimeOnStart = true, super.key});
 
   final bool connectRuntimeOnStart;
 
   @override
+  State<TheDitchApp> createState() => _TheDitchAppState();
+}
+
+class _TheDitchAppState extends State<TheDitchApp> {
+  static const _applicationChannel = MethodChannel('the_ditch/application');
+
+  @override
+  void initState() {
+    super.initState();
+    unawaited(_loadThemeMode());
+  }
+
+  Future<void> _loadThemeMode() async {
+    try {
+      final stored = await _applicationChannel.invokeMethod<String>(
+        'getThemeMode',
+      );
+      ditchThemeMode.value = switch (stored) {
+        'light' => ThemeMode.light,
+        'dark' => ThemeMode.dark,
+        _ => ThemeMode.system,
+      };
+    } on MissingPluginException {
+      // Widget tests and non-macOS hosts use the system default.
+    }
+  }
+
+  @override
   Widget build(BuildContext context) {
-    return MaterialApp(
-      title: 'The Ditch',
-      debugShowCheckedModeBanner: false,
-      theme: DitchTheme.light(),
-      darkTheme: DitchTheme.dark(),
-      themeMode: ThemeMode.system,
-      home: CommandCenterScreen(connectRuntimeOnStart: connectRuntimeOnStart),
+    return ValueListenableBuilder<ThemeMode>(
+      valueListenable: ditchThemeMode,
+      builder: (context, themeMode, _) => MaterialApp(
+        title: 'The Ditch',
+        debugShowCheckedModeBanner: false,
+        theme: DitchTheme.light(),
+        darkTheme: DitchTheme.dark(),
+        themeMode: themeMode,
+        home: CommandCenterScreen(
+          connectRuntimeOnStart: widget.connectRuntimeOnStart,
+        ),
+      ),
     );
+  }
+}
+
+Future<void> setDitchThemeMode(ThemeMode mode) async {
+  ditchThemeMode.value = mode;
+  try {
+    await const MethodChannel('the_ditch/application').invokeMethod<void>(
+      'setThemeMode',
+      switch (mode) {
+        ThemeMode.light => 'light',
+        ThemeMode.dark => 'dark',
+        ThemeMode.system => 'system',
+      },
+    );
+  } on MissingPluginException {
+    // Tests and non-macOS hosts have no persistence channel.
   }
 }
 
@@ -551,6 +602,12 @@ class CommandCenterScreen extends StatefulWidget {
 }
 
 class _CommandCenterScreenState extends State<CommandCenterScreen> {
+  static const _defaultProjectSidebarWidth = 240.0;
+  static const _defaultInspectorWidth = 320.0;
+  static const _minimumProjectSidebarWidth = 160.0;
+  static const _minimumInspectorWidth = 220.0;
+  static const _minimumAgentsWidth = 320.0;
+  static const _splitterExtent = 9.0;
   static const _defaultStartPrompt = '';
   static const _bootstrapProject = DitchProject(
     name: 'The Ditch',
@@ -582,6 +639,8 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
   TerminalPresentation _terminalRestorePresentation =
       TerminalPresentation.docked;
   bool _dockedTerminalExpanded = true;
+  double _projectSidebarWidth = _defaultProjectSidebarWidth;
+  double _inspectorWidth = _defaultInspectorWidth;
   String _selectedProjectKey = canonicalProjectPath(_bootstrapProject.path);
   String? _expandedAgentLocalId;
   String? _focusedAgentLocalId;
@@ -635,6 +694,63 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
 
   void _restoreMaximizedTerminal() {
     _setTerminalPresentation(_terminalRestorePresentation);
+  }
+
+  Future<void> _loadPaneWidths() async {
+    try {
+      final stored = await _applicationChannel.invokeMapMethod<String, dynamic>(
+        'getPaneWidths',
+      );
+      final projects = (stored?['projects'] as num?)?.toDouble() ?? 0;
+      final inspector = (stored?['inspector'] as num?)?.toDouble() ?? 0;
+      if (!mounted) return;
+      setState(() {
+        if (projects >= _minimumProjectSidebarWidth) {
+          _projectSidebarWidth = projects;
+        }
+        if (inspector >= _minimumInspectorWidth) {
+          _inspectorWidth = inspector;
+        }
+      });
+    } on MissingPluginException {
+      // Widget tests and non-macOS hosts keep the defaults.
+    }
+  }
+
+  Future<void> _persistPaneWidths() async {
+    try {
+      await _applicationChannel.invokeMethod<void>('setPaneWidths', {
+        'projects': _projectSidebarWidth,
+        'inspector': _inspectorWidth,
+      });
+    } on MissingPluginException {
+      // Persistence is native-only.
+    }
+  }
+
+  double _maximumProjectSidebarWidth(
+    double workspaceWidth,
+    bool showInspector,
+  ) {
+    final reservedInspector = showInspector
+        ? _inspectorWidth + _splitterExtent
+        : 0.0;
+    return (workspaceWidth -
+            reservedInspector -
+            _minimumAgentsWidth -
+            _splitterExtent)
+        .clamp(_minimumProjectSidebarWidth, 520.0);
+  }
+
+  double _maximumInspectorWidth(double workspaceWidth, bool showSidebar) {
+    final reservedProjects = showSidebar
+        ? _projectSidebarWidth + _splitterExtent
+        : 0.0;
+    return (workspaceWidth -
+            reservedProjects -
+            _minimumAgentsWidth -
+            _splitterExtent)
+        .clamp(_minimumInspectorWidth, 620.0);
   }
 
   Future<void> _ensureSelectedProjectTerminal() async {
@@ -1019,6 +1135,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
   void initState() {
     super.initState();
     _scheduleStatusBarUpdate();
+    unawaited(_loadPaneWidths());
     if (widget.connectRuntimeOnStart) {
       unawaited(_connectRuntime());
     }
@@ -1869,6 +1986,17 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
                   presentation.inspectorVisible &&
                   !compact &&
                   _focusedAgentLocalId == null;
+              final projectSidebarWidth = _projectSidebarWidth.clamp(
+                _minimumProjectSidebarWidth,
+                _maximumProjectSidebarWidth(
+                  constraints.maxWidth,
+                  showInspector,
+                ),
+              );
+              final inspectorWidth = _inspectorWidth.clamp(
+                _minimumInspectorWidth,
+                _maximumInspectorWidth(constraints.maxWidth, showSidebar),
+              );
               final agentsSurface = AgentsSurface(
                 sessions: _visibleSessions,
                 expandedAgentLocalId: _expandedAgentLocalId,
@@ -1899,7 +2027,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
                   ? null
                   : _projectTerminals[_selectedProject.id];
               final projectToolsPanel = ProjectToolsPanel(
-                width: 320,
+                width: inspectorWidth,
                 terminal: selectedTerminal,
                 onEnsureTerminal: _ensureSelectedProjectTerminal,
                 presentation: _terminalPresentation,
@@ -1921,7 +2049,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
                 onDismiss: _dismissAttention,
               );
               final attentionOnly = AttentionPanel(
-                width: 320,
+                width: inspectorWidth,
                 events: _visibleAttention,
                 canStopSession: _canStopAttentionSession,
                 onOpenSession: _openAttentionSession,
@@ -1940,7 +2068,27 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
                   children: [
                     Expanded(child: agentsSurface),
                     if (showInspector) ...[
-                      const VerticalDivider(width: 1),
+                      WorkspaceResizeHandle(
+                        key: const Key('inspector-resize-handle'),
+                        onDragUpdate: (delta) {
+                          setState(() {
+                            _inspectorWidth = (inspectorWidth - delta).clamp(
+                              _minimumInspectorWidth,
+                              _maximumInspectorWidth(
+                                constraints.maxWidth,
+                                showSidebar,
+                              ),
+                            );
+                          });
+                        },
+                        onDragEnd: _persistPaneWidths,
+                        onReset: () {
+                          setState(
+                            () => _inspectorWidth = _defaultInspectorWidth,
+                          );
+                          unawaited(_persistPaneWidths());
+                        },
+                      ),
                       attentionOnlyMode ? attentionOnly : projectToolsPanel,
                     ],
                   ],
@@ -1993,12 +2141,35 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
                   children: [
                     if (showSidebar) ...[
                       ProjectSidebar(
+                        width: projectSidebarWidth,
                         projects: _projects,
                         selectedIndex: _selectedProjectIndex,
                         onAddProject: _addProject,
                         onSelectProject: _selectProject,
                       ),
-                      const VerticalDivider(width: 1),
+                      WorkspaceResizeHandle(
+                        key: const Key('projects-resize-handle'),
+                        onDragUpdate: (delta) {
+                          setState(() {
+                            _projectSidebarWidth = (projectSidebarWidth + delta)
+                                .clamp(
+                                  _minimumProjectSidebarWidth,
+                                  _maximumProjectSidebarWidth(
+                                    constraints.maxWidth,
+                                    showInspector,
+                                  ),
+                                );
+                          });
+                        },
+                        onDragEnd: _persistPaneWidths,
+                        onReset: () {
+                          setState(
+                            () => _projectSidebarWidth =
+                                _defaultProjectSidebarWidth,
+                          );
+                          unawaited(_persistPaneWidths());
+                        },
+                      ),
                     ],
                     Expanded(child: body),
                   ],
@@ -2069,18 +2240,9 @@ class DitchToolbar extends StatelessWidget {
   Widget build(BuildContext context) {
     final tokens = context.ditch;
     final (label, color) = switch (connection) {
-      RuntimeConnectionPhase.connected => (
-        'Connected',
-        const Color(0xff34c759),
-      ),
-      RuntimeConnectionPhase.connecting => (
-        'Connecting',
-        const Color(0xffff9f0a),
-      ),
-      RuntimeConnectionPhase.reconnecting => (
-        'Reconnecting',
-        const Color(0xffff9f0a),
-      ),
+      RuntimeConnectionPhase.connected => ('Connected', tokens.success),
+      RuntimeConnectionPhase.connecting => ('Connecting', tokens.waiting),
+      RuntimeConnectionPhase.reconnecting => ('Reconnecting', tokens.waiting),
       RuntimeConnectionPhase.unavailable => (
         'Runtime unavailable',
         Theme.of(context).colorScheme.error,
@@ -2118,6 +2280,25 @@ class DitchToolbar extends StatelessWidget {
             const SizedBox(width: 7),
             Text(label, style: Theme.of(context).textTheme.bodySmall),
             const SizedBox(width: 6),
+            PopupMenuButton<ThemeMode>(
+              key: const Key('theme-mode-menu'),
+              tooltip: 'Appearance',
+              initialValue: ditchThemeMode.value,
+              onSelected: (mode) => unawaited(setDitchThemeMode(mode)),
+              icon: Icon(
+                Theme.of(context).brightness == Brightness.dark
+                    ? Icons.dark_mode_outlined
+                    : Icons.light_mode_outlined,
+              ),
+              itemBuilder: (context) => const [
+                PopupMenuItem(
+                  value: ThemeMode.system,
+                  child: Text('System appearance'),
+                ),
+                PopupMenuItem(value: ThemeMode.light, child: Text('Light')),
+                PopupMenuItem(value: ThemeMode.dark, child: Text('Dark')),
+              ],
+            ),
             Badge(
               isLabelVisible: attentionCount > 0,
               label: Text('$attentionCount'),
@@ -2271,8 +2452,69 @@ class RuntimeRecoveryView extends StatelessWidget {
   }
 }
 
+class WorkspaceResizeHandle extends StatefulWidget {
+  const WorkspaceResizeHandle({
+    required this.onDragUpdate,
+    required this.onDragEnd,
+    required this.onReset,
+    super.key,
+  });
+
+  final ValueChanged<double> onDragUpdate;
+  final Future<void> Function() onDragEnd;
+  final VoidCallback onReset;
+
+  @override
+  State<WorkspaceResizeHandle> createState() => _WorkspaceResizeHandleState();
+}
+
+class _WorkspaceResizeHandleState extends State<WorkspaceResizeHandle> {
+  bool _active = false;
+
+  void _setActive(bool value) {
+    if (_active == value) return;
+    setState(() => _active = value);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return MouseRegion(
+      cursor: SystemMouseCursors.resizeLeftRight,
+      onEnter: (_) => _setActive(true),
+      onExit: (_) => _setActive(false),
+      child: GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onDoubleTap: widget.onReset,
+        onHorizontalDragStart: (_) => _setActive(true),
+        onHorizontalDragUpdate: (details) =>
+            widget.onDragUpdate(details.delta.dx),
+        onHorizontalDragEnd: (_) {
+          _setActive(false);
+          unawaited(widget.onDragEnd());
+        },
+        child: Semantics(
+          label: 'Resize pane',
+          child: SizedBox(
+            width: _CommandCenterScreenState._splitterExtent,
+            child: Center(
+              child: AnimatedContainer(
+                duration: MediaQuery.disableAnimationsOf(context)
+                    ? const Duration(milliseconds: 1)
+                    : const Duration(milliseconds: 170),
+                width: _active ? 2 : 1,
+                color: _active ? context.ditch.accent : context.ditch.separator,
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
 class ProjectSidebar extends StatelessWidget {
   const ProjectSidebar({
+    required this.width,
     required this.projects,
     required this.selectedIndex,
     required this.onAddProject,
@@ -2280,6 +2522,7 @@ class ProjectSidebar extends StatelessWidget {
     super.key,
   });
 
+  final double width;
   final List<DitchProject> projects;
   final int selectedIndex;
   final VoidCallback onAddProject;
@@ -2291,7 +2534,7 @@ class ProjectSidebar extends StatelessWidget {
     return ColoredBox(
       color: context.ditch.sidebar,
       child: SizedBox(
-        width: 240,
+        width: width,
         child: SafeArea(
           top: false,
           child: Padding(
@@ -3309,10 +3552,18 @@ class _ThinkingStatusStripState extends State<ThinkingStatusStrip>
 
   @override
   Widget build(BuildContext context) {
-    final colors = Theme.of(context).colorScheme;
+    final tokens = context.ditch;
+    final reduceMotion = MediaQuery.disableAnimationsOf(context);
+    if (reduceMotion && _controller.isAnimating) {
+      _controller.stop();
+    } else if (!reduceMotion && widget.visible && !_controller.isAnimating) {
+      _controller.repeat();
+    }
 
     return AnimatedSwitcher(
-      duration: const Duration(milliseconds: 160),
+      duration: reduceMotion
+          ? const Duration(milliseconds: 1)
+          : const Duration(milliseconds: 170),
       child: widget.visible
           ? Container(
               key: const ValueKey('thinking-status'),
@@ -3322,8 +3573,10 @@ class _ThinkingStatusStripState extends State<ThinkingStatusStrip>
                 alignment: Alignment.centerLeft,
                 child: DecoratedBox(
                   decoration: BoxDecoration(
-                    color: colors.inverseSurface,
-                    borderRadius: BorderRadius.circular(8),
+                    color: tokens.waitingSoft,
+                    borderRadius: BorderRadius.circular(
+                      context.ditch.radiusCompact,
+                    ),
                   ),
                   child: Padding(
                     padding: const EdgeInsets.symmetric(
@@ -3333,11 +3586,13 @@ class _ThinkingStatusStripState extends State<ThinkingStatusStrip>
                     child: AnimatedBuilder(
                       animation: _controller,
                       builder: (context, _) {
-                        final dots = 1 + (_controller.value * 3).floor();
+                        final dots = reduceMotion
+                            ? 1
+                            : 1 + (_controller.value * 3).floor();
                         return Text(
                           'Thinking${'.' * dots}',
                           style: Theme.of(context).textTheme.labelLarge
-                              ?.copyWith(color: colors.onInverseSurface),
+                              ?.copyWith(color: tokens.waiting),
                         );
                       },
                     ),
@@ -3460,7 +3715,8 @@ class AgentComposerState extends State<AgentComposer> {
     final hasText = _draftText.trim().isNotEmpty;
     final actionLabel = widget.hasSession ? 'Send' : 'Start';
     final actionIcon = widget.hasSession ? Icons.send : Icons.play_arrow;
-    final enabled = widget.enabled && !widget.isWorking;
+    final editable = widget.enabled;
+    final canSubmit = widget.enabled && !widget.isWorking;
 
     return Padding(
       padding: const EdgeInsets.all(12),
@@ -3552,40 +3808,51 @@ class AgentComposerState extends State<AgentComposer> {
                   },
                 ),
                 const SizedBox(height: 8),
-                Row(
-                  crossAxisAlignment: CrossAxisAlignment.end,
-                  children: [
-                    Expanded(
-                      child: SizedBox(
-                        height: 72,
-                        child: NativeComposerTextView(
-                          key: _nativeComposerKey,
-                          initialText: widget.initialText,
-                          enabled: enabled,
-                          placeholder: widget.hasSession
-                              ? 'Send a follow-up to Codex'
-                              : 'Tell Codex what to do',
-                          onChanged: _handleChanged,
-                          onSubmitRequested: submit,
-                          onEnlarge: widget.onEnlarge,
-                          onEscape: widget.onEscape,
+                LayoutBuilder(
+                  builder: (context, constraints) => Row(
+                    crossAxisAlignment: CrossAxisAlignment.end,
+                    children: [
+                      Expanded(
+                        child: SizedBox(
+                          height: 72,
+                          child: NativeComposerTextView(
+                            key: _nativeComposerKey,
+                            initialText: widget.initialText,
+                            enabled: editable,
+                            placeholder: widget.hasSession
+                                ? 'Send a follow-up to Codex'
+                                : 'Tell Codex what to do',
+                            onChanged: _handleChanged,
+                            onSubmitRequested: submit,
+                            onEnlarge: widget.onEnlarge,
+                            onEscape: widget.onEscape,
+                          ),
                         ),
                       ),
-                    ),
-                    const SizedBox(width: 10),
-                    if (widget.isWorking)
-                      IconButton.filledTonal(
-                        onPressed: widget.onStop,
-                        tooltip: 'Stop Codex',
-                        icon: const Icon(Icons.stop_circle_outlined),
-                      )
-                    else
-                      FilledButton.icon(
-                        onPressed: hasText && enabled ? submit : null,
-                        icon: Icon(actionIcon),
-                        label: Text(actionLabel),
-                      ),
-                  ],
+                      const SizedBox(width: 6),
+                      if (widget.isWorking)
+                        IconButton.filledTonal(
+                          onPressed: widget.onStop,
+                          tooltip: 'Stop Codex',
+                          icon: const Icon(Icons.stop_circle_outlined),
+                        )
+                      else if (constraints.maxWidth < 190)
+                        FilledButton.icon(
+                          onPressed: hasText && canSubmit ? submit : null,
+                          icon: Icon(actionIcon),
+                          label: Text(actionLabel),
+                          style: FilledButton.styleFrom(
+                            padding: const EdgeInsets.symmetric(horizontal: 10),
+                          ),
+                        )
+                      else
+                        FilledButton.icon(
+                          onPressed: hasText && canSubmit ? submit : null,
+                          icon: Icon(actionIcon),
+                          label: Text(actionLabel),
+                        ),
+                    ],
+                  ),
                 ),
               ],
             ),
@@ -3673,6 +3940,7 @@ class NativeComposerTextViewState extends State<NativeComposerTextView> {
   MethodChannel? _channel;
   bool? _lastSentEnabled;
   bool _focusRequested = false;
+  int? _lastAppearanceHash;
   late final TextEditingController _fallbackController;
   late final FocusNode _fallbackFocusNode;
 
@@ -3772,8 +4040,33 @@ class NativeComposerTextViewState extends State<NativeComposerTextView> {
     }
   }
 
+  Map<String, Object> _appearance(BuildContext context) {
+    final tokens = context.ditch;
+    return {
+      'textColor': tokens.ink.toARGB32(),
+      'placeholderColor': tokens.muted.toARGB32(),
+      'caretColor': tokens.accent.toARGB32(),
+      'fontName': 'Avenir Next',
+    };
+  }
+
+  Future<void> _syncNativeAppearance(BuildContext context) async {
+    final channel = _channel;
+    if (channel == null || !mounted) return;
+    final appearance = _appearance(context);
+    final hash = Object.hashAll(appearance.values);
+    if (_lastAppearanceHash == hash) return;
+    _lastAppearanceHash = hash;
+    await channel.invokeMethod<void>('setAppearance', appearance);
+  }
+
   @override
   Widget build(BuildContext context) {
+    if (_channel != null) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) unawaited(_syncNativeAppearance(context));
+      });
+    }
     if (kIsWeb || defaultTargetPlatform != TargetPlatform.macOS) {
       return CallbackShortcuts(
         bindings: {
@@ -3806,12 +4099,14 @@ class NativeComposerTextViewState extends State<NativeComposerTextView> {
         'placeholder': widget.placeholder,
         'fontSize': 14.0,
         'escapeEnabled': widget.onEscape != null,
+        ..._appearance(context),
       },
       creationParamsCodec: const StandardMessageCodec(),
       onPlatformViewCreated: (id) {
         final channel = MethodChannel('the_ditch/composer_text_view/$id');
         _channel = channel;
         _lastSentEnabled = widget.enabled;
+        unawaited(_syncNativeAppearance(context));
         channel.setMethodCallHandler((call) async {
           if (call.method == 'textChanged') {
             final text = call.arguments as String? ?? '';
@@ -4101,8 +4396,9 @@ class ProjectTerminalSurface extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final terminalTheme = ditchTerminalTheme(context);
     return ColoredBox(
-      color: TerminalThemes.defaultTheme.background,
+      color: terminalTheme.background,
       child: Column(
         children: [
           ProjectTerminalHeader(
@@ -4140,7 +4436,7 @@ class ProjectTerminalBody extends StatelessWidget {
         : TerminalView(
             terminal!.terminal,
             autofocus: false,
-            theme: TerminalThemes.defaultTheme,
+            theme: ditchTerminalTheme(context),
             padding: const EdgeInsets.all(8),
             onKeyEvent: onEscape == null
                 ? null
@@ -4154,6 +4450,36 @@ class ProjectTerminalBody extends StatelessWidget {
                   },
           );
   }
+}
+
+TerminalTheme ditchTerminalTheme(BuildContext context) {
+  final tokens = context.ditch;
+  final dark = Theme.of(context).brightness == Brightness.dark;
+  return TerminalTheme(
+    cursor: tokens.accent,
+    selection: tokens.accent.withValues(alpha: 0.30),
+    foreground: dark ? const Color(0xffeef0f4) : const Color(0xff272d39),
+    background: dark ? const Color(0xff090c12) : const Color(0xfff7f6f2),
+    black: dark ? const Color(0xff111620) : const Color(0xff272d39),
+    red: tokens.error,
+    green: tokens.success,
+    yellow: tokens.waiting,
+    blue: tokens.running,
+    magenta: dark ? const Color(0xffd7a7f2) : const Color(0xff7f3ca3),
+    cyan: dark ? const Color(0xff7fd8df) : const Color(0xff167078),
+    white: dark ? const Color(0xffeef0f4) : const Color(0xfff7f6f2),
+    brightBlack: tokens.muted,
+    brightRed: dark ? const Color(0xffffaaa0) : const Color(0xffd55245),
+    brightGreen: dark ? const Color(0xff91e2b9) : const Color(0xff249361),
+    brightYellow: dark ? const Color(0xffffca79) : const Color(0xffba6e08),
+    brightBlue: dark ? const Color(0xffc7d5ff) : const Color(0xff4469bb),
+    brightMagenta: dark ? const Color(0xffe6bef7) : const Color(0xff9852b8),
+    brightCyan: dark ? const Color(0xffa0eaf0) : const Color(0xff238891),
+    brightWhite: tokens.ink,
+    searchHitBackground: tokens.accentSoft,
+    searchHitBackgroundCurrent: tokens.accent,
+    searchHitForeground: const Color(0xff17120d),
+  );
 }
 
 class ProjectTerminalHeader extends StatelessWidget {
@@ -4198,29 +4524,32 @@ class ProjectTerminalHeader extends StatelessWidget {
             Expanded(
               child: InkWell(
                 onTap: onTitleTap,
-                child: Padding(
-                  padding: EdgeInsets.only(left: onClose == null ? 14 : 4),
-                  child: Row(
-                    children: [
-                      Icon(
-                        expanded ? Icons.expand_more : Icons.chevron_right,
-                        size: 18,
-                      ),
-                      const SizedBox(width: 6),
-                      const Icon(Icons.terminal, size: 17),
-                      const SizedBox(width: 8),
-                      const Expanded(
-                        child: Text(
-                          'Terminal',
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
+                child: LayoutBuilder(
+                  builder: (context, constraints) => Padding(
+                    padding: EdgeInsets.only(left: onClose == null ? 14 : 4),
+                    child: Row(
+                      children: [
+                        Icon(
+                          expanded ? Icons.expand_more : Icons.chevron_right,
+                          size: 18,
                         ),
-                      ),
-                      if (!terminalAvailable) ...[
                         const SizedBox(width: 6),
-                        const Icon(Icons.more_horiz, size: 18),
+                        const Icon(Icons.terminal, size: 17),
+                        const SizedBox(width: 8),
+                        const Expanded(
+                          child: Text(
+                            'Terminal',
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                        ),
+                        if (!terminalAvailable &&
+                            constraints.maxWidth >= 96) ...[
+                          const SizedBox(width: 6),
+                          const Icon(Icons.more_horiz, size: 18),
+                        ],
                       ],
-                    ],
+                    ),
                   ),
                 ),
               ),
@@ -4229,19 +4558,37 @@ class ProjectTerminalHeader extends StatelessWidget {
               key: const Key('terminal-expand-horizontal'),
               tooltip: 'Expand terminal horizontally',
               onPressed: () => _toggle(TerminalPresentation.horizontal),
-              icon: const Icon(Icons.swap_horiz, size: 18),
+              icon: Icon(
+                Icons.swap_horiz,
+                size: 18,
+                color: presentation == TerminalPresentation.horizontal
+                    ? context.ditch.accent
+                    : null,
+              ),
             ),
             IconButton(
               key: const Key('terminal-expand-vertical'),
               tooltip: 'Expand terminal vertically',
               onPressed: () => _toggle(TerminalPresentation.vertical),
-              icon: const Icon(Icons.swap_vert, size: 18),
+              icon: Icon(
+                Icons.swap_vert,
+                size: 18,
+                color: presentation == TerminalPresentation.vertical
+                    ? context.ditch.accent
+                    : null,
+              ),
             ),
             IconButton(
               key: const Key('terminal-maximize'),
               tooltip: 'Maximize terminal',
               onPressed: () => _toggle(TerminalPresentation.maximized),
-              icon: const Icon(Icons.fullscreen, size: 19),
+              icon: Icon(
+                Icons.fullscreen,
+                size: 19,
+                color: presentation == TerminalPresentation.maximized
+                    ? context.ditch.accent
+                    : null,
+              ),
             ),
             const SizedBox(width: 4),
           ],

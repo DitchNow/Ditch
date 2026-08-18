@@ -675,6 +675,40 @@ void main() {
     expect(find.byType(AgentsSurface), findsOneWidget);
   });
 
+  testWidgets('workspace splitters resize both side panes', (tester) async {
+    tester.view.physicalSize = const Size(1400, 900);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    await tester.pumpWidget(const TheDitchApp(connectRuntimeOnStart: false));
+
+    final projectsBefore = tester.getSize(find.byType(ProjectSidebar)).width;
+    final inspectorBefore = tester
+        .getSize(find.byType(ProjectToolsPanel))
+        .width;
+
+    await tester.drag(
+      find.byKey(const Key('projects-resize-handle')),
+      const Offset(60, 0),
+    );
+    await tester.pump();
+    expect(
+      tester.getSize(find.byType(ProjectSidebar)).width,
+      greaterThan(projectsBefore),
+    );
+
+    await tester.drag(
+      find.byKey(const Key('inspector-resize-handle')),
+      const Offset(-60, 0),
+    );
+    await tester.pump();
+    expect(
+      tester.getSize(find.byType(ProjectToolsPanel)).width,
+      greaterThan(inspectorBefore),
+    );
+    await tester.pump(const Duration(milliseconds: 50));
+  });
+
   testWidgets('expanded agent has persistent prompt composer', (tester) async {
     await tester.pumpWidget(const TheDitchApp(connectRuntimeOnStart: false));
 
@@ -728,6 +762,42 @@ void main() {
       tester.widget<TextField>(find.byType(TextField)).focusNode?.hasFocus,
       isTrue,
     );
+  });
+
+  testWidgets('composer keeps an editable draft while agent is working', (
+    tester,
+  ) async {
+    String? submitted;
+
+    Widget buildComposer({required bool isWorking}) => MaterialApp(
+      home: Scaffold(
+        body: AgentComposer(
+          initialText: '',
+          hasSession: true,
+          isWorking: isWorking,
+          onSubmit: (value) => submitted = value,
+          onStop: () {},
+        ),
+      ),
+    );
+
+    await tester.pumpWidget(buildComposer(isWorking: true));
+    expect(tester.widget<TextField>(find.byType(TextField)).enabled, isTrue);
+
+    await tester.enterText(find.byType(TextField), 'draft next turn');
+    await tester.sendKeyEvent(LogicalKeyboardKey.enter);
+    await tester.pump();
+
+    expect(submitted, isNull);
+    expect(find.text('draft next turn'), findsOneWidget);
+
+    await tester.pumpWidget(buildComposer(isWorking: false));
+    await tester.pump();
+    expect(find.text('draft next turn'), findsOneWidget);
+
+    await tester.sendKeyEvent(LogicalKeyboardKey.enter);
+    await tester.pump();
+    expect(submitted, 'draft next turn');
   });
 
   testWidgets('agent title supports inline rename', (tester) async {

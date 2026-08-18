@@ -95,11 +95,11 @@ class NativeComposerTextView: NSView, NSTextViewDelegate {
     textView.textContainer?.containerSize = NSSize(width: frame.width, height: CGFloat.greatestFiniteMagnitude)
     textView.textContainer?.widthTracksTextView = true
     textView.drawsBackground = false
-    textView.font = NSFont.systemFont(ofSize: fontSize)
+    textView.font = NSFont(name: "Avenir Next", size: fontSize) ?? NSFont.systemFont(ofSize: fontSize)
     let textContainerInset = NSSize(width: 2, height: 6)
     textView.textContainerInset = textContainerInset
-    textView.textColor = NSColor.labelColor
-    textView.insertionPointColor = NSColor.labelColor
+    textView.textColor = Self.color(arguments?["textColor"], fallback: NSColor.labelColor)
+    textView.insertionPointColor = Self.color(arguments?["caretColor"], fallback: NSColor.labelColor)
     textView.allowsUndo = true
     textView.isAutomaticQuoteSubstitutionEnabled = false
     textView.isAutomaticDashSubstitutionEnabled = false
@@ -124,8 +124,10 @@ class NativeComposerTextView: NSView, NSTextViewDelegate {
     addSubview(scrollView)
 
     placeholderLabel.stringValue = placeholder
-    placeholderLabel.textColor = .placeholderTextColor
-    placeholderLabel.font = NSFont.systemFont(ofSize: fontSize)
+    placeholderLabel.textColor = Self.color(
+      arguments?["placeholderColor"], fallback: NSColor.placeholderTextColor)
+    placeholderLabel.font = NSFont(name: "Avenir Next", size: fontSize)
+      ?? NSFont.systemFont(ofSize: fontSize)
     placeholderLabel.translatesAutoresizingMaskIntoConstraints = false
     placeholderLabel.isHidden = !initialText.isEmpty
     addSubview(placeholderLabel)
@@ -178,6 +180,19 @@ class NativeComposerTextView: NSView, NSTextViewDelegate {
       case "setEnabled":
         self.textView.isEditable = (call.arguments as? Bool) ?? true
         result(nil)
+      case "setAppearance":
+        let appearance = call.arguments as? [String: Any]
+        self.textView.textColor = Self.color(
+          appearance?["textColor"], fallback: NSColor.labelColor)
+        self.textView.insertionPointColor = Self.color(
+          appearance?["caretColor"], fallback: NSColor.labelColor)
+        self.placeholderLabel.textColor = Self.color(
+          appearance?["placeholderColor"], fallback: NSColor.placeholderTextColor)
+        let fontName = appearance?["fontName"] as? String ?? "Avenir Next"
+        self.textView.font = NSFont(name: fontName, size: fontSize)
+          ?? NSFont.systemFont(ofSize: fontSize)
+        self.placeholderLabel.font = self.textView.font
+        result(nil)
       case "focus":
         self.window?.makeFirstResponder(self.textView)
         result(nil)
@@ -196,6 +211,16 @@ class NativeComposerTextView: NSView, NSTextViewDelegate {
     fatalError("init(coder:) has not been implemented")
   }
 
+  private static func color(_ value: Any?, fallback: NSColor) -> NSColor {
+    guard let number = value as? NSNumber else { return fallback }
+    let argb = number.uint32Value
+    return NSColor(
+      calibratedRed: CGFloat((argb >> 16) & 0xff) / 255,
+      green: CGFloat((argb >> 8) & 0xff) / 255,
+      blue: CGFloat(argb & 0xff) / 255,
+      alpha: CGFloat((argb >> 24) & 0xff) / 255)
+  }
+
   func textDidChange(_ notification: Notification) {
     placeholderLabel.isHidden = !textView.string.isEmpty
     if isApplyingFlutterText {
@@ -209,6 +234,34 @@ final class ComposerTextView: NSTextView {
   var onEnlarge: (() -> Void)?
   var onEscape: (() -> Void)?
   var onSubmit: (() -> Void)?
+
+  override func keyDown(with event: NSEvent) {
+    guard event.keyCode == 123 || event.keyCode == 124 else {
+      super.keyDown(with: event)
+      return
+    }
+    let rawModifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+    let modifiers = rawModifiers.subtracting([.capsLock, .numericPad, .function])
+    // Keep Option/Control navigation and input-method behavior native. The
+    // explicit paths below make character and macOS line navigation reliable
+    // when this NSTextView is hosted inside a Flutter platform view.
+    guard !modifiers.contains(.option), !modifiers.contains(.control) else {
+      super.keyDown(with: event)
+      return
+    }
+    let selecting = modifiers.contains(.shift)
+    if modifiers.contains(.command) {
+      if event.keyCode == 123 {
+        selecting ? moveToBeginningOfLineAndModifySelection(nil) : moveToBeginningOfLine(nil)
+      } else {
+        selecting ? moveToEndOfLineAndModifySelection(nil) : moveToEndOfLine(nil)
+      }
+    } else if event.keyCode == 123 {
+      selecting ? moveLeftAndModifySelection(nil) : moveLeft(nil)
+    } else {
+      selecting ? moveRightAndModifySelection(nil) : moveRight(nil)
+    }
+  }
 
   override func doCommand(by selector: Selector) {
     if selector == #selector(insertNewline(_:)) {

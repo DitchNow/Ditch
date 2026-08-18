@@ -10,6 +10,7 @@ import ServiceManagement
 @main
 class AppDelegate: FlutterAppDelegate {
   override func applicationDidFinishLaunching(_ notification: Notification) {
+    applyThemeMode(UserDefaults.standard.string(forKey: "themeMode") ?? "system")
     persistRuntimeEnvironment()
     registerStatusHelper()
   }
@@ -72,6 +73,27 @@ class AppDelegate: FlutterAppDelegate {
         result(true)
       case "runtimeAvailable":
         self.runtimeAvailable { result($0) }
+      case "getThemeMode":
+        result(UserDefaults.standard.string(forKey: "themeMode") ?? "system")
+      case "setThemeMode":
+        let mode = call.arguments as? String ?? "system"
+        UserDefaults.standard.set(mode, forKey: "themeMode")
+        self.applyThemeMode(mode)
+        result(true)
+      case "getPaneWidths":
+        result([
+          "projects": UserDefaults.standard.double(forKey: "projectSidebarWidth"),
+          "inspector": UserDefaults.standard.double(forKey: "inspectorWidth"),
+        ])
+      case "setPaneWidths":
+        let widths = call.arguments as? [String: Any]
+        if let projects = widths?["projects"] as? NSNumber {
+          UserDefaults.standard.set(projects.doubleValue, forKey: "projectSidebarWidth")
+        }
+        if let inspector = widths?["inspector"] as? NSNumber {
+          UserDefaults.standard.set(inspector.doubleValue, forKey: "inspectorWidth")
+        }
+        result(true)
       case "openActivityMonitor":
         let url = URL(fileURLWithPath: "/System/Applications/Utilities/Activity Monitor.app")
         let configuration = NSWorkspace.OpenConfiguration()
@@ -218,6 +240,21 @@ class AppDelegate: FlutterAppDelegate {
     if let window = NSApp.windows.first(where: { $0 is MainFlutterWindow }) ?? NSApp.windows.first {
       window.deminiaturize(nil)
       window.makeKeyAndOrderFront(nil)
+    }
+  }
+
+  private func applyThemeMode(_ mode: String) {
+    switch mode {
+    case "light":
+      NSApp.appearance = NSAppearance(named: .aqua)
+    case "dark":
+      NSApp.appearance = NSAppearance(named: .darkAqua)
+    default:
+      NSApp.appearance = nil
+    }
+    for window in NSApp.windows {
+      window.appearance = NSApp.appearance
+      window.backgroundColor = NSColor.windowBackgroundColor
     }
   }
 }
