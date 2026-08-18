@@ -59,6 +59,9 @@ where
             state_evidence: "Codex process was launched in an owned runtime pane; semantic lifecycle is not yet verified.".to_owned(),
             started_at: now,
             updated_at: now,
+            finished_at: None,
+            exit_code: None,
+            resume_block_reason: None,
         })
     }
 }

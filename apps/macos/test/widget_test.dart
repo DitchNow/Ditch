@@ -133,6 +133,60 @@ void main() {
     expect(find.text('Ready for a new prompt'), findsOneWidget);
   });
 
+  testWidgets('failed session without a Codex thread is read-only', (
+    tester,
+  ) async {
+    tester.view.physicalSize = const Size(1400, 900);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    var submitted = false;
+    final session = AgentSession(
+      localId: 'failed-agent',
+      projectId: 'project-a',
+      provider: AgentProvider.codex,
+      status: AgentStatus.failed,
+      messages: [
+        AgentChatMessage(
+          role: ChatMessageRole.system,
+          text: 'Codex exited with code 1',
+          createdAt: DateTime(2026),
+        ),
+      ],
+      exitCode: 1,
+      finishedAt: DateTime(2026),
+      resumeBlockReason: 'NoCodexThread',
+    );
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: AgentsSurface(
+            sessions: [session],
+            expandedAgentLocalId: session.localId,
+            chatController: ScrollController(),
+            composerKey: GlobalKey<AgentComposerState>(),
+            initialPrompt: 'Retry',
+            onStartCodex: () {},
+            onSubmitPrompt: (_, _) => submitted = true,
+            onStopCodex: (_) {},
+            onToggleExpanded: (_) {},
+          ),
+        ),
+      ),
+    );
+
+    expect(find.textContaining('Codex never created a thread'), findsOneWidget);
+    expect(
+      tester
+          .widget<NativeComposerTextView>(find.byType(NativeComposerTextView))
+          .enabled,
+      isFalse,
+    );
+    expect(submitted, isFalse);
+    expect(find.text('Codex exited with code 1'), findsOneWidget);
+  });
+
   testWidgets('attention cards expose session actions', (tester) async {
     var opened = false;
     var dismissed = false;

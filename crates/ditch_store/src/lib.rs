@@ -1,5 +1,5 @@
 use chrono::{DateTime, Utc};
-use ditch_core::{AgentRun, AgentState, AppPaths, Project, ProjectId};
+use ditch_core::{AgentResumeBlockReason, AgentRun, AgentState, AppPaths, Project, ProjectId};
 use ditch_protocol::{AgentChatMessage, RuntimeAttention};
 use rusqlite::{Connection, Transaction, params};
 use std::fs;
@@ -227,6 +227,12 @@ impl DitchStore {
             ) {
                 agent.run.state = AgentState::Stale;
                 agent.run.updated_at = Utc::now();
+                agent.run.finished_at = Some(agent.run.updated_at);
+                agent.run.resume_block_reason = agent
+                    .run
+                    .native_session_id
+                    .is_none()
+                    .then_some(AgentResumeBlockReason::NoCodexThread);
                 agent.run.last_visible_action = Some(
                     "Runtime restarted; the Codex process can no longer be controlled".to_owned(),
                 );
@@ -495,6 +501,9 @@ mod tests {
             state_evidence: "test".into(),
             started_at: now,
             updated_at: now,
+            finished_at: None,
+            exit_code: None,
+            resume_block_reason: None,
         };
         let message = AgentChatMessage {
             agent_id: run.id,

@@ -126,6 +126,10 @@ pub struct RuntimeStatus {
     pub codex_binary: Option<String>,
     #[serde(default)]
     pub started_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub build_version: String,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

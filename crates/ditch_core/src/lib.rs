@@ -67,6 +67,12 @@ pub enum AgentState {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum AgentResumeBlockReason {
+    NoCodexThread,
+    CodexHomeMismatch,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum AttentionKind {
     ApprovalRequired,
     Blocked,
@@ -172,6 +178,12 @@ pub struct AgentRun {
     pub state_evidence: String,
     pub started_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    #[serde(default)]
+    pub finished_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub exit_code: Option<i32>,
+    #[serde(default)]
+    pub resume_block_reason: Option<AgentResumeBlockReason>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

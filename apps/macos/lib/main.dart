@@ -90,6 +90,9 @@ class AgentSession {
     this.originCodexHome,
     this.currentPrompt,
     this.lastVisibleAction,
+    this.resumeBlockReason,
+    this.exitCode,
+    this.finishedAt,
     DateTime? createdAt,
     DateTime? updatedAt,
   }) : createdAt = createdAt ?? DateTime.now(),
@@ -104,6 +107,9 @@ class AgentSession {
   final String? originCodexHome;
   String? currentPrompt;
   String? lastVisibleAction;
+  final String? resumeBlockReason;
+  final int? exitCode;
+  final DateTime? finishedAt;
   DateTime updatedAt;
   final List<AgentChatMessage> messages;
 
@@ -114,6 +120,11 @@ class AgentSession {
   }
 
   bool get hasCodexThread => codexThreadId != null;
+
+  bool get isTerminal =>
+      status == AgentStatus.failed || status == AgentStatus.stopped;
+
+  bool get cannotResumeWithoutThread => isTerminal && !hasCodexThread;
 
   bool get isWorking {
     return status == AgentStatus.starting || status == AgentStatus.working;
@@ -460,6 +471,8 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
   bool _runtimeReconnectScheduled = false;
   bool _runtimeHomeMismatchReported = false;
   bool _runtimeCodexHomeMatches = true;
+  bool _runtimeSupportsPersistence = true;
+  bool _runtimeCompatibilityReported = false;
   String? _effectiveRuntimeCodexHome;
   bool _legacyRecoveryChecked = false;
   int _selectedProjectIndex = 0;
@@ -598,6 +611,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
       }
       _hydrateRuntimeSnapshot(snapshot);
       if (statusBody is Map<String, dynamic>) {
+        _checkRuntimeCapabilities(statusBody);
         _checkRuntimeCodexHome(statusBody);
       }
       final events = await _runtimeClient.subscribeEvents();
@@ -659,6 +673,28 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
       title: 'Codex home mismatch',
       body:
           'The running Ditch Runtime uses ${effective ?? "an unknown/default Codex home"}, but this app was launched with $requested. Stop and restart the runtime before starting Codex.',
+      global: true,
+    );
+  }
+
+  void _checkRuntimeCapabilities(Map<String, dynamic> status) {
+    final capabilities = status['capabilities'];
+    _runtimeSupportsPersistence =
+        capabilities is List && capabilities.contains('persistent_sessions_v1');
+    if (_runtimeSupportsPersistence) {
+      _runtimeCompatibilityReported = false;
+      return;
+    }
+    if (_runtimeCompatibilityReported) {
+      return;
+    }
+    _runtimeCompatibilityReported = true;
+    _addAttentionRequired(
+      kind: AttentionKind.failed,
+      icon: Icons.system_update_alt_outlined,
+      title: 'Outdated Ditch Runtime',
+      body:
+          'This runtime cannot persist agent sessions. Rebuild and restart The Ditch before starting Codex.',
       global: true,
     );
   }
@@ -1070,7 +1106,22 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
   }
 
   Future<bool> _prepareSelectedProjectForCodex() async {
+    if (!_runtimeSupportsPersistence) {
+      _showProjectSetupResult(
+        title: 'Outdated Ditch Runtime',
+        message:
+            'This runtime cannot persist agent sessions. Rebuild and restart The Ditch, then try again.',
+        isError: true,
+      );
+      return false;
+    }
     if (!_runtimeCodexHomeMatches) {
+      _showProjectSetupResult(
+        title: 'Codex home mismatch',
+        message:
+            'The app and runtime use different CODEX_HOME values. Restart the runtime from this app before starting Codex.',
+        isError: true,
+      );
       return false;
     }
     final project = _selectedProject;
@@ -1129,8 +1180,20 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
       return;
     }
 
-    if (session.codexThreadId == null) {
+    if (session.codexThreadId == null && !session.isTerminal) {
       await _startCodexRuntime(cleanPrompt);
+      return;
+    }
+
+    if (session.cannotResumeWithoutThread) {
+      _addAttentionRequired(
+        kind: AttentionKind.failed,
+        sessionLocalId: session.localId,
+        icon: Icons.block_outlined,
+        title: 'Session cannot be resumed',
+        body:
+            'Codex never created a thread for this session. Its failure details remain available, but you must start a new agent to continue.',
+      );
       return;
     }
 
@@ -1461,6 +1524,13 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
       originCodexHome: agentJson['origin_codex_home']?.toString(),
       currentPrompt: agentJson['current_prompt']?.toString(),
       lastVisibleAction: agentJson['last_visible_action']?.toString(),
+      resumeBlockReason: agentJson['resume_block_reason']?.toString(),
+      exitCode: agentJson['exit_code'] is int
+          ? agentJson['exit_code'] as int
+          : null,
+      finishedAt: agentJson['finished_at'] == null
+          ? null
+          : _dateTimeFromRuntime(agentJson['finished_at']),
       createdAt: _dateTimeFromRuntime(agentJson['started_at']),
       updatedAt: _dateTimeFromRuntime(agentJson['updated_at']),
     );
@@ -1994,10 +2064,20 @@ class ExpandableAgentPanel extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final colors = Theme.of(context).colorScheme;
-    final resumeBlocked = session.hasCodexThread &&
+    final homeMismatch =
+        session.hasCodexThread &&
         session.originCodexHome != null &&
         effectiveCodexHome != null &&
         session.originCodexHome != effectiveCodexHome;
+    final noThread =
+        session.cannotResumeWithoutThread ||
+        session.resumeBlockReason == 'NoCodexThread';
+    final resumeBlocked = noThread || homeMismatch;
+    final resumeBlockedMessage = noThread
+        ? 'This session cannot be resumed because Codex never created a thread. Start a new agent to continue.'
+        : homeMismatch
+        ? 'This session used ${session.originCodexHome}. Switch the runtime to that CODEX_HOME to resume it, or start a new agent.'
+        : null;
 
     return LayoutBuilder(
       builder: (context, constraints) {
@@ -2101,9 +2181,7 @@ class ExpandableAgentPanel extends StatelessWidget {
                         hasSession: session.hasCodexThread,
                         isWorking: session.isWorking,
                         enabled: !resumeBlocked,
-                        disabledMessage: resumeBlocked
-                            ? 'This session used ${session.originCodexHome}. Switch the runtime to that CODEX_HOME to resume it, or start a new agent.'
-                            : null,
+                        disabledMessage: resumeBlockedMessage,
                         onSubmitPrompt: onSubmitPrompt,
                         onStopCodex: onStopCodex,
                       ),

@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use ditch_core::{
-    AgentId, AgentProvider, AgentRun, AgentState, AppPaths, AttentionKind, CodexLaunchMode,
-    Project, ProjectGitPolicy,
+    AgentId, AgentProvider, AgentResumeBlockReason, AgentRun, AgentState, AppPaths, AttentionKind,
+    CodexLaunchMode, Project, ProjectGitPolicy,
 };
 use ditch_protocol::{
     AgentChatMessage, AgentChatRole, ClientRequest, Envelope, HealthResponse, ProtocolError,
@@ -26,10 +26,30 @@ const RUNTIME_IDENTITY: &str = "The Ditch Runtime";
 
 fn main() {
     let paths = AppPaths::for_current_user();
-    if let Err(error) = ensure_app_dirs(&paths).and_then(|_| serve(paths).map_err(Into::into)) {
+    if let Err(error) = validate_codex_home()
+        .and_then(|_| ensure_app_dirs(&paths).map_err(io::Error::other))
+        .and_then(|_| serve(paths))
+    {
         eprintln!("{RUNTIME_IDENTITY} failed: {error}");
         std::process::exit(1);
     }
+}
+
+fn validate_codex_home() -> io::Result<()> {
+    let Some(value) = std::env::var_os("CODEX_HOME") else {
+        return Ok(());
+    };
+    let path = PathBuf::from(&value);
+    if path.is_absolute() {
+        return Ok(());
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!(
+            "CODEX_HOME must be an absolute path; use $HOME/.codex-name instead of {}",
+            path.display()
+        ),
+    ))
 }
 
 struct RuntimeState {
@@ -128,6 +148,8 @@ impl RuntimeState {
                 .map(|path| path.to_string_lossy().into_owned()),
             codex_binary: self.codex_binary.clone(),
             started_at: Some(self.started_at),
+            build_version: env!("CARGO_PKG_VERSION").to_owned(),
+            capabilities: vec!["persistent_sessions_v1".to_owned()],
         }
     }
 
@@ -485,6 +507,9 @@ fn start_codex_session(
         state_evidence: "The Ditch Runtime accepted the session and is launching Codex.".to_owned(),
         started_at: now,
         updated_at: now,
+        finished_at: None,
+        exit_code: None,
+        resume_block_reason: None,
     };
 
     if let Err(error) = verify_project_git_policy(&project) {
@@ -584,6 +609,11 @@ fn persist_launch_failure(
     run.updated_at = Utc::now();
     run.last_visible_action = Some("Codex could not be started".to_owned());
     run.state_evidence = error.clone();
+    run.finished_at = Some(run.updated_at);
+    run.resume_block_reason = run
+        .native_session_id
+        .is_none()
+        .then_some(AgentResumeBlockReason::NoCodexThread);
     let system_message = AgentChatMessage {
         agent_id: run.id,
         role: AgentChatRole::System,
@@ -707,6 +737,9 @@ fn resume_codex_session(
         state_evidence: "The Ditch Runtime accepted the session and is resuming Codex.".to_owned(),
         started_at: now,
         updated_at: now,
+        finished_at: None,
+        exit_code: None,
+        resume_block_reason: None,
     };
 
     if let Err(error) = verify_project_git_policy(&project) {
@@ -830,12 +863,6 @@ fn prompt_agent(
     agent_id: AgentId,
     prompt: String,
 ) -> ServerResponse {
-    let Some(binary) = find_binary("codex") else {
-        let message = "Codex binary was not found on PATH".to_owned();
-        record_terminal_failure(&state, agent_id, message.clone());
-        finish_agent(&state, agent_id, Some(1));
-        return protocol_error("codex_not_found", message);
-    };
     let (project_root, thread_id, allow_non_git) = {
         let state = state
             .lock()
@@ -845,6 +872,17 @@ fn prompt_agent(
         };
         if matches!(record.run.state, AgentState::Starting | AgentState::Working) {
             return protocol_error("agent_busy", "agent session is already working");
+        }
+        if record.run.native_session_id.is_none()
+            && matches!(
+                record.run.state,
+                AgentState::Failed | AgentState::Interrupted | AgentState::Stale
+            )
+        {
+            return protocol_error(
+                "agent_not_resumable",
+                "This session cannot accept another prompt because Codex never created a thread. Start a new agent instead.",
+            );
         }
         let current_home = state
             .codex_home
@@ -861,6 +899,13 @@ fn prompt_agent(
             record.run.native_session_id.clone(),
             record.allow_non_git,
         )
+    };
+
+    let Some(binary) = find_binary("codex") else {
+        let message = "Codex binary was not found on PATH".to_owned();
+        record_terminal_failure(&state, agent_id, message.clone());
+        finish_agent(&state, agent_id, Some(1));
+        return protocol_error("codex_not_found", message);
     };
 
     let child = match spawn_codex_child(
@@ -898,6 +943,10 @@ fn prompt_agent(
         record.run.current_prompt = Some(prompt);
         record.run.last_visible_action = Some("Prompt sent to Codex".to_owned());
         record.run.updated_at = Utc::now();
+        record.run.finished_at = None;
+        record.run.exit_code = None;
+        record.run.resume_block_reason = None;
+        record.terminal_failure = None;
         record.messages.push(user_message.clone());
         let run = record.run.clone();
         state.persist_message(&user_message);
@@ -936,6 +985,12 @@ fn stop_agent(state: Arc<Mutex<RuntimeState>>, agent_id: AgentId) -> ServerRespo
     record.run.state = AgentState::Interrupted;
     record.run.last_visible_action = Some("Stopped by user".to_owned());
     record.run.updated_at = Utc::now();
+    record.run.finished_at = Some(record.run.updated_at);
+    record.run.resume_block_reason = record
+        .run
+        .native_session_id
+        .is_none()
+        .then_some(AgentResumeBlockReason::NoCodexThread);
     let run = record.run.clone();
     state.persist_agent(agent_id);
     state.broadcast(ServerEvent::AgentChanged(run));
@@ -1048,6 +1103,7 @@ fn handle_codex_stdout_line(state: &Arc<Mutex<RuntimeState>>, agent_id: AgentId,
                 };
                 record.run.native_session_id = Some(thread_id.to_owned());
                 record.run.updated_at = Utc::now();
+                record.run.resume_block_reason = None;
                 let run = record.run.clone();
                 state.persist_agent(agent_id);
                 state.broadcast(ServerEvent::AgentChanged(run));
@@ -1272,6 +1328,13 @@ fn finish_agent(state: &Arc<Mutex<RuntimeState>>, agent_id: AgentId, code: Optio
             None => "Codex exited without a code".to_owned(),
         });
         record.run.updated_at = Utc::now();
+        record.run.finished_at = Some(record.run.updated_at);
+        record.run.exit_code = code;
+        record.run.resume_block_reason = record
+            .run
+            .native_session_id
+            .is_none()
+            .then_some(AgentResumeBlockReason::NoCodexThread);
         let attention = if record.run.state == AgentState::Failed {
             let body = record
                 .terminal_failure
@@ -1537,6 +1600,9 @@ mod tests {
                     state_evidence: "fixture".to_owned(),
                     started_at: now,
                     updated_at: now,
+                    finished_at: None,
+                    exit_code: None,
+                    resume_block_reason: None,
                 },
                 project_root: project.root,
                 allow_non_git: false,
@@ -1553,11 +1619,31 @@ mod tests {
 
         finish_agent(&state, agent_id, Some(1));
 
+        let response = prompt_agent(Arc::clone(&state), agent_id, "retry".to_owned());
+        assert!(matches!(
+            response,
+            ServerResponse::Error(ProtocolError { ref code, .. }) if code == "agent_not_resumable"
+        ));
+
         let state = state.lock().expect("fixture state should lock");
         assert_eq!(state.agents[&agent_id].run.state, AgentState::Failed);
+        assert_eq!(state.agents[&agent_id].run.exit_code, Some(1));
+        assert!(state.agents[&agent_id].run.finished_at.is_some());
+        assert_eq!(
+            state.agents[&agent_id].run.resume_block_reason,
+            Some(AgentResumeBlockReason::NoCodexThread)
+        );
+        assert_eq!(state.agents.len(), 1);
         assert_eq!(state.attention.len(), 1);
         assert_eq!(state.attention[0].body, "fixture failure");
         assert_eq!(state.attention[0].project_id, Some(project.id));
+        let persisted = state.store.load().expect("persisted state should load");
+        assert_eq!(persisted.agents.len(), 1);
+        assert_eq!(persisted.agents[0].run.exit_code, Some(1));
+        assert_eq!(
+            persisted.agents[0].run.resume_block_reason,
+            Some(AgentResumeBlockReason::NoCodexThread)
+        );
     }
 
     #[test]
@@ -1587,6 +1673,9 @@ mod tests {
                     state_evidence: "fixture".to_owned(),
                     started_at: now,
                     updated_at: now,
+                    finished_at: None,
+                    exit_code: None,
+                    resume_block_reason: None,
                 },
                 project_root: project.root,
                 allow_non_git: false,
@@ -1642,6 +1731,9 @@ mod tests {
                     state_evidence: "fixture".to_owned(),
                     started_at: now,
                     updated_at: now,
+                    finished_at: None,
+                    exit_code: None,
+                    resume_block_reason: None,
                 },
                 project_root: project.root,
                 allow_non_git: false,
