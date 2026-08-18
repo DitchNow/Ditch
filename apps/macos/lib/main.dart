@@ -97,6 +97,8 @@ void upsertProject(List<DitchProject> projects, DitchProject incoming) {
 
 enum AgentProvider { codex }
 
+enum TerminalPresentation { docked, horizontal, vertical, maximized }
+
 enum AgentApprovalPreset { ask, approveForMe, fullAccess }
 
 class AgentModelOption {
@@ -137,7 +139,8 @@ class AgentExecutionSettings extends ChangeNotifier {
     notifyListeners();
   }
 
-  AgentModelOption? get selectedModel => models.where((item) => item.id == model).firstOrNull;
+  AgentModelOption? get selectedModel =>
+      models.where((item) => item.id == model).firstOrNull;
 
   void setModels(List<AgentModelOption> value) {
     models = value;
@@ -156,12 +159,19 @@ class AgentExecutionSettings extends ChangeNotifier {
 final agentExecutionSettings = AgentExecutionSettings();
 
 class ProjectTerminalSession {
-  ProjectTerminalSession({required this.id, required this.projectId, required this.shell});
+  ProjectTerminalSession({
+    required this.id,
+    required this.projectId,
+    required this.shell,
+  });
 
   final String id;
   final String projectId;
   final String shell;
-  final Terminal terminal = Terminal(maxLines: 10000, platform: TerminalTargetPlatform.macos);
+  final Terminal terminal = Terminal(
+    maxLines: 10000,
+    platform: TerminalTargetPlatform.macos,
+  );
 }
 
 class AgentSession {
@@ -459,15 +469,29 @@ class DitchRuntimeClient {
   });
 
   Future<void> writeProjectTerminal(String terminalId, List<int> data) async {
-    await request({'WriteProjectTerminal': {'terminal_id': terminalId, 'data': data}});
+    await request({
+      'WriteProjectTerminal': {'terminal_id': terminalId, 'data': data},
+    });
   }
 
-  Future<void> resizeProjectTerminal(String terminalId, int columns, int rows) async {
-    await request({'ResizeProjectTerminal': {'terminal_id': terminalId, 'columns': columns, 'rows': rows}});
+  Future<void> resizeProjectTerminal(
+    String terminalId,
+    int columns,
+    int rows,
+  ) async {
+    await request({
+      'ResizeProjectTerminal': {
+        'terminal_id': terminalId,
+        'columns': columns,
+        'rows': rows,
+      },
+    });
   }
 
   Future<void> closeProjectTerminal(String terminalId) async {
-    await request({'CloseProjectTerminal': {'terminal_id': terminalId}});
+    await request({
+      'CloseProjectTerminal': {'terminal_id': terminalId},
+    });
   }
 
   Future<Map<String, dynamic>> stopAgent(String agentId) {
@@ -554,6 +578,10 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
   bool _runtimeCompatibilityReported = false;
   String? _effectiveRuntimeCodexHome;
   bool _legacyRecoveryChecked = false;
+  TerminalPresentation _terminalPresentation = TerminalPresentation.docked;
+  TerminalPresentation _terminalRestorePresentation =
+      TerminalPresentation.docked;
+  bool _dockedTerminalExpanded = true;
   String _selectedProjectKey = canonicalProjectPath(_bootstrapProject.path);
   String? _expandedAgentLocalId;
   String? _focusedAgentLocalId;
@@ -584,8 +612,29 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
       _selectedProjectKey = _projectKey(_projects[index]);
       final sessions = _visibleSessions;
       _expandedAgentLocalId = sessions.isEmpty ? null : sessions.first.localId;
+      _terminalPresentation = TerminalPresentation.docked;
+      _dockedTerminalExpanded = true;
     });
     unawaited(_ensureSelectedProjectTerminal());
+  }
+
+  void _setTerminalPresentation(TerminalPresentation presentation) {
+    setState(() {
+      if (presentation == TerminalPresentation.maximized) {
+        _terminalRestorePresentation =
+            _terminalPresentation == TerminalPresentation.maximized
+            ? TerminalPresentation.docked
+            : _terminalPresentation;
+      }
+      _terminalPresentation = presentation;
+      if (presentation != TerminalPresentation.docked) {
+        _dockedTerminalExpanded = true;
+      }
+    });
+  }
+
+  void _restoreMaximizedTerminal() {
+    _setTerminalPresentation(_terminalRestorePresentation);
   }
 
   Future<void> _ensureSelectedProjectTerminal() async {
@@ -1513,7 +1562,9 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
             .where((entry) => entry.value.id == id)
             .map((entry) => entry.key)
             .toList();
-        if (keys.isNotEmpty) setState(() => keys.forEach(_projectTerminals.remove));
+        if (keys.isNotEmpty) {
+          setState(() => keys.forEach(_projectTerminals.remove));
+        }
       }
       return;
     }
@@ -1844,12 +1895,33 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
                 },
                 onToggleExpanded: _toggleExpandedAgent,
               );
-              final attentionPanel = ProjectToolsPanel(
+              final selectedTerminal = _selectedProject.id == null
+                  ? null
+                  : _projectTerminals[_selectedProject.id];
+              final projectToolsPanel = ProjectToolsPanel(
                 width: 320,
-                terminal: _selectedProject.id == null
-                    ? null
-                    : _projectTerminals[_selectedProject.id],
+                terminal: selectedTerminal,
                 onEnsureTerminal: _ensureSelectedProjectTerminal,
+                presentation: _terminalPresentation,
+                dockedTerminalExpanded: _dockedTerminalExpanded,
+                onToggleDocked: () => setState(
+                  () => _dockedTerminalExpanded = !_dockedTerminalExpanded,
+                ),
+                onPresentationChanged: _setTerminalPresentation,
+                events: _visibleAttention,
+                canStopSession: _canStopAttentionSession,
+                onOpenSession: _openAttentionSession,
+                onStopSession: (event) {
+                  final id = event.sessionLocalId;
+                  final session = id == null
+                      ? null
+                      : _agentSessionByLocalId(id);
+                  if (session != null) _stopCodex(session);
+                },
+                onDismiss: _dismissAttention,
+              );
+              final attentionOnly = AttentionPanel(
+                width: 320,
                 events: _visibleAttention,
                 canStopSession: _canStopAttentionSession,
                 onOpenSession: _openAttentionSession,
@@ -1863,6 +1935,76 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
                 onDismiss: _dismissAttention,
               );
 
+              Widget standardWorkspace({required bool attentionOnlyMode}) {
+                return Row(
+                  children: [
+                    Expanded(child: agentsSurface),
+                    if (showInspector) ...[
+                      const VerticalDivider(width: 1),
+                      attentionOnlyMode ? attentionOnly : projectToolsPanel,
+                    ],
+                  ],
+                );
+              }
+
+              Widget terminalWorkspace() {
+                final body = switch (_terminalPresentation) {
+                  TerminalPresentation.horizontal => Column(
+                    children: [
+                      SizedBox(
+                        height: (constraints.maxHeight * 0.34).clamp(
+                          190.0,
+                          340.0,
+                        ),
+                        child: ProjectTerminalSurface(
+                          terminal: selectedTerminal,
+                          presentation: _terminalPresentation,
+                          onTitleTap: () => _setTerminalPresentation(
+                            TerminalPresentation.docked,
+                          ),
+                          onPresentationChanged: _setTerminalPresentation,
+                        ),
+                      ),
+                      const Divider(height: 1),
+                      Expanded(
+                        child: standardWorkspace(attentionOnlyMode: true),
+                      ),
+                    ],
+                  ),
+                  TerminalPresentation.maximized => CallbackShortcuts(
+                    bindings: {
+                      const SingleActivator(LogicalKeyboardKey.escape):
+                          _restoreMaximizedTerminal,
+                    },
+                    child: Focus(
+                      autofocus: true,
+                      child: ProjectTerminalSurface(
+                        terminal: selectedTerminal,
+                        presentation: _terminalPresentation,
+                        onClose: _restoreMaximizedTerminal,
+                        onTitleTap: _restoreMaximizedTerminal,
+                        onPresentationChanged: _setTerminalPresentation,
+                      ),
+                    ),
+                  ),
+                  _ => standardWorkspace(attentionOnlyMode: false),
+                };
+                return Row(
+                  children: [
+                    if (showSidebar) ...[
+                      ProjectSidebar(
+                        projects: _projects,
+                        selectedIndex: _selectedProjectIndex,
+                        onAddProject: _addProject,
+                        onSelectProject: _selectProject,
+                      ),
+                      const VerticalDivider(width: 1),
+                    ],
+                    Expanded(child: body),
+                  ],
+                );
+              }
+
               return ColoredBox(
                 color: context.ditch.workspace,
                 child: Column(
@@ -1875,7 +2017,6 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
                       inspectorVisible: showInspector,
                       onToggleSidebar: _presentation.toggleSidebar,
                       onToggleInspector: _presentation.toggleInspector,
-                      onNewAgent: _startCodex,
                     ),
                     const Divider(height: 1),
                     Expanded(
@@ -1891,24 +2032,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
                               onQuit: () => _applicationChannel
                                   .invokeMethod<bool>('quitUI'),
                             )
-                          : Row(
-                              children: [
-                                if (showSidebar) ...[
-                                  ProjectSidebar(
-                                    projects: _projects,
-                                    selectedIndex: _selectedProjectIndex,
-                                    onAddProject: _addProject,
-                                    onSelectProject: _selectProject,
-                                  ),
-                                  const VerticalDivider(width: 1),
-                                ],
-                                Expanded(child: agentsSurface),
-                                if (showInspector) ...[
-                                  const VerticalDivider(width: 1),
-                                  attentionPanel,
-                                ],
-                              ],
-                            ),
+                          : terminalWorkspace(),
                     ),
                   ],
                 ),
@@ -1930,7 +2054,6 @@ class DitchToolbar extends StatelessWidget {
     required this.inspectorVisible,
     required this.onToggleSidebar,
     required this.onToggleInspector,
-    required this.onNewAgent,
     super.key,
   });
 
@@ -1941,7 +2064,6 @@ class DitchToolbar extends StatelessWidget {
   final bool inspectorVisible;
   final VoidCallback onToggleSidebar;
   final VoidCallback onToggleInspector;
-  final VoidCallback onNewAgent;
 
   @override
   Widget build(BuildContext context) {
@@ -1995,12 +2117,6 @@ class DitchToolbar extends StatelessWidget {
             ),
             const SizedBox(width: 7),
             Text(label, style: Theme.of(context).textTheme.bodySmall),
-            const SizedBox(width: 12),
-            FilledButton.icon(
-              onPressed: onNewAgent,
-              icon: const Icon(Icons.add, size: 16),
-              label: const Text('New Agent'),
-            ),
             const SizedBox(width: 6),
             Badge(
               isLabelVisible: attentionCount > 0,
@@ -2172,7 +2288,6 @@ class ProjectSidebar extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-
     return ColoredBox(
       color: context.ditch.sidebar,
       child: SizedBox(
@@ -2325,7 +2440,22 @@ class AgentsSurface extends StatelessWidget {
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             if (focusedAgentLocalId == null) ...[
-              Text('Agents', style: Theme.of(context).textTheme.headlineSmall),
+              Row(
+                children: [
+                  Expanded(
+                    child: Text(
+                      'Agents',
+                      style: Theme.of(context).textTheme.headlineSmall,
+                    ),
+                  ),
+                  FilledButton.icon(
+                    key: const Key('agents-new-agent-button'),
+                    onPressed: onStartCodex,
+                    icon: const Icon(Icons.add, size: 16),
+                    label: const Text('New Agent'),
+                  ),
+                ],
+              ),
               const SizedBox(height: 12),
             ],
             Expanded(
@@ -3369,10 +3499,10 @@ class AgentComposerState extends State<AgentComposer> {
                                 }
                               },
                               items: const [
-                              DropdownMenuItem(
-                                value: AgentApprovalPreset.ask,
-                                enabled: false,
-                                child: Text('Ask for approval — unavailable'),
+                                DropdownMenuItem(
+                                  value: AgentApprovalPreset.ask,
+                                  enabled: false,
+                                  child: Text('Ask for approval — unavailable'),
                                 ),
                                 DropdownMenuItem(
                                   value: AgentApprovalPreset.approveForMe,
@@ -3491,10 +3621,17 @@ class ContextWindowIndicator extends StatelessWidget {
             child: Row(
               mainAxisSize: MainAxisSize.min,
               children: [
-                Icon(Icons.data_usage_outlined, size: 14, color: limit == null ? Theme.of(context).disabledColor : null),
+                Icon(
+                  Icons.data_usage_outlined,
+                  size: 14,
+                  color: limit == null ? Theme.of(context).disabledColor : null,
+                ),
                 if (limit != null) ...[
                   const SizedBox(width: 3),
-                  Text(_formatTokens(limit), style: Theme.of(context).textTheme.labelSmall),
+                  Text(
+                    _formatTokens(limit),
+                    style: Theme.of(context).textTheme.labelSmall,
+                  ),
                 ],
               ],
             ),
@@ -3504,7 +3641,8 @@ class ContextWindowIndicator extends StatelessWidget {
     );
   }
 
-  static String _formatTokens(int tokens) => tokens >= 1000 ? '${(tokens / 1000).round()}k' : '$tokens';
+  static String _formatTokens(int tokens) =>
+      tokens >= 1000 ? '${(tokens / 1000).round()}k' : '$tokens';
 }
 
 class NativeComposerTextView extends StatefulWidget {
@@ -3834,6 +3972,10 @@ class ProjectToolsPanel extends StatefulWidget {
     required this.width,
     required this.terminal,
     required this.onEnsureTerminal,
+    required this.presentation,
+    required this.dockedTerminalExpanded,
+    required this.onToggleDocked,
+    required this.onPresentationChanged,
     required this.events,
     required this.canStopSession,
     required this.onOpenSession,
@@ -3845,6 +3987,10 @@ class ProjectToolsPanel extends StatefulWidget {
   final double width;
   final ProjectTerminalSession? terminal;
   final Future<void> Function() onEnsureTerminal;
+  final TerminalPresentation presentation;
+  final bool dockedTerminalExpanded;
+  final VoidCallback onToggleDocked;
+  final ValueChanged<TerminalPresentation> onPresentationChanged;
   final List<AttentionEvent> events;
   final bool Function(AttentionEvent event) canStopSession;
   final ValueChanged<AttentionEvent> onOpenSession;
@@ -3856,62 +4002,69 @@ class ProjectToolsPanel extends StatefulWidget {
 }
 
 class _ProjectToolsPanelState extends State<ProjectToolsPanel> {
-  bool _terminalExpanded = true;
-
   @override
   void initState() {
     super.initState();
     if (widget.terminal == null) {
-      WidgetsBinding.instance.addPostFrameCallback((_) => widget.onEnsureTerminal());
+      WidgetsBinding.instance.addPostFrameCallback(
+        (_) => widget.onEnsureTerminal(),
+      );
     }
   }
 
   @override
   void didUpdateWidget(ProjectToolsPanel oldWidget) {
     super.didUpdateWidget(oldWidget);
-    if (widget.terminal == null && oldWidget.terminal?.projectId != widget.terminal?.projectId) {
-      WidgetsBinding.instance.addPostFrameCallback((_) => widget.onEnsureTerminal());
+    if (widget.terminal == null &&
+        oldWidget.terminal?.projectId != widget.terminal?.projectId) {
+      WidgetsBinding.instance.addPostFrameCallback(
+        (_) => widget.onEnsureTerminal(),
+      );
     }
   }
 
   @override
   Widget build(BuildContext context) {
     final terminal = widget.terminal;
+    if (widget.presentation == TerminalPresentation.vertical) {
+      return SizedBox(
+        width: widget.width,
+        child: Column(
+          children: [
+            Expanded(
+              child: ProjectTerminalSurface(
+                terminal: terminal,
+                presentation: widget.presentation,
+                onTitleTap: () =>
+                    widget.onPresentationChanged(TerminalPresentation.docked),
+                onPresentationChanged: widget.onPresentationChanged,
+              ),
+            ),
+            const Divider(height: 1),
+            AttentionHeader(
+              collapsed: true,
+              onTap: () =>
+                  widget.onPresentationChanged(TerminalPresentation.docked),
+            ),
+          ],
+        ),
+      );
+    }
     return SizedBox(
       width: widget.width,
       child: Column(
         children: [
-          Material(
-            color: context.ditch.inspector,
-            child: InkWell(
-              onTap: () => setState(() => _terminalExpanded = !_terminalExpanded),
-              child: Padding(
-                padding: const EdgeInsets.fromLTRB(16, 12, 10, 12),
-                child: Row(
-                  children: [
-                    Icon(_terminalExpanded ? Icons.expand_more : Icons.chevron_right),
-                    const SizedBox(width: 6),
-                    const Icon(Icons.terminal, size: 17),
-                    const SizedBox(width: 8),
-                    const Expanded(child: Text('Terminal')),
-                    if (terminal == null)
-                      const Icon(Icons.more_horiz, size: 18),
-                  ],
-                ),
-              ),
-            ),
+          ProjectTerminalHeader(
+            terminalAvailable: terminal != null,
+            expanded: widget.dockedTerminalExpanded,
+            presentation: widget.presentation,
+            onTitleTap: widget.onToggleDocked,
+            onPresentationChanged: widget.onPresentationChanged,
           ),
-          if (_terminalExpanded)
+          if (widget.dockedTerminalExpanded)
             SizedBox(
               height: 250,
-              child: terminal == null
-                  ? const Center(child: Text('Starting project shell…'))
-                  : TerminalView(
-                      terminal.terminal,
-                      autofocus: false,
-                      theme: TerminalThemes.defaultTheme,
-                      padding: const EdgeInsets.all(8),
-                    ),
+              child: ProjectTerminalBody(terminal: terminal),
             ),
           const Divider(height: 1),
           Expanded(
@@ -3925,6 +4078,211 @@ class _ProjectToolsPanelState extends State<ProjectToolsPanel> {
             ),
           ),
         ],
+      ),
+    );
+  }
+}
+
+class ProjectTerminalSurface extends StatelessWidget {
+  const ProjectTerminalSurface({
+    required this.terminal,
+    required this.presentation,
+    required this.onTitleTap,
+    required this.onPresentationChanged,
+    this.onClose,
+    super.key,
+  });
+
+  final ProjectTerminalSession? terminal;
+  final TerminalPresentation presentation;
+  final VoidCallback onTitleTap;
+  final ValueChanged<TerminalPresentation> onPresentationChanged;
+  final VoidCallback? onClose;
+
+  @override
+  Widget build(BuildContext context) {
+    return ColoredBox(
+      color: TerminalThemes.defaultTheme.background,
+      child: Column(
+        children: [
+          ProjectTerminalHeader(
+            terminalAvailable: terminal != null,
+            expanded: true,
+            presentation: presentation,
+            onTitleTap: onTitleTap,
+            onPresentationChanged: onPresentationChanged,
+            onClose: onClose,
+          ),
+          Expanded(
+            child: ProjectTerminalBody(
+              terminal: terminal,
+              onEscape: presentation == TerminalPresentation.maximized
+                  ? onClose
+                  : null,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class ProjectTerminalBody extends StatelessWidget {
+  const ProjectTerminalBody({required this.terminal, this.onEscape, super.key});
+
+  final ProjectTerminalSession? terminal;
+  final VoidCallback? onEscape;
+
+  @override
+  Widget build(BuildContext context) {
+    return terminal == null
+        ? const Center(child: Text('Starting project shell…'))
+        : TerminalView(
+            terminal!.terminal,
+            autofocus: false,
+            theme: TerminalThemes.defaultTheme,
+            padding: const EdgeInsets.all(8),
+            onKeyEvent: onEscape == null
+                ? null
+                : (_, event) {
+                    if (event is KeyDownEvent &&
+                        event.logicalKey == LogicalKeyboardKey.escape) {
+                      onEscape!();
+                      return KeyEventResult.handled;
+                    }
+                    return KeyEventResult.ignored;
+                  },
+          );
+  }
+}
+
+class ProjectTerminalHeader extends StatelessWidget {
+  const ProjectTerminalHeader({
+    required this.terminalAvailable,
+    required this.expanded,
+    required this.presentation,
+    required this.onTitleTap,
+    required this.onPresentationChanged,
+    this.onClose,
+    super.key,
+  });
+
+  final bool terminalAvailable;
+  final bool expanded;
+  final TerminalPresentation presentation;
+  final VoidCallback onTitleTap;
+  final ValueChanged<TerminalPresentation> onPresentationChanged;
+  final VoidCallback? onClose;
+
+  void _toggle(TerminalPresentation target) {
+    onPresentationChanged(
+      presentation == target ? TerminalPresentation.docked : target,
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Material(
+      color: context.ditch.inspector,
+      child: SizedBox(
+        height: 44,
+        child: Row(
+          children: [
+            if (onClose != null)
+              IconButton(
+                key: const Key('terminal-maximize-close'),
+                tooltip: 'Restore terminal',
+                onPressed: onClose,
+                icon: const Icon(Icons.close, size: 18),
+              ),
+            Expanded(
+              child: InkWell(
+                onTap: onTitleTap,
+                child: Padding(
+                  padding: EdgeInsets.only(left: onClose == null ? 14 : 4),
+                  child: Row(
+                    children: [
+                      Icon(
+                        expanded ? Icons.expand_more : Icons.chevron_right,
+                        size: 18,
+                      ),
+                      const SizedBox(width: 6),
+                      const Icon(Icons.terminal, size: 17),
+                      const SizedBox(width: 8),
+                      const Expanded(
+                        child: Text(
+                          'Terminal',
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ),
+                      if (!terminalAvailable) ...[
+                        const SizedBox(width: 6),
+                        const Icon(Icons.more_horiz, size: 18),
+                      ],
+                    ],
+                  ),
+                ),
+              ),
+            ),
+            IconButton(
+              key: const Key('terminal-expand-horizontal'),
+              tooltip: 'Expand terminal horizontally',
+              onPressed: () => _toggle(TerminalPresentation.horizontal),
+              icon: const Icon(Icons.swap_horiz, size: 18),
+            ),
+            IconButton(
+              key: const Key('terminal-expand-vertical'),
+              tooltip: 'Expand terminal vertically',
+              onPressed: () => _toggle(TerminalPresentation.vertical),
+              icon: const Icon(Icons.swap_vert, size: 18),
+            ),
+            IconButton(
+              key: const Key('terminal-maximize'),
+              tooltip: 'Maximize terminal',
+              onPressed: () => _toggle(TerminalPresentation.maximized),
+              icon: const Icon(Icons.fullscreen, size: 19),
+            ),
+            const SizedBox(width: 4),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class AttentionHeader extends StatelessWidget {
+  const AttentionHeader({required this.collapsed, this.onTap, super.key});
+
+  final bool collapsed;
+  final VoidCallback? onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    return Material(
+      color: context.ditch.inspector,
+      child: InkWell(
+        key: const Key('attention-header'),
+        onTap: onTap,
+        child: SizedBox(
+          height: 50,
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16),
+            child: Row(
+              children: [
+                Icon(
+                  collapsed ? Icons.chevron_right : Icons.expand_more,
+                  size: 18,
+                ),
+                const SizedBox(width: 6),
+                Text(
+                  'Attention',
+                  style: Theme.of(context).textTheme.titleLarge,
+                ),
+              ],
+            ),
+          ),
+        ),
       ),
     );
   }
@@ -3950,40 +4308,43 @@ class AttentionPanel extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-
     return ColoredBox(
       color: context.ditch.inspector,
       child: SizedBox(
         width: width,
         child: SafeArea(
           top: false,
-          child: SingleChildScrollView(
-            padding: const EdgeInsets.all(16),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text('Attention', style: theme.textTheme.titleLarge),
-                const SizedBox(height: 12),
-                if (events.isEmpty)
-                  const AttentionEmptyState()
-                else
-                  for (final event in events) ...[
-                    AttentionItem(
-                      event: event,
-                      canStop: canStopSession(event),
-                      onOpen: event.canOpenSession
-                          ? () => onOpenSession(event)
-                          : null,
-                      onStop: canStopSession(event)
-                          ? () => onStopSession(event)
-                          : null,
-                      onDismiss: () => onDismiss(event),
-                    ),
-                    const SizedBox(height: 12),
-                  ],
-              ],
-            ),
+          child: Column(
+            children: [
+              const AttentionHeader(collapsed: false),
+              Expanded(
+                child: SingleChildScrollView(
+                  padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      if (events.isEmpty)
+                        const AttentionEmptyState()
+                      else
+                        for (final event in events) ...[
+                          AttentionItem(
+                            event: event,
+                            canStop: canStopSession(event),
+                            onOpen: event.canOpenSession
+                                ? () => onOpenSession(event)
+                                : null,
+                            onStop: canStopSession(event)
+                                ? () => onStopSession(event)
+                                : null,
+                            onDismiss: () => onDismiss(event),
+                          ),
+                          const SizedBox(height: 12),
+                        ],
+                    ],
+                  ),
+                ),
+              ),
+            ],
           ),
         ),
       ),

@@ -604,34 +604,75 @@ void main() {
     );
   });
 
-  testWidgets('new agent toolbar action remains enabled while agents work', (
+  testWidgets('new agent action lives in the Agents header', (tester) async {
+    await tester.pumpWidget(const TheDitchApp(connectRuntimeOnStart: false));
+
+    expect(find.byKey(const Key('agents-new-agent-button')), findsOneWidget);
+    expect(
+      find.descendant(
+        of: find.byType(DitchToolbar),
+        matching: find.text('New Agent'),
+      ),
+      findsNothing,
+    );
+  });
+
+  testWidgets('terminal supports horizontal and vertical workspace expansion', (
     tester,
   ) async {
-    await tester.pumpWidget(
-      MaterialApp(
-        home: DitchToolbar(
-          projectName: 'Fixture',
-          connection: RuntimeConnectionPhase.connected,
-          attentionCount: 0,
-          sidebarVisible: true,
-          inspectorVisible: true,
-          onToggleSidebar: () {},
-          onToggleInspector: () {},
-          onNewAgent: () {},
-        ),
-      ),
+    tester.view.physicalSize = const Size(1200, 800);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    await tester.pumpWidget(const TheDitchApp(connectRuntimeOnStart: false));
+
+    await tester.tap(find.byKey(const Key('terminal-expand-horizontal')));
+    await tester.pump();
+    expect(find.byType(ProjectTerminalSurface), findsOneWidget);
+    expect(
+      tester.getTopLeft(find.byType(ProjectTerminalSurface)).dy,
+      lessThan(tester.getTopLeft(find.text('Agents')).dy),
     );
 
-    final startButton = tester.widget<ButtonStyleButton>(
-      find.ancestor(
-        of: find.text('New Agent'),
-        matching: find.byWidgetPredicate(
-          (widget) => widget is ButtonStyleButton,
-        ),
-      ),
+    await tester.tap(find.byKey(const Key('terminal-expand-vertical')));
+    await tester.pump();
+    final collapsedAttention = tester.widget<AttentionHeader>(
+      find.byType(AttentionHeader),
     );
+    expect(collapsedAttention.collapsed, isTrue);
 
-    expect(startButton.onPressed, isNotNull);
+    await tester.tap(find.byKey(const Key('attention-header')));
+    await tester.pump();
+    expect(find.byType(ProjectTerminalSurface), findsNothing);
+    expect(
+      tester.widget<AttentionHeader>(find.byType(AttentionHeader)).collapsed,
+      isFalse,
+    );
+  });
+
+  testWidgets('maximized terminal restores with close or Escape', (
+    tester,
+  ) async {
+    tester.view.physicalSize = const Size(1200, 800);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    await tester.pumpWidget(const TheDitchApp(connectRuntimeOnStart: false));
+
+    await tester.tap(find.byKey(const Key('terminal-maximize')));
+    await tester.pump();
+    expect(find.byKey(const Key('terminal-maximize-close')), findsOneWidget);
+    expect(find.byType(AgentsSurface), findsNothing);
+
+    await tester.tap(find.byKey(const Key('terminal-maximize-close')));
+    await tester.pump();
+    expect(find.byType(AgentsSurface), findsOneWidget);
+
+    await tester.tap(find.byKey(const Key('terminal-maximize')));
+    await tester.pump();
+    await tester.sendKeyEvent(LogicalKeyboardKey.escape);
+    await tester.pump();
+    expect(find.byType(AgentsSurface), findsOneWidget);
   });
 
   testWidgets('expanded agent has persistent prompt composer', (tester) async {
