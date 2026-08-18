@@ -94,6 +94,15 @@ class AppDelegate: FlutterAppDelegate {
           UserDefaults.standard.set(inspector.doubleValue, forKey: "inspectorWidth")
         }
         result(true)
+      case "revealInFinder":
+        guard let path = call.arguments as? String,
+          FileManager.default.fileExists(atPath: path)
+        else {
+          result(false)
+          return
+        }
+        let projectURL = URL(fileURLWithPath: path, isDirectory: true)
+        result(NSWorkspace.shared.open(projectURL))
       case "openActivityMonitor":
         let url = URL(fileURLWithPath: "/System/Applications/Utilities/Activity Monitor.app")
         let configuration = NSWorkspace.OpenConfiguration()

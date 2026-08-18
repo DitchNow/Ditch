@@ -677,6 +677,38 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
     unawaited(_ensureSelectedProjectTerminal());
   }
 
+  Future<void> _revealProjectInFinder(DitchProject project) async {
+    try {
+      final revealed =
+          await _applicationChannel.invokeMethod<bool>(
+            'revealInFinder',
+            project.path,
+          ) ??
+          false;
+      if (!revealed && mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Could not reveal ${project.name} in Finder.'),
+          ),
+        );
+      }
+    } on MissingPluginException {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Finder integration is unavailable.')),
+        );
+      }
+    } on PlatformException {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Could not reveal ${project.name} in Finder.'),
+          ),
+        );
+      }
+    }
+  }
+
   void _setTerminalPresentation(TerminalPresentation presentation) {
     setState(() {
       if (presentation == TerminalPresentation.maximized) {
@@ -2146,6 +2178,8 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
                         selectedIndex: _selectedProjectIndex,
                         onAddProject: _addProject,
                         onSelectProject: _selectProject,
+                        onRevealProject: (project) =>
+                            unawaited(_revealProjectInFinder(project)),
                       ),
                       WorkspaceResizeHandle(
                         key: const Key('projects-resize-handle'),
@@ -2519,6 +2553,7 @@ class ProjectSidebar extends StatelessWidget {
     required this.selectedIndex,
     required this.onAddProject,
     required this.onSelectProject,
+    required this.onRevealProject,
     super.key,
   });
 
@@ -2527,6 +2562,7 @@ class ProjectSidebar extends StatelessWidget {
   final int selectedIndex;
   final VoidCallback onAddProject;
   final ValueChanged<int> onSelectProject;
+  final ValueChanged<DitchProject> onRevealProject;
 
   @override
   Widget build(BuildContext context) {
@@ -2562,6 +2598,7 @@ class ProjectSidebar extends StatelessWidget {
                         path: project.path,
                         selected: index == selectedIndex,
                         onTap: () => onSelectProject(index),
+                        onReveal: () => onRevealProject(project),
                       );
                     },
                   ),
@@ -2587,6 +2624,7 @@ class ProjectTile extends StatelessWidget {
     required this.path,
     required this.selected,
     required this.onTap,
+    required this.onReveal,
     super.key,
   });
 
@@ -2594,6 +2632,7 @@ class ProjectTile extends StatelessWidget {
   final String path;
   final bool selected;
   final VoidCallback onTap;
+  final VoidCallback onReveal;
 
   @override
   Widget build(BuildContext context) {
@@ -2611,7 +2650,7 @@ class ProjectTile extends StatelessWidget {
           padding: const EdgeInsets.all(10),
           child: Row(
             children: [
-              const Icon(Icons.folder_open, size: 18),
+              const Icon(Icons.folder_outlined, size: 18),
               const SizedBox(width: 8),
               Expanded(
                 child: Column(
@@ -2626,6 +2665,19 @@ class ProjectTile extends StatelessWidget {
                     ),
                   ],
                 ),
+              ),
+              const SizedBox(width: 4),
+              IconButton(
+                key: ValueKey('reveal-project-$path'),
+                onPressed: onReveal,
+                tooltip: 'Show in Finder',
+                visualDensity: VisualDensity.compact,
+                constraints: const BoxConstraints.tightFor(
+                  width: 28,
+                  height: 28,
+                ),
+                padding: EdgeInsets.zero,
+                icon: const Icon(Icons.folder_open_outlined, size: 16),
               ),
             ],
           ),

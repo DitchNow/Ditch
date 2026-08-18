@@ -133,7 +133,6 @@ final class StatusHost: NSObject, NSApplicationDelegate {
       button.image = statusImage()
       button.imagePosition = .imageLeft
       button.title = ""
-      button.contentTintColor = NSColor.labelColor
       button.toolTip = "The Ditch Runtime"
     }
 
@@ -372,44 +371,64 @@ final class StatusHost: NSObject, NSApplicationDelegate {
   }
 
   private func statusImage() -> NSImage {
-    if let image = NSImage(systemSymbolName: "cpu", accessibilityDescription: "The Ditch Runtime") {
-      image.isTemplate = true
-      return image
-    }
-
     let image = NSImage(size: NSSize(width: 18, height: 18))
     image.lockFocus()
 
-    NSColor.black.setStroke()
     NSColor.black.setFill()
 
-    let body = NSBezierPath(
-      roundedRect: NSRect(x: 4.5, y: 4.5, width: 9, height: 9),
-      xRadius: 2,
-      yRadius: 2)
-    body.lineWidth = 2
-    body.stroke()
+    // Use more of the standard 18-point status-item canvas so the mark has the
+    // same optical weight as neighboring menu-bar icons.
+    let scale = NSAffineTransform()
+    scale.translateX(by: 9, yBy: 9)
+    scale.scale(by: 1.09)
+    scale.translateX(by: -9, yBy: -9)
+    scale.concat()
 
-    NSBezierPath(rect: NSRect(x: 7.25, y: 14, width: 1.5, height: 3)).fill()
-    NSBezierPath(rect: NSRect(x: 9.25, y: 14, width: 1.5, height: 3)).fill()
-    NSBezierPath(rect: NSRect(x: 7.25, y: 1, width: 1.5, height: 3)).fill()
-    NSBezierPath(rect: NSRect(x: 9.25, y: 1, width: 1.5, height: 3)).fill()
-    NSBezierPath(rect: NSRect(x: 1, y: 7.25, width: 3, height: 1.5)).fill()
-    NSBezierPath(rect: NSRect(x: 1, y: 9.25, width: 3, height: 1.5)).fill()
-    NSBezierPath(rect: NSRect(x: 14, y: 7.25, width: 3, height: 1.5)).fill()
-    NSBezierPath(rect: NSRect(x: 14, y: 9.25, width: 3, height: 1.5)).fill()
+    // A compact, clean rendering of The Ditch's chip-shaped D mark. Drawing it
+    // here keeps the login-item helper self-contained and resolution independent.
+    let mark = NSBezierPath()
+    mark.windingRule = .evenOdd
+    mark.appendRoundedRect(
+      NSRect(x: 3.25, y: 3.25, width: 11.5, height: 11.5),
+      xRadius: 2.4,
+      yRadius: 2.4)
 
-    NSBezierPath(
-      roundedRect: NSRect(x: 7, y: 7, width: 1.75, height: 1.75),
-      xRadius: 0.5,
-      yRadius: 0.5).fill()
-    NSBezierPath(
-      roundedRect: NSRect(x: 9.25, y: 9.25, width: 1.75, height: 1.75),
-      xRadius: 0.5,
-      yRadius: 0.5).fill()
+    // The counter has a straight left edge and a rounded right edge, forming D.
+    mark.move(to: NSPoint(x: 6.4, y: 6.25))
+    mark.line(to: NSPoint(x: 8.85, y: 6.25))
+    mark.curve(
+      to: NSPoint(x: 12.05, y: 9),
+      controlPoint1: NSPoint(x: 10.8, y: 6.25),
+      controlPoint2: NSPoint(x: 12.05, y: 7.35))
+    mark.curve(
+      to: NSPoint(x: 8.85, y: 11.75),
+      controlPoint1: NSPoint(x: 12.05, y: 10.65),
+      controlPoint2: NSPoint(x: 10.8, y: 11.75))
+    mark.line(to: NSPoint(x: 6.4, y: 11.75))
+    mark.close()
+    mark.fill()
+
+    let pins: [NSRect] = [
+      NSRect(x: 5.1, y: 13.9, width: 1.55, height: 3.1),
+      NSRect(x: 8.2, y: 13.9, width: 1.55, height: 3.1),
+      NSRect(x: 11.35, y: 13.9, width: 1.55, height: 3.1),
+      NSRect(x: 5.1, y: 1, width: 1.55, height: 3.1),
+      NSRect(x: 8.2, y: 1, width: 1.55, height: 3.1),
+      NSRect(x: 11.35, y: 1, width: 1.55, height: 3.1),
+      NSRect(x: 1, y: 5.1, width: 3.1, height: 1.55),
+      NSRect(x: 1, y: 8.2, width: 3.1, height: 1.55),
+      NSRect(x: 1, y: 11.35, width: 3.1, height: 1.55),
+      NSRect(x: 13.9, y: 5.1, width: 3.1, height: 1.55),
+      NSRect(x: 13.9, y: 8.2, width: 3.1, height: 1.55),
+      NSRect(x: 13.9, y: 11.35, width: 3.1, height: 1.55),
+    ]
+    for pin in pins {
+      NSBezierPath(roundedRect: pin, xRadius: 0.75, yRadius: 0.75).fill()
+    }
 
     image.unlockFocus()
     image.isTemplate = true
+    image.accessibilityDescription = "The Ditch Runtime"
     return image
   }
 }

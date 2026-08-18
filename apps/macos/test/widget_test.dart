@@ -709,6 +709,34 @@ void main() {
     await tester.pump(const Duration(milliseconds: 50));
   });
 
+  testWidgets('project reveal button does not select the project row', (
+    tester,
+  ) async {
+    var selected = false;
+    var revealed = false;
+    const path = '/tmp/the-ditch-project';
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: ProjectTile(
+            name: 'The Ditch',
+            path: path,
+            selected: false,
+            onTap: () => selected = true,
+            onReveal: () => revealed = true,
+          ),
+        ),
+      ),
+    );
+
+    await tester.tap(find.byKey(const ValueKey('reveal-project-$path')));
+    await tester.pump();
+
+    expect(revealed, isTrue);
+    expect(selected, isFalse);
+  });
+
   testWidgets('expanded agent has persistent prompt composer', (tester) async {
     await tester.pumpWidget(const TheDitchApp(connectRuntimeOnStart: false));
 
