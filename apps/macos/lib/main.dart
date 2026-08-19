@@ -306,7 +306,36 @@ void reconcileAgentSession(List<AgentSession> sessions, AgentSession incoming) {
   );
 }
 
-enum AttentionKind { approvalRequired, blocked, failed, needsInput }
+enum AttentionKind { approvalRequired, blocked, completed, failed, needsInput }
+
+class AgentNotificationTarget {
+  const AgentNotificationTarget({
+    required this.projectId,
+    required this.agentId,
+    this.attentionId,
+  });
+
+  final String projectId;
+  final String agentId;
+  final String? attentionId;
+
+  static AgentNotificationTarget? fromArguments(Object? arguments) {
+    if (arguments is! Map) return null;
+    final projectId = arguments['projectId']?.toString();
+    final agentId = arguments['agentId']?.toString();
+    if (projectId == null ||
+        projectId.isEmpty ||
+        agentId == null ||
+        agentId.isEmpty) {
+      return null;
+    }
+    return AgentNotificationTarget(
+      projectId: projectId,
+      agentId: agentId,
+      attentionId: arguments['attentionId']?.toString(),
+    );
+  }
+}
 
 class AttentionEvent {
   const AttentionEvent({
@@ -644,6 +673,8 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
   String _selectedProjectKey = canonicalProjectPath(_bootstrapProject.path);
   String? _expandedAgentLocalId;
   String? _focusedAgentLocalId;
+  AgentNotificationTarget? _pendingNotificationTarget;
+  bool _runtimeSnapshotHydrated = false;
   final List<AgentSession> _agentSessions = [];
 
   String _projectKey(DitchProject project) =>
@@ -1043,6 +1074,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
     if (_runtimeReconnectScheduled || !mounted) {
       return;
     }
+    _runtimeSnapshotHydrated = false;
     _runtimeReconnectScheduled = true;
     Future<void>.delayed(const Duration(milliseconds: 500), () async {
       if (!mounted) {
@@ -1155,8 +1187,15 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
       } else {
         _expandedAgentLocalId = null;
       }
+      _runtimeSnapshotHydrated = true;
     });
     _scheduleStatusBarUpdate();
+    final pendingTarget = _pendingNotificationTarget;
+    if (pendingTarget != null) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) _openNotificationTarget(pendingTarget);
+      });
+    }
   }
 
   DitchProject? _projectFromRuntime(Object? value) {
@@ -1166,6 +1205,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
   @override
   void initState() {
     super.initState();
+    _configureNativeNavigation();
     _scheduleStatusBarUpdate();
     unawaited(_loadPaneWidths());
     if (widget.connectRuntimeOnStart) {
@@ -1175,11 +1215,95 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
 
   @override
   void dispose() {
+    _applicationChannel.setMethodCallHandler(null);
     _presentation.dispose();
     _runtimeEvents?.cancel();
     _chatController.dispose();
     _agentListController.dispose();
     super.dispose();
+  }
+
+  void _configureNativeNavigation() {
+    _applicationChannel.setMethodCallHandler((call) async {
+      if (call.method != 'openAgent') return false;
+      final target = AgentNotificationTarget.fromArguments(call.arguments);
+      if (target == null) return false;
+      _receiveNotificationTarget(target);
+      return true;
+    });
+    unawaited(
+      _applicationChannel
+          .invokeMapMethod<String, dynamic>('consumePendingNavigation')
+          .then((arguments) {
+            final target = AgentNotificationTarget.fromArguments(arguments);
+            if (target != null) _receiveNotificationTarget(target);
+          })
+          .onError((_, _) {}),
+    );
+  }
+
+  void _receiveNotificationTarget(AgentNotificationTarget target) {
+    _pendingNotificationTarget = target;
+    if (_runtimeSnapshotHydrated) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) _openNotificationTarget(target);
+      });
+    }
+  }
+
+  void _openNotificationTarget(AgentNotificationTarget target) {
+    if (_pendingNotificationTarget != target) return;
+    final projectIndex = _projects.indexWhere(
+      (project) => project.id == target.projectId,
+    );
+    final session = _agentSessions
+        .where(
+          (candidate) =>
+              candidate.localId == target.agentId &&
+              candidate.projectId == target.projectId,
+        )
+        .firstOrNull;
+    if (projectIndex < 0 || session == null) {
+      _pendingNotificationTarget = null;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            'This notification refers to an agent session that is no longer available.',
+          ),
+        ),
+      );
+      return;
+    }
+
+    setState(() {
+      _selectedProjectKey = _projectKey(_projects[projectIndex]);
+      _expandedAgentLocalId = session.localId;
+      _focusedAgentLocalId = null;
+      _pendingNotificationTarget = null;
+      if (target.attentionId != null) {
+        _attention.removeWhere((event) => event.id == target.attentionId);
+      }
+    });
+    _scheduleStatusBarUpdate();
+    unawaited(_ensureSelectedProjectTerminal());
+    final attentionId = target.attentionId;
+    if (attentionId != null) {
+      unawaited(_runtimeClient.dismissAttention(attentionId));
+    }
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
+      if (!mounted) return;
+      final headerContext = GlobalObjectKey(
+        'agent-header-${session.localId}',
+      ).currentContext;
+      if (headerContext != null) {
+        await Scrollable.ensureVisible(
+          headerContext,
+          alignment: 0,
+          duration: const Duration(milliseconds: 180),
+          curve: Curves.easeOut,
+        );
+      }
+    });
   }
 
   Future<void> _addProject() async {
@@ -1868,15 +1992,18 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
     final kind = switch (value['kind']?.toString()) {
       'ApprovalRequired' => AttentionKind.approvalRequired,
       'Blocked' => AttentionKind.blocked,
+      'Completed' => AttentionKind.completed,
       'Failed' => AttentionKind.failed,
       _ => AttentionKind.needsInput,
     };
     return AttentionEvent(
       id: id,
       kind: kind,
-      icon: kind == AttentionKind.failed
-          ? Icons.error_outline
-          : Icons.notifications_active_outlined,
+      icon: switch (kind) {
+        AttentionKind.failed => Icons.error_outline,
+        AttentionKind.completed => Icons.task_alt_outlined,
+        _ => Icons.notifications_active_outlined,
+      },
       title: title,
       body: body,
       sessionLocalId: _agentIdToString(value['agent_id']),

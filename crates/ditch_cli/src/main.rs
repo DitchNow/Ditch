@@ -18,6 +18,9 @@ fn main() {
         [runtime, command] if runtime == "runtime" && command == "reconnect" => {
             print_response(ClientRequest::Snapshot)
         }
+        [runtime, command] if runtime == "runtime" && command == "attention-stream" => {
+            stream_attention()
+        }
         [runtime, command, agent_id] if runtime == "runtime" && command == "stop-agent" => {
             stop_agent(agent_id)
         }
@@ -47,6 +50,7 @@ fn print_help() -> Result<(), i32> {
     eprintln!("  ditch doctor");
     eprintln!("  ditch runtime status");
     eprintln!("  ditch runtime reconnect");
+    eprintln!("  ditch runtime attention-stream");
     eprintln!("  ditch runtime stop-agent <agent-uuid>");
     eprintln!("  ditch runtime stop");
     eprintln!("  ditch runtime stop --force");
@@ -132,4 +136,48 @@ fn send_request(request: ClientRequest) -> io::Result<ServerResponse> {
     let envelope = serde_json::from_str::<Envelope<ServerResponse>>(&line)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     Ok(envelope.body)
+}
+
+fn stream_attention() -> Result<(), i32> {
+    let paths = AppPaths::for_current_user();
+    let mut stream = UnixStream::connect(paths.socket_path).map_err(|error| {
+        eprintln!("{error}");
+        1
+    })?;
+    let envelope = Envelope {
+        protocol_version: ditch_protocol::PROTOCOL_VERSION,
+        id: Uuid::new_v4(),
+        sent_at: Utc::now(),
+        body: ClientRequest::SubscribeAttention,
+    };
+    serde_json::to_writer(&mut stream, &envelope).map_err(|error| {
+        eprintln!("{error}");
+        1
+    })?;
+    stream.write_all(b"\n").map_err(|error| {
+        eprintln!("{error}");
+        1
+    })?;
+    stream.flush().map_err(|error| {
+        eprintln!("{error}");
+        1
+    })?;
+
+    let reader = BufReader::new(stream);
+    let mut stdout = io::stdout().lock();
+    for line in reader.lines() {
+        let line = line.map_err(|error| {
+            eprintln!("{error}");
+            1
+        })?;
+        writeln!(stdout, "{line}").map_err(|error| {
+            eprintln!("{error}");
+            1
+        })?;
+        stdout.flush().map_err(|error| {
+            eprintln!("{error}");
+            1
+        })?;
+    }
+    Ok(())
 }

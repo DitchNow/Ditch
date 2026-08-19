@@ -36,6 +36,7 @@ pub enum ClientRequest {
     SubscribeEvents {
         since_sequence: u64,
     },
+    SubscribeAttention,
     ListProjects,
     DiscoverProjects {
         search_root: String,
@@ -222,6 +223,7 @@ pub struct RuntimeAttention {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum ServerEvent {
     SnapshotReplaced(Snapshot),
+    AttentionSnapshotReplaced(Vec<RuntimeAttention>),
     RuntimeStatusChanged(RuntimeStatus),
     ProjectChanged(Project),
     TaskChanged(Task),

@@ -41,6 +41,7 @@ export CLANG_MODULE_CACHE_PATH="$SWIFT_CACHE"
 /usr/bin/swiftc -parse-as-library "$PROJECT_DIR/StatusHost/StatusHost.swift" \
   "$DITCHD_LIBRARY" \
   -framework Cocoa \
+  -framework UserNotifications \
   -o "$HELPER_MACOS/ditchd"
 
 cat > "$HELPER_CONTENTS/Info.plist" <<'PLIST'
@@ -58,7 +59,7 @@ cat > "$HELPER_CONTENTS/Info.plist" <<'PLIST'
   <key>CFBundleInfoDictionaryVersion</key>
   <string>6.0</string>
   <key>CFBundleName</key>
-  <string>The Ditch Runtime</string>
+  <string>The Ditch</string>
   <key>CFBundlePackageType</key>
   <string>APPL</string>
   <key>CFBundleShortVersionString</key>

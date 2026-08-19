@@ -67,6 +67,7 @@ struct RuntimeState {
     terminals: HashMap<uuid::Uuid, ProjectTerminalRecord>,
     terminal_by_project: HashMap<ditch_core::ProjectId, uuid::Uuid>,
     subscribers: Vec<Sender<String>>,
+    attention_subscribers: Vec<Sender<String>>,
     next_sequence: u64,
     instance_id: uuid::Uuid,
     attention: Vec<RuntimeAttention>,
@@ -130,6 +131,7 @@ impl RuntimeState {
             terminals: HashMap::new(),
             terminal_by_project: HashMap::new(),
             subscribers: Vec::new(),
+            attention_subscribers: Vec::new(),
             next_sequence: 1,
             instance_id: uuid::Uuid::new_v4(),
             attention: durable.attention,
@@ -166,7 +168,10 @@ impl RuntimeState {
             codex_binary: self.codex_binary.clone(),
             started_at: Some(self.started_at),
             build_version: env!("CARGO_PKG_VERSION").to_owned(),
-            capabilities: vec!["persistent_sessions_v1".to_owned()],
+            capabilities: vec![
+                "persistent_sessions_v1".to_owned(),
+                "attention_stream_v1".to_owned(),
+            ],
         }
     }
 
@@ -189,6 +194,10 @@ impl RuntimeState {
     }
 
     fn broadcast(&mut self, event: ServerEvent) {
+        let is_attention_event = matches!(
+            event,
+            ServerEvent::AttentionRaised(_) | ServerEvent::AttentionDismissed { .. }
+        );
         let envelope = Envelope::new(SequencedEvent {
             sequence: self.next_sequence,
             event,
@@ -204,6 +213,16 @@ impl RuntimeState {
             }
         }
         self.subscribers = live;
+
+        if is_attention_event {
+            let mut live = Vec::new();
+            for tx in self.attention_subscribers.drain(..) {
+                if tx.send(line.clone()).is_ok() {
+                    live.push(tx);
+                }
+            }
+            self.attention_subscribers = live;
+        }
     }
 
     fn persist_agent(&mut self, agent_id: AgentId) {
@@ -293,6 +312,9 @@ fn handle_client(mut stream: UnixStream, state: Arc<Mutex<RuntimeState>>) -> io:
     if let ClientRequest::SubscribeEvents { .. } = request {
         return subscribe(stream, state);
     }
+    if let ClientRequest::SubscribeAttention = request {
+        return subscribe_attention(stream, state);
+    }
 
     let response = handle_request(request, state);
     let envelope = Envelope::new(response);
@@ -311,6 +333,35 @@ fn subscribe(mut stream: UnixStream, state: Arc<Mutex<RuntimeState>>) -> io::Res
         let envelope = Envelope::new(SequencedEvent {
             sequence: state.next_sequence,
             event: ServerEvent::SnapshotReplaced(state.snapshot()),
+        });
+        state.next_sequence += 1;
+        serde_json::to_string(&envelope)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?
+    };
+
+    stream.write_all(initial.as_bytes())?;
+    stream.write_all(b"\n")?;
+    stream.flush()?;
+
+    for line in rx {
+        stream.write_all(line.as_bytes())?;
+        stream.write_all(b"\n")?;
+        stream.flush()?;
+    }
+
+    Ok(())
+}
+
+fn subscribe_attention(mut stream: UnixStream, state: Arc<Mutex<RuntimeState>>) -> io::Result<()> {
+    let (tx, rx) = mpsc::channel::<String>();
+    let initial = {
+        let mut state = state
+            .lock()
+            .expect("runtime state lock should not be poisoned");
+        state.attention_subscribers.push(tx);
+        let envelope = Envelope::new(SequencedEvent {
+            sequence: state.next_sequence,
+            event: ServerEvent::AttentionSnapshotReplaced(state.attention.clone()),
         });
         state.next_sequence += 1;
         serde_json::to_string(&envelope)
@@ -485,7 +536,8 @@ fn handle_request(request: ClientRequest, state: Arc<Mutex<RuntimeState>>) -> Se
         ClientRequest::StartCodex { .. }
         | ClientRequest::ApprovePermission { .. }
         | ClientRequest::DenyPermission { .. }
-        | ClientRequest::SubscribeEvents { .. } => protocol_error(
+        | ClientRequest::SubscribeEvents { .. }
+        | ClientRequest::SubscribeAttention => protocol_error(
             "unsupported_request",
             "request is not implemented by this runtime",
         ),
@@ -1865,9 +1917,13 @@ fn finish_agent(state: &Arc<Mutex<RuntimeState>>, agent_id: AgentId, code: Optio
             return;
         };
         if !matches!(record.run.state, AgentState::Interrupted) {
-            record.run.state = match code {
-                Some(0) => AgentState::Completed,
-                _ => AgentState::Failed,
+            record.run.state = if record.terminal_failure.is_some() {
+                AgentState::Failed
+            } else {
+                match code {
+                    Some(0) => AgentState::Completed,
+                    _ => AgentState::Failed,
+                }
             };
         }
         record.run.last_visible_action = Some(match code {
@@ -1882,36 +1938,47 @@ fn finish_agent(state: &Arc<Mutex<RuntimeState>>, agent_id: AgentId, code: Optio
             .native_session_id
             .is_none()
             .then_some(AgentResumeBlockReason::NoCodexThread);
-        let attention = if record.run.state == AgentState::Failed {
-            let body = record
-                .terminal_failure
-                .clone()
-                .or_else(|| {
-                    record
-                        .messages
-                        .iter()
-                        .rev()
-                        .find(|message| message.role == AgentChatRole::System)
-                        .map(|message| message.text.clone())
+        let attention = match record.run.state {
+            AgentState::Failed => {
+                let body = record
+                    .terminal_failure
+                    .clone()
+                    .or_else(|| {
+                        record
+                            .messages
+                            .iter()
+                            .rev()
+                            .find(|message| message.role == AgentChatRole::System)
+                            .map(|message| message.text.clone())
+                    })
+                    .unwrap_or_else(|| {
+                        record
+                            .run
+                            .last_visible_action
+                            .clone()
+                            .unwrap_or_else(|| "The agent failed".to_owned())
+                    });
+                Some(RuntimeAttention {
+                    id: uuid::Uuid::new_v4(),
+                    kind: AttentionKind::Failed,
+                    agent_id: Some(agent_id),
+                    project_id: Some(record.run.project_id),
+                    title: "Agent failed".to_owned(),
+                    body,
+                    created_at: Utc::now(),
                 })
-                .unwrap_or_else(|| {
-                    record
-                        .run
-                        .last_visible_action
-                        .clone()
-                        .unwrap_or_else(|| "Codex failed".to_owned())
-                });
-            Some(RuntimeAttention {
+            }
+            AgentState::Completed => Some(RuntimeAttention {
                 id: uuid::Uuid::new_v4(),
-                kind: AttentionKind::Failed,
+                kind: AttentionKind::Completed,
                 agent_id: Some(agent_id),
                 project_id: Some(record.run.project_id),
-                title: "Codex run failed".to_owned(),
-                body,
+                title: "Agent finished".to_owned(),
+                body: "The agent finished its task. Open The Ditch to review the result."
+                    .to_owned(),
                 created_at: Utc::now(),
-            })
-        } else {
-            None
+            }),
+            _ => None,
         };
         (record.run.clone(), attention)
     };
@@ -2081,6 +2148,78 @@ mod tests {
         };
         ensure_app_dirs(&paths).expect("test app directories should be created");
         RuntimeState::new(paths).expect("test runtime should initialize")
+    }
+
+    #[test]
+    fn attention_subscribers_only_receive_attention_events() {
+        let mut state = test_runtime();
+        let (all_tx, all_rx) = mpsc::channel();
+        let (attention_tx, attention_rx) = mpsc::channel();
+        state.subscribers.push(all_tx);
+        state.attention_subscribers.push(attention_tx);
+
+        state.broadcast(ServerEvent::RuntimeStatusChanged(state.runtime_status()));
+        assert!(
+            all_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("general subscriber should receive status")
+                .contains("RuntimeStatusChanged")
+        );
+        assert!(matches!(
+            attention_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+
+        let attention_id = uuid::Uuid::new_v4();
+        state.broadcast(ServerEvent::AttentionDismissed { attention_id });
+        assert!(
+            all_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("general subscriber should receive attention")
+                .contains(&attention_id.to_string())
+        );
+        assert!(
+            attention_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("attention subscriber should receive attention")
+                .contains(&attention_id.to_string())
+        );
+    }
+
+    #[test]
+    fn attention_subscription_starts_with_a_compact_attention_snapshot() {
+        let state = Arc::new(Mutex::new(test_runtime()));
+        let (server, client) = UnixStream::pair().expect("fixture stream should open");
+        let subscription_state = Arc::clone(&state);
+        let subscription = thread::spawn(move || subscribe_attention(server, subscription_state));
+
+        client
+            .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+            .expect("fixture timeout should apply");
+        let mut reader = BufReader::new(client);
+        let mut line = String::new();
+        reader
+            .read_line(&mut line)
+            .expect("initial attention event should be readable");
+        let event: Value = serde_json::from_str(&line).expect("event should be valid JSON");
+        assert!(
+            event
+                .pointer("/body/event/AttentionSnapshotReplaced")
+                .is_some()
+        );
+        assert!(!line.contains("\"projects\""));
+        assert!(!line.contains("\"messages\""));
+        assert!(line.len() < 512);
+
+        state
+            .lock()
+            .expect("runtime state lock should not be poisoned")
+            .attention_subscribers
+            .clear();
+        subscription
+            .join()
+            .expect("subscription thread should stop")
+            .expect("subscription should close cleanly");
     }
 
     #[test]
@@ -2314,6 +2453,61 @@ mod tests {
             persisted.agents[0].run.resume_block_reason,
             Some(AgentResumeBlockReason::NoCodexThread)
         );
+    }
+
+    #[test]
+    fn completed_agent_creates_project_scoped_attention() {
+        let mut runtime = test_runtime();
+        let project = Project::new("Fixture", "/tmp/fixture-completed");
+        runtime.store.upsert_project(&project).unwrap();
+        runtime.projects.insert(project.root_key(), project.clone());
+        let agent_id = AgentId::new();
+        let now = Utc::now();
+        runtime.agents.insert(
+            agent_id,
+            AgentRecord {
+                run: AgentRun {
+                    id: agent_id,
+                    provider: AgentProvider::Codex,
+                    state: AgentState::Working,
+                    launch_mode: CodexLaunchMode::Exec,
+                    execution_profile: AgentExecutionProfile::default(),
+                    project_id: project.id,
+                    task_id: None,
+                    pane_id: None,
+                    native_session_id: Some("thread-completed".to_owned()),
+                    codex_title: Some("Notification test".to_owned()),
+                    user_title: None,
+                    origin_codex_home: None,
+                    current_prompt: Some("finish soon".to_owned()),
+                    last_visible_action: None,
+                    state_confidence: 1.0,
+                    state_evidence: "fixture".to_owned(),
+                    started_at: now,
+                    updated_at: now,
+                    finished_at: None,
+                    exit_code: None,
+                    resume_block_reason: None,
+                },
+                project_root: project.root,
+                allow_non_git: false,
+                messages: Vec::new(),
+                terminal_failure: None,
+            },
+        );
+        let state = Arc::new(Mutex::new(runtime));
+
+        finish_agent(&state, agent_id, Some(0));
+
+        let state = state.lock().expect("fixture state should lock");
+        assert_eq!(state.agents[&agent_id].run.state, AgentState::Completed);
+        assert_eq!(state.attention.len(), 1);
+        assert_eq!(state.attention[0].kind, AttentionKind::Completed);
+        assert_eq!(state.attention[0].agent_id, Some(agent_id));
+        assert_eq!(state.attention[0].project_id, Some(project.id));
+        let persisted = state.store.load().expect("persisted state should load");
+        assert_eq!(persisted.attention.len(), 1);
+        assert_eq!(persisted.attention[0].kind, AttentionKind::Completed);
     }
 
     #[test]

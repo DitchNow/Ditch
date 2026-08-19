@@ -1,11 +1,15 @@
 import Cocoa
 import Foundation
+import UserNotifications
 
 @_silgen_name("ditch_runtime_run")
 private func ditchRuntimeRun() -> Int32
 
 @main
-final class StatusHost: NSObject, NSApplicationDelegate {
+final class StatusHost: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate {
+  private static let agentEventCategory = "DITCH_AGENT_EVENT"
+  private static let openAgentAction = "DITCH_OPEN_AGENT"
+  private static let notifiedAttentionDefaultsKey = "notifiedAttentionIds"
   private var statusItem: NSStatusItem?
   private let menu = NSMenu()
   private let stateItem = NSMenuItem(title: "Runtime: Starting", action: nil, keyEquivalent: "")
@@ -17,6 +21,10 @@ final class StatusHost: NSObject, NSApplicationDelegate {
   private var runtimeStartInFlight = false
   private var runtimeThreadStarted = false
   private var shutdownRequested = false
+  private var attentionStreamProcess: Process?
+  private var attentionStreamBuffer = Data()
+  private var activeAttentionIds = Set<String>()
+  private var notifiedAttentionIds = Set<String>()
   private var lastRuntimeStatus: RuntimeStatus?
   private var lastStartAttempt = Date.distantPast
   private var appPath = ""
@@ -45,6 +53,7 @@ final class StatusHost: NSObject, NSApplicationDelegate {
     try? FileManager.default.removeItem(atPath: obsoletePid)
     log("launch integrated ditchd appPath=\(appPath) helperDirectory=\(helperDirectory)")
     writePidFile()
+    configureNotifications()
     configureStatusItem()
     ensureRuntimeAvailable()
     timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
@@ -52,8 +61,27 @@ final class StatusHost: NSObject, NSApplicationDelegate {
     }
   }
 
+  private func configureNotifications() {
+    let center = UNUserNotificationCenter.current()
+    center.delegate = self
+    let open = UNNotificationAction(
+      identifier: Self.openAgentAction,
+      title: "Open",
+      options: [.foreground])
+    center.setNotificationCategories([
+      UNNotificationCategory(
+        identifier: Self.agentEventCategory,
+        actions: [open],
+        intentIdentifiers: [],
+        options: [])
+    ])
+    notifiedAttentionIds = Set(
+      UserDefaults.standard.stringArray(forKey: Self.notifiedAttentionDefaultsKey) ?? [])
+  }
+
   func applicationWillTerminate(_ notification: Notification) {
     timer?.invalidate()
+    stopAttentionStream()
     if !pidFilePath.isEmpty {
       try? FileManager.default.removeItem(atPath: pidFilePath)
     }
@@ -189,6 +217,7 @@ final class StatusHost: NSObject, NSApplicationDelegate {
   private func applyRuntimeStatus(_ status: RuntimeStatus?) {
     lastRuntimeStatus = status
     guard let status else {
+      stopAttentionStream()
       stateItem.title = "Runtime: Offline"
       sessionsItem.title = "0 active sessions"
       attentionItem.title = "0 alerts"
@@ -211,6 +240,265 @@ final class StatusHost: NSObject, NSApplicationDelegate {
       attentionCount: status.attentionCount)
     statusItem?.button?.toolTip =
       "The Ditch Runtime • \(status.activeSessionCount) active"
+    startAttentionStream()
+  }
+
+  private func startAttentionStream() {
+    guard !shutdownRequested, attentionStreamProcess == nil else { return }
+    let cliPath = URL(fileURLWithPath: helperDirectory).appendingPathComponent("ditch_cli").path
+    guard FileManager.default.isExecutableFile(atPath: cliPath) else {
+      log("ditch_cli not executable at \(cliPath)")
+      return
+    }
+
+    let process = Process()
+    let stdout = Pipe()
+    let stderr = Pipe()
+    process.executableURL = URL(fileURLWithPath: cliPath)
+    process.arguments = ["runtime", "attention-stream"]
+    process.standardOutput = stdout
+    process.standardError = stderr
+    attentionStreamBuffer.removeAll(keepingCapacity: true)
+    attentionStreamProcess = process
+
+    stdout.fileHandleForReading.readabilityHandler = { [weak self] handle in
+      let data = handle.availableData
+      guard !data.isEmpty else { return }
+      DispatchQueue.main.async { self?.consumeAttentionStream(data) }
+    }
+    stderr.fileHandleForReading.readabilityHandler = { [weak self] handle in
+      let data = handle.availableData
+      guard !data.isEmpty, let message = String(data: data, encoding: .utf8) else { return }
+      self?.log("attention stream: \(message.trimmingCharacters(in: .whitespacesAndNewlines))")
+    }
+    process.terminationHandler = { [weak self, weak process] _ in
+      DispatchQueue.main.async {
+        guard let self, let process, self.attentionStreamProcess === process else { return }
+        stdout.fileHandleForReading.readabilityHandler = nil
+        stderr.fileHandleForReading.readabilityHandler = nil
+        self.attentionStreamProcess = nil
+        self.attentionStreamBuffer.removeAll(keepingCapacity: true)
+      }
+    }
+
+    do {
+      try process.run()
+      log("attention stream connected")
+    } catch {
+      stdout.fileHandleForReading.readabilityHandler = nil
+      stderr.fileHandleForReading.readabilityHandler = nil
+      attentionStreamProcess = nil
+      log("attention stream failed to start: \(error)")
+    }
+  }
+
+  private func stopAttentionStream() {
+    guard let process = attentionStreamProcess else { return }
+    attentionStreamProcess = nil
+    if let stdout = process.standardOutput as? Pipe {
+      stdout.fileHandleForReading.readabilityHandler = nil
+    }
+    if let stderr = process.standardError as? Pipe {
+      stderr.fileHandleForReading.readabilityHandler = nil
+    }
+    if process.isRunning { process.terminate() }
+    attentionStreamBuffer.removeAll(keepingCapacity: true)
+  }
+
+  private func consumeAttentionStream(_ data: Data) {
+    attentionStreamBuffer.append(data)
+    while let newline = attentionStreamBuffer.firstIndex(of: 0x0A) {
+      let line = attentionStreamBuffer[..<newline]
+      attentionStreamBuffer.removeSubrange(...newline)
+      guard !line.isEmpty else { continue }
+      handleAttentionStreamLine(Data(line))
+    }
+  }
+
+  private func handleAttentionStreamLine(_ data: Data) {
+    guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+      let body = root["body"] as? [String: Any],
+      let event = body["event"] as? [String: Any]
+    else {
+      log("ignored invalid attention stream event")
+      return
+    }
+
+    if let values = event["AttentionSnapshotReplaced"] as? [Any] {
+      reconcileNotifications(values.compactMap(Self.agentAttention))
+      return
+    }
+    if let value = event["AttentionRaised"], let attention = Self.agentAttention(value) {
+      activeAttentionIds.insert(attention.id)
+      requestNotifications([attention])
+      return
+    }
+    if let value = event["AttentionDismissed"] as? [String: Any],
+      let id = Self.identifier(value["attention_id"])
+    {
+      activeAttentionIds.remove(id)
+      notifiedAttentionIds.remove(id)
+      persistNotifiedAttentionIds()
+      let notificationId = "ditch-attention-\(id)"
+      let center = UNUserNotificationCenter.current()
+      center.removeDeliveredNotifications(withIdentifiers: [notificationId])
+      center.removePendingNotificationRequests(withIdentifiers: [notificationId])
+    }
+  }
+
+  private static func agentAttention(_ value: Any) -> AgentAttention? {
+    guard let item = value as? [String: Any],
+      let id = identifier(item["id"]),
+      let kind = item["kind"] as? String,
+      let projectId = identifier(item["project_id"]),
+      let agentId = identifier(item["agent_id"]),
+      let title = item["title"] as? String,
+      let body = item["body"] as? String
+    else { return nil }
+    return AgentAttention(
+      id: id,
+      kind: kind,
+      projectId: projectId,
+      agentId: agentId,
+      title: title,
+      body: body)
+  }
+
+  private static func identifier(_ value: Any?) -> String? {
+    if let value = value as? String { return value }
+    if let value = value as? [String: Any] { return value["0"] as? String }
+    return nil
+  }
+
+  private func reconcileNotifications(_ attention: [AgentAttention]) {
+    let currentIds = Set(attention.map(\.id))
+    activeAttentionIds = currentIds
+    notifiedAttentionIds.formIntersection(currentIds)
+    persistNotifiedAttentionIds()
+
+    let center = UNUserNotificationCenter.current()
+    center.getDeliveredNotifications { delivered in
+      let obsolete = delivered
+        .map(\.request.identifier)
+        .filter { $0.hasPrefix("ditch-attention-") && !currentIds.contains(String($0.dropFirst("ditch-attention-".count))) }
+      if !obsolete.isEmpty { center.removeDeliveredNotifications(withIdentifiers: obsolete) }
+    }
+
+    requestNotifications(attention.filter { !notifiedAttentionIds.contains($0.id) })
+  }
+
+  private func requestNotifications(_ attention: [AgentAttention]) {
+    let newAttention = attention.filter { !notifiedAttentionIds.contains($0.id) }
+    guard !newAttention.isEmpty else { return }
+    let center = UNUserNotificationCenter.current()
+    center.getNotificationSettings { [weak self] settings in
+      guard let self else { return }
+      switch settings.authorizationStatus {
+      case .notDetermined:
+        center.requestAuthorization(options: [.alert]) { granted, error in
+          if let error { self.log("notification authorization failed: \(error)") }
+          if granted { self.postNotifications(newAttention) }
+        }
+      case .authorized, .provisional, .ephemeral:
+        self.postNotifications(newAttention)
+      case .denied:
+        break
+      @unknown default:
+        break
+      }
+    }
+  }
+
+  private func postNotifications(_ attention: [AgentAttention]) {
+    let center = UNUserNotificationCenter.current()
+    for item in attention {
+      DispatchQueue.main.async { [weak self] in
+        guard let self, !self.notifiedAttentionIds.contains(item.id) else { return }
+        self.notifiedAttentionIds.insert(item.id)
+        self.persistNotifiedAttentionIds()
+
+        let content = UNMutableNotificationContent()
+        content.title = item.title
+        content.body = item.body
+        content.categoryIdentifier = Self.agentEventCategory
+        content.threadIdentifier = item.projectId
+        content.userInfo = [
+          "attentionId": item.id,
+          "projectId": item.projectId,
+          "agentId": item.agentId,
+        ]
+        let request = UNNotificationRequest(
+          identifier: "ditch-attention-\(item.id)",
+          content: content,
+          trigger: nil)
+        center.add(request) { error in
+          guard let error else { return }
+          self.log("notification delivery failed: \(error)")
+          DispatchQueue.main.async {
+            self.notifiedAttentionIds.remove(item.id)
+            self.persistNotifiedAttentionIds()
+          }
+        }
+      }
+    }
+  }
+
+  private func persistNotifiedAttentionIds() {
+    UserDefaults.standard.set(
+      notifiedAttentionIds.sorted(),
+      forKey: Self.notifiedAttentionDefaultsKey)
+  }
+
+  func userNotificationCenter(
+    _ center: UNUserNotificationCenter,
+    willPresent notification: UNNotification,
+    withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
+  ) {
+    if #available(macOS 11.0, *) {
+      completionHandler([.banner, .list])
+    } else {
+      completionHandler([.alert])
+    }
+  }
+
+  func userNotificationCenter(
+    _ center: UNUserNotificationCenter,
+    didReceive response: UNNotificationResponse,
+    withCompletionHandler completionHandler: @escaping () -> Void
+  ) {
+    defer { completionHandler() }
+    guard response.actionIdentifier == Self.openAgentAction
+        || response.actionIdentifier == UNNotificationDefaultActionIdentifier,
+      let projectId = response.notification.request.content.userInfo["projectId"] as? String,
+      let agentId = response.notification.request.content.userInfo["agentId"] as? String,
+      let attentionId = response.notification.request.content.userInfo["attentionId"] as? String
+    else { return }
+    openAgent(projectId: projectId, agentId: agentId, attentionId: attentionId)
+  }
+
+  private func openAgent(projectId: String, agentId: String, attentionId: String) {
+    guard UUID(uuidString: projectId) != nil,
+      UUID(uuidString: agentId) != nil,
+      UUID(uuidString: attentionId) != nil,
+      !appPath.isEmpty
+    else { return }
+    var components = URLComponents()
+    components.scheme = "theditch"
+    components.host = "agent"
+    components.queryItems = [
+      URLQueryItem(name: "project", value: projectId),
+      URLQueryItem(name: "agent", value: agentId),
+      URLQueryItem(name: "attention", value: attentionId),
+    ]
+    guard let url = components.url else { return }
+    let configuration = NSWorkspace.OpenConfiguration()
+    configuration.activates = true
+    NSWorkspace.shared.open(
+      [url],
+      withApplicationAt: URL(fileURLWithPath: appPath),
+      configuration: configuration) { [weak self] _, error in
+        if let error { self?.log("opening notification target failed: \(error)") }
+      }
   }
 
   /// AppKit and the Rust runtime share this process. AppKit remains on the main
@@ -445,4 +733,13 @@ private struct CommandOutput {
   let exitCode: Int32
   let stdout: String
   let stderr: String
+}
+
+private struct AgentAttention {
+  let id: String
+  let kind: String
+  let projectId: String
+  let agentId: String
+  let title: String
+  let body: String
 }

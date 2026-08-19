@@ -9,6 +9,9 @@ import ServiceManagement
 /// Terminating this process must never stop The Ditch Runtime or its agents.
 @main
 class AppDelegate: FlutterAppDelegate {
+  private var applicationChannel: FlutterMethodChannel?
+  private var pendingAgentNavigation: [String: String]?
+
   override func applicationDidFinishLaunching(_ notification: Notification) {
     applyThemeMode(UserDefaults.standard.string(forKey: "themeMode") ?? "system")
     persistRuntimeEnvironment()
@@ -61,6 +64,7 @@ class AppDelegate: FlutterAppDelegate {
     let channel = FlutterMethodChannel(
       name: "the_ditch/application",
       binaryMessenger: messenger)
+    applicationChannel = channel
 
     channel.setMethodCallHandler { [weak self] call, result in
       guard let self else {
@@ -71,6 +75,10 @@ class AppDelegate: FlutterAppDelegate {
       case "showWindow":
         self.showMainWindow()
         result(true)
+      case "consumePendingNavigation":
+        let pending = self.pendingAgentNavigation
+        self.pendingAgentNavigation = nil
+        result(pending)
       case "runtimeAvailable":
         self.runtimeAvailable { result($0) }
       case "getThemeMode":
@@ -117,6 +125,39 @@ class AppDelegate: FlutterAppDelegate {
         result(FlutterMethodNotImplemented)
       }
     }
+  }
+
+  override func application(_ application: NSApplication, open urls: [URL]) {
+    for url in urls where handleAgentNavigationURL(url) {
+      return
+    }
+  }
+
+  @discardableResult
+  private func handleAgentNavigationURL(_ url: URL) -> Bool {
+    guard url.scheme == "theditch", url.host == "agent",
+      let components = URLComponents(url: url, resolvingAgainstBaseURL: false)
+    else { return false }
+    let values = Dictionary(
+      uniqueKeysWithValues: (components.queryItems ?? []).compactMap { item in
+        item.value.map { (item.name, $0) }
+      })
+    guard let projectId = values["project"], UUID(uuidString: projectId) != nil,
+      let agentId = values["agent"], UUID(uuidString: agentId) != nil
+    else { return false }
+
+    var target = ["projectId": projectId, "agentId": agentId]
+    if let attentionId = values["attention"], UUID(uuidString: attentionId) != nil {
+      target["attentionId"] = attentionId
+    }
+    pendingAgentNavigation = target
+    showMainWindow()
+    applicationChannel?.invokeMethod("openAgent", arguments: target) { [weak self] response in
+      if (response as? Bool) == true {
+        self?.pendingAgentNavigation = nil
+      }
+    }
+    return true
   }
 
   func configureProjectPickerChannel(messenger: FlutterBinaryMessenger) {

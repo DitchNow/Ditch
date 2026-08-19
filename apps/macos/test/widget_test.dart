@@ -189,6 +189,23 @@ void main() {
     ]);
   });
 
+  test('notification navigation preserves exact project and agent ids', () {
+    final target = AgentNotificationTarget.fromArguments({
+      'projectId': 'project-a',
+      'agentId': 'agent-b',
+      'attentionId': 'attention-c',
+    });
+
+    expect(target, isNotNull);
+    expect(target!.projectId, 'project-a');
+    expect(target.agentId, 'agent-b');
+    expect(target.attentionId, 'attention-c');
+    expect(
+      AgentNotificationTarget.fromArguments({'projectId': 'project-a'}),
+      isNull,
+    );
+  });
+
   testWidgets('renders command center shell', (tester) async {
     await tester.pumpWidget(const TheDitchApp(connectRuntimeOnStart: false));
 
