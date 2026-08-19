@@ -3037,68 +3037,82 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
                       _selectedProject.id!,
                       ProjectFilesState.new,
                     );
-              final projectToolsPanel = ProjectToolsPanel(
-                width: inspectorWidth,
-                projectId: _selectedProject.id,
-                terminal: selectedTerminal,
-                files: selectedFiles,
-                onEnsureTerminal: _ensureSelectedProjectTerminal,
-                onEnsureFiles: () {
-                  final projectId = _selectedProject.id;
-                  if (projectId != null) {
-                    return _loadProjectDirectory(projectId, '');
-                  }
-                  return Future.value();
-                },
-                presentation: _terminalPresentation,
-                presentedTool: _presentedTool,
-                dockedTerminalExpanded: _dockedTerminalExpanded,
-                dockedFilesExpanded: _dockedFilesExpanded,
-                onToggleDocked: () => setState(
-                  () => _dockedTerminalExpanded = !_dockedTerminalExpanded,
-                ),
-                onToggleFiles: () => setState(
-                  () => _dockedFilesExpanded = !_dockedFilesExpanded,
-                ),
-                onPresentationChanged: _setTerminalPresentation,
-                onToolPresentationChanged: _setToolPresentation,
-                onToggleDirectory: (entry) {
-                  final projectId = _selectedProject.id;
-                  if (projectId != null) {
-                    unawaited(_toggleProjectDirectory(projectId, entry));
-                  }
-                },
-                onOpenFile: (entry) {
-                  final projectId = _selectedProject.id;
-                  if (projectId != null) {
-                    unawaited(_openProjectFile(projectId, entry));
-                  }
-                },
-                onRevealFile: (entry) => unawaited(_revealProjectEntry(entry)),
-                onBackToFiles: selectedFiles == null
-                    ? null
-                    : () => unawaited(_closeProjectFile(selectedFiles)),
-                onSaveFile: selectedFiles == null
-                    ? null
-                    : () => unawaited(_saveProjectFile(selectedFiles)),
-                onReloadFile:
-                    selectedFiles == null || _selectedProject.id == null
-                    ? null
-                    : () => unawaited(
-                        _reloadProjectFile(_selectedProject.id!, selectedFiles),
-                      ),
-                onOverwriteFile: selectedFiles == null
-                    ? null
-                    : () => unawaited(_overwriteProjectFile(selectedFiles)),
-                onRefreshFiles: () {
-                  final projectId = _selectedProject.id;
-                  if (projectId != null) {
-                    unawaited(
-                      _loadProjectDirectory(projectId, '', refresh: true),
-                    );
-                  }
-                },
-              );
+              ProjectToolsPanel projectToolsPanel({required bool showFiles}) {
+                final editorOwnsHorizontalPresentation =
+                    _presentedTool == WorkspaceToolKind.editor &&
+                    _terminalPresentation == TerminalPresentation.horizontal;
+                return ProjectToolsPanel(
+                  width: inspectorWidth,
+                  projectId: _selectedProject.id,
+                  terminal: selectedTerminal,
+                  files: selectedFiles,
+                  showFiles: showFiles,
+                  onEnsureTerminal: _ensureSelectedProjectTerminal,
+                  onEnsureFiles: () {
+                    final projectId = _selectedProject.id;
+                    if (projectId != null) {
+                      return _loadProjectDirectory(projectId, '');
+                    }
+                    return Future.value();
+                  },
+                  presentation: editorOwnsHorizontalPresentation
+                      ? TerminalPresentation.docked
+                      : _terminalPresentation,
+                  presentedTool: editorOwnsHorizontalPresentation
+                      ? WorkspaceToolKind.terminal
+                      : _presentedTool,
+                  dockedTerminalExpanded: _dockedTerminalExpanded,
+                  dockedFilesExpanded: _dockedFilesExpanded,
+                  onToggleDocked: () => setState(
+                    () => _dockedTerminalExpanded = !_dockedTerminalExpanded,
+                  ),
+                  onToggleFiles: () => setState(
+                    () => _dockedFilesExpanded = !_dockedFilesExpanded,
+                  ),
+                  onPresentationChanged: _setTerminalPresentation,
+                  onToolPresentationChanged: _setToolPresentation,
+                  onToggleDirectory: (entry) {
+                    final projectId = _selectedProject.id;
+                    if (projectId != null) {
+                      unawaited(_toggleProjectDirectory(projectId, entry));
+                    }
+                  },
+                  onOpenFile: (entry) {
+                    final projectId = _selectedProject.id;
+                    if (projectId != null) {
+                      unawaited(_openProjectFile(projectId, entry));
+                    }
+                  },
+                  onRevealFile: (entry) =>
+                      unawaited(_revealProjectEntry(entry)),
+                  onBackToFiles: selectedFiles == null
+                      ? null
+                      : () => unawaited(_closeProjectFile(selectedFiles)),
+                  onSaveFile: selectedFiles == null
+                      ? null
+                      : () => unawaited(_saveProjectFile(selectedFiles)),
+                  onReloadFile:
+                      selectedFiles == null || _selectedProject.id == null
+                      ? null
+                      : () => unawaited(
+                          _reloadProjectFile(
+                            _selectedProject.id!,
+                            selectedFiles,
+                          ),
+                        ),
+                  onOverwriteFile: selectedFiles == null
+                      ? null
+                      : () => unawaited(_overwriteProjectFile(selectedFiles)),
+                  onRefreshFiles: () {
+                    final projectId = _selectedProject.id;
+                    if (projectId != null) {
+                      unawaited(
+                        _loadProjectDirectory(projectId, '', refresh: true),
+                      );
+                    }
+                  },
+                );
+              }
 
               Widget expandedToolSurface({VoidCallback? onClose}) {
                 if (_presentedTool == WorkspaceToolKind.editor &&
@@ -3128,7 +3142,10 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
                 );
               }
 
-              Widget standardWorkspace({required bool includeInspector}) {
+              Widget standardWorkspace({
+                required bool includeInspector,
+                bool hideFileSurface = false,
+              }) {
                 return Row(
                   children: [
                     Expanded(child: agentsSurface),
@@ -3154,7 +3171,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
                           unawaited(_persistPaneWidths());
                         },
                       ),
-                      projectToolsPanel,
+                      projectToolsPanel(showFiles: !hideFileSurface),
                     ],
                   ],
                 );
@@ -3162,6 +3179,26 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
 
               Widget terminalWorkspace() {
                 final body = switch (_terminalPresentation) {
+                  TerminalPresentation.horizontal
+                      when _presentedTool == WorkspaceToolKind.editor =>
+                    Column(
+                      children: [
+                        Expanded(
+                          child: standardWorkspace(
+                            includeInspector: true,
+                            hideFileSurface: true,
+                          ),
+                        ),
+                        const Divider(height: 1),
+                        SizedBox(
+                          height: (constraints.maxHeight * 0.34).clamp(
+                            190.0,
+                            340.0,
+                          ),
+                          child: expandedToolSurface(),
+                        ),
+                      ],
+                    ),
                   TerminalPresentation.horizontal => Column(
                     children: [
                       SizedBox(
@@ -5788,6 +5825,7 @@ class ProjectToolsPanel extends StatefulWidget {
     required this.projectId,
     required this.terminal,
     required this.files,
+    required this.showFiles,
     required this.onEnsureTerminal,
     required this.onEnsureFiles,
     required this.presentation,
@@ -5813,6 +5851,7 @@ class ProjectToolsPanel extends StatefulWidget {
   final String? projectId;
   final ProjectTerminalSession? terminal;
   final ProjectFilesState? files;
+  final bool showFiles;
   final Future<void> Function() onEnsureTerminal;
   final Future<void> Function() onEnsureFiles;
   final TerminalPresentation presentation;
@@ -5906,29 +5945,37 @@ class _ProjectToolsPanelState extends State<ProjectToolsPanel> {
           ),
           if (widget.dockedTerminalExpanded)
             Expanded(child: ProjectTerminalBody(terminal: terminal)),
-          ProjectFilesHeader(
-            expanded: widget.dockedFilesExpanded,
-            hasDocument: widget.files?.document != null,
-            onTitleTap: widget.onToggleFiles,
-            onRefresh: widget.onRefreshFiles,
-          ),
-          if (widget.dockedFilesExpanded)
-            Expanded(
-              child: ProjectFilesBody(
-                files: widget.files,
-                presentation: widget.presentation,
-                onToggleDirectory: widget.onToggleDirectory,
-                onOpenFile: widget.onOpenFile,
-                onRevealFile: widget.onRevealFile,
-                onBack: widget.onBackToFiles,
-                onSave: widget.onSaveFile,
-                onReload: widget.onReloadFile,
-                onOverwrite: widget.onOverwriteFile,
-                onPresentationChanged: (value) => widget
-                    .onToolPresentationChanged(WorkspaceToolKind.editor, value),
-              ),
+          if (widget.showFiles) ...[
+            ProjectFilesHeader(
+              expanded: widget.dockedFilesExpanded,
+              hasDocument: widget.files?.document != null,
+              onTitleTap: widget.onToggleFiles,
+              onRefresh: widget.onRefreshFiles,
             ),
-          if (!widget.dockedTerminalExpanded && !widget.dockedFilesExpanded)
+            if (widget.dockedFilesExpanded)
+              Expanded(
+                child: ProjectFilesBody(
+                  files: widget.files,
+                  presentation: widget.presentation,
+                  onToggleDirectory: widget.onToggleDirectory,
+                  onOpenFile: widget.onOpenFile,
+                  onRevealFile: widget.onRevealFile,
+                  onBack: widget.onBackToFiles,
+                  onSave: widget.onSaveFile,
+                  onReload: widget.onReloadFile,
+                  onOverwrite: widget.onOverwriteFile,
+                  onPresentationChanged: (value) =>
+                      widget.onToolPresentationChanged(
+                        WorkspaceToolKind.editor,
+                        value,
+                      ),
+                ),
+              ),
+          ],
+          if (!widget.showFiles)
+            const Expanded(child: SizedBox())
+          else if (!widget.dockedTerminalExpanded &&
+              !widget.dockedFilesExpanded)
             const Spacer(),
         ],
       ),
