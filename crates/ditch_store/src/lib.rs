@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
 use ditch_core::{AgentResumeBlockReason, AgentRun, AgentState, AppPaths, Project, ProjectId};
-use ditch_protocol::{AgentChatMessage, RuntimeAttention};
+use ditch_protocol::{AgentChatMessage, AgentMessagePage, RuntimeAttention, SequencedAgentMessage};
 use rusqlite::{Connection, Transaction, params};
 use std::fs;
 use std::io;
@@ -101,7 +101,10 @@ impl DitchStore {
             .collect::<Result<Vec<_>, _>>()?;
         for agent in &mut agents {
             let mut stmt = self.connection.prepare(
-                "SELECT message_json FROM agent_messages WHERE agent_id = ?1 ORDER BY sequence",
+                "SELECT message_json FROM (
+                   SELECT sequence,message_json FROM agent_messages
+                   WHERE agent_id = ?1 ORDER BY sequence DESC LIMIT 200
+                 ) ORDER BY sequence",
             )?;
             agent.messages = stmt
                 .query_map(params![agent.run.id.0.to_string()], |row| {
@@ -158,6 +161,49 @@ impl DitchStore {
             params![message.agent_id.0.to_string(), sequence, to_json(message)?, message.created_at.to_rfc3339()],
         )?;
         Ok(())
+    }
+
+    pub fn list_agent_messages(
+        &self,
+        agent_id: ditch_core::AgentId,
+        before_sequence: Option<u64>,
+        limit: u16,
+    ) -> Result<AgentMessagePage, StoreError> {
+        let limit = usize::from(limit.clamp(1, 200));
+        let before = before_sequence.unwrap_or(u64::MAX);
+        let mut stmt = self.connection.prepare(
+            "SELECT sequence,message_json FROM agent_messages
+             WHERE agent_id=?1 AND sequence < ?2
+             ORDER BY sequence DESC LIMIT ?3",
+        )?;
+        let mut newest_first = stmt
+            .query_map(
+                params![
+                    agent_id.0.to_string(),
+                    i64::try_from(before).unwrap_or(i64::MAX),
+                    i64::try_from(limit + 1).unwrap_or(201),
+                ],
+                |row| {
+                    Ok(SequencedAgentMessage {
+                        sequence: u64::try_from(row.get::<_, i64>(0)?).unwrap_or_default(),
+                        message: from_json(&row.get::<_, String>(1)?)?,
+                    })
+                },
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        let has_more = newest_first.len() > limit;
+        if has_more {
+            newest_first.truncate(limit);
+        }
+        newest_first.reverse();
+        Ok(AgentMessagePage {
+            agent_id,
+            next_before_sequence: has_more
+                .then(|| newest_first.first().map(|item| item.sequence))
+                .flatten(),
+            has_more,
+            messages: newest_first,
+        })
     }
 
     pub fn persist_new_agent(
@@ -536,6 +582,38 @@ mod tests {
             store
                 .persist_new_agent(&run, &message, Some("/tmp/codex-home"))
                 .unwrap();
+            for index in 2..=5 {
+                store
+                    .append_message(&AgentChatMessage {
+                        agent_id: run.id,
+                        role: ditch_protocol::AgentChatRole::Assistant,
+                        text: format!("message-{index}"),
+                        created_at: now,
+                    })
+                    .unwrap();
+            }
+            let latest = store.list_agent_messages(run.id, None, 2).unwrap();
+            assert_eq!(
+                latest
+                    .messages
+                    .iter()
+                    .map(|item| item.sequence)
+                    .collect::<Vec<_>>(),
+                vec![4, 5]
+            );
+            assert!(latest.has_more);
+            let older = store
+                .list_agent_messages(run.id, latest.next_before_sequence, 2)
+                .unwrap();
+            assert_eq!(
+                older
+                    .messages
+                    .iter()
+                    .map(|item| item.sequence)
+                    .collect::<Vec<_>>(),
+                vec![2, 3]
+            );
+            assert!(older.has_more);
         }
         {
             let mut store = DitchStore::open(&paths).unwrap();
@@ -544,8 +622,8 @@ mod tests {
             assert_eq!(restored.projects, vec![project]);
             assert_eq!(restored.agents.len(), 1);
             assert_eq!(restored.agents[0].run.state, AgentState::Stale);
-            assert_eq!(restored.agents[0].messages.len(), 2);
-            assert!(restored.agents[0].messages[1].text.contains("restarted"));
+            assert_eq!(restored.agents[0].messages.len(), 6);
+            assert!(restored.agents[0].messages[5].text.contains("restarted"));
             store.delete_agent(run.id).unwrap();
             let deleted = store.load().unwrap();
             assert!(deleted.agents.is_empty());

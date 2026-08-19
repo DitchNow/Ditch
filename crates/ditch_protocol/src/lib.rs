@@ -37,6 +37,11 @@ pub enum ClientRequest {
         since_sequence: u64,
     },
     SubscribeAttention,
+    ListAgentMessages {
+        agent_id: AgentId,
+        before_sequence: Option<u64>,
+        limit: u16,
+    },
     ListProjects,
     DiscoverProjects {
         search_root: String,
@@ -125,6 +130,7 @@ pub enum ServerResponse {
     ProjectTerminal(ProjectTerminal),
     ProjectCreated(Project),
     AgentStarted(AgentRun),
+    AgentMessages(AgentMessagePage),
     Accepted,
     Error(ProtocolError),
 }
@@ -206,6 +212,20 @@ pub struct AgentChatMessage {
     pub role: AgentChatRole,
     pub text: String,
     pub created_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SequencedAgentMessage {
+    pub sequence: u64,
+    pub message: AgentChatMessage,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AgentMessagePage {
+    pub agent_id: AgentId,
+    pub messages: Vec<SequencedAgentMessage>,
+    pub next_before_sequence: Option<u64>,
+    pub has_more: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

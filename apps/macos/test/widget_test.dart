@@ -259,7 +259,7 @@ void main() {
             sessions: const [],
             expandedAgentLocalId: null,
             focusedAgentLocalId: null,
-            chatController: ScrollController(),
+            chatViewport: ConversationViewportController(),
             agentListController: ScrollController(),
             composerKey: GlobalKey<AgentComposerState>(),
             initialPrompt: 'Start here',
@@ -312,7 +312,7 @@ void main() {
             sessions: [session],
             expandedAgentLocalId: session.localId,
             focusedAgentLocalId: null,
-            chatController: ScrollController(),
+            chatViewport: ConversationViewportController(),
             agentListController: ScrollController(),
             composerKey: GlobalKey<AgentComposerState>(),
             initialPrompt: 'Retry',
@@ -401,7 +401,7 @@ void main() {
             sessions: [session],
             expandedAgentLocalId: session.localId,
             focusedAgentLocalId: null,
-            chatController: ScrollController(),
+            chatViewport: ConversationViewportController(),
             agentListController: ScrollController(),
             composerKey: GlobalKey<AgentComposerState>(),
             initialPrompt: '',
@@ -438,7 +438,7 @@ void main() {
             sessions: [session],
             expandedAgentLocalId: session.localId,
             focusedAgentLocalId: session.localId,
-            chatController: ScrollController(),
+            chatViewport: ConversationViewportController(),
             agentListController: ScrollController(),
             composerKey: GlobalKey<AgentComposerState>(),
             initialPrompt: '',
@@ -485,7 +485,9 @@ void main() {
             sessions: [session],
             expandedAgentLocalId: session.localId,
             focusedAgentLocalId: null,
-            chatController: chatController,
+            chatViewport: ConversationViewportController(
+              scrollController: chatController,
+            ),
             agentListController: agentListController,
             composerKey: GlobalKey<AgentComposerState>(),
             initialPrompt: '',
@@ -502,22 +504,199 @@ void main() {
     );
 
     expect(chatController.position.maxScrollExtent, greaterThan(0));
+    expect(chatController.offset, chatController.position.minScrollExtent);
     expect(
-      chatController.offset,
-      moreOrLessEquals(chatController.position.maxScrollExtent),
+      find.text('Message 29 with enough text to occupy a chat row.'),
+      findsOneWidget,
     );
-    chatController.jumpTo(0);
-    await tester.pump();
+    expect(
+      find.text('Message 0 with enough text to occupy a chat row.'),
+      findsNothing,
+    );
     final header = find.byType(InkWell).first;
     final composer = find.byType(AgentComposer);
     final headerTop = tester.getTopLeft(header);
     final composerTop = tester.getTopLeft(composer);
-    await tester.drag(find.byType(ListView).last, const Offset(0, -300));
+    await tester.drag(find.byType(ListView).last, const Offset(0, 300));
     await tester.pumpAndSettle();
     expect(chatController.offset, greaterThan(0));
-    expect(agentListController.offset, 0);
     expect(tester.getTopLeft(header), headerTop);
     expect(tester.getTopLeft(composer), composerTop);
+  });
+
+  testWidgets('detached conversation counts new messages without jumping', (
+    tester,
+  ) async {
+    final viewport = ConversationViewportController();
+    final messages = List.generate(
+      30,
+      (index) => AgentChatMessage(
+        identity: 'message-$index',
+        role: ChatMessageRole.assistant,
+        text: 'Message $index with enough text to occupy a row.',
+        createdAt: DateTime(2026),
+      ),
+    );
+    String? historyError;
+    late StateSetter rebuild;
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: StatefulBuilder(
+            builder: (context, setState) {
+              rebuild = setState;
+              return AgentsSurface(
+                sessions: [
+                  AgentSession(
+                    localId: 'detached-agent',
+                    provider: AgentProvider.codex,
+                    status: AgentStatus.completed,
+                    messages: messages,
+                    hasOlderMessages: true,
+                    historyError: historyError,
+                  ),
+                ],
+                expandedAgentLocalId: 'detached-agent',
+                focusedAgentLocalId: null,
+                chatViewport: viewport,
+                agentListController: ScrollController(),
+                composerKey: GlobalKey<AgentComposerState>(),
+                initialPrompt: '',
+                onStartCodex: () {},
+                onSubmitPrompt: (_, _) {},
+                onStopCodex: (_) {},
+                onDeleteAgent: (_) {},
+                onRenameAgent: (_, _) {},
+                onFocusAgent: (_) {},
+                onToggleExpanded: (_) {},
+              );
+            },
+          ),
+        ),
+      ),
+    );
+    await tester.pump();
+    await tester.drag(find.byType(ListView), const Offset(0, 300));
+    await tester.pumpAndSettle();
+    expect(viewport.mode, ConversationViewportMode.detached);
+    final detachedOffset = viewport.scrollController.offset;
+
+    rebuild(() {
+      messages.add(
+        AgentChatMessage(
+          identity: 'message-30',
+          role: ChatMessageRole.assistant,
+          text: 'Newest message',
+          createdAt: DateTime(2026),
+        ),
+      );
+    });
+    await tester.pump();
+    await tester.pump();
+
+    expect(
+      viewport.scrollController.offset,
+      greaterThanOrEqualTo(detachedOffset),
+    );
+    expect(find.text('1 new message'), findsOneWidget);
+    await tester.tap(find.byKey(const Key('conversation-new-messages')));
+    await tester.pumpAndSettle();
+    expect(viewport.mode, ConversationViewportMode.following);
+    expect(viewport.unseenCount, 0);
+    expect(viewport.scrollController.offset, 0);
+
+    await tester.drag(find.byType(ListView), const Offset(0, 300));
+    await tester.pumpAndSettle();
+    final beforeOlderHistory = viewport.scrollController.offset;
+    rebuild(() {
+      messages.insert(
+        0,
+        AgentChatMessage(
+          identity: 'message-older',
+          role: ChatMessageRole.assistant,
+          text: 'Older history',
+          createdAt: DateTime(2025),
+        ),
+      );
+    });
+    await tester.pump();
+    expect(viewport.unseenCount, 0);
+    expect(
+      viewport.scrollController.offset,
+      moreOrLessEquals(beforeOlderHistory),
+    );
+
+    viewport.scrollController.jumpTo(
+      viewport.scrollController.position.maxScrollExtent,
+    );
+    await tester.pump();
+    final beforeHistoryFailure = viewport.scrollController.offset;
+    rebuild(() => historyError = 'Could not load message history.');
+    await tester.pump();
+    expect(find.byKey(const Key('conversation-history-retry')), findsOneWidget);
+    expect(
+      viewport.scrollController.offset,
+      moreOrLessEquals(beforeHistoryFailure),
+    );
+  });
+
+  testWidgets('focused mode preserves the active agent reading position', (
+    tester,
+  ) async {
+    final viewport = ConversationViewportController();
+    final session = AgentSession(
+      localId: 'focus-scroll-agent',
+      provider: AgentProvider.codex,
+      status: AgentStatus.completed,
+      messages: List.generate(
+        30,
+        (index) => AgentChatMessage(
+          identity: 'focus-message-$index',
+          role: ChatMessageRole.assistant,
+          text: 'Message $index with enough text to occupy a row.',
+          createdAt: DateTime(2026),
+        ),
+      ),
+    );
+    var focused = false;
+    late StateSetter rebuild;
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: StatefulBuilder(
+            builder: (context, setState) {
+              rebuild = setState;
+              return AgentsSurface(
+                sessions: [session],
+                expandedAgentLocalId: session.localId,
+                focusedAgentLocalId: focused ? session.localId : null,
+                chatViewport: viewport,
+                agentListController: ScrollController(),
+                composerKey: GlobalKey<AgentComposerState>(),
+                initialPrompt: '',
+                onStartCodex: () {},
+                onSubmitPrompt: (_, _) {},
+                onStopCodex: (_) {},
+                onDeleteAgent: (_) {},
+                onRenameAgent: (_, _) {},
+                onFocusAgent: (_) {},
+                onToggleExpanded: (_) {},
+              );
+            },
+          ),
+        ),
+      ),
+    );
+    await tester.pump();
+    await tester.drag(find.byType(ListView), const Offset(0, 300));
+    await tester.pumpAndSettle();
+    final detachedOffset = viewport.scrollController.offset;
+
+    rebuild(() => focused = true);
+    await tester.pump();
+
+    expect(viewport.mode, ConversationViewportMode.detached);
+    expect(viewport.scrollController.offset, moreOrLessEquals(detachedOffset));
   });
 
   testWidgets('opens add project dialog', (tester) async {
@@ -896,7 +1075,7 @@ void main() {
     expect(find.byKey(const Key('ready-agent-card')), findsOneWidget);
   });
 
-  testWidgets('expanded agent stays in list with a bounded conversation', (
+  testWidgets('expanded agent owns one bounded conversation scrollable', (
     tester,
   ) async {
     tester.view.physicalSize = const Size(1200, 1400);
@@ -924,7 +1103,7 @@ void main() {
             sessions: sessions,
             expandedAgentLocalId: 'agent-a',
             focusedAgentLocalId: null,
-            chatController: ScrollController(),
+            chatViewport: ConversationViewportController(),
             agentListController: ScrollController(),
             composerKey: GlobalKey<AgentComposerState>(),
             initialPrompt: 'Start here',
@@ -941,14 +1120,8 @@ void main() {
     );
 
     expect(find.byType(DropdownButton<String>), findsNothing);
-    // The second row remains in the lazily built outer list below the
-    // viewport-sized expanded row.
     expect(find.byType(ExpandableAgentPanel), findsOneWidget);
     expect(find.byType(AgentChatPanel), findsOneWidget);
-    final embeddedChat = tester.widget<AgentChatPanel>(
-      find.byType(AgentChatPanel),
-    );
-    expect(embeddedChat.embedded, isFalse);
     expect(
       find.descendant(
         of: find.byType(AgentChatPanel),
@@ -956,7 +1129,7 @@ void main() {
       ),
       findsOneWidget,
     );
-    expect(find.byType(CustomScrollView), findsOneWidget);
+    expect(find.byType(CustomScrollView), findsNothing);
     expect(find.byType(ListView), findsOneWidget);
   });
 
@@ -973,7 +1146,17 @@ void main() {
         localId: 'agent-$index',
         provider: AgentProvider.codex,
         status: AgentStatus.completed,
-        messages: const [],
+        messages: index == 2
+            ? List.generate(
+                30,
+                (messageIndex) => AgentChatMessage(
+                  identity: 'agent-2-message-$messageIndex',
+                  role: ChatMessageRole.assistant,
+                  text: 'Message $messageIndex',
+                  createdAt: DateTime(2026),
+                ),
+              )
+            : const [],
       ),
     );
 
@@ -984,7 +1167,7 @@ void main() {
             sessions: sessions,
             expandedAgentLocalId: 'agent-2',
             focusedAgentLocalId: null,
-            chatController: ScrollController(),
+            chatViewport: ConversationViewportController(),
             agentListController: ScrollController(),
             composerKey: GlobalKey<AgentComposerState>(),
             initialPrompt: '',
@@ -1000,30 +1183,16 @@ void main() {
       ),
     );
 
-    final outerScroll = find.byType(CustomScrollView);
-    final header = find
-        .descendant(
-          of: find.byKey(const ValueKey('agent-2')),
-          matching: find.byType(InkWell),
-        )
-        .first;
+    await tester.pump();
+    final transcript = find.byType(ListView);
+    final header = find.byType(InkWell).first;
     final composer = find.byType(AgentComposer);
-    await tester.drag(outerScroll, const Offset(0, -1000));
+    final headerTop = tester.getTopLeft(header);
+    final composerTop = tester.getTopLeft(composer);
+    await tester.drag(transcript, const Offset(0, 300));
     await tester.pumpAndSettle();
-
-    final viewportTop = tester.getTopLeft(outerScroll).dy;
-    final viewportBottom = tester.getBottomRight(outerScroll).dy;
-    final pinnedHeaderTop = tester.getTopLeft(header).dy;
-    expect(pinnedHeaderTop, lessThan(viewportTop + 20));
-    expect(tester.getTopLeft(composer).dy, greaterThanOrEqualTo(viewportTop));
-    expect(
-      tester.getBottomRight(composer).dy,
-      lessThanOrEqualTo(viewportBottom),
-    );
-
-    await tester.drag(find.byType(ListView), const Offset(0, -200));
-    await tester.pumpAndSettle();
-    expect(tester.getTopLeft(header).dy, moreOrLessEquals(pinnedHeaderTop));
+    expect(tester.getTopLeft(header), headerTop);
+    expect(tester.getTopLeft(composer), composerTop);
   });
 
   testWidgets('chat messages alternate clearly between left and right', (
@@ -1040,8 +1209,6 @@ void main() {
                   text: 'User message',
                   createdAt: DateTime(2026),
                 ),
-                chatController: ScrollController(),
-                agentListController: ScrollController(),
               ),
               AgentChatBubble(
                 message: AgentChatMessage(
@@ -1049,8 +1216,6 @@ void main() {
                   text: 'Assistant message',
                   createdAt: DateTime(2026),
                 ),
-                chatController: ScrollController(),
-                agentListController: ScrollController(),
               ),
             ],
           ),

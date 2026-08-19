@@ -4,6 +4,7 @@ import 'dart:io';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart' show ScrollDirection;
 import 'package:flutter/services.dart';
 import 'package:xterm/xterm.dart';
 
@@ -241,6 +242,11 @@ class AgentSession {
     this.resumeBlockReason,
     this.exitCode,
     this.finishedAt,
+    this.messagesLoaded = true,
+    this.messagesLoading = false,
+    this.hasOlderMessages = false,
+    this.nextBeforeSequence,
+    this.historyError,
     DateTime? createdAt,
     DateTime? updatedAt,
   }) : createdAt = createdAt ?? DateTime.now(),
@@ -262,6 +268,11 @@ class AgentSession {
   final DateTime? finishedAt;
   DateTime updatedAt;
   final List<AgentChatMessage> messages;
+  bool messagesLoaded;
+  bool messagesLoading;
+  bool hasOlderMessages;
+  int? nextBeforeSequence;
+  String? historyError;
 
   String get displayName {
     final override = userTitle?.trim();
@@ -395,15 +406,231 @@ CodexProcessDiagnostic? codexStderrDiagnosticFromChunk(String chunk) {
 }
 
 class AgentChatMessage {
-  const AgentChatMessage({
+  AgentChatMessage({
     required this.role,
     required this.text,
     required this.createdAt,
-  });
+    String? identity,
+  }) : identity = identity ?? 'local-message-${_nextChatMessageIdentity++}';
 
+  final String identity;
   final ChatMessageRole role;
   final String text;
   final DateTime createdAt;
+}
+
+int _nextChatMessageIdentity = 1;
+
+enum ConversationViewportMode { initializing, following, detached }
+
+class ConversationViewportController extends ChangeNotifier {
+  ConversationViewportController({ScrollController? scrollController})
+    : scrollController = scrollController ?? ScrollController();
+
+  static const nearLatestThreshold = 72.0;
+  static const _arrivalDuration = Duration(milliseconds: 180);
+
+  final ScrollController scrollController;
+  ConversationViewportMode _mode = ConversationViewportMode.initializing;
+  final Set<String> _knownItemIds = {};
+  List<String> _orderedItemIds = const [];
+  final Set<String> _unseenItemIds = {};
+  bool _frameScheduled = false;
+  bool _disposed = false;
+  int _openingGeneration = 0;
+  VoidCallback? _onInitialPositioned;
+
+  ConversationViewportMode get mode => _mode;
+  int get unseenCount => _unseenItemIds.length;
+  bool get isDetached => _mode == ConversationViewportMode.detached;
+
+  // The transcript is reversed. All coordinate assumptions stay here:
+  // visual latest = minScrollExtent; visual oldest = maxScrollExtent.
+  double get _distanceFromLatest {
+    if (!scrollController.hasClients) return 0;
+    final position = scrollController.position;
+    return position.pixels - position.minScrollExtent;
+  }
+
+  bool get isNearLatest =>
+      !scrollController.hasClients ||
+      _distanceFromLatest <= nearLatestThreshold;
+
+  bool get isNearOldest {
+    if (!scrollController.hasClients) return false;
+    final position = scrollController.position;
+    return position.maxScrollExtent - position.pixels <= nearLatestThreshold;
+  }
+
+  void beginOpening({VoidCallback? onInitialPositioned}) {
+    _openingGeneration += 1;
+    _mode = ConversationViewportMode.initializing;
+    _knownItemIds.clear();
+    _orderedItemIds = const [];
+    _unseenItemIds.clear();
+    _onInitialPositioned = onInitialPositioned;
+    _scheduleLatest(immediate: true, generation: _openingGeneration);
+    notifyListeners();
+  }
+
+  void attach({VoidCallback? onInitialPositioned}) {
+    if (_mode == ConversationViewportMode.initializing) {
+      _onInitialPositioned ??= onInitialPositioned;
+      _scheduleLatest(immediate: true, generation: _openingGeneration);
+    } else if (_mode == ConversationViewportMode.following) {
+      _scheduleLatest(immediate: true, generation: _openingGeneration);
+    }
+  }
+
+  void synchronizeItems(List<String> itemIds) {
+    if (_disposed) return;
+    if (_mode == ConversationViewportMode.initializing) {
+      _knownItemIds
+        ..clear()
+        ..addAll(itemIds);
+      _orderedItemIds = List.of(itemIds);
+      _scheduleLatest(immediate: true, generation: _openingGeneration);
+      return;
+    }
+
+    final previousOrder = _orderedItemIds;
+    final added = itemIds.where((id) => !_knownItemIds.contains(id)).toList();
+    final olderHistoryOnly =
+        added.isNotEmpty &&
+        itemIds.length >= previousOrder.length &&
+        _listSuffixEquals(itemIds, previousOrder);
+    _knownItemIds
+      ..clear()
+      ..addAll(itemIds);
+    _orderedItemIds = List.of(itemIds);
+    if (added.isEmpty) {
+      if (_mode == ConversationViewportMode.following) {
+        _scheduleLatest(immediate: true, generation: _openingGeneration);
+      }
+      return;
+    }
+    if (olderHistoryOnly) return;
+
+    if (_mode == ConversationViewportMode.detached) {
+      _preserveDetachedAnchor(added);
+    } else {
+      _scheduleLatest(immediate: true, generation: _openingGeneration);
+    }
+  }
+
+  bool _listSuffixEquals(List<String> values, List<String> suffix) {
+    if (suffix.length > values.length) return false;
+    final start = values.length - suffix.length;
+    for (var index = 0; index < suffix.length; index++) {
+      if (values[start + index] != suffix[index]) return false;
+    }
+    return true;
+  }
+
+  bool handleScrollNotification(ScrollNotification notification) {
+    if (_disposed || !scrollController.hasClients) return false;
+    final userDriven = switch (notification) {
+      ScrollStartNotification(:final dragDetails) => dragDetails != null,
+      ScrollUpdateNotification(:final dragDetails) => dragDetails != null,
+      UserScrollNotification(:final direction) =>
+        direction != ScrollDirection.idle,
+      _ => false,
+    };
+
+    if (isNearLatest) {
+      _setFollowing();
+    } else if (userDriven && _mode != ConversationViewportMode.detached) {
+      _mode = ConversationViewportMode.detached;
+      notifyListeners();
+    }
+    return false;
+  }
+
+  void showLatest() {
+    if (_disposed) return;
+    _mode = ConversationViewportMode.following;
+    _unseenItemIds.clear();
+    notifyListeners();
+    if (!scrollController.hasClients) {
+      _scheduleLatest(immediate: true, generation: _openingGeneration);
+      return;
+    }
+    final position = scrollController.position;
+    final distance = _distanceFromLatest;
+    if (distance > position.viewportDimension * 4) {
+      scrollController.jumpTo(position.minScrollExtent);
+    } else {
+      unawaited(
+        scrollController.animateTo(
+          position.minScrollExtent,
+          duration: _arrivalDuration,
+          curve: Curves.easeOut,
+        ),
+      );
+    }
+  }
+
+  void _setFollowing() {
+    if (_mode == ConversationViewportMode.following && _unseenItemIds.isEmpty) {
+      return;
+    }
+    _mode = ConversationViewportMode.following;
+    _unseenItemIds.clear();
+    notifyListeners();
+  }
+
+  void _preserveDetachedAnchor(List<String> added) {
+    if (!scrollController.hasClients) {
+      _unseenItemIds.addAll(added);
+      notifyListeners();
+      return;
+    }
+    final position = scrollController.position;
+    final oldPixels = position.pixels;
+    final oldMaxExtent = position.maxScrollExtent;
+    _unseenItemIds.addAll(added);
+    notifyListeners();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (_disposed || !scrollController.hasClients) return;
+      final current = scrollController.position;
+      final extentGrowth = current.maxScrollExtent - oldMaxExtent;
+      if (extentGrowth <= 0) return;
+      scrollController.jumpTo(
+        (oldPixels + extentGrowth).clamp(
+          current.minScrollExtent,
+          current.maxScrollExtent,
+        ),
+      );
+    });
+  }
+
+  void _scheduleLatest({required bool immediate, required int generation}) {
+    if (_disposed || _frameScheduled) return;
+    _frameScheduled = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _frameScheduled = false;
+      if (_disposed || generation != _openingGeneration) return;
+      if (!scrollController.hasClients) return;
+      final position = scrollController.position;
+      scrollController.jumpTo(position.minScrollExtent);
+      if (_mode == ConversationViewportMode.initializing) {
+        _mode = ConversationViewportMode.following;
+        final callback = _onInitialPositioned;
+        _onInitialPositioned = null;
+        notifyListeners();
+        callback?.call();
+      }
+    });
+  }
+
+  @override
+  void dispose() {
+    _disposed = true;
+    _openingGeneration += 1;
+    _onInitialPositioned = null;
+    scrollController.dispose();
+    super.dispose();
+  }
 }
 
 List<AgentSession> sessionsForProject(
@@ -412,6 +639,9 @@ List<AgentSession> sessionsForProject(
 ) {
   return sessions.where((session) => session.projectId == projectId).toList();
 }
+
+void _ignoreAgentSession(AgentSession _) {}
+void _ignoreCallback() {}
 
 List<AttentionEvent> attentionForProject(
   Iterable<AttentionEvent> events,
@@ -445,6 +675,20 @@ class DitchRuntimeClient {
 
   Future<Map<String, dynamic>> snapshot() {
     return request('Snapshot');
+  }
+
+  Future<Map<String, dynamic>> listAgentMessages({
+    required String agentId,
+    int? beforeSequence,
+    int limit = 100,
+  }) {
+    return request({
+      'ListAgentMessages': {
+        'agent_id': agentId,
+        'before_sequence': beforeSequence,
+        'limit': limit,
+      },
+    });
   }
 
   Future<Map<String, dynamic>> createProject({
@@ -644,7 +888,8 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
   );
   static const _applicationChannel = MethodChannel('the_ditch/application');
 
-  final _chatController = ScrollController();
+  final _idleChatViewport = ConversationViewportController();
+  final _chatViewports = <String, ConversationViewportController>{};
   final _agentListController = ScrollController();
   final _composerKey = GlobalKey<AgentComposerState>();
   final _runtimeClient = DitchRuntimeClient();
@@ -677,6 +922,15 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
   bool _runtimeSnapshotHydrated = false;
   final List<AgentSession> _agentSessions = [];
 
+  ConversationViewportController get _chatViewport {
+    final agentId = _focusedAgentLocalId ?? _expandedAgentLocalId;
+    if (agentId == null) return _idleChatViewport;
+    return _chatViewports.putIfAbsent(
+      agentId,
+      () => ConversationViewportController()..beginOpening(),
+    );
+  }
+
   String _projectKey(DitchProject project) =>
       project.id ?? canonicalProjectPath(project.path);
 
@@ -705,6 +959,14 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
       _terminalPresentation = TerminalPresentation.docked;
       _dockedTerminalExpanded = true;
     });
+    final expandedId = _expandedAgentLocalId;
+    if (expandedId != null) {
+      _chatViewports
+          .putIfAbsent(expandedId, ConversationViewportController.new)
+          .beginOpening(onInitialPositioned: _focusComposerAfterLayout);
+      final session = _agentSessionByLocalId(expandedId);
+      if (session != null) unawaited(_loadAgentMessages(session));
+    }
     unawaited(_ensureSelectedProjectTerminal());
   }
 
@@ -1114,16 +1376,25 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
     }
 
     final messagesByAgent = <String, List<AgentChatMessage>>{};
+    final messageOrdinals = <String, int>{};
     if (messagesJson is List) {
       for (final messageJson in messagesJson) {
-        final message = _agentChatMessageFromRuntime(messageJson);
         final agentId = _agentIdFromRuntimeMessage(messageJson);
+        final ordinal = agentId == null ? null : messageOrdinals[agentId] ?? 0;
+        final message = _agentChatMessageFromRuntime(
+          messageJson,
+          identity: agentId == null ? null : 'persisted:$agentId:$ordinal',
+        );
         if (message != null && agentId != null) {
           messagesByAgent.putIfAbsent(agentId, () => []).add(message);
+          messageOrdinals[agentId] = ordinal! + 1;
         }
       }
     }
 
+    final existingSessions = {
+      for (final session in _agentSessions) session.localId: session,
+    };
     final sessionsById = <String, AgentSession>{};
     for (final agentJson in agentsJson) {
       final session = _agentSessionFromRuntime(
@@ -1131,11 +1402,29 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
         messagesByAgent[_agentIdFromRuntimeAgent(agentJson)] ?? const [],
       );
       if (session != null) {
+        final existing = existingSessions[session.localId];
+        if (existing != null) {
+          session.messages
+            ..clear()
+            ..addAll(existing.messages);
+          session.messagesLoaded = existing.messagesLoaded;
+          session.messagesLoading = existing.messagesLoading;
+          session.hasOlderMessages = existing.hasOlderMessages;
+          session.nextBeforeSequence = existing.nextBeforeSequence;
+          session.historyError = existing.historyError;
+        }
         sessionsById[session.localId] = session;
       }
     }
     final sessions = sessionsById.values.toList();
     sessions.sort((a, b) => b.updatedAt.compareTo(a.updatedAt));
+    final removedViewportIds = _chatViewports.keys
+        .where((agentId) => !sessionsById.containsKey(agentId))
+        .toList();
+    final removedViewports = removedViewportIds
+        .map(_chatViewports.remove)
+        .whereType<ConversationViewportController>()
+        .toList();
     final attentionJson = snapshot['attention'];
     final attention = <AttentionEvent>[];
     if (attentionJson is List) {
@@ -1189,6 +1478,17 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
       }
       _runtimeSnapshotHydrated = true;
     });
+    if (removedViewports.isNotEmpty) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        for (final viewport in removedViewports) {
+          viewport.dispose();
+        }
+      });
+    }
+    final expanded = _expandedAgentLocalId == null
+        ? null
+        : sessionsById[_expandedAgentLocalId];
+    if (expanded != null) unawaited(_loadAgentMessages(expanded));
     _scheduleStatusBarUpdate();
     final pendingTarget = _pendingNotificationTarget;
     if (pendingTarget != null) {
@@ -1218,7 +1518,10 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
     _applicationChannel.setMethodCallHandler(null);
     _presentation.dispose();
     _runtimeEvents?.cancel();
-    _chatController.dispose();
+    _idleChatViewport.dispose();
+    for (final viewport in _chatViewports.values) {
+      viewport.dispose();
+    }
     _agentListController.dispose();
     super.dispose();
   }
@@ -1284,6 +1587,10 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
         _attention.removeWhere((event) => event.id == target.attentionId);
       }
     });
+    _chatViewports
+        .putIfAbsent(session.localId, ConversationViewportController.new)
+        .beginOpening(onInitialPositioned: _focusComposerAfterLayout);
+    unawaited(_loadAgentMessages(session));
     _scheduleStatusBarUpdate();
     unawaited(_ensureSelectedProjectTerminal());
     final attentionId = target.attentionId;
@@ -1747,13 +2054,12 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
     }
 
     setState(() => _expandedAgentLocalId = sessionLocalId);
+    _chatViewports
+        .putIfAbsent(sessionLocalId, ConversationViewportController.new)
+        .beginOpening(onInitialPositioned: _focusComposerAfterLayout);
+    final session = _agentSessionByLocalId(sessionLocalId);
+    if (session != null) unawaited(_loadAgentMessages(session));
     _scheduleStatusBarUpdate();
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (!_chatController.hasClients) {
-        return;
-      }
-      _chatController.jumpTo(_chatController.position.maxScrollExtent);
-    });
   }
 
   void _dismissAttention(AttentionEvent event) {
@@ -1875,12 +2181,18 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
     if (agentDeleted is Map<String, dynamic>) {
       final id = _agentIdToString(agentDeleted['agent_id']);
       if (id != null) {
+        final removedViewport = _chatViewports.remove(id);
         setState(() {
           _agentSessions.removeWhere((session) => session.localId == id);
           _attention.removeWhere((event) => event.sessionLocalId == id);
           if (_expandedAgentLocalId == id) _expandedAgentLocalId = null;
           if (_focusedAgentLocalId == id) _focusedAgentLocalId = null;
         });
+        if (removedViewport != null) {
+          WidgetsBinding.instance.addPostFrameCallback(
+            (_) => removedViewport.dispose(),
+          );
+        }
         _scheduleStatusBarUpdate();
       }
       return;
@@ -1897,7 +2209,12 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
       if (session == null) {
         return;
       }
-      _addChatMessage(session, message.role, message.text);
+      _addChatMessage(
+        session,
+        message.role,
+        message.text,
+        identity: message.identity,
+      );
       return;
     }
 
@@ -1952,15 +2269,9 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
       projectId: agentJson['project_id']?.toString(),
       provider: AgentProvider.codex,
       status: _agentStatusFromRuntime(state),
-      messages: messages.isEmpty
-          ? [
-              AgentChatMessage(
-                role: ChatMessageRole.system,
-                text: 'Runtime session connected.',
-                createdAt: DateTime.now(),
-              ),
-            ]
-          : List<AgentChatMessage>.from(messages),
+      messages: List<AgentChatMessage>.from(messages),
+      messagesLoaded: messages.isNotEmpty,
+      hasOlderMessages: messages.isNotEmpty,
       codexThreadId: agentJson['native_session_id']?.toString(),
       codexTitle: agentJson['codex_title']?.toString(),
       userTitle: agentJson['user_title']?.toString(),
@@ -2012,7 +2323,10 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
     );
   }
 
-  AgentChatMessage? _agentChatMessageFromRuntime(Object? messageJson) {
+  AgentChatMessage? _agentChatMessageFromRuntime(
+    Object? messageJson, {
+    String? identity,
+  }) {
     if (messageJson is! Map<String, dynamic>) {
       return null;
     }
@@ -2020,10 +2334,18 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
     if (text == null || text.trim().isEmpty) {
       return null;
     }
+    final role = _chatRoleFromRuntime(messageJson['role']?.toString());
+    final createdAt = _dateTimeFromRuntime(messageJson['created_at']);
+    final agentId = _agentIdFromRuntimeMessage(messageJson) ?? 'unknown-agent';
+    final runtimeIdentity = messageJson['id']?.toString();
     return AgentChatMessage(
-      role: _chatRoleFromRuntime(messageJson['role']?.toString()),
+      identity:
+          identity ??
+          runtimeIdentity ??
+          '$agentId:${createdAt.toUtc().microsecondsSinceEpoch}:${role.name}',
+      role: role,
       text: text,
-      createdAt: _dateTimeFromRuntime(messageJson['created_at']),
+      createdAt: createdAt,
     );
   }
 
@@ -2081,8 +2403,9 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
   void _addChatMessage(
     AgentSession session,
     ChatMessageRole role,
-    String text,
-  ) {
+    String text, {
+    String? identity,
+  }) {
     if (!mounted) {
       return;
     }
@@ -2094,12 +2417,90 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
         }
       }
       session.messages.add(
-        AgentChatMessage(role: role, text: text, createdAt: DateTime.now()),
+        AgentChatMessage(
+          identity: identity,
+          role: role,
+          text: text,
+          createdAt: DateTime.now(),
+        ),
       );
       session.updatedAt = DateTime.now();
     });
     _scheduleStatusBarUpdate();
   }
+
+  Future<void> _loadAgentMessages(AgentSession session) async {
+    if (session.messagesLoading ||
+        (session.messagesLoaded && !session.hasOlderMessages)) {
+      return;
+    }
+    final initial = !session.messagesLoaded;
+    setState(() {
+      session.messagesLoading = true;
+      session.historyError = null;
+    });
+    try {
+      final response = await _runtimeClient.listAgentMessages(
+        agentId: session.localId,
+        beforeSequence: initial ? null : session.nextBeforeSequence,
+      );
+      final page = response['AgentMessages'];
+      if (page is! Map<String, dynamic>) {
+        throw const FormatException(
+          'Runtime returned an invalid message page.',
+        );
+      }
+      final pageItems = <AgentChatMessage>[];
+      final rawMessages = page['messages'];
+      if (rawMessages is List) {
+        for (final rawItem in rawMessages) {
+          if (rawItem is! Map<String, dynamic>) continue;
+          final sequence = rawItem['sequence'];
+          final message = _agentChatMessageFromRuntime(
+            rawItem['message'],
+            identity: sequence is int
+                ? 'persisted:${session.localId}:$sequence'
+                : null,
+          );
+          if (message != null) pageItems.add(message);
+        }
+      }
+      if (!mounted) return;
+      final target = _agentSessionByLocalId(session.localId);
+      if (target == null) return;
+      setState(() {
+        final known = target.messages
+            .map((message) => message.identity)
+            .toSet();
+        final knownContent = target.messages.map(_messageContentKey).toSet();
+        final additions = pageItems
+            .where(
+              (message) =>
+                  !known.contains(message.identity) &&
+                  !knownContent.contains(_messageContentKey(message)),
+            )
+            .toList();
+        target.messages.insertAll(0, additions);
+        target.messagesLoaded = true;
+        target.messagesLoading = false;
+        target.hasOlderMessages = page['has_more'] == true;
+        target.nextBeforeSequence = page['next_before_sequence'] is int
+            ? page['next_before_sequence'] as int
+            : null;
+      });
+    } on Object catch (error) {
+      if (!mounted) return;
+      final target = _agentSessionByLocalId(session.localId);
+      if (target == null) return;
+      setState(() {
+        target.messagesLoading = false;
+        target.historyError = 'Could not load message history. $error';
+      });
+    }
+  }
+
+  String _messageContentKey(AgentChatMessage message) =>
+      '${message.role.name}\u0000${message.createdAt.toUtc().microsecondsSinceEpoch}\u0000${message.text}';
 
   void _focusComposerAfterLayout() {
     WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -2113,21 +2514,10 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
       _expandedAgentLocalId = collapsing ? null : session.localId;
     });
     if (collapsing) return;
-    WidgetsBinding.instance.addPostFrameCallback((_) async {
-      if (!mounted) return;
-      final headerContext = GlobalObjectKey(
-        'agent-header-${session.localId}',
-      ).currentContext;
-      if (headerContext != null) {
-        await Scrollable.ensureVisible(
-          headerContext,
-          alignment: 0,
-          duration: const Duration(milliseconds: 180),
-          curve: Curves.easeOut,
-        );
-      }
-      if (mounted) _composerKey.currentState?.focus();
-    });
+    _chatViewports
+        .putIfAbsent(session.localId, ConversationViewportController.new)
+        .beginOpening(onInitialPositioned: _focusComposerAfterLayout);
+    unawaited(_loadAgentMessages(session));
   }
 
   @override
@@ -2160,7 +2550,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
                 sessions: _visibleSessions,
                 expandedAgentLocalId: _expandedAgentLocalId,
                 focusedAgentLocalId: _focusedAgentLocalId,
-                chatController: _chatController,
+                chatViewport: _chatViewport,
                 agentListController: _agentListController,
                 composerKey: _composerKey,
                 initialPrompt: _defaultStartPrompt,
@@ -2168,6 +2558,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
                 onStartCodex: _startCodex,
                 onStartPrompt: _startCodexRuntime,
                 onSubmitPrompt: _submitComposer,
+                onLoadMessages: _loadAgentMessages,
                 onStopCodex: _stopCodex,
                 onDeleteAgent: _deleteAgent,
                 onRenameAgent: _renameAgent,
@@ -2819,7 +3210,7 @@ class AgentsSurface extends StatelessWidget {
     required this.sessions,
     required this.expandedAgentLocalId,
     required this.focusedAgentLocalId,
-    required this.chatController,
+    required this.chatViewport,
     required this.agentListController,
     required this.composerKey,
     required this.initialPrompt,
@@ -2827,6 +3218,7 @@ class AgentsSurface extends StatelessWidget {
     required this.onStartCodex,
     this.onStartPrompt,
     required this.onSubmitPrompt,
+    this.onLoadMessages = _ignoreAgentSession,
     required this.onStopCodex,
     required this.onDeleteAgent,
     required this.onRenameAgent,
@@ -2838,7 +3230,7 @@ class AgentsSurface extends StatelessWidget {
   final List<AgentSession> sessions;
   final String? expandedAgentLocalId;
   final String? focusedAgentLocalId;
-  final ScrollController chatController;
+  final ConversationViewportController chatViewport;
   final ScrollController agentListController;
   final GlobalKey<AgentComposerState> composerKey;
   final String initialPrompt;
@@ -2846,6 +3238,7 @@ class AgentsSurface extends StatelessWidget {
   final VoidCallback onStartCodex;
   final ValueChanged<String>? onStartPrompt;
   final void Function(AgentSession session, String prompt) onSubmitPrompt;
+  final ValueChanged<AgentSession> onLoadMessages;
   final ValueChanged<AgentSession> onStopCodex;
   final ValueChanged<AgentSession> onDeleteAgent;
   final void Function(AgentSession session, String? title) onRenameAgent;
@@ -2885,7 +3278,7 @@ class AgentsSurface extends StatelessWidget {
                 sessions: sessions,
                 expandedAgentLocalId: expandedAgentLocalId,
                 focusedAgentLocalId: focusedAgentLocalId,
-                chatController: chatController,
+                chatViewport: chatViewport,
                 agentListController: agentListController,
                 composerKey: composerKey,
                 initialPrompt: initialPrompt,
@@ -2893,6 +3286,7 @@ class AgentsSurface extends StatelessWidget {
                 onStartPrompt: onStartPrompt ?? (_) {},
                 onToggleExpanded: onToggleExpanded,
                 onSubmitPrompt: onSubmitPrompt,
+                onLoadMessages: onLoadMessages,
                 onStopCodex: onStopCodex,
                 onDeleteAgent: onDeleteAgent,
                 onRenameAgent: onRenameAgent,
@@ -2911,7 +3305,7 @@ class AgentSessionList extends StatelessWidget {
     required this.sessions,
     required this.expandedAgentLocalId,
     required this.focusedAgentLocalId,
-    required this.chatController,
+    required this.chatViewport,
     required this.agentListController,
     required this.composerKey,
     required this.initialPrompt,
@@ -2919,6 +3313,7 @@ class AgentSessionList extends StatelessWidget {
     required this.onStartPrompt,
     required this.onToggleExpanded,
     required this.onSubmitPrompt,
+    this.onLoadMessages = _ignoreAgentSession,
     required this.onStopCodex,
     required this.onDeleteAgent,
     required this.onRenameAgent,
@@ -2929,7 +3324,7 @@ class AgentSessionList extends StatelessWidget {
   final List<AgentSession> sessions;
   final String? expandedAgentLocalId;
   final String? focusedAgentLocalId;
-  final ScrollController chatController;
+  final ConversationViewportController chatViewport;
   final ScrollController agentListController;
   final GlobalKey<AgentComposerState> composerKey;
   final String initialPrompt;
@@ -2937,6 +3332,7 @@ class AgentSessionList extends StatelessWidget {
   final ValueChanged<String> onStartPrompt;
   final ValueChanged<AgentSession> onToggleExpanded;
   final void Function(AgentSession session, String prompt) onSubmitPrompt;
+  final ValueChanged<AgentSession> onLoadMessages;
   final ValueChanged<AgentSession> onStopCodex;
   final ValueChanged<AgentSession> onDeleteAgent;
   final void Function(AgentSession session, String? title) onRenameAgent;
@@ -2966,9 +3362,9 @@ class AgentSessionList extends StatelessWidget {
             const SizedBox(height: 12),
             Expanded(
               child: AgentChatPanel(
+                conversationId: 'new-agent',
                 messages: const [],
-                controller: chatController,
-                agentListController: agentListController,
+                viewport: chatViewport,
                 enlarged: false,
                 composerKey: composerKey,
                 initialPrompt: initialPrompt,
@@ -3003,8 +3399,7 @@ class AgentSessionList extends StatelessWidget {
               session: focusedSession,
               expanded: true,
               enlarged: true,
-              chatController: chatController,
-              agentListController: agentListController,
+              chatViewport: chatViewport,
               composerKey: composerKey,
               initialPrompt: initialPrompt,
               effectiveCodexHome: effectiveCodexHome,
@@ -3014,6 +3409,7 @@ class AgentSessionList extends StatelessWidget {
               onRename: (title) => onRenameAgent(focusedSession, title),
               onSubmitPrompt: (prompt) =>
                   onSubmitPrompt(focusedSession, prompt),
+              onLoadMessages: () => onLoadMessages(focusedSession),
               onStopCodex: () => onStopCodex(focusedSession),
             ),
           ),
@@ -3030,81 +3426,22 @@ class AgentSessionList extends StatelessWidget {
     }
     if (expandedSession != null) {
       final session = expandedSession;
-      return Scrollbar(
-        controller: agentListController,
-        interactive: true,
-        child: CustomScrollView(
-          key: const PageStorageKey<String>('expanded-agent-session-list'),
-          controller: agentListController,
-          slivers: [
-            for (var index = 0; index < expandedIndex; index++) ...[
-              SliverToBoxAdapter(
-                child: ExpandableAgentPanel(
-                  key: ValueKey(sessions[index].localId),
-                  session: sessions[index],
-                  expanded: false,
-                  enlarged: false,
-                  chatController: null,
-                  agentListController: agentListController,
-                  composerKey: null,
-                  initialPrompt: initialPrompt,
-                  effectiveCodexHome: effectiveCodexHome,
-                  onTap: () => onToggleExpanded(sessions[index]),
-                  onEnlarge: () => onFocusAgent(sessions[index]),
-                  onDelete: () => onDeleteAgent(sessions[index]),
-                  onRename: (title) => onRenameAgent(sessions[index], title),
-                  onSubmitPrompt: (prompt) =>
-                      onSubmitPrompt(sessions[index], prompt),
-                  onStopCodex: () => onStopCodex(sessions[index]),
-                ),
-              ),
-              const SliverToBoxAdapter(child: SizedBox(height: 10)),
-            ],
-            PinnedHeaderSliver(
-              child: ColoredBox(
-                color: context.ditch.workspace,
-                child: ExpandableAgentPanel(
-                  key: ValueKey(session.localId),
-                  session: session,
-                  expanded: true,
-                  enlarged: false,
-                  headerOnly: true,
-                  chatController: null,
-                  agentListController: agentListController,
-                  composerKey: null,
-                  initialPrompt: initialPrompt,
-                  effectiveCodexHome: effectiveCodexHome,
-                  onTap: () => onToggleExpanded(session),
-                  onEnlarge: () => onFocusAgent(session),
-                  onDelete: () => onDeleteAgent(session),
-                  onRename: (title) => onRenameAgent(session, title),
-                  onSubmitPrompt: (prompt) => onSubmitPrompt(session, prompt),
-                  onStopCodex: () => onStopCodex(session),
-                ),
-              ),
-            ),
-            SliverFillRemaining(
-              child: AgentChatPanel(
-                messages: session.messages,
-                controller: chatController,
-                agentListController: agentListController,
-                enlarged: false,
-                composerKey: composerKey,
-                initialPrompt: session.hasCodexThread ? '' : initialPrompt,
-                hasSession: session.hasCodexThread,
-                isWorking: session.isWorking,
-                enabled: _canResumeSession(session, effectiveCodexHome),
-                disabledMessage: _resumeBlockedMessage(
-                  session,
-                  effectiveCodexHome,
-                ),
-                onSubmitPrompt: (prompt) => onSubmitPrompt(session, prompt),
-                onStopCodex: () => onStopCodex(session),
-                onEnlarge: () => onFocusAgent(session),
-              ),
-            ),
-          ],
-        ),
+      return ExpandableAgentPanel(
+        key: ValueKey('expanded-${session.localId}'),
+        session: session,
+        expanded: true,
+        enlarged: false,
+        chatViewport: chatViewport,
+        composerKey: composerKey,
+        initialPrompt: initialPrompt,
+        effectiveCodexHome: effectiveCodexHome,
+        onTap: () => onToggleExpanded(session),
+        onEnlarge: () => onFocusAgent(session),
+        onDelete: () => onDeleteAgent(session),
+        onRename: (title) => onRenameAgent(session, title),
+        onSubmitPrompt: (prompt) => onSubmitPrompt(session, prompt),
+        onLoadMessages: () => onLoadMessages(session),
+        onStopCodex: () => onStopCodex(session),
       );
     }
     return LayoutBuilder(
@@ -3125,9 +3462,7 @@ class AgentSessionList extends StatelessWidget {
               session: session,
               expanded: expanded,
               enlarged: false,
-              fillAvailable: expanded,
-              chatController: expanded ? chatController : null,
-              agentListController: agentListController,
+              chatViewport: expanded ? chatViewport : null,
               composerKey: expanded ? composerKey : null,
               initialPrompt: initialPrompt,
               effectiveCodexHome: effectiveCodexHome,
@@ -3136,6 +3471,7 @@ class AgentSessionList extends StatelessWidget {
               onDelete: () => onDeleteAgent(session),
               onRename: (title) => onRenameAgent(session, title),
               onSubmitPrompt: (prompt) => onSubmitPrompt(session, prompt),
+              onLoadMessages: () => onLoadMessages(session),
               onStopCodex: () => onStopCodex(session),
             );
             if (!expanded) return panel;
@@ -3262,10 +3598,7 @@ class ExpandableAgentPanel extends StatelessWidget {
     required this.session,
     required this.expanded,
     required this.enlarged,
-    this.fillAvailable = false,
-    this.headerOnly = false,
-    required this.chatController,
-    required this.agentListController,
+    required this.chatViewport,
     required this.composerKey,
     required this.initialPrompt,
     this.effectiveCodexHome,
@@ -3274,6 +3607,7 @@ class ExpandableAgentPanel extends StatelessWidget {
     required this.onDelete,
     required this.onRename,
     required this.onSubmitPrompt,
+    this.onLoadMessages = _ignoreCallback,
     required this.onStopCodex,
     super.key,
   });
@@ -3281,10 +3615,7 @@ class ExpandableAgentPanel extends StatelessWidget {
   final AgentSession session;
   final bool expanded;
   final bool enlarged;
-  final bool fillAvailable;
-  final bool headerOnly;
-  final ScrollController? chatController;
-  final ScrollController agentListController;
+  final ConversationViewportController? chatViewport;
   final GlobalKey<AgentComposerState>? composerKey;
   final String initialPrompt;
   final String? effectiveCodexHome;
@@ -3293,6 +3624,7 @@ class ExpandableAgentPanel extends StatelessWidget {
   final VoidCallback onDelete;
   final ValueChanged<String?> onRename;
   final ValueChanged<String> onSubmitPrompt;
+  final VoidCallback onLoadMessages;
   final VoidCallback onStopCodex;
 
   @override
@@ -3376,11 +3708,10 @@ class ExpandableAgentPanel extends StatelessWidget {
           ],
         );
         Widget buildChatPanel() => AgentChatPanel(
+          conversationId: session.localId,
           messages: session.messages,
-          controller: chatController!,
-          agentListController: agentListController,
+          viewport: chatViewport!,
           enlarged: enlarged,
-          embedded: !(enlarged || fillAvailable),
           composerKey: composerKey!,
           initialPrompt: session.hasCodexThread ? '' : initialPrompt,
           hasSession: session.hasCodexThread,
@@ -3388,6 +3719,11 @@ class ExpandableAgentPanel extends StatelessWidget {
           enabled: !resumeBlocked,
           disabledMessage: resumeBlockedMessage,
           onSubmitPrompt: onSubmitPrompt,
+          messagesReady: session.messagesLoaded,
+          messagesLoading: session.messagesLoading,
+          hasOlderMessages: session.hasOlderMessages,
+          historyError: session.historyError,
+          onLoadOlder: onLoadMessages,
           onStopCodex: onStopCodex,
           onEnlarge: onEnlarge,
         );
@@ -3433,17 +3769,12 @@ class ExpandableAgentPanel extends StatelessWidget {
                             ),
                     ),
                   ),
-                  if (!headerOnly && expanded && (enlarged || fillAvailable))
+                  if (expanded)
                     Expanded(
                       child: Padding(
                         padding: const EdgeInsets.only(top: 12),
                         child: buildChatPanel(),
                       ),
-                    )
-                  else if (!headerOnly && expanded)
-                    Padding(
-                      padding: const EdgeInsets.only(top: 12),
-                      child: buildChatPanel(),
                     ),
                 ],
               ),
@@ -3474,15 +3805,19 @@ class ExpandableAgentPanel extends StatelessWidget {
 
 class AgentChatPanel extends StatelessWidget {
   const AgentChatPanel({
+    required this.conversationId,
     required this.messages,
-    required this.controller,
-    required this.agentListController,
+    required this.viewport,
     required this.enlarged,
-    this.embedded = false,
     required this.composerKey,
     required this.initialPrompt,
     required this.hasSession,
     required this.isWorking,
+    this.messagesReady = true,
+    this.messagesLoading = false,
+    this.hasOlderMessages = false,
+    this.historyError,
+    this.onLoadOlder = _ignoreCallback,
     this.enabled = true,
     this.disabledMessage,
     required this.onSubmitPrompt,
@@ -3491,15 +3826,19 @@ class AgentChatPanel extends StatelessWidget {
     super.key,
   });
 
+  final String conversationId;
   final List<AgentChatMessage> messages;
-  final ScrollController controller;
-  final ScrollController agentListController;
+  final ConversationViewportController viewport;
   final bool enlarged;
-  final bool embedded;
   final GlobalKey<AgentComposerState> composerKey;
   final String initialPrompt;
   final bool hasSession;
   final bool isWorking;
+  final bool messagesReady;
+  final bool messagesLoading;
+  final bool hasOlderMessages;
+  final String? historyError;
+  final VoidCallback onLoadOlder;
   final bool enabled;
   final String? disabledMessage;
   final ValueChanged<String> onSubmitPrompt;
@@ -3553,139 +3892,258 @@ class AgentChatPanel extends StatelessWidget {
       ),
     ];
 
-    if (embedded) {
-      return ColoredBox(
-        color: context.ditch.workspace,
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            toolbar,
-            const Divider(height: 1),
-            Padding(
-              padding: const EdgeInsets.all(12),
-              child: Column(
-                children: [
-                  for (var index = 0; index < messages.length; index++) ...[
-                    if (index > 0) const SizedBox(height: 10),
-                    AgentChatBubble(
-                      message: messages[index],
-                      chatController: controller,
-                      agentListController: agentListController,
-                      embedded: true,
-                    ),
-                  ],
-                ],
-              ),
+    return ColoredBox(
+      color: context.ditch.workspace,
+      child: Column(
+        children: [
+          toolbar,
+          const Divider(height: 1),
+          Expanded(
+            child: ConversationTranscript(
+              key: ValueKey('conversation-$conversationId'),
+              messages: messages,
+              viewport: viewport,
+              ready: messagesReady,
+              loadingOlder: messagesLoading,
+              hasOlderMessages: hasOlderMessages,
+              historyError: historyError,
+              onLoadOlder: onLoadOlder,
+              onInitialPositioned: () => composerKey.currentState?.focus(),
             ),
-            ...footer,
-          ],
-        ),
-      );
-    }
-
-    return ConversationViewportLifecycle(
-      controller: controller,
-      composerKey: composerKey,
-      messageCount: messages.length,
-      child: ColoredBox(
-        color: context.ditch.workspace,
-        child: Column(
-          children: [
-            toolbar,
-            const Divider(height: 1),
-            Expanded(
-              child: Scrollbar(
-                controller: controller,
-                interactive: true,
-                child: ListView.separated(
-                  controller: controller,
-                  padding: const EdgeInsets.all(12),
-                  itemCount: messages.length,
-                  separatorBuilder: (_, _) => const SizedBox(height: 10),
-                  itemBuilder: (context, index) {
-                    return AgentChatBubble(
-                      message: messages[index],
-                      chatController: controller,
-                      agentListController: agentListController,
-                      embedded: false,
-                    );
-                  },
-                ),
-              ),
-            ),
-            ...footer,
-          ],
-        ),
+          ),
+          ...footer,
+        ],
       ),
     );
   }
 }
 
-class ConversationViewportLifecycle extends StatefulWidget {
-  const ConversationViewportLifecycle({
-    required this.controller,
-    required this.composerKey,
-    required this.messageCount,
-    required this.child,
+class ConversationTranscript extends StatefulWidget {
+  const ConversationTranscript({
+    required this.messages,
+    required this.viewport,
+    this.ready = true,
+    this.loadingOlder = false,
+    this.hasOlderMessages = false,
+    this.historyError,
+    this.onLoadOlder = _ignoreCallback,
+    this.onInitialPositioned,
     super.key,
   });
 
-  final ScrollController controller;
-  final GlobalKey<AgentComposerState> composerKey;
-  final int messageCount;
-  final Widget child;
+  final List<AgentChatMessage> messages;
+  final ConversationViewportController viewport;
+  final bool ready;
+  final bool loadingOlder;
+  final bool hasOlderMessages;
+  final String? historyError;
+  final VoidCallback onLoadOlder;
+  final VoidCallback? onInitialPositioned;
 
   @override
-  State<ConversationViewportLifecycle> createState() =>
-      _ConversationViewportLifecycleState();
+  State<ConversationTranscript> createState() => _ConversationTranscriptState();
 }
 
-class _ConversationViewportLifecycleState
-    extends State<ConversationViewportLifecycle> {
-  static const _nearBottomThreshold = 72.0;
-
+class _ConversationTranscriptState extends State<ConversationTranscript> {
   @override
   void initState() {
     super.initState();
-    _scheduleBottom(focusComposer: true, animate: false);
-  }
-
-  @override
-  void didUpdateWidget(ConversationViewportLifecycle oldWidget) {
-    super.didUpdateWidget(oldWidget);
-    if (widget.messageCount == oldWidget.messageCount) return;
-
-    final shouldFollow =
-        !widget.controller.hasClients ||
-        widget.controller.position.maxScrollExtent -
-                widget.controller.position.pixels <=
-            _nearBottomThreshold;
-    if (shouldFollow) {
-      _scheduleBottom(focusComposer: false, animate: true);
+    if (widget.ready) {
+      widget.viewport.synchronizeItems(_itemIds);
+      widget.viewport.attach(onInitialPositioned: widget.onInitialPositioned);
+    } else {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) widget.onLoadOlder();
+      });
     }
   }
 
-  void _scheduleBottom({required bool focusComposer, required bool animate}) {
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (!mounted) return;
-      if (widget.controller.hasClients) {
-        final target = widget.controller.position.maxScrollExtent;
-        if (animate) {
-          widget.controller.animateTo(
-            target,
-            duration: const Duration(milliseconds: 180),
-            curve: Curves.easeOut,
-          );
-        } else {
-          widget.controller.jumpTo(target);
-        }
+  @override
+  void didUpdateWidget(ConversationTranscript oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.viewport != widget.viewport) {
+      if (widget.ready) {
+        widget.viewport.attach(onInitialPositioned: widget.onInitialPositioned);
       }
-      if (focusComposer) widget.composerKey.currentState?.focus();
-    });
+    }
+    if (widget.ready) {
+      widget.viewport.synchronizeItems(_itemIds);
+      if (!oldWidget.ready) {
+        widget.viewport.attach(onInitialPositioned: widget.onInitialPositioned);
+      }
+    }
   }
 
+  List<String> get _itemIds => widget.messages
+      .map((message) => message.identity)
+      .toList(growable: false);
+
   @override
-  Widget build(BuildContext context) => widget.child;
+  Widget build(BuildContext context) {
+    final controller = widget.viewport.scrollController;
+    if (!widget.ready) {
+      return Center(
+        child: widget.historyError == null
+            ? const CircularProgressIndicator(
+                key: Key('conversation-initial-loading'),
+              )
+            : _HistoryLoadFailure(
+                message: widget.historyError!,
+                onRetry: widget.onLoadOlder,
+              ),
+      );
+    }
+    final showHistoryControl =
+        widget.hasOlderMessages ||
+        widget.loadingOlder ||
+        widget.historyError != null;
+    final showEmptyState = widget.messages.isEmpty;
+    return Stack(
+      fit: StackFit.expand,
+      children: [
+        NotificationListener<ScrollNotification>(
+          onNotification: (notification) {
+            widget.viewport.handleScrollNotification(notification);
+            if ((notification is ScrollUpdateNotification ||
+                    notification is ScrollEndNotification) &&
+                widget.viewport.isNearOldest &&
+                widget.hasOlderMessages &&
+                !widget.loadingOlder) {
+              widget.onLoadOlder();
+            }
+            return false;
+          },
+          child: Scrollbar(
+            controller: controller,
+            interactive: true,
+            child: ListView.separated(
+              key: PageStorageKey<String>('transcript-${widget.key}'),
+              controller: controller,
+              reverse: true,
+              padding: const EdgeInsets.fromLTRB(12, 12, 12, 20),
+              itemCount: showEmptyState
+                  ? 1
+                  : widget.messages.length + (showHistoryControl ? 1 : 0),
+              separatorBuilder: (_, _) => const SizedBox(height: 10),
+              itemBuilder: (context, index) {
+                if (showEmptyState) {
+                  return const Center(child: Text('No messages yet.'));
+                }
+                if (index == widget.messages.length) {
+                  return _HistoryLoadControl(
+                    loading: widget.loadingOlder,
+                    error: widget.historyError,
+                    onRetry: widget.onLoadOlder,
+                  );
+                }
+                final message =
+                    widget.messages[widget.messages.length - 1 - index];
+                return KeyedSubtree(
+                  key: ValueKey(message.identity),
+                  child: AgentChatBubble(message: message),
+                );
+              },
+            ),
+          ),
+        ),
+        ListenableBuilder(
+          listenable: widget.viewport,
+          builder: (context, _) {
+            final count = widget.viewport.unseenCount;
+            return AnimatedSwitcher(
+              duration: const Duration(milliseconds: 140),
+              child: count == 0
+                  ? const SizedBox.shrink(
+                      key: ValueKey('no-new-conversation-items'),
+                    )
+                  : Align(
+                      key: const ValueKey('new-conversation-items'),
+                      alignment: Alignment.bottomCenter,
+                      child: Padding(
+                        padding: const EdgeInsets.only(bottom: 16),
+                        child: Semantics(
+                          label:
+                              '$count new ${count == 1 ? "message" : "messages"}',
+                          button: true,
+                          child: FilledButton.icon(
+                            key: const Key('conversation-new-messages'),
+                            onPressed: widget.viewport.showLatest,
+                            icon: const Icon(Icons.arrow_downward, size: 16),
+                            label: Text(
+                              '$count new ${count == 1 ? "message" : "messages"}',
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+            );
+          },
+        ),
+      ],
+    );
+  }
+}
+
+class _HistoryLoadControl extends StatelessWidget {
+  const _HistoryLoadControl({
+    required this.loading,
+    required this.error,
+    required this.onRetry,
+  });
+
+  final bool loading;
+  final String? error;
+  final VoidCallback onRetry;
+
+  @override
+  Widget build(BuildContext context) {
+    if (error != null) {
+      return _HistoryLoadFailure(message: error!, onRetry: onRetry);
+    }
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 12),
+      child: Center(
+        child: loading
+            ? const SizedBox.square(
+                dimension: 20,
+                child: CircularProgressIndicator(strokeWidth: 2),
+              )
+            : TextButton.icon(
+                key: const Key('conversation-load-older'),
+                onPressed: onRetry,
+                icon: const Icon(Icons.history, size: 16),
+                label: const Text('Load earlier messages'),
+              ),
+      ),
+    );
+  }
+}
+
+class _HistoryLoadFailure extends StatelessWidget {
+  const _HistoryLoadFailure({required this.message, required this.onRetry});
+
+  final String message;
+  final VoidCallback onRetry;
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.all(12),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Text(message, textAlign: TextAlign.center),
+          const SizedBox(height: 8),
+          OutlinedButton.icon(
+            key: const Key('conversation-history-retry'),
+            onPressed: onRetry,
+            icon: const Icon(Icons.refresh, size: 16),
+            label: const Text('Retry'),
+          ),
+        ],
+      ),
+    );
+  }
 }
 
 class ThinkingStatusStrip extends StatefulWidget {
@@ -4307,18 +4765,9 @@ class NativeComposerTextViewState extends State<NativeComposerTextView> {
 }
 
 class AgentChatBubble extends StatelessWidget {
-  const AgentChatBubble({
-    required this.message,
-    required this.chatController,
-    required this.agentListController,
-    this.embedded = false,
-    super.key,
-  });
+  const AgentChatBubble({required this.message, super.key});
 
   final AgentChatMessage message;
-  final ScrollController chatController;
-  final ScrollController agentListController;
-  final bool embedded;
 
   @override
   Widget build(BuildContext context) {

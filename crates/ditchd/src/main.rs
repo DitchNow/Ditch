@@ -8,11 +8,11 @@ use ditch_protocol::{
     ProjectTerminal, ProtocolError, RuntimeAttention, RuntimeStatus, ServerEvent, ServerResponse,
     Snapshot,
 };
-use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 use ditch_store::{
     DitchStore, discover_legacy_projects, ensure_app_dirs, ensure_project_metadata,
     load_project_config, save_project_config,
 };
+use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fs;
@@ -171,6 +171,7 @@ impl RuntimeState {
             capabilities: vec![
                 "persistent_sessions_v1".to_owned(),
                 "attention_stream_v1".to_owned(),
+                "transcript_pagination_v1".to_owned(),
             ],
         }
     }
@@ -185,11 +186,7 @@ impl RuntimeState {
                 .map(|record| record.run.clone())
                 .collect(),
             attention: self.attention.clone(),
-            messages: self
-                .agents
-                .values()
-                .flat_map(|record| record.messages.clone())
-                .collect(),
+            messages: Vec::new(),
         }
     }
 
@@ -405,6 +402,22 @@ fn handle_request(request: ClientRequest, state: Arc<Mutex<RuntimeState>>) -> Se
                 .lock()
                 .expect("runtime state lock should not be poisoned");
             ServerResponse::Snapshot(state.snapshot())
+        }
+        ClientRequest::ListAgentMessages {
+            agent_id,
+            before_sequence,
+            limit,
+        } => {
+            let state = state
+                .lock()
+                .expect("runtime state lock should not be poisoned");
+            match state
+                .store
+                .list_agent_messages(agent_id, before_sequence, limit)
+            {
+                Ok(page) => ServerResponse::AgentMessages(page),
+                Err(error) => protocol_error("message_history_failed", error.to_string()),
+            }
         }
         ClientRequest::Shutdown => shutdown_runtime(state),
         ClientRequest::ListProjects => {
@@ -623,7 +636,10 @@ fn open_project_terminal(
         let state = state
             .lock()
             .expect("runtime state lock should not be poisoned");
-        let project = state.projects.values().find(|project| project.id == project_id);
+        let project = state
+            .projects
+            .values()
+            .find(|project| project.id == project_id);
         let Some(project) = project else {
             return protocol_error("project_not_found", "The selected project no longer exists");
         };
@@ -725,12 +741,22 @@ fn write_project_terminal(
         let state = state
             .lock()
             .expect("runtime state lock should not be poisoned");
-        state.terminals.get(&terminal_id).map(|record| Arc::clone(&record.writer))
+        state
+            .terminals
+            .get(&terminal_id)
+            .map(|record| Arc::clone(&record.writer))
     };
     let Some(writer) = writer else {
-        return protocol_error("terminal_not_found", "The terminal session is no longer active");
+        return protocol_error(
+            "terminal_not_found",
+            "The terminal session is no longer active",
+        );
     };
-    match writer.lock().expect("terminal writer lock should not be poisoned").write_all(&data) {
+    match writer
+        .lock()
+        .expect("terminal writer lock should not be poisoned")
+        .write_all(&data)
+    {
         Ok(()) => ServerResponse::Accepted,
         Err(error) => protocol_error("terminal_write_failed", error.to_string()),
     }
@@ -746,10 +772,16 @@ fn resize_project_terminal(
         let state = state
             .lock()
             .expect("runtime state lock should not be poisoned");
-        state.terminals.get(&terminal_id).map(|record| Arc::clone(&record.master))
+        state
+            .terminals
+            .get(&terminal_id)
+            .map(|record| Arc::clone(&record.master))
     };
     let Some(master) = master else {
-        return protocol_error("terminal_not_found", "The terminal session is no longer active");
+        return protocol_error(
+            "terminal_not_found",
+            "The terminal session is no longer active",
+        );
     };
     match master
         .lock()
@@ -761,7 +793,10 @@ fn resize_project_terminal(
     }
 }
 
-fn close_project_terminal(state: Arc<Mutex<RuntimeState>>, terminal_id: uuid::Uuid) -> ServerResponse {
+fn close_project_terminal(
+    state: Arc<Mutex<RuntimeState>>,
+    terminal_id: uuid::Uuid,
+) -> ServerResponse {
     let mut terminal = {
         let mut state = state
             .lock()
@@ -769,7 +804,9 @@ fn close_project_terminal(state: Arc<Mutex<RuntimeState>>, terminal_id: uuid::Uu
         let Some(terminal) = state.terminals.remove(&terminal_id) else {
             return ServerResponse::Accepted;
         };
-        state.terminal_by_project.remove(&terminal.descriptor.project_id);
+        state
+            .terminal_by_project
+            .remove(&terminal.descriptor.project_id);
         terminal
     };
     let _ = terminal.child.kill();
