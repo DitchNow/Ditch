@@ -1435,10 +1435,26 @@ fn prompt_agent(
 
 fn stop_agent(state: Arc<Mutex<RuntimeState>>, agent_id: AgentId) -> ServerResponse {
     let child = {
-        let state = state
+        let mut state = state
             .lock()
             .expect("runtime state lock should not be poisoned");
-        state.children.get(&agent_id).cloned()
+        let child = state.children.remove(&agent_id);
+        let Some(record) = state.agents.get_mut(&agent_id) else {
+            return protocol_error("agent_not_found", "agent session was not found");
+        };
+        record.run.state = AgentState::Interrupted;
+        record.run.last_visible_action = Some("Stopped by user".to_owned());
+        record.run.updated_at = Utc::now();
+        record.run.finished_at = Some(record.run.updated_at);
+        record.run.resume_block_reason = record
+            .run
+            .native_session_id
+            .is_none()
+            .then_some(AgentResumeBlockReason::NoCodexThread);
+        let run = record.run.clone();
+        state.persist_agent(agent_id);
+        state.broadcast(ServerEvent::AgentChanged(run));
+        child
     };
 
     if let Some(child) = child {
@@ -1447,26 +1463,6 @@ fn stop_agent(state: Arc<Mutex<RuntimeState>>, agent_id: AgentId) -> ServerRespo
             .expect("child lock should not be poisoned")
             .kill();
     }
-
-    let mut state = state
-        .lock()
-        .expect("runtime state lock should not be poisoned");
-    state.children.remove(&agent_id);
-    let Some(record) = state.agents.get_mut(&agent_id) else {
-        return protocol_error("agent_not_found", "agent session was not found");
-    };
-    record.run.state = AgentState::Interrupted;
-    record.run.last_visible_action = Some("Stopped by user".to_owned());
-    record.run.updated_at = Utc::now();
-    record.run.finished_at = Some(record.run.updated_at);
-    record.run.resume_block_reason = record
-        .run
-        .native_session_id
-        .is_none()
-        .then_some(AgentResumeBlockReason::NoCodexThread);
-    let run = record.run.clone();
-    state.persist_agent(agent_id);
-    state.broadcast(ServerEvent::AgentChanged(run));
     ServerResponse::Accepted
 }
 
@@ -1579,12 +1575,17 @@ fn attach_codex_io(state: Arc<Mutex<RuntimeState>>, agent_id: AgentId, child: Ar
     };
 
     thread::spawn(move || {
-        let code = child
-            .lock()
-            .expect("child lock should not be poisoned")
-            .wait()
-            .ok()
-            .and_then(|status| status.code());
+        let code = loop {
+            let status = child
+                .lock()
+                .expect("child lock should not be poisoned")
+                .try_wait();
+            match status {
+                Ok(Some(status)) => break status.code(),
+                Ok(None) => thread::sleep(std::time::Duration::from_millis(25)),
+                Err(_) => break None,
+            }
+        };
         if let Some(reader) = stdout_thread {
             let _ = reader.join();
         }
@@ -2022,7 +2023,8 @@ fn finish_agent(state: &Arc<Mutex<RuntimeState>>, agent_id: AgentId, code: Optio
         let Some(record) = state.agents.get_mut(&agent_id) else {
             return;
         };
-        if !matches!(record.run.state, AgentState::Interrupted) {
+        let interrupted = matches!(record.run.state, AgentState::Interrupted);
+        if !interrupted {
             record.run.state = if record.terminal_failure.is_some() {
                 AgentState::Failed
             } else {
@@ -2031,11 +2033,11 @@ fn finish_agent(state: &Arc<Mutex<RuntimeState>>, agent_id: AgentId, code: Optio
                     _ => AgentState::Failed,
                 }
             };
+            record.run.last_visible_action = Some(match code {
+                Some(code) => format!("Codex exited with code {code}"),
+                None => "Codex exited without a code".to_owned(),
+            });
         }
-        record.run.last_visible_action = Some(match code {
-            Some(code) => format!("Codex exited with code {code}"),
-            None => "Codex exited without a code".to_owned(),
-        });
         record.run.updated_at = Utc::now();
         record.run.finished_at = Some(record.run.updated_at);
         record.run.exit_code = code;
@@ -2717,6 +2719,72 @@ mod tests {
             "Reconnecting... 2/5 (stream disconnected before completion: Broken pipe)"
         ));
         assert!(!is_transient_reconnect("stream disconnected permanently"));
+    }
+
+    #[test]
+    fn stop_agent_interrupts_a_running_child_without_waiting_for_natural_exit() {
+        let mut runtime = test_runtime();
+        let project = Project::new("Fixture", "/tmp/fixture-stop");
+        runtime.store.upsert_project(&project).unwrap();
+        runtime.projects.insert(project.root_key(), project.clone());
+        let agent_id = AgentId::new();
+        let now = Utc::now();
+        runtime.agents.insert(
+            agent_id,
+            AgentRecord {
+                run: AgentRun {
+                    id: agent_id,
+                    provider: AgentProvider::Codex,
+                    state: AgentState::Working,
+                    launch_mode: CodexLaunchMode::Exec,
+                    execution_profile: AgentExecutionProfile::default(),
+                    project_id: project.id,
+                    task_id: None,
+                    pane_id: None,
+                    native_session_id: Some("thread-stop".to_owned()),
+                    codex_title: Some("Stop test".to_owned()),
+                    user_title: None,
+                    origin_codex_home: None,
+                    current_prompt: Some("keep working".to_owned()),
+                    last_visible_action: None,
+                    state_confidence: 1.0,
+                    state_evidence: "fixture".to_owned(),
+                    started_at: now,
+                    updated_at: now,
+                    finished_at: None,
+                    exit_code: None,
+                    resume_block_reason: None,
+                },
+                project_root: project.root,
+                allow_non_git: false,
+                messages: Vec::new(),
+                terminal_failure: None,
+            },
+        );
+        let child = Arc::new(Mutex::new(
+            Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .expect("fixture child should start"),
+        ));
+        runtime.children.insert(agent_id, Arc::clone(&child));
+        let state = Arc::new(Mutex::new(runtime));
+        attach_codex_io(Arc::clone(&state), agent_id, child);
+
+        let started = std::time::Instant::now();
+        let response = stop_agent(Arc::clone(&state), agent_id);
+
+        assert!(matches!(response, ServerResponse::Accepted));
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        thread::sleep(std::time::Duration::from_millis(100));
+        let state = state.lock().expect("fixture state should lock");
+        assert_eq!(state.agents[&agent_id].run.state, AgentState::Interrupted);
+        assert_eq!(
+            state.agents[&agent_id].run.last_visible_action.as_deref(),
+            Some("Stopped by user")
+        );
+        assert!(!state.children.contains_key(&agent_id));
+        assert!(state.attention.is_empty());
     }
 
     #[test]

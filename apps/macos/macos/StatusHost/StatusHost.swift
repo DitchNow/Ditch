@@ -397,7 +397,7 @@ final class StatusHost: NSObject, NSApplicationDelegate, UNUserNotificationCente
       guard let self else { return }
       switch settings.authorizationStatus {
       case .notDetermined:
-        center.requestAuthorization(options: [.alert]) { granted, error in
+        center.requestAuthorization(options: [.alert, .sound]) { granted, error in
           if let error { self.log("notification authorization failed: \(error)") }
           if granted { self.postNotifications(newAttention) }
         }
@@ -432,6 +432,7 @@ final class StatusHost: NSObject, NSApplicationDelegate, UNUserNotificationCente
         content.title = title
         content.subtitle = "Project: \(Self.nonEmpty(item.projectName) ?? "The Ditch")"
         content.body = Self.notificationSummary(item.body)
+        content.sound = .default
         content.categoryIdentifier = Self.agentEventCategory
         content.threadIdentifier = item.projectId
         content.userInfo = [
@@ -482,9 +483,9 @@ final class StatusHost: NSObject, NSApplicationDelegate, UNUserNotificationCente
     withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
   ) {
     if #available(macOS 11.0, *) {
-      completionHandler([.banner, .list])
+      completionHandler([.banner, .list, .sound])
     } else {
-      completionHandler([.alert])
+      completionHandler([.alert, .sound])
     }
   }
 

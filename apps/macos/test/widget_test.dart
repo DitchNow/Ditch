@@ -5,6 +5,11 @@ import 'package:the_ditch/main.dart';
 import 'package:the_ditch/application/command_center_controller.dart';
 import 'package:the_ditch/data/runtime_models.dart';
 
+final _testAgentHeaderKeys = <String, GlobalKey>{};
+
+GlobalKey _testAgentHeaderKey(String agentId) =>
+    _testAgentHeaderKeys.putIfAbsent(agentId, GlobalKey.new);
+
 void main() {
   test('presentation controller publishes immutable connection states', () {
     final controller = CommandCenterController();
@@ -387,6 +392,7 @@ void main() {
             chatViewport: ConversationViewportController(),
             agentListController: ScrollController(),
             composerKey: GlobalKey<AgentComposerState>(),
+            headerKeyForAgent: _testAgentHeaderKey,
             initialPrompt: 'Start here',
             onStartCodex: () {},
             onStartPrompt: (_) {},
@@ -440,6 +446,7 @@ void main() {
             chatViewport: ConversationViewportController(),
             agentListController: ScrollController(),
             composerKey: GlobalKey<AgentComposerState>(),
+            headerKeyForAgent: _testAgentHeaderKey,
             initialPrompt: 'Retry',
             onStartCodex: () {},
             onSubmitPrompt: (_, _) => submitted = true,
@@ -541,6 +548,7 @@ void main() {
             chatViewport: ConversationViewportController(),
             agentListController: ScrollController(),
             composerKey: GlobalKey<AgentComposerState>(),
+            headerKeyForAgent: _testAgentHeaderKey,
             initialPrompt: '',
             onStartCodex: () {},
             onSubmitPrompt: (_, _) {},
@@ -578,6 +586,7 @@ void main() {
             chatViewport: ConversationViewportController(),
             agentListController: ScrollController(),
             composerKey: GlobalKey<AgentComposerState>(),
+            headerKeyForAgent: _testAgentHeaderKey,
             initialPrompt: '',
             onStartCodex: () {},
             onSubmitPrompt: (_, _) {},
@@ -627,6 +636,7 @@ void main() {
             ),
             agentListController: agentListController,
             composerKey: GlobalKey<AgentComposerState>(),
+            headerKeyForAgent: _testAgentHeaderKey,
             initialPrompt: '',
             onStartCodex: () {},
             onSubmitPrompt: (_, _) {},
@@ -698,6 +708,7 @@ void main() {
                 chatViewport: viewport,
                 agentListController: ScrollController(),
                 composerKey: GlobalKey<AgentComposerState>(),
+                headerKeyForAgent: _testAgentHeaderKey,
                 initialPrompt: '',
                 onStartCodex: () {},
                 onSubmitPrompt: (_, _) {},
@@ -810,6 +821,7 @@ void main() {
                 chatViewport: viewport,
                 agentListController: ScrollController(),
                 composerKey: GlobalKey<AgentComposerState>(),
+                headerKeyForAgent: _testAgentHeaderKey,
                 initialPrompt: '',
                 onStartCodex: () {},
                 onSubmitPrompt: (_, _) {},
@@ -1261,6 +1273,65 @@ void main() {
     expect(renamed, 'Plan');
   });
 
+  testWidgets('agent title draft survives live agent updates', (tester) async {
+    final headerKey = GlobalKey();
+    final session = AgentSession(
+      localId: 'agent-live-update',
+      provider: AgentProvider.codex,
+      status: AgentStatus.working,
+      messages: [],
+      codexTitle: 'Working agent',
+    );
+
+    Widget buildPanel() => MaterialApp(
+      home: Scaffold(
+        body: ExpandableAgentPanel(
+          headerKey: headerKey,
+          session: session,
+          expanded: false,
+          enlarged: false,
+          chatViewport: null,
+          composerKey: null,
+          initialPrompt: '',
+          onTap: () {},
+          onEnlarge: () {},
+          onDelete: () {},
+          onRename: (_) {},
+          onSubmitPrompt: (_) {},
+          onStopCodex: () {},
+        ),
+      ),
+    );
+
+    await tester.pumpWidget(buildPanel());
+    await tester.tap(find.text('Working agent'));
+    await tester.pump();
+    await tester.enterText(
+      find.byKey(const Key('agent-title-editor')),
+      'Partial rename',
+    );
+
+    session.lastVisibleAction = 'Received another tool update';
+    session.messages.add(
+      AgentChatMessage(
+        role: ChatMessageRole.tool,
+        text: 'Tool finished',
+        createdAt: DateTime(2026),
+      ),
+    );
+    await tester.pumpWidget(buildPanel());
+    await tester.pump();
+
+    final editor = tester.widget<TextField>(
+      find.byKey(const Key('agent-title-editor')),
+    );
+    expect(editor.controller?.text, 'Partial rename');
+    expect(
+      tester.widget<EditableText>(find.byType(EditableText)).focusNode.hasFocus,
+      isTrue,
+    );
+  });
+
   testWidgets('empty state does not expose a meaningless stop action', (
     tester,
   ) async {
@@ -1320,6 +1391,7 @@ void main() {
             chatViewport: ConversationViewportController(),
             agentListController: ScrollController(),
             composerKey: GlobalKey<AgentComposerState>(),
+            headerKeyForAgent: _testAgentHeaderKey,
             initialPrompt: 'Start here',
             onStartCodex: () {},
             onSubmitPrompt: (_, _) {},
@@ -1384,6 +1456,7 @@ void main() {
             chatViewport: ConversationViewportController(),
             agentListController: ScrollController(),
             composerKey: GlobalKey<AgentComposerState>(),
+            headerKeyForAgent: _testAgentHeaderKey,
             initialPrompt: '',
             onStartCodex: () {},
             onSubmitPrompt: (_, _) {},

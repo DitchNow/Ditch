@@ -1042,6 +1042,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
   final _chatViewports = <String, ConversationViewportController>{};
   final _agentListController = ScrollController();
   final _composerKey = GlobalKey<AgentComposerState>();
+  final _agentHeaderKeys = <String, GlobalKey>{};
   final _runtimeClient = DitchRuntimeClient();
   final _presentation = CommandCenterController();
   int _nextAgentSessionId = 1;
@@ -1103,6 +1104,11 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
 
   int get _unreadNotificationCount =>
       _attention.where((event) => !_readAttentionIds.contains(event.id)).length;
+
+  GlobalKey _agentHeaderKey(String agentId) => _agentHeaderKeys.putIfAbsent(
+    agentId,
+    () => GlobalKey(debugLabel: 'agent-header-$agentId'),
+  );
 
   Future<void> _selectProject(int index) async {
     final currentProjectId = _selectedProject.id;
@@ -1616,6 +1622,9 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
         .map(_chatViewports.remove)
         .whereType<ConversationViewportController>()
         .toList();
+    final removedHeaderKeyIds = _agentHeaderKeys.keys
+        .where((agentId) => !sessionsById.containsKey(agentId))
+        .toList();
     final attentionJson = snapshot['attention'];
     final attention = <AttentionEvent>[];
     if (attentionJson is List) {
@@ -1653,6 +1662,9 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
       _agentSessions
         ..clear()
         ..addAll(sessions);
+      for (final agentId in removedHeaderKeyIds) {
+        _agentHeaderKeys.remove(agentId);
+      }
       _attention
         ..clear()
         ..addAll(attention);
@@ -1795,9 +1807,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
     }
     WidgetsBinding.instance.addPostFrameCallback((_) async {
       if (!mounted) return;
-      final headerContext = GlobalObjectKey(
-        'agent-header-${session.localId}',
-      ).currentContext;
+      final headerContext = _agentHeaderKey(session.localId).currentContext;
       if (headerContext != null) {
         await Scrollable.ensureVisible(
           headerContext,
@@ -2411,6 +2421,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
         final removedViewport = _chatViewports.remove(id);
         setState(() {
           _agentSessions.removeWhere((session) => session.localId == id);
+          _agentHeaderKeys.remove(id);
           _attention.removeWhere((event) => event.sessionLocalId == id);
           if (_expandedAgentLocalId == id) _expandedAgentLocalId = null;
           if (_focusedAgentLocalId == id) _focusedAgentLocalId = null;
@@ -3008,6 +3019,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
                 chatViewport: _chatViewport,
                 agentListController: _agentListController,
                 composerKey: _composerKey,
+                headerKeyForAgent: _agentHeaderKey,
                 initialPrompt: _defaultStartPrompt,
                 effectiveCodexHome: _effectiveRuntimeCodexHome,
                 onStartCodex: _startCodex,
@@ -3966,6 +3978,7 @@ class AgentsSurface extends StatelessWidget {
     required this.chatViewport,
     required this.agentListController,
     required this.composerKey,
+    required this.headerKeyForAgent,
     required this.initialPrompt,
     this.effectiveCodexHome,
     required this.onStartCodex,
@@ -3986,6 +3999,7 @@ class AgentsSurface extends StatelessWidget {
   final ConversationViewportController chatViewport;
   final ScrollController agentListController;
   final GlobalKey<AgentComposerState> composerKey;
+  final GlobalKey Function(String agentId) headerKeyForAgent;
   final String initialPrompt;
   final String? effectiveCodexHome;
   final VoidCallback onStartCodex;
@@ -4034,6 +4048,7 @@ class AgentsSurface extends StatelessWidget {
                 chatViewport: chatViewport,
                 agentListController: agentListController,
                 composerKey: composerKey,
+                headerKeyForAgent: headerKeyForAgent,
                 initialPrompt: initialPrompt,
                 effectiveCodexHome: effectiveCodexHome,
                 onStartPrompt: onStartPrompt ?? (_) {},
@@ -4061,6 +4076,7 @@ class AgentSessionList extends StatelessWidget {
     required this.chatViewport,
     required this.agentListController,
     required this.composerKey,
+    required this.headerKeyForAgent,
     required this.initialPrompt,
     this.effectiveCodexHome,
     required this.onStartPrompt,
@@ -4080,6 +4096,7 @@ class AgentSessionList extends StatelessWidget {
   final ConversationViewportController chatViewport;
   final ScrollController agentListController;
   final GlobalKey<AgentComposerState> composerKey;
+  final GlobalKey Function(String agentId) headerKeyForAgent;
   final String initialPrompt;
   final String? effectiveCodexHome;
   final ValueChanged<String> onStartPrompt;
@@ -4149,6 +4166,7 @@ class AgentSessionList extends StatelessWidget {
             padding: const EdgeInsets.all(12),
             child: ExpandableAgentPanel(
               key: ValueKey('focused-${focusedSession.localId}'),
+              headerKey: headerKeyForAgent(focusedSession.localId),
               session: focusedSession,
               expanded: true,
               enlarged: true,
@@ -4181,6 +4199,7 @@ class AgentSessionList extends StatelessWidget {
       final session = expandedSession;
       return ExpandableAgentPanel(
         key: ValueKey('expanded-${session.localId}'),
+        headerKey: headerKeyForAgent(session.localId),
         session: session,
         expanded: true,
         enlarged: false,
@@ -4212,6 +4231,7 @@ class AgentSessionList extends StatelessWidget {
             final expanded = expandedAgentLocalId == session.localId;
             final panel = ExpandableAgentPanel(
               key: ValueKey(session.localId),
+              headerKey: headerKeyForAgent(session.localId),
               session: session,
               expanded: expanded,
               enlarged: false,
@@ -4348,6 +4368,7 @@ String? _resumeBlockedMessage(
 
 class ExpandableAgentPanel extends StatelessWidget {
   const ExpandableAgentPanel({
+    required this.headerKey,
     required this.session,
     required this.expanded,
     required this.enlarged,
@@ -4366,6 +4387,7 @@ class ExpandableAgentPanel extends StatelessWidget {
   });
 
   final AgentSession session;
+  final GlobalKey headerKey;
   final bool expanded;
   final bool enlarged;
   final ConversationViewportController? chatViewport;
@@ -4499,7 +4521,7 @@ class ExpandableAgentPanel extends StatelessWidget {
               child: Column(
                 children: [
                   InkWell(
-                    key: GlobalObjectKey('agent-header-${session.localId}'),
+                    key: headerKey,
                     onTap: onTap,
                     borderRadius: BorderRadius.circular(8),
                     child: Padding(
