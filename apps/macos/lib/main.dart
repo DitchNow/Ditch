@@ -358,6 +358,8 @@ class AttentionEvent {
     required this.createdAt,
     this.sessionLocalId,
     this.projectId,
+    this.projectName,
+    this.agentName,
   });
 
   final String id;
@@ -368,6 +370,8 @@ class AttentionEvent {
   final DateTime createdAt;
   final String? sessionLocalId;
   final String? projectId;
+  final String? projectName;
+  final String? agentName;
 
   bool get canOpenSession => sessionLocalId != null;
 }
@@ -375,35 +379,6 @@ class AttentionEvent {
 enum AgentStatus { idle, starting, working, completed, failed, stopped }
 
 enum ChatMessageRole { user, assistant, system, tool }
-
-enum CodexProcessEventKind { diagnostic }
-
-class CodexProcessDiagnostic {
-  const CodexProcessDiagnostic({
-    required this.kind,
-    required this.text,
-    required this.createdAt,
-  });
-
-  final CodexProcessEventKind kind;
-  final String text;
-  final DateTime createdAt;
-
-  bool get isVisibleInChat => true;
-}
-
-CodexProcessDiagnostic? codexStderrDiagnosticFromChunk(String chunk) {
-  final text = chunk.trim();
-  if (text.isEmpty) {
-    return null;
-  }
-
-  return CodexProcessDiagnostic(
-    kind: CodexProcessEventKind.diagnostic,
-    text: text,
-    createdAt: DateTime.now(),
-  );
-}
 
 class AgentChatMessage {
   AgentChatMessage({
@@ -420,6 +395,80 @@ class AgentChatMessage {
 }
 
 int _nextChatMessageIdentity = 1;
+
+class ConversationItem {
+  ConversationItem.message(AgentChatMessage message)
+    : this._(
+        identity: message.identity,
+        message: message,
+        toolMessages: const [],
+        isActiveToolGroup: false,
+      );
+
+  const ConversationItem.toolGroup({
+    required String identity,
+    required List<AgentChatMessage> toolMessages,
+    required bool isActiveToolGroup,
+  }) : this._(
+         identity: identity,
+         message: null,
+         toolMessages: toolMessages,
+         isActiveToolGroup: isActiveToolGroup,
+       );
+
+  const ConversationItem._({
+    required this.identity,
+    required this.message,
+    required this.toolMessages,
+    required this.isActiveToolGroup,
+  });
+
+  final String identity;
+  final AgentChatMessage? message;
+  final List<AgentChatMessage> toolMessages;
+  final bool isActiveToolGroup;
+
+  bool get isToolGroup => toolMessages.isNotEmpty;
+}
+
+List<ConversationItem> buildConversationItems(
+  List<AgentChatMessage> messages, {
+  required bool isWorking,
+}) {
+  final items = <ConversationItem>[];
+  var segmentStart = 0;
+  while (segmentStart < messages.length) {
+    var segmentEnd = segmentStart + 1;
+    while (segmentEnd < messages.length &&
+        messages[segmentEnd].role != ChatMessageRole.user) {
+      segmentEnd += 1;
+    }
+    final tools = messages
+        .sublist(segmentStart, segmentEnd)
+        .where((message) => message.role == ChatMessageRole.tool)
+        .toList(growable: false);
+    var emittedTools = false;
+    for (var index = segmentStart; index < segmentEnd; index++) {
+      final message = messages[index];
+      if (message.role == ChatMessageRole.tool) {
+        if (!emittedTools) {
+          items.add(
+            ConversationItem.toolGroup(
+              identity: 'tool-activity:${tools.first.identity}',
+              toolMessages: tools,
+              isActiveToolGroup: isWorking && segmentEnd == messages.length,
+            ),
+          );
+          emittedTools = true;
+        }
+      } else {
+        items.add(ConversationItem.message(message));
+      }
+    }
+    segmentStart = segmentEnd;
+  }
+  return items;
+}
 
 enum ConversationViewportMode { initializing, following, detached }
 
@@ -898,6 +947,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
   int _nextAttentionId = 1;
   final _projects = <DitchProject>[_bootstrapProject];
   final _attention = <AttentionEvent>[];
+  final _readAttentionIds = <String>{};
   final Map<String, ProjectTerminalSession> _projectTerminals = {};
 
   StreamSubscription<Map<String, dynamic>>? _runtimeEvents;
@@ -947,9 +997,8 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
     return sessionsForProject(_agentSessions, _selectedProject.id);
   }
 
-  List<AttentionEvent> get _visibleAttention {
-    return attentionForProject(_attention, _selectedProject.id);
-  }
+  int get _unreadNotificationCount =>
+      _attention.where((event) => !_readAttentionIds.contains(event.id)).length;
 
   void _selectProject(int index) {
     setState(() {
@@ -1465,6 +1514,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
       _attention
         ..clear()
         ..addAll(attention);
+      _readAttentionIds.retainAll(attention.map((event) => event.id).toSet());
       final visibleSessions = _visibleSessions;
       if (visibleSessions.isNotEmpty) {
         _expandedAgentLocalId =
@@ -1585,6 +1635,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
       _pendingNotificationTarget = null;
       if (target.attentionId != null) {
         _attention.removeWhere((event) => event.id == target.attentionId);
+        _readAttentionIds.remove(target.attentionId);
       }
     });
     _chatViewports
@@ -2028,6 +2079,15 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
     if (!mounted) {
       return;
     }
+    final session = sessionLocalId == null
+        ? null
+        : _agentSessionByLocalId(sessionLocalId);
+    final eventProjectId = global
+        ? null
+        : (projectId ?? session?.projectId ?? _selectedProject.id);
+    final project = _projects
+        .where((candidate) => candidate.id == eventProjectId)
+        .firstOrNull;
     setState(() {
       _attention.insert(
         0,
@@ -2038,7 +2098,9 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
           title: title,
           body: body,
           sessionLocalId: sessionLocalId,
-          projectId: global ? null : (projectId ?? _selectedProject.id),
+          projectId: eventProjectId,
+          projectName: project?.name,
+          agentName: session?.displayName,
           createdAt: DateTime.now(),
         ),
       );
@@ -2053,7 +2115,15 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
       return;
     }
 
-    setState(() => _expandedAgentLocalId = sessionLocalId);
+    final project = _projects
+        .where((candidate) => candidate.id == event.projectId)
+        .firstOrNull;
+    setState(() {
+      if (project != null) _selectedProjectKey = _projectKey(project);
+      _expandedAgentLocalId = sessionLocalId;
+      _focusedAgentLocalId = null;
+      _readAttentionIds.add(event.id);
+    });
     _chatViewports
         .putIfAbsent(sessionLocalId, ConversationViewportController.new)
         .beginOpening(onInitialPositioned: _focusComposerAfterLayout);
@@ -2065,9 +2135,30 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
   void _dismissAttention(AttentionEvent event) {
     setState(() {
       _attention.removeWhere((candidate) => candidate.id == event.id);
+      _readAttentionIds.remove(event.id);
     });
     _scheduleStatusBarUpdate();
     unawaited(_runtimeClient.dismissAttention(event.id));
+  }
+
+  void _markNotificationsRead() {
+    setState(
+      () => _readAttentionIds.addAll(_attention.map((event) => event.id)),
+    );
+  }
+
+  void _dismissAllNotifications() {
+    final events = List<AttentionEvent>.from(_attention);
+    setState(() {
+      _attention.clear();
+      _readAttentionIds.clear();
+    });
+    for (final event in events) {
+      if (!event.id.startsWith('attention-')) {
+        unawaited(_runtimeClient.dismissAttention(event.id));
+      }
+    }
+    _scheduleStatusBarUpdate();
   }
 
   void _resolveAttentionForSession(AgentSession resumedSession) {
@@ -2090,6 +2181,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
       _attention.removeWhere(
         (event) => relatedSessionIds.contains(event.sessionLocalId),
       );
+      _readAttentionIds.removeAll(resolved.map((event) => event.id));
     });
     for (final event in resolved) {
       if (!event.id.startsWith('attention-')) {
@@ -2097,14 +2189,6 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
       }
     }
     _scheduleStatusBarUpdate();
-  }
-
-  bool _canStopAttentionSession(AttentionEvent event) {
-    final sessionLocalId = event.sessionLocalId;
-    if (sessionLocalId == null) {
-      return false;
-    }
-    return _agentSessionByLocalId(sessionLocalId)?.isWorking ?? false;
   }
 
   void _handleRuntimeEvent(Map<String, dynamic> envelopeBody) {
@@ -2234,7 +2318,10 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
     if (attentionDismissed is Map<String, dynamic>) {
       final id = attentionDismissed['attention_id']?.toString();
       if (id != null) {
-        setState(() => _attention.removeWhere((item) => item.id == id));
+        setState(() {
+          _attention.removeWhere((item) => item.id == id);
+          _readAttentionIds.remove(id);
+        });
         _scheduleStatusBarUpdate();
       }
       return;
@@ -2319,6 +2406,8 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
       body: body,
       sessionLocalId: _agentIdToString(value['agent_id']),
       projectId: value['project_id']?.toString(),
+      projectName: value['project_name']?.toString(),
+      agentName: value['agent_name']?.toString(),
       createdAt: _dateTimeFromRuntime(value['created_at']),
     );
   }
@@ -2586,38 +2675,13 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
                   () => _dockedTerminalExpanded = !_dockedTerminalExpanded,
                 ),
                 onPresentationChanged: _setTerminalPresentation,
-                events: _visibleAttention,
-                canStopSession: _canStopAttentionSession,
-                onOpenSession: _openAttentionSession,
-                onStopSession: (event) {
-                  final id = event.sessionLocalId;
-                  final session = id == null
-                      ? null
-                      : _agentSessionByLocalId(id);
-                  if (session != null) _stopCodex(session);
-                },
-                onDismiss: _dismissAttention,
-              );
-              final attentionOnly = AttentionPanel(
-                width: inspectorWidth,
-                events: _visibleAttention,
-                canStopSession: _canStopAttentionSession,
-                onOpenSession: _openAttentionSession,
-                onStopSession: (event) {
-                  final id = event.sessionLocalId;
-                  final session = id == null
-                      ? null
-                      : _agentSessionByLocalId(id);
-                  if (session != null) _stopCodex(session);
-                },
-                onDismiss: _dismissAttention,
               );
 
-              Widget standardWorkspace({required bool attentionOnlyMode}) {
+              Widget standardWorkspace({required bool includeInspector}) {
                 return Row(
                   children: [
                     Expanded(child: agentsSurface),
-                    if (showInspector) ...[
+                    if (showInspector && includeInspector) ...[
                       WorkspaceResizeHandle(
                         key: const Key('inspector-resize-handle'),
                         onDragUpdate: (delta) {
@@ -2639,7 +2703,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
                           unawaited(_persistPaneWidths());
                         },
                       ),
-                      attentionOnlyMode ? attentionOnly : projectToolsPanel,
+                      projectToolsPanel,
                     ],
                   ],
                 );
@@ -2665,7 +2729,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
                       ),
                       const Divider(height: 1),
                       Expanded(
-                        child: standardWorkspace(attentionOnlyMode: true),
+                        child: standardWorkspace(includeInspector: false),
                       ),
                     ],
                   ),
@@ -2685,7 +2749,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
                       ),
                     ),
                   ),
-                  _ => standardWorkspace(attentionOnlyMode: false),
+                  _ => standardWorkspace(includeInspector: true),
                 };
                 return Row(
                   children: [
@@ -2735,9 +2799,14 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
                     DitchToolbar(
                       projectName: _selectedProject.name,
                       connection: presentation.connection,
-                      attentionCount: _visibleAttention.length,
+                      notifications: _attention,
+                      unreadNotificationCount: _unreadNotificationCount,
                       sidebarVisible: showSidebar,
                       inspectorVisible: showInspector,
+                      onNotificationsViewed: _markNotificationsRead,
+                      onOpenNotification: _openAttentionSession,
+                      onDismissNotification: _dismissAttention,
+                      onDismissAllNotifications: _dismissAllNotifications,
                       onToggleSidebar: _presentation.toggleSidebar,
                       onToggleInspector: _presentation.toggleInspector,
                     ),
@@ -2772,21 +2841,31 @@ class DitchToolbar extends StatelessWidget {
   const DitchToolbar({
     required this.projectName,
     required this.connection,
-    required this.attentionCount,
+    required this.notifications,
+    required this.unreadNotificationCount,
     required this.sidebarVisible,
     required this.inspectorVisible,
     required this.onToggleSidebar,
     required this.onToggleInspector,
+    required this.onNotificationsViewed,
+    required this.onOpenNotification,
+    required this.onDismissNotification,
+    required this.onDismissAllNotifications,
     super.key,
   });
 
   final String projectName;
   final RuntimeConnectionPhase connection;
-  final int attentionCount;
+  final List<AttentionEvent> notifications;
+  final int unreadNotificationCount;
   final bool sidebarVisible;
   final bool inspectorVisible;
   final VoidCallback onToggleSidebar;
   final VoidCallback onToggleInspector;
+  final VoidCallback onNotificationsViewed;
+  final ValueChanged<AttentionEvent> onOpenNotification;
+  final ValueChanged<AttentionEvent> onDismissNotification;
+  final VoidCallback onDismissAllNotifications;
 
   @override
   Widget build(BuildContext context) {
@@ -2851,17 +2930,21 @@ class DitchToolbar extends StatelessWidget {
                 PopupMenuItem(value: ThemeMode.dark, child: Text('Dark')),
               ],
             ),
-            Badge(
-              isLabelVisible: attentionCount > 0,
-              label: Text('$attentionCount'),
-              child: IconButton(
-                tooltip: inspectorVisible ? 'Hide attention' : 'Show attention',
-                onPressed: onToggleInspector,
-                icon: Icon(
-                  inspectorVisible
-                      ? Icons.vertical_split
-                      : Icons.vertical_split_outlined,
-                ),
+            NotificationCenterButton(
+              notifications: notifications,
+              unreadCount: unreadNotificationCount,
+              onViewed: onNotificationsViewed,
+              onOpen: onOpenNotification,
+              onDismiss: onDismissNotification,
+              onDismissAll: onDismissAllNotifications,
+            ),
+            IconButton(
+              tooltip: inspectorVisible ? 'Hide terminal' : 'Show terminal',
+              onPressed: onToggleInspector,
+              icon: Icon(
+                inspectorVisible
+                    ? Icons.vertical_split
+                    : Icons.vertical_split_outlined,
               ),
             ),
           ],
@@ -3059,6 +3142,199 @@ class _WorkspaceResizeHandleState extends State<WorkspaceResizeHandle> {
             ),
           ),
         ),
+      ),
+    );
+  }
+}
+
+class NotificationCenterButton extends StatefulWidget {
+  const NotificationCenterButton({
+    required this.notifications,
+    required this.unreadCount,
+    required this.onViewed,
+    required this.onOpen,
+    required this.onDismiss,
+    required this.onDismissAll,
+    super.key,
+  });
+
+  final List<AttentionEvent> notifications;
+  final int unreadCount;
+  final VoidCallback onViewed;
+  final ValueChanged<AttentionEvent> onOpen;
+  final ValueChanged<AttentionEvent> onDismiss;
+  final VoidCallback onDismissAll;
+
+  @override
+  State<NotificationCenterButton> createState() =>
+      _NotificationCenterButtonState();
+}
+
+class _NotificationCenterButtonState extends State<NotificationCenterButton> {
+  final _controller = MenuController();
+
+  void _toggle() {
+    if (_controller.isOpen) {
+      _controller.close();
+    } else {
+      widget.onViewed();
+      _controller.open();
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final notifications = List<AttentionEvent>.from(widget.notifications)
+      ..sort((a, b) => b.createdAt.compareTo(a.createdAt));
+    return MenuAnchor(
+      controller: _controller,
+      alignmentOffset: const Offset(-340, 4),
+      style: MenuStyle(
+        padding: const WidgetStatePropertyAll(EdgeInsets.zero),
+        backgroundColor: WidgetStatePropertyAll(context.ditch.surface),
+      ),
+      menuChildren: [
+        SizedBox(
+          key: const Key('notification-center'),
+          width: 380,
+          height: notifications.isEmpty ? 150 : 430,
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Padding(
+                padding: const EdgeInsets.fromLTRB(16, 12, 8, 8),
+                child: Row(
+                  children: [
+                    Expanded(
+                      child: Text(
+                        'Notifications',
+                        style: Theme.of(context).textTheme.titleMedium,
+                      ),
+                    ),
+                    if (notifications.isNotEmpty)
+                      TextButton(
+                        key: const Key('clear-notifications'),
+                        onPressed: widget.onDismissAll,
+                        child: const Text('Clear all'),
+                      ),
+                  ],
+                ),
+              ),
+              const Divider(height: 1),
+              Expanded(
+                child: notifications.isEmpty
+                    ? const Center(child: Text('No notifications'))
+                    : ListView.separated(
+                        primary: false,
+                        padding: const EdgeInsets.all(10),
+                        itemCount: notifications.length,
+                        separatorBuilder: (_, _) => const SizedBox(height: 8),
+                        itemBuilder: (context, index) {
+                          final event = notifications[index];
+                          return _NotificationCenterItem(
+                            event: event,
+                            onOpen: event.canOpenSession
+                                ? () {
+                                    _controller.close();
+                                    widget.onOpen(event);
+                                  }
+                                : null,
+                            onDismiss: () => widget.onDismiss(event),
+                          );
+                        },
+                      ),
+              ),
+            ],
+          ),
+        ),
+      ],
+      builder: (context, controller, _) => Badge(
+        isLabelVisible: widget.unreadCount > 0,
+        label: Text('${widget.unreadCount}'),
+        child: IconButton(
+          key: const Key('notification-bell'),
+          tooltip: 'Notifications',
+          onPressed: _toggle,
+          icon: Icon(
+            controller.isOpen
+                ? Icons.notifications
+                : Icons.notifications_outlined,
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _NotificationCenterItem extends StatelessWidget {
+  const _NotificationCenterItem({
+    required this.event,
+    required this.onDismiss,
+    this.onOpen,
+  });
+
+  final AttentionEvent event;
+  final VoidCallback? onOpen;
+  final VoidCallback onDismiss;
+
+  @override
+  Widget build(BuildContext context) {
+    final project = event.projectName?.trim();
+    final agent = event.agentName?.trim();
+    final source = [
+      if (project != null && project.isNotEmpty) project,
+      if (agent != null && agent.isNotEmpty) agent,
+    ].join(' · ');
+    return DitchSurface(
+      padding: const EdgeInsets.all(12),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Icon(event.icon, size: 19),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  event.title,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: Theme.of(context).textTheme.titleSmall,
+                ),
+                if (source.isNotEmpty) ...[
+                  const SizedBox(height: 2),
+                  Text(
+                    source,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: Theme.of(context).textTheme.labelSmall,
+                  ),
+                ],
+                const SizedBox(height: 5),
+                Text(event.body, maxLines: 3, overflow: TextOverflow.ellipsis),
+                const SizedBox(height: 8),
+                Row(
+                  children: [
+                    if (onOpen != null)
+                      TextButton.icon(
+                        onPressed: onOpen,
+                        icon: const Icon(Icons.open_in_full, size: 15),
+                        label: const Text('Open'),
+                      ),
+                    const Spacer(),
+                    IconButton(
+                      tooltip: 'Dismiss notification',
+                      visualDensity: VisualDensity.compact,
+                      onPressed: onDismiss,
+                      icon: const Icon(Icons.close, size: 16),
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ),
+        ],
       ),
     );
   }
@@ -3902,6 +4178,7 @@ class AgentChatPanel extends StatelessWidget {
             child: ConversationTranscript(
               key: ValueKey('conversation-$conversationId'),
               messages: messages,
+              isWorking: isWorking,
               viewport: viewport,
               ready: messagesReady,
               loadingOlder: messagesLoading,
@@ -3922,6 +4199,7 @@ class ConversationTranscript extends StatefulWidget {
   const ConversationTranscript({
     required this.messages,
     required this.viewport,
+    this.isWorking = false,
     this.ready = true,
     this.loadingOlder = false,
     this.hasOlderMessages = false,
@@ -3933,6 +4211,7 @@ class ConversationTranscript extends StatefulWidget {
 
   final List<AgentChatMessage> messages;
   final ConversationViewportController viewport;
+  final bool isWorking;
   final bool ready;
   final bool loadingOlder;
   final bool hasOlderMessages;
@@ -3974,9 +4253,11 @@ class _ConversationTranscriptState extends State<ConversationTranscript> {
     }
   }
 
-  List<String> get _itemIds => widget.messages
-      .map((message) => message.identity)
-      .toList(growable: false);
+  List<ConversationItem> get _items =>
+      buildConversationItems(widget.messages, isWorking: widget.isWorking);
+
+  List<String> get _itemIds =>
+      _items.map((item) => item.identity).toList(growable: false);
 
   @override
   Widget build(BuildContext context) {
@@ -3998,6 +4279,7 @@ class _ConversationTranscriptState extends State<ConversationTranscript> {
         widget.loadingOlder ||
         widget.historyError != null;
     final showEmptyState = widget.messages.isEmpty;
+    final items = _items;
     return Stack(
       fit: StackFit.expand,
       children: [
@@ -4023,24 +4305,28 @@ class _ConversationTranscriptState extends State<ConversationTranscript> {
               padding: const EdgeInsets.fromLTRB(12, 12, 12, 20),
               itemCount: showEmptyState
                   ? 1
-                  : widget.messages.length + (showHistoryControl ? 1 : 0),
+                  : items.length + (showHistoryControl ? 1 : 0),
               separatorBuilder: (_, _) => const SizedBox(height: 10),
               itemBuilder: (context, index) {
                 if (showEmptyState) {
                   return const Center(child: Text('No messages yet.'));
                 }
-                if (index == widget.messages.length) {
+                if (index == items.length) {
                   return _HistoryLoadControl(
                     loading: widget.loadingOlder,
                     error: widget.historyError,
                     onRetry: widget.onLoadOlder,
                   );
                 }
-                final message =
-                    widget.messages[widget.messages.length - 1 - index];
+                final item = items[items.length - 1 - index];
                 return KeyedSubtree(
-                  key: ValueKey(message.identity),
-                  child: AgentChatBubble(message: message),
+                  key: ValueKey(item.identity),
+                  child: item.isToolGroup
+                      ? ToolActivityGroup(
+                          messages: item.toolMessages,
+                          active: item.isActiveToolGroup,
+                        )
+                      : AgentChatBubble(message: item.message!),
                 );
               },
             ),
@@ -4764,6 +5050,172 @@ class NativeComposerTextViewState extends State<NativeComposerTextView> {
   }
 }
 
+class ToolActivityGroup extends StatefulWidget {
+  const ToolActivityGroup({
+    required this.messages,
+    required this.active,
+    super.key,
+  });
+
+  final List<AgentChatMessage> messages;
+  final bool active;
+
+  @override
+  State<ToolActivityGroup> createState() => _ToolActivityGroupState();
+}
+
+class _ToolActivityGroupState extends State<ToolActivityGroup> {
+  late bool _expanded;
+
+  @override
+  void initState() {
+    super.initState();
+    _expanded = widget.active;
+  }
+
+  @override
+  void didUpdateWidget(ToolActivityGroup oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.active && !widget.active) {
+      _expanded = false;
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final colors = Theme.of(context).colorScheme;
+    final foreground = colors.onTertiaryContainer;
+    final count = widget.messages.length;
+    final summary =
+        'Tool activity · $count ${count == 1 ? "action" : "actions"}';
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final maxWidth = constraints.maxWidth < 520
+            ? constraints.maxWidth * 0.9
+            : (constraints.maxWidth * 0.72).clamp(360.0, 760.0);
+        return Align(
+          alignment: Alignment.centerLeft,
+          child: ConstrainedBox(
+            constraints: BoxConstraints(maxWidth: maxWidth),
+            child: DecoratedBox(
+              decoration: BoxDecoration(
+                color: colors.tertiaryContainer,
+                borderRadius: BorderRadius.circular(context.ditch.radiusMedium),
+              ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  Semantics(
+                    button: true,
+                    expanded: _expanded,
+                    label: summary,
+                    child: InkWell(
+                      key: const Key('tool-activity-toggle'),
+                      borderRadius: BorderRadius.circular(
+                        context.ditch.radiusMedium,
+                      ),
+                      onTap: () => setState(() => _expanded = !_expanded),
+                      child: Padding(
+                        padding: const EdgeInsets.fromLTRB(12, 8, 8, 8),
+                        child: Row(
+                          children: [
+                            Icon(Icons.terminal, size: 16, color: foreground),
+                            const SizedBox(width: 7),
+                            Expanded(
+                              child: Text(
+                                summary,
+                                style: Theme.of(context).textTheme.labelMedium
+                                    ?.copyWith(
+                                      color: foreground,
+                                      fontWeight: FontWeight.w700,
+                                    ),
+                              ),
+                            ),
+                            if (widget.active)
+                              Padding(
+                                padding: const EdgeInsets.only(right: 6),
+                                child: Text(
+                                  'Running',
+                                  style: Theme.of(context).textTheme.labelSmall
+                                      ?.copyWith(color: foreground),
+                                ),
+                              ),
+                            Icon(
+                              _expanded
+                                  ? Icons.keyboard_arrow_up
+                                  : Icons.keyboard_arrow_down,
+                              color: foreground,
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ),
+                  if (_expanded) ...[
+                    Divider(
+                      height: 1,
+                      color: foreground.withValues(alpha: .18),
+                    ),
+                    Padding(
+                      padding: const EdgeInsets.fromLTRB(12, 10, 12, 12),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.stretch,
+                        children: [
+                          for (var index = 0; index < count; index++) ...[
+                            Row(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Expanded(
+                                  child: SelectionArea(
+                                    child: Text(
+                                      widget.messages[index].text,
+                                      style: Theme.of(context)
+                                          .textTheme
+                                          .bodySmall
+                                          ?.copyWith(
+                                            color: foreground,
+                                            height: 1.4,
+                                            fontFamily: 'SF Mono',
+                                            fontSize: 12.5,
+                                          ),
+                                    ),
+                                  ),
+                                ),
+                                IconButton(
+                                  visualDensity: VisualDensity.compact,
+                                  tooltip: 'Copy tool action',
+                                  icon: const Icon(
+                                    Icons.copy_outlined,
+                                    size: 15,
+                                  ),
+                                  onPressed: () => Clipboard.setData(
+                                    ClipboardData(
+                                      text: widget.messages[index].text,
+                                    ),
+                                  ),
+                                ),
+                              ],
+                            ),
+                            if (index < count - 1)
+                              Divider(
+                                height: 16,
+                                color: foreground.withValues(alpha: .14),
+                              ),
+                          ],
+                        ],
+                      ),
+                    ),
+                  ],
+                ],
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+}
+
 class AgentChatBubble extends StatelessWidget {
   const AgentChatBubble({required this.message, super.key});
 
@@ -4899,11 +5351,6 @@ class ProjectToolsPanel extends StatefulWidget {
     required this.dockedTerminalExpanded,
     required this.onToggleDocked,
     required this.onPresentationChanged,
-    required this.events,
-    required this.canStopSession,
-    required this.onOpenSession,
-    required this.onStopSession,
-    required this.onDismiss,
     super.key,
   });
 
@@ -4914,11 +5361,6 @@ class ProjectToolsPanel extends StatefulWidget {
   final bool dockedTerminalExpanded;
   final VoidCallback onToggleDocked;
   final ValueChanged<TerminalPresentation> onPresentationChanged;
-  final List<AttentionEvent> events;
-  final bool Function(AttentionEvent event) canStopSession;
-  final ValueChanged<AttentionEvent> onOpenSession;
-  final ValueChanged<AttentionEvent> onStopSession;
-  final ValueChanged<AttentionEvent> onDismiss;
 
   @override
   State<ProjectToolsPanel> createState() => _ProjectToolsPanelState();
@@ -4952,24 +5394,12 @@ class _ProjectToolsPanelState extends State<ProjectToolsPanel> {
     if (widget.presentation == TerminalPresentation.vertical) {
       return SizedBox(
         width: widget.width,
-        child: Column(
-          children: [
-            Expanded(
-              child: ProjectTerminalSurface(
-                terminal: terminal,
-                presentation: widget.presentation,
-                onTitleTap: () =>
-                    widget.onPresentationChanged(TerminalPresentation.docked),
-                onPresentationChanged: widget.onPresentationChanged,
-              ),
-            ),
-            const Divider(height: 1),
-            AttentionHeader(
-              collapsed: true,
-              onTap: () =>
-                  widget.onPresentationChanged(TerminalPresentation.docked),
-            ),
-          ],
+        child: ProjectTerminalSurface(
+          terminal: terminal,
+          presentation: widget.presentation,
+          onTitleTap: () =>
+              widget.onPresentationChanged(TerminalPresentation.docked),
+          onPresentationChanged: widget.onPresentationChanged,
         ),
       );
     }
@@ -4985,21 +5415,9 @@ class _ProjectToolsPanelState extends State<ProjectToolsPanel> {
             onPresentationChanged: widget.onPresentationChanged,
           ),
           if (widget.dockedTerminalExpanded)
-            SizedBox(
-              height: 250,
-              child: ProjectTerminalBody(terminal: terminal),
-            ),
-          const Divider(height: 1),
-          Expanded(
-            child: AttentionPanel(
-              width: widget.width,
-              events: widget.events,
-              canStopSession: widget.canStopSession,
-              onOpenSession: widget.onOpenSession,
-              onStopSession: widget.onStopSession,
-              onDismiss: widget.onDismiss,
-            ),
-          ),
+            Expanded(child: ProjectTerminalBody(terminal: terminal))
+          else
+            const Spacer(),
         ],
       ),
     );
@@ -5221,197 +5639,6 @@ class ProjectTerminalHeader extends StatelessWidget {
             const SizedBox(width: 4),
           ],
         ),
-      ),
-    );
-  }
-}
-
-class AttentionHeader extends StatelessWidget {
-  const AttentionHeader({required this.collapsed, this.onTap, super.key});
-
-  final bool collapsed;
-  final VoidCallback? onTap;
-
-  @override
-  Widget build(BuildContext context) {
-    return Material(
-      color: context.ditch.inspector,
-      child: InkWell(
-        key: const Key('attention-header'),
-        onTap: onTap,
-        child: SizedBox(
-          height: 50,
-          child: Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 16),
-            child: Row(
-              children: [
-                Icon(
-                  collapsed ? Icons.chevron_right : Icons.expand_more,
-                  size: 18,
-                ),
-                const SizedBox(width: 6),
-                Text(
-                  'Attention',
-                  style: Theme.of(context).textTheme.titleLarge,
-                ),
-              ],
-            ),
-          ),
-        ),
-      ),
-    );
-  }
-}
-
-class AttentionPanel extends StatelessWidget {
-  const AttentionPanel({
-    required this.width,
-    required this.events,
-    required this.canStopSession,
-    required this.onOpenSession,
-    required this.onStopSession,
-    required this.onDismiss,
-    super.key,
-  });
-
-  final double width;
-  final List<AttentionEvent> events;
-  final bool Function(AttentionEvent event) canStopSession;
-  final ValueChanged<AttentionEvent> onOpenSession;
-  final ValueChanged<AttentionEvent> onStopSession;
-  final ValueChanged<AttentionEvent> onDismiss;
-
-  @override
-  Widget build(BuildContext context) {
-    return ColoredBox(
-      color: context.ditch.inspector,
-      child: SizedBox(
-        width: width,
-        child: SafeArea(
-          top: false,
-          child: Column(
-            children: [
-              const AttentionHeader(collapsed: false),
-              Expanded(
-                child: SingleChildScrollView(
-                  padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      if (events.isEmpty)
-                        const AttentionEmptyState()
-                      else
-                        for (final event in events) ...[
-                          AttentionItem(
-                            event: event,
-                            canStop: canStopSession(event),
-                            onOpen: event.canOpenSession
-                                ? () => onOpenSession(event)
-                                : null,
-                            onStop: canStopSession(event)
-                                ? () => onStopSession(event)
-                                : null,
-                            onDismiss: () => onDismiss(event),
-                          ),
-                          const SizedBox(height: 12),
-                        ],
-                    ],
-                  ),
-                ),
-              ),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-}
-
-class AttentionEmptyState extends StatelessWidget {
-  const AttentionEmptyState({super.key});
-
-  @override
-  Widget build(BuildContext context) {
-    return DitchSurface(
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          const Icon(Icons.check_circle_outline, size: 20),
-          const SizedBox(width: 10),
-          Expanded(
-            child: Text(
-              'No agent sessions need attention.',
-              style: Theme.of(context).textTheme.bodyMedium,
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-class AttentionItem extends StatelessWidget {
-  const AttentionItem({
-    required this.event,
-    required this.canStop,
-    required this.onDismiss,
-    this.onOpen,
-    this.onStop,
-    super.key,
-  });
-
-  final AttentionEvent event;
-  final bool canStop;
-  final VoidCallback? onOpen;
-  final VoidCallback? onStop;
-  final VoidCallback onDismiss;
-
-  @override
-  Widget build(BuildContext context) {
-    return DitchSurface(
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Icon(event.icon, size: 20),
-          const SizedBox(width: 10),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  event.title,
-                  style: Theme.of(context).textTheme.titleSmall,
-                ),
-                const SizedBox(height: 4),
-                Text(event.body),
-                const SizedBox(height: 10),
-                Wrap(
-                  spacing: 8,
-                  runSpacing: 8,
-                  children: [
-                    if (onOpen != null)
-                      OutlinedButton.icon(
-                        onPressed: onOpen,
-                        icon: const Icon(Icons.open_in_full, size: 16),
-                        label: const Text('Open'),
-                      ),
-                    if (canStop && onStop != null)
-                      OutlinedButton.icon(
-                        onPressed: onStop,
-                        icon: const Icon(Icons.stop_circle_outlined, size: 16),
-                        label: const Text('Stop'),
-                      ),
-                    TextButton.icon(
-                      onPressed: onDismiss,
-                      icon: const Icon(Icons.done, size: 16),
-                      label: const Text('Dismiss'),
-                    ),
-                  ],
-                ),
-              ],
-            ),
-          ),
-        ],
       ),
     );
   }

@@ -235,6 +235,10 @@ pub struct RuntimeAttention {
     pub agent_id: Option<AgentId>,
     #[serde(default)]
     pub project_id: Option<ProjectId>,
+    #[serde(default)]
+    pub project_name: Option<String>,
+    #[serde(default)]
+    pub agent_name: Option<String>,
     pub title: String,
     pub body: String,
     pub created_at: DateTime<Utc>,

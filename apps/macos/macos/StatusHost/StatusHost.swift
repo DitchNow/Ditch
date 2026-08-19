@@ -360,6 +360,8 @@ final class StatusHost: NSObject, NSApplicationDelegate, UNUserNotificationCente
       kind: kind,
       projectId: projectId,
       agentId: agentId,
+      projectName: item["project_name"] as? String,
+      agentName: item["agent_name"] as? String,
       title: title,
       body: body)
   }
@@ -418,8 +420,18 @@ final class StatusHost: NSObject, NSApplicationDelegate, UNUserNotificationCente
         self.persistNotifiedAttentionIds()
 
         let content = UNMutableNotificationContent()
-        content.title = item.title
-        content.body = item.body
+        let agentName = Self.nonEmpty(item.agentName) ?? "Codex"
+        let title: String
+        switch item.kind {
+        case "Completed": title = "Agent “\(agentName)” finished"
+        case "Failed": title = "Agent “\(agentName)” failed"
+        case "Blocked": title = "Agent “\(agentName)” needs attention"
+        case "ApprovalRequired": title = "Agent “\(agentName)” requires approval"
+        default: title = "Agent “\(agentName)” — \(item.title)"
+        }
+        content.title = title
+        content.subtitle = "Project: \(Self.nonEmpty(item.projectName) ?? "The Ditch")"
+        content.body = Self.notificationSummary(item.body)
         content.categoryIdentifier = Self.agentEventCategory
         content.threadIdentifier = item.projectId
         content.userInfo = [
@@ -447,6 +459,21 @@ final class StatusHost: NSObject, NSApplicationDelegate, UNUserNotificationCente
     UserDefaults.standard.set(
       notifiedAttentionIds.sorted(),
       forKey: Self.notifiedAttentionDefaultsKey)
+  }
+
+  private static func nonEmpty(_ value: String?) -> String? {
+    guard let value else { return nil }
+    let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+    return trimmed.isEmpty ? nil : trimmed
+  }
+
+  private static func notificationSummary(_ value: String) -> String {
+    let compact = value
+      .components(separatedBy: .whitespacesAndNewlines)
+      .filter { !$0.isEmpty }
+      .joined(separator: " ")
+    guard compact.count > 220 else { return compact }
+    return String(compact.prefix(219)) + "…"
   }
 
   func userNotificationCenter(
@@ -740,6 +767,8 @@ private struct AgentAttention {
   let kind: String
   let projectId: String
   let agentId: String
+  let projectName: String?
+  let agentName: String?
   let title: String
   let body: String
 }

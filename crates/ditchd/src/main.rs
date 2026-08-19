@@ -1063,8 +1063,10 @@ fn persist_launch_failure(
         kind: AttentionKind::Failed,
         agent_id: Some(run.id),
         project_id: Some(project.id),
+        project_name: Some(project.name.clone()),
+        agent_name: Some(agent_display_name(&run)),
         title: "Codex failed to start".to_owned(),
-        body: error.clone(),
+        body: notification_summary(&error),
         created_at: Utc::now(),
     };
     let mut state = state
@@ -1533,16 +1535,7 @@ fn attach_codex_io(state: Arc<Mutex<RuntimeState>>, agent_id: AgentId, child: Ar
                     Ok(line) => {
                         let text = line.trim();
                         if !text.is_empty() {
-                            if is_workspace_permission_denial(text) {
-                                record_terminal_failure(&state, agent_id, text.to_owned());
-                            } else {
-                                append_message(
-                                    &state,
-                                    agent_id,
-                                    AgentChatRole::System,
-                                    text.to_owned(),
-                                );
-                            }
+                            log_codex_diagnostic(&state, agent_id, "stderr", text);
                         }
                     }
                     Err(error) => {
@@ -1581,7 +1574,7 @@ fn handle_codex_stdout_line(state: &Arc<Mutex<RuntimeState>>, agent_id: AgentId,
     let Ok(value) = serde_json::from_str::<Value>(line) else {
         let text = line.trim();
         if looks_like_diagnostic(text) {
-            append_message(state, agent_id, AgentChatRole::System, text.to_owned());
+            log_codex_diagnostic(state, agent_id, "stdout", text);
         }
         return;
     };
@@ -1589,12 +1582,8 @@ fn handle_codex_stdout_line(state: &Arc<Mutex<RuntimeState>>, agent_id: AgentId,
         return;
     };
 
-    if let Some(message) = find_workspace_permission_denial(&value) {
-        record_terminal_failure(state, agent_id, message);
-    }
-
     match event_type {
-        "turn.started" => update_agent_action(state, agent_id, "Codex is working"),
+        "turn.started" => start_agent_turn(state, agent_id),
         "thread.started" => {
             if let Some(thread_id) = value.get("thread_id").and_then(Value::as_str) {
                 let codex_title =
@@ -1695,6 +1684,7 @@ fn handle_codex_stdout_line(state: &Arc<Mutex<RuntimeState>>, agent_id: AgentId,
                 return;
             };
             record.run.state = AgentState::Completed;
+            record.terminal_failure = None;
             record.run.last_visible_action = Some("Turn completed".to_owned());
             if let Some(title) = codex_title {
                 record.run.codex_title = Some(title);
@@ -1842,6 +1832,7 @@ fn record_terminal_failure(state: &Arc<Mutex<RuntimeState>>, agent_id: AgentId, 
             return;
         };
         record.terminal_failure = Some(message.clone());
+        record.run.state = AgentState::Failed;
     }
     append_message(state, agent_id, AgentChatRole::System, message.clone());
     if is_workspace_permission_denial(&message) {
@@ -1856,15 +1847,6 @@ fn is_workspace_permission_denial(message: &str) -> bool {
         || lower.contains("writing is blocked")
         || lower.contains("workspace write access"))
         && (lower.contains("reject") || lower.contains("block") || lower.contains("disabled"))
-}
-
-fn find_workspace_permission_denial(value: &Value) -> Option<String> {
-    match value {
-        Value::String(message) if is_workspace_permission_denial(message) => Some(message.clone()),
-        Value::Array(items) => items.iter().find_map(find_workspace_permission_denial),
-        Value::Object(items) => items.values().find_map(find_workspace_permission_denial),
-        _ => None,
-    }
 }
 
 fn raise_workspace_permission_attention(
@@ -1884,13 +1866,26 @@ fn raise_workspace_permission_attention(
         .agents
         .get(&agent_id)
         .map(|record| record.run.project_id);
+    let project_name = project_id.and_then(|project_id| {
+        state
+            .projects
+            .values()
+            .find(|project| project.id == project_id)
+            .map(|project| project.name.clone())
+    });
+    let agent_name = state
+        .agents
+        .get(&agent_id)
+        .map(|record| agent_display_name(&record.run));
     let attention = RuntimeAttention {
         id: uuid::Uuid::new_v4(),
         kind: AttentionKind::Blocked,
         agent_id: Some(agent_id),
         project_id,
+        project_name,
+        agent_name,
         title: "Codex cannot write this project".to_owned(),
-        body,
+        body: notification_summary(&body),
         created_at: Utc::now(),
     };
     if let Err(error) = state.store.upsert_attention(&attention) {
@@ -1912,6 +1907,40 @@ fn update_agent_action(state: &Arc<Mutex<RuntimeState>>, agent_id: AgentId, acti
     let run = record.run.clone();
     state.persist_agent(agent_id);
     state.broadcast(ServerEvent::AgentChanged(run));
+}
+
+fn start_agent_turn(state: &Arc<Mutex<RuntimeState>>, agent_id: AgentId) {
+    let mut state = state
+        .lock()
+        .expect("runtime state lock should not be poisoned");
+    let Some(record) = state.agents.get_mut(&agent_id) else {
+        return;
+    };
+    record.terminal_failure = None;
+    record.run.state = AgentState::Working;
+    record.run.last_visible_action = Some("Codex is working".to_owned());
+    record.run.updated_at = Utc::now();
+    let run = record.run.clone();
+    state.persist_agent(agent_id);
+    state.broadcast(ServerEvent::AgentChanged(run));
+}
+
+fn log_codex_diagnostic(
+    state: &Arc<Mutex<RuntimeState>>,
+    agent_id: AgentId,
+    stream: &str,
+    text: &str,
+) {
+    let path = state
+        .lock()
+        .expect("runtime state lock should not be poisoned")
+        .paths
+        .logs_dir
+        .join("runtime.log");
+    let line = format!("{} Codex {} {stream}: {text}\n", Utc::now(), agent_id.0);
+    if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = file.write_all(line.as_bytes());
+    }
 }
 
 fn append_message(
@@ -1950,6 +1979,21 @@ fn finish_agent(state: &Arc<Mutex<RuntimeState>>, agent_id: AgentId, code: Optio
         .expect("runtime state lock should not be poisoned");
     state.children.remove(&agent_id);
     let (run, attention) = {
+        let has_blocked_attention = state.attention.iter().any(|attention| {
+            attention.agent_id == Some(agent_id)
+                && attention.kind == AttentionKind::Blocked
+                && attention.title == "Codex cannot write this project"
+        });
+        let project_name = state
+            .agents
+            .get(&agent_id)
+            .and_then(|record| {
+                state
+                    .projects
+                    .values()
+                    .find(|project| project.id == record.run.project_id)
+            })
+            .map(|project| project.name.clone());
         let Some(record) = state.agents.get_mut(&agent_id) else {
             return;
         };
@@ -1976,6 +2020,7 @@ fn finish_agent(state: &Arc<Mutex<RuntimeState>>, agent_id: AgentId, code: Optio
             .is_none()
             .then_some(AgentResumeBlockReason::NoCodexThread);
         let attention = match record.run.state {
+            AgentState::Failed if has_blocked_attention => None,
             AgentState::Failed => {
                 let body = record
                     .terminal_failure
@@ -2000,8 +2045,10 @@ fn finish_agent(state: &Arc<Mutex<RuntimeState>>, agent_id: AgentId, code: Optio
                     kind: AttentionKind::Failed,
                     agent_id: Some(agent_id),
                     project_id: Some(record.run.project_id),
+                    project_name: project_name.clone(),
+                    agent_name: Some(agent_display_name(&record.run)),
                     title: "Agent failed".to_owned(),
-                    body,
+                    body: notification_summary(&body),
                     created_at: Utc::now(),
                 })
             }
@@ -2010,9 +2057,10 @@ fn finish_agent(state: &Arc<Mutex<RuntimeState>>, agent_id: AgentId, code: Optio
                 kind: AttentionKind::Completed,
                 agent_id: Some(agent_id),
                 project_id: Some(record.run.project_id),
+                project_name,
+                agent_name: Some(agent_display_name(&record.run)),
                 title: "Agent finished".to_owned(),
-                body: "The agent finished its task. Open The Ditch to review the result."
-                    .to_owned(),
+                body: "Task completed successfully.".to_owned(),
                 created_at: Utc::now(),
             }),
             _ => None,
@@ -2028,6 +2076,31 @@ fn finish_agent(state: &Arc<Mutex<RuntimeState>>, agent_id: AgentId, code: Optio
         state.attention.push(attention.clone());
         state.broadcast(ServerEvent::AttentionRaised(attention));
     }
+}
+
+fn agent_display_name(run: &AgentRun) -> String {
+    run.user_title
+        .as_deref()
+        .filter(|title| !title.trim().is_empty())
+        .or_else(|| {
+            run.codex_title
+                .as_deref()
+                .filter(|title| !title.trim().is_empty())
+        })
+        .unwrap_or("Codex")
+        .trim()
+        .to_owned()
+}
+
+fn notification_summary(value: &str) -> String {
+    const MAX_CHARS: usize = 220;
+    let compact = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.chars().count() <= MAX_CHARS {
+        return compact;
+    }
+    let mut summary = compact.chars().take(MAX_CHARS - 1).collect::<String>();
+    summary.push('…');
+    summary
 }
 
 fn spawn_codex_child(
@@ -2542,9 +2615,87 @@ mod tests {
         assert_eq!(state.attention[0].kind, AttentionKind::Completed);
         assert_eq!(state.attention[0].agent_id, Some(agent_id));
         assert_eq!(state.attention[0].project_id, Some(project.id));
+        assert_eq!(state.attention[0].project_name.as_deref(), Some("Fixture"));
+        assert_eq!(
+            state.attention[0].agent_name.as_deref(),
+            Some("Notification test")
+        );
         let persisted = state.store.load().expect("persisted state should load");
         assert_eq!(persisted.attention.len(), 1);
         assert_eq!(persisted.attention[0].kind, AttentionKind::Completed);
+    }
+
+    #[test]
+    fn assistant_and_tool_text_cannot_create_false_permission_failures() {
+        let mut runtime = test_runtime();
+        let project = Project::new("Safe project", "/tmp/safe-content");
+        runtime.store.upsert_project(&project).unwrap();
+        runtime.projects.insert(project.root_key(), project.clone());
+        let agent_id = AgentId::new();
+        let now = Utc::now();
+        runtime.agents.insert(
+            agent_id,
+            AgentRecord {
+                run: AgentRun {
+                    id: agent_id,
+                    provider: AgentProvider::Codex,
+                    state: AgentState::Working,
+                    launch_mode: CodexLaunchMode::Exec,
+                    execution_profile: AgentExecutionProfile::default(),
+                    project_id: project.id,
+                    task_id: None,
+                    pane_id: None,
+                    native_session_id: Some("thread-safe".to_owned()),
+                    codex_title: Some("Safety test".to_owned()),
+                    user_title: None,
+                    origin_codex_home: None,
+                    current_prompt: Some("explain the detector".to_owned()),
+                    last_visible_action: None,
+                    state_confidence: 1.0,
+                    state_evidence: "fixture".to_owned(),
+                    started_at: now,
+                    updated_at: now,
+                    finished_at: None,
+                    exit_code: None,
+                    resume_block_reason: None,
+                },
+                project_root: project.root,
+                allow_non_git: false,
+                messages: Vec::new(),
+                terminal_failure: None,
+            },
+        );
+        let state = Arc::new(Mutex::new(runtime));
+
+        handle_codex_stdout_line(
+            &state,
+            agent_id,
+            r#"{"type":"item.completed","item":{"type":"command_execution","command":"patch source containing writing is blocked by a read-only sandbox and block"}}"#,
+        );
+        handle_codex_stdout_line(
+            &state,
+            agent_id,
+            r#"{"type":"item.completed","item":{"type":"agent_message","text":"This answer discusses workspace_permission_denial and writing is blocked, but reports no failure."}}"#,
+        );
+        handle_codex_stdout_line(&state, agent_id, r#"{"type":"turn.completed"}"#);
+        finish_agent(&state, agent_id, Some(0));
+
+        let state = state.lock().expect("fixture state should lock");
+        assert_eq!(state.agents[&agent_id].run.state, AgentState::Completed);
+        assert!(state.agents[&agent_id].terminal_failure.is_none());
+        assert_eq!(state.attention.len(), 1);
+        assert_eq!(state.attention[0].kind, AttentionKind::Completed);
+        assert_eq!(
+            state
+                .agents
+                .get(&agent_id)
+                .unwrap()
+                .messages
+                .iter()
+                .filter(|message| message.role == AgentChatRole::System)
+                .count(),
+            0
+        );
     }
 
     #[test]

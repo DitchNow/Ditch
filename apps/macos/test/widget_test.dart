@@ -128,19 +128,114 @@ void main() {
     expect(sessions.single.currentPrompt, 'try again');
   });
 
-  test('classifies stderr chunks as visible diagnostics', () {
-    final diagnostic = codexStderrDiagnosticFromChunk(
-      'ERROR codex_models_manager::cache: failed to load models cache',
-    );
+  test('groups tool messages by user turn with stable visible identity', () {
+    final messages = [
+      AgentChatMessage(
+        identity: 'user-1',
+        role: ChatMessageRole.user,
+        text: 'First task',
+        createdAt: DateTime(2026),
+      ),
+      AgentChatMessage(
+        identity: 'tool-1',
+        role: ChatMessageRole.tool,
+        text: 'command one',
+        createdAt: DateTime(2026),
+      ),
+      AgentChatMessage(
+        identity: 'tool-2',
+        role: ChatMessageRole.tool,
+        text: 'command two',
+        createdAt: DateTime(2026),
+      ),
+      AgentChatMessage(
+        identity: 'assistant-1',
+        role: ChatMessageRole.assistant,
+        text: 'Finished',
+        createdAt: DateTime(2026),
+      ),
+      AgentChatMessage(
+        identity: 'user-2',
+        role: ChatMessageRole.user,
+        text: 'Second task',
+        createdAt: DateTime(2026),
+      ),
+      AgentChatMessage(
+        identity: 'tool-3',
+        role: ChatMessageRole.tool,
+        text: 'command three',
+        createdAt: DateTime(2026),
+      ),
+    ];
 
-    expect(diagnostic, isNotNull);
-    expect(diagnostic!.kind, CodexProcessEventKind.diagnostic);
-    expect(diagnostic.isVisibleInChat, isTrue);
-    expect(diagnostic.text, contains('models cache'));
+    final items = buildConversationItems(messages, isWorking: true);
+
+    expect(items, hasLength(5));
+    expect(items[1].identity, 'tool-activity:tool-1');
+    expect(items[1].toolMessages, hasLength(2));
+    expect(items[1].isActiveToolGroup, isFalse);
+    expect(items[4].identity, 'tool-activity:tool-3');
+    expect(items[4].isActiveToolGroup, isTrue);
   });
 
-  test('ignores empty stderr chunks', () {
-    expect(codexStderrDiagnosticFromChunk('   \n'), isNull);
+  testWidgets('tool activity collapses when the active turn finishes', (
+    tester,
+  ) async {
+    final viewport = ConversationViewportController();
+    addTearDown(viewport.dispose);
+    var working = true;
+    late StateSetter rebuild;
+    final messages = [
+      AgentChatMessage(
+        identity: 'group-user',
+        role: ChatMessageRole.user,
+        text: 'Run checks',
+        createdAt: DateTime(2026),
+      ),
+      AgentChatMessage(
+        identity: 'group-tool-1',
+        role: ChatMessageRole.tool,
+        text: 'cargo test',
+        createdAt: DateTime(2026),
+      ),
+      AgentChatMessage(
+        identity: 'group-tool-2',
+        role: ChatMessageRole.tool,
+        text: 'flutter test',
+        createdAt: DateTime(2026),
+      ),
+    ];
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: StatefulBuilder(
+            builder: (context, setState) {
+              rebuild = setState;
+              return ConversationTranscript(
+                messages: messages,
+                viewport: viewport,
+                isWorking: working,
+              );
+            },
+          ),
+        ),
+      ),
+    );
+    await tester.pump();
+
+    expect(find.text('Tool activity · 2 actions'), findsOneWidget);
+    expect(find.text('cargo test'), findsOneWidget);
+    expect(find.text('flutter test'), findsOneWidget);
+
+    rebuild(() => working = false);
+    await tester.pump();
+    expect(find.text('cargo test'), findsNothing);
+    expect(find.text('flutter test'), findsNothing);
+
+    await tester.tap(find.byKey(const Key('tool-activity-toggle')));
+    await tester.pump();
+    expect(find.text('cargo test'), findsOneWidget);
+    expect(find.text('flutter test'), findsOneWidget);
   });
 
   test('sessions and attention are scoped to their project', () {
@@ -212,7 +307,8 @@ void main() {
     expect(find.text('The Ditch'), findsWidgets);
     expect(find.text('PROJECTS'), findsOneWidget);
     expect(find.text('Agents'), findsOneWidget);
-    expect(find.text('Attention'), findsOneWidget);
+    expect(find.text('Attention'), findsNothing);
+    expect(find.byKey(const Key('notification-bell')), findsOneWidget);
     expect(find.text('New Agent'), findsOneWidget);
   });
 
@@ -238,12 +334,14 @@ void main() {
     expect(find.text('/tmp/ditchd.sock'), findsOneWidget);
   });
 
-  testWidgets('attention starts empty instead of showing activity feed noise', (
+  testWidgets('notification center starts empty without activity feed noise', (
     tester,
   ) async {
     await tester.pumpWidget(const TheDitchApp(connectRuntimeOnStart: false));
 
-    expect(find.text('No agent sessions need attention.'), findsOneWidget);
+    await tester.tap(find.byKey(const Key('notification-bell')));
+    await tester.pump();
+    expect(find.text('No notifications'), findsOneWidget);
     expect(find.text('Bells enabled'), findsNothing);
     expect(find.text('Codex prompted'), findsNothing);
     expect(find.text('Codex started'), findsNothing);
@@ -339,44 +437,56 @@ void main() {
     expect(find.text('Codex exited with code 1'), findsOneWidget);
   });
 
-  testWidgets('attention cards expose session actions', (tester) async {
+  testWidgets('notification bell exposes global session actions', (
+    tester,
+  ) async {
     var opened = false;
     var dismissed = false;
 
     await tester.pumpWidget(
       MaterialApp(
         home: Scaffold(
-          body: AttentionPanel(
-            width: 320,
-            events: [
-              AttentionEvent(
-                id: 'attention-test',
-                kind: AttentionKind.failed,
-                icon: Icons.error_outline,
-                title: 'Codex failed',
-                body: 'Exit code: 1.',
-                sessionLocalId: 'agent-0',
-                createdAt: DateTime(2026),
-              ),
-            ],
-            canStopSession: (_) => false,
-            onOpenSession: (_) => opened = true,
-            onStopSession: (_) {},
-            onDismiss: (_) => dismissed = true,
+          body: Align(
+            alignment: Alignment.topRight,
+            child: NotificationCenterButton(
+              notifications: [
+                AttentionEvent(
+                  id: 'attention-test',
+                  kind: AttentionKind.failed,
+                  icon: Icons.error_outline,
+                  title: 'Codex failed',
+                  body: 'Exit code: 1.',
+                  sessionLocalId: 'agent-0',
+                  projectName: 'The Ditch',
+                  agentName: 'Build agent',
+                  createdAt: DateTime(2026),
+                ),
+              ],
+              unreadCount: 1,
+              onViewed: () {},
+              onOpen: (_) => opened = true,
+              onDismiss: (_) => dismissed = true,
+              onDismissAll: () {},
+            ),
           ),
         ),
       ),
     );
 
+    await tester.tap(find.byKey(const Key('notification-bell')));
+    await tester.pump();
     expect(find.text('Codex failed'), findsOneWidget);
+    expect(find.text('The Ditch · Build agent'), findsOneWidget);
     expect(find.text('Open'), findsOneWidget);
-    expect(find.text('Dismiss'), findsOneWidget);
+    expect(find.byTooltip('Dismiss notification'), findsOneWidget);
 
     await tester.tap(find.text('Open'));
     await tester.pump();
     expect(opened, isTrue);
 
-    await tester.tap(find.text('Dismiss'));
+    await tester.tap(find.byKey(const Key('notification-bell')));
+    await tester.pump();
+    await tester.tap(find.byTooltip('Dismiss notification'));
     await tester.pump();
     expect(dismissed, isTrue);
   });
@@ -832,18 +942,8 @@ void main() {
 
     await tester.tap(find.byKey(const Key('terminal-expand-vertical')));
     await tester.pump();
-    final collapsedAttention = tester.widget<AttentionHeader>(
-      find.byType(AttentionHeader),
-    );
-    expect(collapsedAttention.collapsed, isTrue);
-
-    await tester.tap(find.byKey(const Key('attention-header')));
-    await tester.pump();
-    expect(find.byType(ProjectTerminalSurface), findsNothing);
-    expect(
-      tester.widget<AttentionHeader>(find.byType(AttentionHeader)).collapsed,
-      isFalse,
-    );
+    expect(find.byType(ProjectTerminalSurface), findsOneWidget);
+    expect(find.text('Attention'), findsNothing);
   });
 
   testWidgets('maximized terminal restores with close or Escape', (

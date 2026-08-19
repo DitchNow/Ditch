@@ -2,6 +2,7 @@ use chrono::{DateTime, Utc};
 use ditch_core::{AgentResumeBlockReason, AgentRun, AgentState, AppPaths, Project, ProjectId};
 use ditch_protocol::{AgentChatMessage, AgentMessagePage, RuntimeAttention, SequencedAgentMessage};
 use rusqlite::{Connection, Transaction, params};
+use std::collections::HashSet;
 use std::fs;
 use std::io;
 use std::path::Path;
@@ -50,6 +51,7 @@ impl DitchStore {
         ensure_column(&connection, "agents", "codex_home", "TEXT")?;
         connection.pragma_update(None, "user_version", 1)?;
         let mut store = Self { connection };
+        store.cleanup_polluted_permission_alerts()?;
         store.import_legacy_registry_if_empty(paths)?;
         Ok(store)
     }
@@ -63,6 +65,96 @@ impl DitchStore {
                 self.upsert_project(&project)?;
             }
         }
+        Ok(())
+    }
+
+    fn cleanup_polluted_permission_alerts(&mut self) -> Result<(), StoreError> {
+        let mut stmt = self.connection.prepare(
+            "SELECT agent_id,attention_json FROM attention_events
+             WHERE dismissed_at IS NULL AND agent_id IS NOT NULL",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    from_json::<RuntimeAttention>(&row.get::<_, String>(1)?)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(stmt);
+
+        let mut polluted_agents = HashSet::new();
+        for (agent_id, attention) in &rows {
+            if attention.title != "Codex cannot write this project" {
+                continue;
+            }
+            let stored = self.connection.query_row(
+                "SELECT run_json,terminal_failure FROM agents WHERE id=?1",
+                params![agent_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+            );
+            let Ok((run_json, terminal_failure)) = stored else {
+                continue;
+            };
+            let run: AgentRun = from_json(&run_json)?;
+            if run.state == AgentState::Failed
+                && run.exit_code == Some(0)
+                && (looks_like_embedded_content(&attention.body)
+                    || terminal_failure
+                        .as_deref()
+                        .is_some_and(looks_like_embedded_content))
+            {
+                polluted_agents.insert(agent_id.clone());
+            }
+        }
+        if polluted_agents.is_empty() {
+            return Ok(());
+        }
+
+        let now = Utc::now().to_rfc3339();
+        let tx = self.connection.transaction()?;
+        for agent_id in &polluted_agents {
+            tx.execute(
+                "UPDATE attention_events SET dismissed_at=?2
+                 WHERE agent_id=?1 AND dismissed_at IS NULL
+                   AND json_extract(attention_json,'$.kind') IN ('Blocked','Failed')",
+                params![agent_id, now],
+            )?;
+            let stored = tx.query_row(
+                "SELECT run_json,terminal_failure FROM agents WHERE id=?1",
+                params![agent_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+            );
+            let Ok((run_json, terminal_failure)) = stored else {
+                continue;
+            };
+            let mut run: AgentRun = from_json(&run_json)?;
+            if run.state == AgentState::Failed
+                && run.exit_code == Some(0)
+                && terminal_failure
+                    .as_deref()
+                    .is_some_and(looks_like_embedded_content)
+            {
+                if let Some(failure) = terminal_failure.as_deref() {
+                    tx.execute(
+                        "DELETE FROM agent_messages
+                         WHERE agent_id=?1
+                           AND json_extract(message_json,'$.role')='System'
+                           AND json_extract(message_json,'$.text')=?2",
+                        params![agent_id, failure],
+                    )?;
+                }
+                run.state = AgentState::Completed;
+                run.state_evidence =
+                    "Successful exit restored after removing a legacy false permission alert."
+                        .to_owned();
+                tx.execute(
+                    "UPDATE agents SET state=?2,run_json=?3,terminal_failure=NULL WHERE id=?1",
+                    params![agent_id, to_json(&AgentState::Completed)?, to_json(&run)?],
+                )?;
+            }
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -341,6 +433,23 @@ fn parse_time(value: String) -> rusqlite::Result<DateTime<Utc>> {
             rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
         })
 }
+
+fn looks_like_embedded_content(value: &str) -> bool {
+    value.chars().count() > 400
+        || (value.contains('\n')
+            && [
+                "diff --git",
+                "apply_patch",
+                "fn ",
+                "class ",
+                "let ",
+                "widget.",
+                "workspace_permission_denial",
+            ]
+            .iter()
+            .any(|marker| value.contains(marker)))
+}
+
 fn ensure_column(
     connection: &Connection,
     table: &str,
