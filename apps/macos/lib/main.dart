@@ -151,6 +151,58 @@ enum AgentProvider { codex }
 
 enum TerminalPresentation { docked, horizontal, vertical, maximized }
 
+enum WorkspaceToolKind { terminal, editor }
+
+enum ProjectFileEntryKind { directory, file, symlink }
+
+class ProjectFileEntry {
+  const ProjectFileEntry({
+    required this.name,
+    required this.relativePath,
+    required this.kind,
+    required this.size,
+  });
+
+  final String name;
+  final String relativePath;
+  final ProjectFileEntryKind kind;
+  final int size;
+
+  bool get isDirectory => kind == ProjectFileEntryKind.directory;
+  bool get isFile => kind == ProjectFileEntryKind.file;
+}
+
+class ProjectEditorDocument {
+  ProjectEditorDocument({
+    required this.relativePath,
+    required String content,
+    required this.revision,
+  }) : originalContent = content,
+       controller = TextEditingController(text: content);
+
+  final String relativePath;
+  final TextEditingController controller;
+  String originalContent;
+  String revision;
+  bool saving = false;
+  bool conflict = false;
+  String? error;
+
+  bool get dirty => controller.text != originalContent;
+
+  void dispose() => controller.dispose();
+}
+
+class ProjectFilesState {
+  final Map<String, List<ProjectFileEntry>> directories = {};
+  final Set<String> expandedDirectories = {};
+  final Set<String> loadingDirectories = {};
+  String? error;
+  ProjectEditorDocument? document;
+
+  void dispose() => document?.dispose();
+}
+
 enum AgentApprovalPreset { ask, approveForMe, fullAccess }
 
 class AgentModelOption {
@@ -316,6 +368,24 @@ void reconcileAgentSession(List<AgentSession> sessions, AgentSession incoming) {
         session.localId == incoming.localId && !identical(session, existing),
   );
 }
+
+List<AgentChatMessage> uniqueRuntimeMessages(
+  Iterable<AgentChatMessage> existing,
+  Iterable<AgentChatMessage> incoming,
+) {
+  final identities = existing.map((message) => message.identity).toSet();
+  final content = existing.map(agentMessageContentKey).toSet();
+  return incoming
+      .where(
+        (message) =>
+            !identities.contains(message.identity) &&
+            !content.contains(agentMessageContentKey(message)),
+      )
+      .toList();
+}
+
+String agentMessageContentKey(AgentChatMessage message) =>
+    '${message.role.name}\u0000${message.createdAt.toUtc().microsecondsSinceEpoch}\u0000${message.text}';
 
 enum AttentionKind { approvalRequired, blocked, completed, failed, needsInput }
 
@@ -867,6 +937,37 @@ class DitchRuntimeClient {
     });
   }
 
+  Future<Map<String, dynamic>> listProjectDirectory({
+    required String projectId,
+    required String relativePath,
+  }) => request({
+    'ListProjectDirectory': {
+      'project_id': projectId,
+      'relative_path': relativePath,
+    },
+  });
+
+  Future<Map<String, dynamic>> readProjectFile({
+    required String projectId,
+    required String relativePath,
+  }) => request({
+    'ReadProjectFile': {'project_id': projectId, 'relative_path': relativePath},
+  });
+
+  Future<Map<String, dynamic>> writeProjectFile({
+    required String projectId,
+    required String relativePath,
+    required String? expectedRevision,
+    required String content,
+  }) => request({
+    'WriteProjectFile': {
+      'project_id': projectId,
+      'relative_path': relativePath,
+      'expected_revision': expectedRevision,
+      'content': content,
+    },
+  });
+
   Future<Map<String, dynamic>> stopAgent(String agentId) {
     return request({
       'StopAgent': {'agent_id': agentId},
@@ -949,6 +1050,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
   final _attention = <AttentionEvent>[];
   final _readAttentionIds = <String>{};
   final Map<String, ProjectTerminalSession> _projectTerminals = {};
+  final Map<String, ProjectFilesState> _projectFiles = {};
 
   StreamSubscription<Map<String, dynamic>>? _runtimeEvents;
   String? _runtimeInstanceId;
@@ -962,7 +1064,9 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
   TerminalPresentation _terminalPresentation = TerminalPresentation.docked;
   TerminalPresentation _terminalRestorePresentation =
       TerminalPresentation.docked;
+  WorkspaceToolKind _presentedTool = WorkspaceToolKind.terminal;
   bool _dockedTerminalExpanded = true;
+  bool _dockedFilesExpanded = true;
   double _projectSidebarWidth = _defaultProjectSidebarWidth;
   double _inspectorWidth = _defaultInspectorWidth;
   String _selectedProjectKey = canonicalProjectPath(_bootstrapProject.path);
@@ -1000,12 +1104,25 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
   int get _unreadNotificationCount =>
       _attention.where((event) => !_readAttentionIds.contains(event.id)).length;
 
-  void _selectProject(int index) {
+  Future<void> _selectProject(int index) async {
+    final currentProjectId = _selectedProject.id;
+    final currentFiles = currentProjectId == null
+        ? null
+        : _projectFiles[currentProjectId];
+    if (currentFiles != null && !await _confirmDiscardEditor(currentFiles)) {
+      return;
+    }
+    if (currentFiles?.document?.dirty == true) {
+      currentFiles!.document!.dispose();
+      currentFiles.document = null;
+    }
+    if (!mounted) return;
     setState(() {
       _selectedProjectKey = _projectKey(_projects[index]);
       final sessions = _visibleSessions;
       _expandedAgentLocalId = sessions.isEmpty ? null : sessions.first.localId;
       _terminalPresentation = TerminalPresentation.docked;
+      _presentedTool = WorkspaceToolKind.terminal;
       _dockedTerminalExpanded = true;
     });
     final expandedId = _expandedAgentLocalId;
@@ -1051,7 +1168,27 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
     }
   }
 
+  Future<void> _revealProjectEntry(ProjectFileEntry entry) async {
+    final path = '${_selectedProject.path}/${entry.relativePath}';
+    try {
+      await _applicationChannel.invokeMethod<bool>('revealInFinder', path);
+    } on Object {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Could not reveal ${entry.name} in Finder.')),
+        );
+      }
+    }
+  }
+
   void _setTerminalPresentation(TerminalPresentation presentation) {
+    _setToolPresentation(WorkspaceToolKind.terminal, presentation);
+  }
+
+  void _setToolPresentation(
+    WorkspaceToolKind tool,
+    TerminalPresentation presentation,
+  ) {
     setState(() {
       if (presentation == TerminalPresentation.maximized) {
         _terminalRestorePresentation =
@@ -1059,15 +1196,20 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
             ? TerminalPresentation.docked
             : _terminalPresentation;
       }
+      _presentedTool = tool;
       _terminalPresentation = presentation;
       if (presentation != TerminalPresentation.docked) {
-        _dockedTerminalExpanded = true;
+        if (tool == WorkspaceToolKind.terminal) {
+          _dockedTerminalExpanded = true;
+        } else {
+          _dockedFilesExpanded = true;
+        }
       }
     });
   }
 
   void _restoreMaximizedTerminal() {
-    _setTerminalPresentation(_terminalRestorePresentation);
+    _setToolPresentation(_presentedTool, _terminalRestorePresentation);
   }
 
   Future<void> _loadPaneWidths() async {
@@ -1572,6 +1714,9 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
     for (final viewport in _chatViewports.values) {
       viewport.dispose();
     }
+    for (final files in _projectFiles.values) {
+      files.dispose();
+    }
     _agentListController.dispose();
     super.dispose();
   }
@@ -1809,21 +1954,19 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
         prompt: prompt,
       );
       final run = response['AgentStarted'];
-      final session = _agentSessionFromRuntime(run, [
-        AgentChatMessage(
-          role: ChatMessageRole.user,
-          text: prompt,
-          createdAt: DateTime.now(),
-        ),
-      ]);
+      final session = _agentSessionFromRuntime(run, const []);
       if (session != null) {
         final existing = _agentSessionByLocalId(session.localId);
+        final target = existing ?? session;
         setState(() {
           if (existing == null) {
             _agentSessions.insert(0, session);
           }
           _expandedAgentLocalId = session.localId;
         });
+        if (target.messages.isEmpty) {
+          unawaited(_loadAgentMessages(target));
+        }
         _scheduleStatusBarUpdate();
       }
     } on Object catch (error) {
@@ -2298,6 +2441,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
         message.role,
         message.text,
         identity: message.identity,
+        createdAt: message.createdAt,
       );
       return;
     }
@@ -2494,6 +2638,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
     ChatMessageRole role,
     String text, {
     String? identity,
+    DateTime? createdAt,
   }) {
     if (!mounted) {
       return;
@@ -2510,7 +2655,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
           identity: identity,
           role: role,
           text: text,
-          createdAt: DateTime.now(),
+          createdAt: createdAt ?? DateTime.now(),
         ),
       );
       session.updatedAt = DateTime.now();
@@ -2558,17 +2703,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
       final target = _agentSessionByLocalId(session.localId);
       if (target == null) return;
       setState(() {
-        final known = target.messages
-            .map((message) => message.identity)
-            .toSet();
-        final knownContent = target.messages.map(_messageContentKey).toSet();
-        final additions = pageItems
-            .where(
-              (message) =>
-                  !known.contains(message.identity) &&
-                  !knownContent.contains(_messageContentKey(message)),
-            )
-            .toList();
+        final additions = uniqueRuntimeMessages(target.messages, pageItems);
         target.messages.insertAll(0, additions);
         target.messagesLoaded = true;
         target.messagesLoading = false;
@@ -2588,9 +2723,6 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
     }
   }
 
-  String _messageContentKey(AgentChatMessage message) =>
-      '${message.role.name}\u0000${message.createdAt.toUtc().microsecondsSinceEpoch}\u0000${message.text}';
-
   void _focusComposerAfterLayout() {
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (mounted) _composerKey.currentState?.focus();
@@ -2607,6 +2739,240 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
         .putIfAbsent(session.localId, ConversationViewportController.new)
         .beginOpening(onInitialPositioned: _focusComposerAfterLayout);
     unawaited(_loadAgentMessages(session));
+  }
+
+  Future<void> _loadProjectDirectory(
+    String projectId,
+    String relativePath, {
+    bool refresh = false,
+  }) async {
+    final files = _projectFiles.putIfAbsent(projectId, ProjectFilesState.new);
+    if (files.loadingDirectories.contains(relativePath) ||
+        (!refresh && files.directories.containsKey(relativePath))) {
+      return;
+    }
+    setState(() {
+      files.loadingDirectories.add(relativePath);
+      files.error = null;
+    });
+    try {
+      final response = await _runtimeClient.listProjectDirectory(
+        projectId: projectId,
+        relativePath: relativePath,
+      );
+      final value = response['ProjectDirectory'];
+      if (value is! Map<String, dynamic> || value['entries'] is! List) {
+        throw const FormatException('Runtime returned an invalid directory.');
+      }
+      final entries = (value['entries'] as List)
+          .whereType<Map>()
+          .map((entry) {
+            final kind = switch (entry['kind']?.toString()) {
+              'Directory' => ProjectFileEntryKind.directory,
+              'File' => ProjectFileEntryKind.file,
+              _ => ProjectFileEntryKind.symlink,
+            };
+            return ProjectFileEntry(
+              name: entry['name']?.toString() ?? '',
+              relativePath: entry['relative_path']?.toString() ?? '',
+              kind: kind,
+              size: (entry['size'] as num?)?.toInt() ?? 0,
+            );
+          })
+          .where((entry) => entry.name.isNotEmpty)
+          .toList();
+      if (!mounted) return;
+      setState(() {
+        files.directories[relativePath] = entries;
+        files.loadingDirectories.remove(relativePath);
+      });
+    } on Object catch (error) {
+      if (!mounted) return;
+      setState(() {
+        files.loadingDirectories.remove(relativePath);
+        files.error = '$error';
+      });
+    }
+  }
+
+  Future<void> _toggleProjectDirectory(
+    String projectId,
+    ProjectFileEntry entry,
+  ) async {
+    final files = _projectFiles.putIfAbsent(projectId, ProjectFilesState.new);
+    if (files.expandedDirectories.contains(entry.relativePath)) {
+      setState(() => files.expandedDirectories.remove(entry.relativePath));
+      return;
+    }
+    setState(() => files.expandedDirectories.add(entry.relativePath));
+    await _loadProjectDirectory(projectId, entry.relativePath);
+  }
+
+  Future<bool> _confirmDiscardEditor(ProjectFilesState files) async {
+    final document = files.document;
+    if (document == null || !document.dirty) return true;
+    final result = await showDialog<String>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Unsaved changes'),
+        content: Text('Save changes to ${document.relativePath}?'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, 'cancel'),
+            child: const Text('Cancel'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(context, 'discard'),
+            child: const Text('Discard'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(context, 'save'),
+            child: const Text('Save'),
+          ),
+        ],
+      ),
+    );
+    if (result == 'save') return _saveProjectFile(files);
+    return result == 'discard';
+  }
+
+  Future<void> _openProjectFile(
+    String projectId,
+    ProjectFileEntry entry,
+  ) async {
+    final files = _projectFiles.putIfAbsent(projectId, ProjectFilesState.new);
+    if (!await _confirmDiscardEditor(files)) return;
+    try {
+      final response = await _runtimeClient.readProjectFile(
+        projectId: projectId,
+        relativePath: entry.relativePath,
+      );
+      final value = response['ProjectFile'];
+      if (value is! Map<String, dynamic>) {
+        throw const FormatException('Runtime returned an invalid file.');
+      }
+      final document = ProjectEditorDocument(
+        relativePath: entry.relativePath,
+        content: value['content']?.toString() ?? '',
+        revision: value['revision']?.toString() ?? '',
+      );
+      document.controller.addListener(() {
+        if (mounted && identical(files.document, document)) setState(() {});
+      });
+      if (!mounted) {
+        document.dispose();
+        return;
+      }
+      setState(() {
+        files.document?.dispose();
+        files.document = document;
+        files.error = null;
+      });
+    } on Object catch (error) {
+      if (!mounted) return;
+      setState(() => files.error = '$error');
+    }
+  }
+
+  Future<bool> _saveProjectFile(
+    ProjectFilesState files, {
+    bool overwrite = false,
+  }) async {
+    final projectId = _selectedProject.id;
+    final document = files.document;
+    if (projectId == null || document == null || document.saving) return false;
+    setState(() {
+      document.saving = true;
+      document.conflict = false;
+      document.error = null;
+    });
+    try {
+      final response = await _runtimeClient.writeProjectFile(
+        projectId: projectId,
+        relativePath: document.relativePath,
+        expectedRevision: overwrite ? null : document.revision,
+        content: document.controller.text,
+      );
+      final value = response['ProjectFileSaved'];
+      if (value is! Map<String, dynamic>) {
+        throw const FormatException('Runtime returned an invalid save result.');
+      }
+      if (!mounted) return false;
+      setState(() {
+        document.revision = value['revision']?.toString() ?? document.revision;
+        document.originalContent = document.controller.text;
+        document.saving = false;
+        document.conflict = false;
+      });
+      return true;
+    } on Object catch (error) {
+      if (!mounted) return false;
+      setState(() {
+        document.saving = false;
+        document.conflict =
+            error is DitchRuntimeException && error.code == 'file_changed';
+        document.error = document.conflict
+            ? 'This file changed on disk.'
+            : '$error';
+      });
+      return false;
+    }
+  }
+
+  Future<void> _closeProjectFile(ProjectFilesState files) async {
+    if (!await _confirmDiscardEditor(files)) return;
+    setState(() {
+      files.document?.dispose();
+      files.document = null;
+      if (_presentedTool == WorkspaceToolKind.editor) {
+        _presentedTool = WorkspaceToolKind.terminal;
+        _terminalPresentation = TerminalPresentation.docked;
+      }
+    });
+  }
+
+  Future<void> _reloadProjectFile(
+    String projectId,
+    ProjectFilesState files,
+  ) async {
+    final path = files.document?.relativePath;
+    if (path == null) return;
+    await _openProjectFile(
+      projectId,
+      ProjectFileEntry(
+        name: path.split('/').last,
+        relativePath: path,
+        kind: ProjectFileEntryKind.file,
+        size: 0,
+      ),
+    );
+  }
+
+  Future<void> _overwriteProjectFile(ProjectFilesState files) async {
+    final document = files.document;
+    if (document == null) return;
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Overwrite external changes?'),
+        content: Text(
+          '${document.relativePath} changed on disk. Overwriting will replace those external changes.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('Overwrite'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed == true) {
+      await _saveProjectFile(files, overwrite: true);
+    }
   }
 
   @override
@@ -2665,17 +3031,102 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
               final selectedTerminal = _selectedProject.id == null
                   ? null
                   : _projectTerminals[_selectedProject.id];
+              final selectedFiles = _selectedProject.id == null
+                  ? null
+                  : _projectFiles.putIfAbsent(
+                      _selectedProject.id!,
+                      ProjectFilesState.new,
+                    );
               final projectToolsPanel = ProjectToolsPanel(
                 width: inspectorWidth,
+                projectId: _selectedProject.id,
                 terminal: selectedTerminal,
+                files: selectedFiles,
                 onEnsureTerminal: _ensureSelectedProjectTerminal,
+                onEnsureFiles: () {
+                  final projectId = _selectedProject.id;
+                  if (projectId != null) {
+                    return _loadProjectDirectory(projectId, '');
+                  }
+                  return Future.value();
+                },
                 presentation: _terminalPresentation,
+                presentedTool: _presentedTool,
                 dockedTerminalExpanded: _dockedTerminalExpanded,
+                dockedFilesExpanded: _dockedFilesExpanded,
                 onToggleDocked: () => setState(
                   () => _dockedTerminalExpanded = !_dockedTerminalExpanded,
                 ),
+                onToggleFiles: () => setState(
+                  () => _dockedFilesExpanded = !_dockedFilesExpanded,
+                ),
                 onPresentationChanged: _setTerminalPresentation,
+                onToolPresentationChanged: _setToolPresentation,
+                onToggleDirectory: (entry) {
+                  final projectId = _selectedProject.id;
+                  if (projectId != null) {
+                    unawaited(_toggleProjectDirectory(projectId, entry));
+                  }
+                },
+                onOpenFile: (entry) {
+                  final projectId = _selectedProject.id;
+                  if (projectId != null) {
+                    unawaited(_openProjectFile(projectId, entry));
+                  }
+                },
+                onRevealFile: (entry) => unawaited(_revealProjectEntry(entry)),
+                onBackToFiles: selectedFiles == null
+                    ? null
+                    : () => unawaited(_closeProjectFile(selectedFiles)),
+                onSaveFile: selectedFiles == null
+                    ? null
+                    : () => unawaited(_saveProjectFile(selectedFiles)),
+                onReloadFile:
+                    selectedFiles == null || _selectedProject.id == null
+                    ? null
+                    : () => unawaited(
+                        _reloadProjectFile(_selectedProject.id!, selectedFiles),
+                      ),
+                onOverwriteFile: selectedFiles == null
+                    ? null
+                    : () => unawaited(_overwriteProjectFile(selectedFiles)),
+                onRefreshFiles: () {
+                  final projectId = _selectedProject.id;
+                  if (projectId != null) {
+                    unawaited(
+                      _loadProjectDirectory(projectId, '', refresh: true),
+                    );
+                  }
+                },
               );
+
+              Widget expandedToolSurface({VoidCallback? onClose}) {
+                if (_presentedTool == WorkspaceToolKind.editor &&
+                    selectedFiles?.document != null) {
+                  return ProjectFileEditorSurface(
+                    files: selectedFiles!,
+                    presentation: _terminalPresentation,
+                    onBack: () => unawaited(_closeProjectFile(selectedFiles)),
+                    onSave: () => unawaited(_saveProjectFile(selectedFiles)),
+                    onReload: () => unawaited(
+                      _reloadProjectFile(_selectedProject.id!, selectedFiles),
+                    ),
+                    onOverwrite: () =>
+                        unawaited(_overwriteProjectFile(selectedFiles)),
+                    onPresentationChanged: (value) =>
+                        _setToolPresentation(WorkspaceToolKind.editor, value),
+                    onClose: onClose,
+                  );
+                }
+                return ProjectTerminalSurface(
+                  terminal: selectedTerminal,
+                  presentation: _terminalPresentation,
+                  onTitleTap: () =>
+                      _setTerminalPresentation(TerminalPresentation.docked),
+                  onPresentationChanged: _setTerminalPresentation,
+                  onClose: onClose,
+                );
+              }
 
               Widget standardWorkspace({required bool includeInspector}) {
                 return Row(
@@ -2718,14 +3169,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
                           190.0,
                           340.0,
                         ),
-                        child: ProjectTerminalSurface(
-                          terminal: selectedTerminal,
-                          presentation: _terminalPresentation,
-                          onTitleTap: () => _setTerminalPresentation(
-                            TerminalPresentation.docked,
-                          ),
-                          onPresentationChanged: _setTerminalPresentation,
-                        ),
+                        child: expandedToolSurface(),
                       ),
                       const Divider(height: 1),
                       Expanded(
@@ -2740,12 +3184,8 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
                     },
                     child: Focus(
                       autofocus: true,
-                      child: ProjectTerminalSurface(
-                        terminal: selectedTerminal,
-                        presentation: _terminalPresentation,
+                      child: expandedToolSurface(
                         onClose: _restoreMaximizedTerminal,
-                        onTitleTap: _restoreMaximizedTerminal,
-                        onPresentationChanged: _setTerminalPresentation,
                       ),
                     ),
                   ),
@@ -5345,22 +5785,53 @@ class AgentChatBubble extends StatelessWidget {
 class ProjectToolsPanel extends StatefulWidget {
   const ProjectToolsPanel({
     required this.width,
+    required this.projectId,
     required this.terminal,
+    required this.files,
     required this.onEnsureTerminal,
+    required this.onEnsureFiles,
     required this.presentation,
+    required this.presentedTool,
     required this.dockedTerminalExpanded,
+    required this.dockedFilesExpanded,
     required this.onToggleDocked,
+    required this.onToggleFiles,
     required this.onPresentationChanged,
+    required this.onToolPresentationChanged,
+    required this.onToggleDirectory,
+    required this.onOpenFile,
+    required this.onRevealFile,
+    required this.onBackToFiles,
+    required this.onSaveFile,
+    required this.onReloadFile,
+    required this.onOverwriteFile,
+    required this.onRefreshFiles,
     super.key,
   });
 
   final double width;
+  final String? projectId;
   final ProjectTerminalSession? terminal;
+  final ProjectFilesState? files;
   final Future<void> Function() onEnsureTerminal;
+  final Future<void> Function() onEnsureFiles;
   final TerminalPresentation presentation;
+  final WorkspaceToolKind presentedTool;
   final bool dockedTerminalExpanded;
+  final bool dockedFilesExpanded;
   final VoidCallback onToggleDocked;
+  final VoidCallback onToggleFiles;
   final ValueChanged<TerminalPresentation> onPresentationChanged;
+  final void Function(WorkspaceToolKind, TerminalPresentation)
+  onToolPresentationChanged;
+  final ValueChanged<ProjectFileEntry> onToggleDirectory;
+  final ValueChanged<ProjectFileEntry> onOpenFile;
+  final ValueChanged<ProjectFileEntry> onRevealFile;
+  final VoidCallback? onBackToFiles;
+  final VoidCallback? onSaveFile;
+  final VoidCallback? onReloadFile;
+  final VoidCallback? onOverwriteFile;
+  final VoidCallback onRefreshFiles;
 
   @override
   State<ProjectToolsPanel> createState() => _ProjectToolsPanelState();
@@ -5375,6 +5846,7 @@ class _ProjectToolsPanelState extends State<ProjectToolsPanel> {
         (_) => widget.onEnsureTerminal(),
       );
     }
+    WidgetsBinding.instance.addPostFrameCallback((_) => widget.onEnsureFiles());
   }
 
   @override
@@ -5386,6 +5858,11 @@ class _ProjectToolsPanelState extends State<ProjectToolsPanel> {
         (_) => widget.onEnsureTerminal(),
       );
     }
+    if (oldWidget.projectId != widget.projectId) {
+      WidgetsBinding.instance.addPostFrameCallback(
+        (_) => widget.onEnsureFiles(),
+      );
+    }
   }
 
   @override
@@ -5394,13 +5871,26 @@ class _ProjectToolsPanelState extends State<ProjectToolsPanel> {
     if (widget.presentation == TerminalPresentation.vertical) {
       return SizedBox(
         width: widget.width,
-        child: ProjectTerminalSurface(
-          terminal: terminal,
-          presentation: widget.presentation,
-          onTitleTap: () =>
-              widget.onPresentationChanged(TerminalPresentation.docked),
-          onPresentationChanged: widget.onPresentationChanged,
-        ),
+        child:
+            widget.presentedTool == WorkspaceToolKind.editor &&
+                widget.files?.document != null
+            ? ProjectFileEditorSurface(
+                files: widget.files!,
+                presentation: widget.presentation,
+                onBack: widget.onBackToFiles!,
+                onSave: widget.onSaveFile!,
+                onReload: widget.onReloadFile!,
+                onOverwrite: widget.onOverwriteFile!,
+                onPresentationChanged: (value) => widget
+                    .onToolPresentationChanged(WorkspaceToolKind.editor, value),
+              )
+            : ProjectTerminalSurface(
+                terminal: terminal,
+                presentation: widget.presentation,
+                onTitleTap: () =>
+                    widget.onPresentationChanged(TerminalPresentation.docked),
+                onPresentationChanged: widget.onPresentationChanged,
+              ),
       );
     }
     return SizedBox(
@@ -5415,9 +5905,420 @@ class _ProjectToolsPanelState extends State<ProjectToolsPanel> {
             onPresentationChanged: widget.onPresentationChanged,
           ),
           if (widget.dockedTerminalExpanded)
-            Expanded(child: ProjectTerminalBody(terminal: terminal))
-          else
+            Expanded(child: ProjectTerminalBody(terminal: terminal)),
+          ProjectFilesHeader(
+            expanded: widget.dockedFilesExpanded,
+            hasDocument: widget.files?.document != null,
+            onTitleTap: widget.onToggleFiles,
+            onRefresh: widget.onRefreshFiles,
+          ),
+          if (widget.dockedFilesExpanded)
+            Expanded(
+              child: ProjectFilesBody(
+                files: widget.files,
+                presentation: widget.presentation,
+                onToggleDirectory: widget.onToggleDirectory,
+                onOpenFile: widget.onOpenFile,
+                onRevealFile: widget.onRevealFile,
+                onBack: widget.onBackToFiles,
+                onSave: widget.onSaveFile,
+                onReload: widget.onReloadFile,
+                onOverwrite: widget.onOverwriteFile,
+                onPresentationChanged: (value) => widget
+                    .onToolPresentationChanged(WorkspaceToolKind.editor, value),
+              ),
+            ),
+          if (!widget.dockedTerminalExpanded && !widget.dockedFilesExpanded)
             const Spacer(),
+        ],
+      ),
+    );
+  }
+}
+
+class ProjectFilesHeader extends StatelessWidget {
+  const ProjectFilesHeader({
+    required this.expanded,
+    required this.hasDocument,
+    required this.onTitleTap,
+    required this.onRefresh,
+    super.key,
+  });
+
+  final bool expanded;
+  final bool hasDocument;
+  final VoidCallback onTitleTap;
+  final VoidCallback onRefresh;
+
+  @override
+  Widget build(BuildContext context) {
+    return Material(
+      color: context.ditch.inspector,
+      child: SizedBox(
+        height: 44,
+        child: Row(
+          children: [
+            Expanded(
+              child: InkWell(
+                onTap: onTitleTap,
+                child: Padding(
+                  padding: const EdgeInsets.only(left: 14),
+                  child: Row(
+                    children: [
+                      Icon(
+                        expanded ? Icons.expand_more : Icons.chevron_right,
+                        size: 18,
+                      ),
+                      const SizedBox(width: 6),
+                      const Icon(Icons.folder_outlined, size: 17),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: Text(
+                          hasDocument ? 'Editor' : 'File Explorer',
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+            IconButton(
+              key: const Key('files-refresh'),
+              tooltip: 'Refresh files',
+              onPressed: onRefresh,
+              icon: const Icon(Icons.refresh, size: 18),
+            ),
+            const SizedBox(width: 4),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class ProjectFilesBody extends StatelessWidget {
+  const ProjectFilesBody({
+    required this.files,
+    required this.presentation,
+    required this.onToggleDirectory,
+    required this.onOpenFile,
+    required this.onRevealFile,
+    required this.onBack,
+    required this.onSave,
+    required this.onReload,
+    required this.onOverwrite,
+    required this.onPresentationChanged,
+    super.key,
+  });
+
+  final ProjectFilesState? files;
+  final TerminalPresentation presentation;
+  final ValueChanged<ProjectFileEntry> onToggleDirectory;
+  final ValueChanged<ProjectFileEntry> onOpenFile;
+  final ValueChanged<ProjectFileEntry> onRevealFile;
+  final VoidCallback? onBack;
+  final VoidCallback? onSave;
+  final VoidCallback? onReload;
+  final VoidCallback? onOverwrite;
+  final ValueChanged<TerminalPresentation> onPresentationChanged;
+
+  List<(ProjectFileEntry, int)> _visibleEntries(ProjectFilesState state) {
+    final visible = <(ProjectFileEntry, int)>[];
+    void append(String directory, int depth) {
+      for (final entry in state.directories[directory] ?? const []) {
+        visible.add((entry, depth));
+        if (entry.isDirectory &&
+            state.expandedDirectories.contains(entry.relativePath)) {
+          append(entry.relativePath, depth + 1);
+        }
+      }
+    }
+
+    append('', 0);
+    return visible;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final state = files;
+    if (state == null) return const Center(child: Text('Select a project.'));
+    final document = state.document;
+    if (document != null) {
+      return ProjectFileEditorBody(
+        document: document,
+        presentation: presentation,
+        onBack: onBack!,
+        onSave: onSave!,
+        onReload: onReload!,
+        onOverwrite: onOverwrite!,
+        onPresentationChanged: onPresentationChanged,
+      );
+    }
+    if (!state.directories.containsKey('') &&
+        state.loadingDirectories.contains('')) {
+      return const Center(child: CircularProgressIndicator());
+    }
+    final entries = _visibleEntries(state);
+    return Column(
+      children: [
+        if (state.error != null)
+          Padding(
+            padding: const EdgeInsets.all(10),
+            child: Text(
+              state.error!,
+              style: TextStyle(color: context.ditch.error),
+            ),
+          ),
+        Expanded(
+          child: entries.isEmpty
+              ? const Center(child: Text('No files to show.'))
+              : ListView.builder(
+                  key: const Key('project-file-tree'),
+                  primary: false,
+                  itemCount: entries.length,
+                  itemBuilder: (context, index) {
+                    final (entry, depth) = entries[index];
+                    final expanded = state.expandedDirectories.contains(
+                      entry.relativePath,
+                    );
+                    final loading = state.loadingDirectories.contains(
+                      entry.relativePath,
+                    );
+                    return ListTile(
+                      dense: true,
+                      contentPadding: EdgeInsets.only(
+                        left: 10 + depth * 16,
+                        right: 8,
+                      ),
+                      leading: loading
+                          ? const SizedBox.square(
+                              dimension: 16,
+                              child: CircularProgressIndicator(strokeWidth: 2),
+                            )
+                          : Icon(
+                              entry.isDirectory
+                                  ? expanded
+                                        ? Icons.folder_open_outlined
+                                        : Icons.folder_outlined
+                                  : entry.isFile
+                                  ? Icons.description_outlined
+                                  : Icons.link,
+                              size: 17,
+                            ),
+                      title: Text(
+                        entry.name,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(fontSize: 13),
+                      ),
+                      trailing: IconButton(
+                        tooltip: 'Reveal in Finder',
+                        visualDensity: VisualDensity.compact,
+                        onPressed: () => onRevealFile(entry),
+                        icon: const Icon(Icons.open_in_new, size: 15),
+                      ),
+                      onTap: entry.isDirectory
+                          ? () => onToggleDirectory(entry)
+                          : entry.isFile
+                          ? () => onOpenFile(entry)
+                          : null,
+                    );
+                  },
+                ),
+        ),
+      ],
+    );
+  }
+}
+
+class ProjectFileEditorSurface extends StatelessWidget {
+  const ProjectFileEditorSurface({
+    required this.files,
+    required this.presentation,
+    required this.onBack,
+    required this.onSave,
+    required this.onReload,
+    required this.onOverwrite,
+    required this.onPresentationChanged,
+    this.onClose,
+    super.key,
+  });
+
+  final ProjectFilesState files;
+  final TerminalPresentation presentation;
+  final VoidCallback onBack;
+  final VoidCallback onSave;
+  final VoidCallback onReload;
+  final VoidCallback onOverwrite;
+  final ValueChanged<TerminalPresentation> onPresentationChanged;
+  final VoidCallback? onClose;
+
+  @override
+  Widget build(BuildContext context) {
+    final document = files.document!;
+    return ColoredBox(
+      color: context.ditch.workspace,
+      child: ProjectFileEditorBody(
+        document: document,
+        presentation: presentation,
+        onBack: onBack,
+        onSave: onSave,
+        onReload: onReload,
+        onOverwrite: onOverwrite,
+        onPresentationChanged: onPresentationChanged,
+        onClose: onClose,
+      ),
+    );
+  }
+}
+
+class ProjectFileEditorBody extends StatelessWidget {
+  const ProjectFileEditorBody({
+    required this.document,
+    required this.presentation,
+    required this.onBack,
+    required this.onSave,
+    required this.onReload,
+    required this.onOverwrite,
+    required this.onPresentationChanged,
+    this.onClose,
+    super.key,
+  });
+
+  final ProjectEditorDocument document;
+  final TerminalPresentation presentation;
+  final VoidCallback onBack;
+  final VoidCallback onSave;
+  final VoidCallback onReload;
+  final VoidCallback onOverwrite;
+  final ValueChanged<TerminalPresentation> onPresentationChanged;
+  final VoidCallback? onClose;
+
+  void _toggle(TerminalPresentation target) {
+    onPresentationChanged(
+      presentation == target ? TerminalPresentation.docked : target,
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return CallbackShortcuts(
+      bindings: {
+        const SingleActivator(LogicalKeyboardKey.keyS, meta: true): onSave,
+      },
+      child: Column(
+        children: [
+          Material(
+            color: context.ditch.inspector,
+            child: SizedBox(
+              height: 44,
+              child: Row(
+                children: [
+                  IconButton(
+                    key: const Key('editor-back'),
+                    tooltip: 'Back to file tree',
+                    onPressed: onBack,
+                    icon: const Icon(Icons.arrow_back, size: 18),
+                  ),
+                  Expanded(
+                    child: Text(
+                      '${document.dirty ? '● ' : ''}${document.relativePath}',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(fontSize: 13),
+                    ),
+                  ),
+                  IconButton(
+                    key: const Key('editor-save'),
+                    tooltip: 'Save file (⌘S)',
+                    onPressed: document.dirty && !document.saving
+                        ? onSave
+                        : null,
+                    icon: document.saving
+                        ? const SizedBox.square(
+                            dimension: 16,
+                            child: CircularProgressIndicator(strokeWidth: 2),
+                          )
+                        : const Icon(Icons.save_outlined, size: 18),
+                  ),
+                  IconButton(
+                    key: const Key('editor-expand-horizontal'),
+                    tooltip: 'Expand editor horizontally',
+                    onPressed: () => _toggle(TerminalPresentation.horizontal),
+                    icon: const Icon(Icons.swap_horiz, size: 18),
+                  ),
+                  IconButton(
+                    key: const Key('editor-expand-vertical'),
+                    tooltip: 'Expand editor vertically',
+                    onPressed: () => _toggle(TerminalPresentation.vertical),
+                    icon: const Icon(Icons.swap_vert, size: 18),
+                  ),
+                  IconButton(
+                    key: const Key('editor-maximize'),
+                    tooltip: 'Maximize editor',
+                    onPressed: () => _toggle(TerminalPresentation.maximized),
+                    icon: const Icon(Icons.fullscreen, size: 19),
+                  ),
+                  if (onClose != null)
+                    IconButton(
+                      key: const Key('editor-maximize-close'),
+                      tooltip: 'Restore editor',
+                      onPressed: onClose,
+                      icon: const Icon(Icons.close, size: 18),
+                    ),
+                ],
+              ),
+            ),
+          ),
+          if (document.error != null)
+            Material(
+              color: context.ditch.error.withValues(alpha: .10),
+              child: Padding(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 12,
+                  vertical: 8,
+                ),
+                child: Row(
+                  children: [
+                    Expanded(child: Text(document.error!)),
+                    TextButton(
+                      onPressed: onReload,
+                      child: const Text('Reload'),
+                    ),
+                    if (document.conflict)
+                      TextButton(
+                        onPressed: onOverwrite,
+                        child: const Text('Overwrite'),
+                      ),
+                  ],
+                ),
+              ),
+            ),
+          Expanded(
+            child: Padding(
+              padding: const EdgeInsets.all(10),
+              child: TextField(
+                key: const Key('project-file-editor'),
+                controller: document.controller,
+                expands: true,
+                maxLines: null,
+                minLines: null,
+                keyboardType: TextInputType.multiline,
+                textAlignVertical: TextAlignVertical.top,
+                style: const TextStyle(
+                  fontFamily: 'SF Mono',
+                  fontSize: 13,
+                  height: 1.45,
+                ),
+                decoration: const InputDecoration(
+                  border: OutlineInputBorder(),
+                  contentPadding: EdgeInsets.all(12),
+                ),
+              ),
+            ),
+          ),
         ],
       ),
     );

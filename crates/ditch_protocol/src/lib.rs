@@ -98,6 +98,20 @@ pub enum ClientRequest {
     CloseProjectTerminal {
         terminal_id: Uuid,
     },
+    ListProjectDirectory {
+        project_id: ProjectId,
+        relative_path: String,
+    },
+    ReadProjectFile {
+        project_id: ProjectId,
+        relative_path: String,
+    },
+    WriteProjectFile {
+        project_id: ProjectId,
+        relative_path: String,
+        expected_revision: Option<String>,
+        content: String,
+    },
     StopAgent {
         agent_id: AgentId,
     },
@@ -128,6 +142,9 @@ pub enum ServerResponse {
     Projects(Vec<Project>),
     AgentModels(Vec<AgentModel>),
     ProjectTerminal(ProjectTerminal),
+    ProjectDirectory(ProjectDirectory),
+    ProjectFile(ProjectFile),
+    ProjectFileSaved(ProjectFileSaved),
     ProjectCreated(Project),
     AgentStarted(AgentRun),
     AgentMessages(AgentMessagePage),
@@ -157,6 +174,45 @@ pub struct ProjectTerminal {
     pub id: Uuid,
     pub project_id: ProjectId,
     pub shell: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ProjectFileKind {
+    Directory,
+    File,
+    Symlink,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProjectFileEntry {
+    pub name: String,
+    pub relative_path: String,
+    pub kind: ProjectFileKind,
+    pub size: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProjectDirectory {
+    pub project_id: ProjectId,
+    pub relative_path: String,
+    pub entries: Vec<ProjectFileEntry>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProjectFile {
+    pub project_id: ProjectId,
+    pub relative_path: String,
+    pub content: String,
+    pub revision: String,
+    pub size: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProjectFileSaved {
+    pub project_id: ProjectId,
+    pub relative_path: String,
+    pub revision: String,
+    pub size: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

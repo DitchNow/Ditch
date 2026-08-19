@@ -2,9 +2,11 @@ use chrono::{DateTime, Utc};
 use ditch_core::{
     AgentApprovalPreset, AgentExecutionProfile, AgentId, AgentProvider, AgentResumeBlockReason,
     AgentRun, AgentState, AppPaths, AttentionKind, CodexLaunchMode, Project, ProjectGitPolicy,
+    ProjectId,
 };
 use ditch_protocol::{
     AgentChatMessage, AgentChatRole, AgentModel, ClientRequest, Envelope, HealthResponse,
+    ProjectDirectory, ProjectFile, ProjectFileEntry, ProjectFileKind, ProjectFileSaved,
     ProjectTerminal, ProtocolError, RuntimeAttention, RuntimeStatus, ServerEvent, ServerResponse,
     Snapshot,
 };
@@ -15,7 +17,9 @@ use ditch_store::{
 use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 use serde_json::Value;
 use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -172,6 +176,7 @@ impl RuntimeState {
                 "persistent_sessions_v1".to_owned(),
                 "attention_stream_v1".to_owned(),
                 "transcript_pagination_v1".to_owned(),
+                "project_files_v1".to_owned(),
             ],
         }
     }
@@ -532,6 +537,26 @@ fn handle_request(request: ClientRequest, state: Arc<Mutex<RuntimeState>>) -> Se
         ClientRequest::CloseProjectTerminal { terminal_id } => {
             close_project_terminal(state, terminal_id)
         }
+        ClientRequest::ListProjectDirectory {
+            project_id,
+            relative_path,
+        } => list_project_directory(state, project_id, &relative_path),
+        ClientRequest::ReadProjectFile {
+            project_id,
+            relative_path,
+        } => read_project_file(state, project_id, &relative_path),
+        ClientRequest::WriteProjectFile {
+            project_id,
+            relative_path,
+            expected_revision,
+            content,
+        } => write_project_file(
+            state,
+            project_id,
+            &relative_path,
+            expected_revision.as_deref(),
+            &content,
+        ),
         ClientRequest::StopAgent { agent_id } => stop_agent(state, agent_id),
         ClientRequest::DeleteAgent { agent_id } => delete_agent(state, agent_id),
         ClientRequest::RenameAgent { agent_id, title } => rename_agent(state, agent_id, title),
@@ -2198,6 +2223,216 @@ fn canonical_project_root(root: &Path) -> PathBuf {
     root.canonicalize().unwrap_or_else(|_| root.to_path_buf())
 }
 
+const MAX_EDITABLE_FILE_BYTES: u64 = 1024 * 1024;
+
+fn project_for_file_request(
+    state: &Arc<Mutex<RuntimeState>>,
+    project_id: ProjectId,
+) -> Result<Project, ServerResponse> {
+    state
+        .lock()
+        .expect("runtime state lock should not be poisoned")
+        .projects
+        .values()
+        .find(|project| project.id == project_id)
+        .cloned()
+        .ok_or_else(|| protocol_error("project_not_found", "project was not found"))
+}
+
+fn resolve_project_path(project: &Project, relative_path: &str) -> Result<PathBuf, ServerResponse> {
+    let relative = Path::new(relative_path);
+    if relative.is_absolute()
+        || relative.components().any(|component| {
+            !matches!(
+                component,
+                std::path::Component::Normal(_) | std::path::Component::CurDir
+            )
+        })
+    {
+        return Err(protocol_error(
+            "invalid_project_path",
+            "path must stay inside the selected project",
+        ));
+    }
+    let root = project
+        .root
+        .canonicalize()
+        .map_err(|error| protocol_error("project_path_failed", format!("project root: {error}")))?;
+    let candidate = root.join(relative);
+    let resolved = candidate.canonicalize().map_err(|error| {
+        protocol_error("project_path_failed", format!("{relative_path}: {error}"))
+    })?;
+    if !resolved.starts_with(&root) {
+        return Err(protocol_error(
+            "project_path_outside_root",
+            "path resolves outside the selected project",
+        ));
+    }
+    Ok(resolved)
+}
+
+fn list_project_directory(
+    state: Arc<Mutex<RuntimeState>>,
+    project_id: ProjectId,
+    relative_path: &str,
+) -> ServerResponse {
+    let project = match project_for_file_request(&state, project_id) {
+        Ok(project) => project,
+        Err(response) => return response,
+    };
+    let directory = match resolve_project_path(&project, relative_path) {
+        Ok(path) if path.is_dir() => path,
+        Ok(_) => return protocol_error("not_a_directory", "path is not a directory"),
+        Err(response) => return response,
+    };
+    let entries = match fs::read_dir(&directory) {
+        Ok(entries) => entries,
+        Err(error) => return protocol_error("directory_read_failed", error.to_string()),
+    };
+    let excluded = [
+        ".git",
+        ".ditch",
+        ".dart_tool",
+        "build",
+        "target",
+        "node_modules",
+    ];
+    let mut values = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if excluded.contains(&name.as_str()) {
+            continue;
+        }
+        let Ok(metadata) = fs::symlink_metadata(entry.path()) else {
+            continue;
+        };
+        let kind = if metadata.file_type().is_symlink() {
+            ProjectFileKind::Symlink
+        } else if metadata.is_dir() {
+            ProjectFileKind::Directory
+        } else if metadata.is_file() {
+            ProjectFileKind::File
+        } else {
+            continue;
+        };
+        let child_path = if relative_path.is_empty() {
+            name.clone()
+        } else {
+            format!("{relative_path}/{name}")
+        };
+        values.push(ProjectFileEntry {
+            name,
+            relative_path: child_path,
+            kind,
+            size: metadata.len(),
+        });
+    }
+    values.sort_by(|left, right| {
+        let left_rank = !matches!(left.kind, ProjectFileKind::Directory);
+        let right_rank = !matches!(right.kind, ProjectFileKind::Directory);
+        left_rank
+            .cmp(&right_rank)
+            .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
+    });
+    ServerResponse::ProjectDirectory(ProjectDirectory {
+        project_id,
+        relative_path: relative_path.to_owned(),
+        entries: values,
+    })
+}
+
+fn read_project_file(
+    state: Arc<Mutex<RuntimeState>>,
+    project_id: ProjectId,
+    relative_path: &str,
+) -> ServerResponse {
+    let project = match project_for_file_request(&state, project_id) {
+        Ok(project) => project,
+        Err(response) => return response,
+    };
+    let path = match resolve_project_path(&project, relative_path) {
+        Ok(path) if path.is_file() => path,
+        Ok(_) => return protocol_error("not_a_file", "path is not a file"),
+        Err(response) => return response,
+    };
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) => return protocol_error("file_read_failed", error.to_string()),
+    };
+    if bytes.len() as u64 > MAX_EDITABLE_FILE_BYTES {
+        return protocol_error("file_too_large", "files larger than 1 MB are not editable");
+    }
+    let content = match String::from_utf8(bytes.clone()) {
+        Ok(content) if !content.contains('\0') => content,
+        _ => return protocol_error("binary_file", "only UTF-8 text files are editable"),
+    };
+    ServerResponse::ProjectFile(ProjectFile {
+        project_id,
+        relative_path: relative_path.to_owned(),
+        revision: file_revision(&bytes),
+        size: bytes.len() as u64,
+        content,
+    })
+}
+
+fn write_project_file(
+    state: Arc<Mutex<RuntimeState>>,
+    project_id: ProjectId,
+    relative_path: &str,
+    expected_revision: Option<&str>,
+    content: &str,
+) -> ServerResponse {
+    if content.len() as u64 > MAX_EDITABLE_FILE_BYTES {
+        return protocol_error("file_too_large", "files larger than 1 MB are not editable");
+    }
+    let project = match project_for_file_request(&state, project_id) {
+        Ok(project) => project,
+        Err(response) => return response,
+    };
+    let path = match resolve_project_path(&project, relative_path) {
+        Ok(path) if path.is_file() => path,
+        Ok(_) => return protocol_error("not_a_file", "path is not a file"),
+        Err(response) => return response,
+    };
+    let original = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) => return protocol_error("file_read_failed", error.to_string()),
+    };
+    if expected_revision.is_some_and(|revision| file_revision(&original) != revision) {
+        return protocol_error(
+            "file_changed",
+            "the file changed on disk; reload it before saving",
+        );
+    }
+    let permissions = match fs::metadata(&path) {
+        Ok(metadata) => metadata.permissions(),
+        Err(error) => return protocol_error("file_write_failed", error.to_string()),
+    };
+    let Some(parent) = path.parent() else {
+        return protocol_error("file_write_failed", "file has no parent directory");
+    };
+    let temporary = parent.join(format!(".ditch-save-{}.tmp", uuid::Uuid::new_v4()));
+    let write_result = fs::write(&temporary, content.as_bytes())
+        .and_then(|_| fs::set_permissions(&temporary, permissions))
+        .and_then(|_| fs::rename(&temporary, &path));
+    if let Err(error) = write_result {
+        let _ = fs::remove_file(&temporary);
+        return protocol_error("file_write_failed", error.to_string());
+    }
+    ServerResponse::ProjectFileSaved(ProjectFileSaved {
+        project_id,
+        relative_path: relative_path.to_owned(),
+        revision: file_revision(content.as_bytes()),
+        size: content.len() as u64,
+    })
+}
+
+fn file_revision(bytes: &[u8]) -> String {
+    let mut hasher = DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
 fn find_binary(name: &str) -> Option<String> {
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let static_candidates = [
@@ -2805,5 +3040,71 @@ mod tests {
             .expect_err("cross-project resume must fail");
 
         assert!(error.contains("belongs to /tmp/original, not /tmp/other"));
+    }
+
+    #[test]
+    fn project_files_are_scoped_readable_and_revision_safe() {
+        let mut runtime = test_runtime();
+        let root = runtime.paths.data_dir.join("editable-project");
+        fs::create_dir_all(root.join("lib")).expect("fixture directory should exist");
+        fs::write(root.join("README.md"), "before\n").expect("fixture file should exist");
+        fs::write(root.join("lib/main.dart"), "void main() {}\n")
+            .expect("nested fixture should exist");
+        fs::create_dir_all(root.join(".git")).expect("excluded fixture should exist");
+        let project = Project::new("Editable", &root);
+        runtime.store.upsert_project(&project).unwrap();
+        runtime.projects.insert(project.root_key(), project.clone());
+        let state = Arc::new(Mutex::new(runtime));
+
+        let ServerResponse::ProjectDirectory(directory) =
+            list_project_directory(Arc::clone(&state), project.id, "")
+        else {
+            panic!("root directory should list");
+        };
+        assert_eq!(
+            directory
+                .entries
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["lib", "README.md"]
+        );
+
+        let ServerResponse::ProjectFile(file) =
+            read_project_file(Arc::clone(&state), project.id, "README.md")
+        else {
+            panic!("text file should open");
+        };
+        assert_eq!(file.content, "before\n");
+        let stale_revision = file.revision.clone();
+        let ServerResponse::ProjectFileSaved(saved) = write_project_file(
+            Arc::clone(&state),
+            project.id,
+            "README.md",
+            Some(&file.revision),
+            "after\n",
+        ) else {
+            panic!("matching revision should save");
+        };
+        assert_ne!(saved.revision, stale_revision);
+        assert_eq!(
+            fs::read_to_string(root.join("README.md")).unwrap(),
+            "after\n"
+        );
+
+        assert!(matches!(
+            write_project_file(
+                Arc::clone(&state),
+                project.id,
+                "README.md",
+                Some(&stale_revision),
+                "overwrite\n",
+            ),
+            ServerResponse::Error(ProtocolError { ref code, .. }) if code == "file_changed"
+        ));
+        assert!(matches!(
+            read_project_file(state, project.id, "../outside.txt"),
+            ServerResponse::Error(ProtocolError { ref code, .. }) if code == "invalid_project_path"
+        ));
     }
 }

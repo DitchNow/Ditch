@@ -128,6 +128,33 @@ void main() {
     expect(sessions.single.currentPrompt, 'try again');
   });
 
+  test('live and persisted copies of one prompt reconcile exactly once', () {
+    final createdAt = DateTime.utc(2026, 8, 19, 20, 43);
+    final live = AgentChatMessage(
+      identity: 'agent-1:$createdAt:user',
+      role: ChatMessageRole.user,
+      text: 'Run the task',
+      createdAt: createdAt,
+    );
+    final persisted = AgentChatMessage(
+      identity: 'persisted:agent-1:1',
+      role: ChatMessageRole.user,
+      text: 'Run the task',
+      createdAt: createdAt,
+    );
+    final deliberatelyRepeated = AgentChatMessage(
+      identity: 'persisted:agent-1:2',
+      role: ChatMessageRole.user,
+      text: 'Run the task',
+      createdAt: createdAt.add(const Duration(seconds: 1)),
+    );
+
+    expect(uniqueRuntimeMessages([live], [persisted]), isEmpty);
+    expect(uniqueRuntimeMessages([live], [persisted, deliberatelyRepeated]), [
+      deliberatelyRepeated,
+    ]);
+  });
+
   test('groups tool messages by user turn with stable visible identity', () {
     final messages = [
       AgentChatMessage(
@@ -944,6 +971,93 @@ void main() {
     await tester.pump();
     expect(find.byType(ProjectTerminalSurface), findsOneWidget);
     expect(find.text('Attention'), findsNothing);
+  });
+
+  testWidgets('project file tree opens directories and text files', (
+    tester,
+  ) async {
+    final files = ProjectFilesState()
+      ..directories[''] = const [
+        ProjectFileEntry(
+          name: 'lib',
+          relativePath: 'lib',
+          kind: ProjectFileEntryKind.directory,
+          size: 0,
+        ),
+        ProjectFileEntry(
+          name: 'README.md',
+          relativePath: 'README.md',
+          kind: ProjectFileEntryKind.file,
+          size: 10,
+        ),
+      ];
+    ProjectFileEntry? toggled;
+    ProjectFileEntry? opened;
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: ProjectFilesBody(
+            files: files,
+            presentation: TerminalPresentation.docked,
+            onToggleDirectory: (entry) => toggled = entry,
+            onOpenFile: (entry) => opened = entry,
+            onRevealFile: (_) {},
+            onBack: () {},
+            onSave: () {},
+            onReload: () {},
+            onOverwrite: () {},
+            onPresentationChanged: (_) {},
+          ),
+        ),
+      ),
+    );
+
+    await tester.tap(find.text('lib'));
+    await tester.tap(find.text('README.md'));
+    expect(toggled?.relativePath, 'lib');
+    expect(opened?.relativePath, 'README.md');
+    files.dispose();
+  });
+
+  testWidgets('project editor edits saves and exposes every presentation', (
+    tester,
+  ) async {
+    final document = ProjectEditorDocument(
+      relativePath: 'lib/main.dart',
+      content: 'before',
+      revision: 'revision-1',
+    );
+    document.controller.text = 'after';
+    final presentations = <TerminalPresentation>[];
+    var saves = 0;
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: ProjectFileEditorBody(
+            document: document,
+            presentation: TerminalPresentation.docked,
+            onBack: () {},
+            onSave: () => saves++,
+            onReload: () {},
+            onOverwrite: () {},
+            onPresentationChanged: presentations.add,
+          ),
+        ),
+      ),
+    );
+
+    expect(document.dirty, isTrue);
+    await tester.tap(find.byKey(const Key('editor-save')));
+    await tester.tap(find.byKey(const Key('editor-expand-horizontal')));
+    await tester.tap(find.byKey(const Key('editor-expand-vertical')));
+    await tester.tap(find.byKey(const Key('editor-maximize')));
+    expect(saves, 1);
+    expect(presentations, [
+      TerminalPresentation.horizontal,
+      TerminalPresentation.vertical,
+      TerminalPresentation.maximized,
+    ]);
+    document.dispose();
   });
 
   testWidgets('maximized terminal restores with close or Escape', (
