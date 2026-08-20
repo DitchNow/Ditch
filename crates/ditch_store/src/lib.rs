@@ -53,7 +53,36 @@ impl DitchStore {
         let mut store = Self { connection };
         store.cleanup_polluted_permission_alerts()?;
         store.import_legacy_registry_if_empty(paths)?;
+        store.cleanup_missing_legacy_bootstrap_project()?;
         Ok(store)
+    }
+
+    /// Early development builds registered the source checkout as every
+    /// user's first project. Remove that one obsolete record when its root is
+    /// gone; other unavailable projects may live on disconnected volumes and
+    /// must remain registered.
+    fn cleanup_missing_legacy_bootstrap_project(&mut self) -> Result<(), StoreError> {
+        let legacy_suffix = Path::new("Documents/Personal/The Ditch v2");
+        let mut stmt = self
+            .connection
+            .prepare("SELECT id,name,root FROM projects")?;
+        let candidates = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(stmt);
+        for (id, name, root) in candidates {
+            let root = Path::new(&root);
+            if name == "The Ditch" && root.ends_with(legacy_suffix) && !root.is_dir() {
+                self.delete_project(ProjectId(parse_uuid(id)?))?;
+            }
+        }
+        Ok(())
     }
 
     fn import_legacy_registry_if_empty(&mut self, paths: &AppPaths) -> Result<(), StoreError> {
@@ -224,6 +253,32 @@ impl DitchStore {
              ON CONFLICT(id) DO UPDATE SET name=excluded.name,root=excluded.root,archived_at=excluded.archived_at,git_policy=excluded.git_policy",
             params![project.id.0.to_string(), project.name, project.root.to_string_lossy(), project.created_at.to_rfc3339(), project.archived_at.map(|v| v.to_rfc3339()), to_json(&project.git_policy)?],
         )?;
+        Ok(())
+    }
+
+    /// Removes only The Ditch's persisted state for a project. The project
+    /// directory and its `.ditch` metadata are deliberately never touched.
+    pub fn delete_project(&mut self, project_id: ProjectId) -> Result<(), StoreError> {
+        let tx = self.connection.transaction()?;
+        let id = project_id.0.to_string();
+        tx.execute(
+            "DELETE FROM permission_requests
+             WHERE project_id=?1 OR agent_id IN (SELECT id FROM agents WHERE project_id=?1)",
+            params![id],
+        )?;
+        tx.execute(
+            "DELETE FROM attention_events
+             WHERE project_id=?1 OR agent_id IN (SELECT id FROM agents WHERE project_id=?1)",
+            params![id],
+        )?;
+        tx.execute(
+            "DELETE FROM agent_messages WHERE agent_id IN (SELECT id FROM agents WHERE project_id=?1)",
+            params![id],
+        )?;
+        tx.execute("DELETE FROM agents WHERE project_id=?1", params![id])?;
+        tx.execute("DELETE FROM tasks WHERE project_id=?1", params![id])?;
+        tx.execute("DELETE FROM projects WHERE id=?1", params![id])?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -739,6 +794,64 @@ mod tests {
             assert!(deleted.agents.is_empty());
             assert!(deleted.attention.is_empty());
         }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn deleting_project_removes_only_app_owned_state() {
+        let root =
+            std::env::temp_dir().join(format!("ditch-store-delete-{}", uuid::Uuid::new_v4()));
+        let project_root = root.join("user-project");
+        let paths = AppPaths {
+            data_dir: root.join("app-data"),
+            database_path: root.join("app-data/ditch.sqlite3"),
+            socket_path: root.join("app-data/ditchd.sock"),
+            logs_dir: root.join("app-data/logs"),
+            scrollback_dir: root.join("app-data/scrollback"),
+        };
+        ensure_app_dirs(&paths).unwrap();
+        fs::create_dir_all(&project_root).unwrap();
+        fs::write(project_root.join("keep-me.txt"), "user data").unwrap();
+        let project = Project::new("User project", &project_root);
+
+        let mut store = DitchStore::open(&paths).unwrap();
+        store.upsert_project(&project).unwrap();
+        store.delete_project(project.id).unwrap();
+
+        assert!(store.load().unwrap().projects.is_empty());
+        assert_eq!(
+            fs::read_to_string(project_root.join("keep-me.txt")).unwrap(),
+            "user data"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn removes_only_the_missing_obsolete_bootstrap_registration() {
+        let root = std::env::temp_dir().join(format!(
+            "ditch-store-bootstrap-migration-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let paths = AppPaths {
+            data_dir: root.clone(),
+            database_path: root.join("ditch.sqlite3"),
+            socket_path: root.join("ditchd.sock"),
+            logs_dir: root.join("logs"),
+            scrollback_dir: root.join("scrollback"),
+        };
+        ensure_app_dirs(&paths).unwrap();
+        let missing_root = root.join("home/Documents/Personal/The Ditch v2");
+        let legacy = Project::new("The Ditch", &missing_root);
+        let unavailable_but_valid = Project::new("External project", root.join("missing-volume"));
+        {
+            let mut store = DitchStore::open(&paths).unwrap();
+            store.upsert_project(&legacy).unwrap();
+            store.upsert_project(&unavailable_but_valid).unwrap();
+        }
+
+        let store = DitchStore::open(&paths).unwrap();
+        let restored = store.load().unwrap();
+        assert_eq!(restored.projects, vec![unavailable_but_valid]);
         fs::remove_dir_all(root).unwrap();
     }
 }

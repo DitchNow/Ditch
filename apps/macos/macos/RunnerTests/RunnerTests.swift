@@ -2,11 +2,22 @@ import Cocoa
 import FlutterMacOS
 import XCTest
 
+@testable import The_Ditch
+
 class RunnerTests: XCTestCase {
 
-  func testExample() {
-    // If you add code to the Runner application, consider adding tests here.
-    // See https://developer.apple.com/documentation/xctest for more information about using XCTest.
+  func testUninstallArtifactsAreLimitedToDitchOwnedLibraryPaths() {
+    let home = URL(fileURLWithPath: "/Users/tester", isDirectory: true)
+
+    let paths = Set(
+      AppDelegate.uninstallArtifactURLs(homeDirectory: home).map(\.path))
+
+    XCTAssertTrue(paths.allSatisfy { $0.hasPrefix("/Users/tester/Library/") })
+    XCTAssertTrue(paths.contains("/Users/tester/Library/Application Support/The Ditch"))
+    XCTAssertTrue(paths.contains("/Users/tester/Library/Preferences/ai.theditch.app.plist"))
+    XCTAssertTrue(paths.contains("/Users/tester/Library/Caches/ai.theditch.runtime"))
+    XCTAssertTrue(paths.contains("/Users/tester/Library/Preferences/ai.theditch.status.plist"))
+    XCTAssertFalse(paths.contains { $0.contains("/Documents/") })
   }
 
 }

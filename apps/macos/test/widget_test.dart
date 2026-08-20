@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/gestures.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:the_ditch/main.dart';
@@ -9,6 +10,16 @@ final _testAgentHeaderKeys = <String, GlobalKey>{};
 
 GlobalKey _testAgentHeaderKey(String agentId) =>
     _testAgentHeaderKeys.putIfAbsent(agentId, GlobalKey.new);
+
+const _testProject = DitchProject(
+  name: 'The Ditch',
+  path: '/tmp/the-ditch-test-project',
+);
+
+Widget _testApp() => const TheDitchApp(
+  connectRuntimeOnStart: false,
+  initialProjects: [_testProject],
+);
 
 void main() {
   test('presentation controller publishes immutable connection states', () {
@@ -334,7 +345,7 @@ void main() {
   });
 
   testWidgets('renders command center shell', (tester) async {
-    await tester.pumpWidget(const TheDitchApp(connectRuntimeOnStart: false));
+    await tester.pumpWidget(_testApp());
 
     expect(find.text('The Ditch'), findsWidgets);
     expect(find.text('PROJECTS'), findsOneWidget);
@@ -342,6 +353,21 @@ void main() {
     expect(find.text('Attention'), findsNothing);
     expect(find.byKey(const Key('notification-bell')), findsOneWidget);
     expect(find.text('New Agent'), findsOneWidget);
+  });
+
+  testWidgets('fresh install opens the add project flow without a bootstrap', (
+    tester,
+  ) async {
+    await tester.pumpWidget(const TheDitchApp(connectRuntimeOnStart: false));
+    await tester.pumpAndSettle();
+
+    expect(find.widgetWithText(AlertDialog, 'Add Project'), findsOneWidget);
+    expect(find.byKey(const Key('first-project-add')), findsOneWidget);
+    expect(
+      find.text('/Users/tester/Documents/Personal/The Ditch v2'),
+      findsNothing,
+    );
+    expect(find.text('PROJECTS'), findsNothing);
   });
 
   testWidgets('runtime failure has a dedicated recovery surface', (
@@ -369,7 +395,7 @@ void main() {
   testWidgets('notification center starts empty without activity feed noise', (
     tester,
   ) async {
-    await tester.pumpWidget(const TheDitchApp(connectRuntimeOnStart: false));
+    await tester.pumpWidget(_testApp());
 
     await tester.tap(find.byKey(const Key('notification-bell')));
     await tester.pump();
@@ -849,7 +875,7 @@ void main() {
   });
 
   testWidgets('opens add project dialog', (tester) async {
-    await tester.pumpWidget(const TheDitchApp(connectRuntimeOnStart: false));
+    await tester.pumpWidget(_testApp());
 
     await tester.tap(find.text('Add Project'));
     await tester.pumpAndSettle();
@@ -877,7 +903,7 @@ void main() {
       ),
     );
 
-    await tester.pumpWidget(const TheDitchApp(connectRuntimeOnStart: false));
+    await tester.pumpWidget(_testApp());
     await tester.tap(find.text('Add Project'));
     await tester.pumpAndSettle();
     await tester.tap(find.text('Browse Folder…'));
@@ -916,7 +942,7 @@ void main() {
   });
 
   testWidgets('start codex opens an initial prompt dialog', (tester) async {
-    await tester.pumpWidget(const TheDitchApp(connectRuntimeOnStart: false));
+    await tester.pumpWidget(_testApp());
 
     await tester.tap(find.text('New Agent'));
     await tester.pumpAndSettle();
@@ -950,7 +976,7 @@ void main() {
   });
 
   testWidgets('new agent action lives in the Agents header', (tester) async {
-    await tester.pumpWidget(const TheDitchApp(connectRuntimeOnStart: false));
+    await tester.pumpWidget(_testApp());
 
     expect(find.byKey(const Key('agents-new-agent-button')), findsOneWidget);
     expect(
@@ -969,7 +995,7 @@ void main() {
     tester.view.devicePixelRatio = 1;
     addTearDown(tester.view.resetPhysicalSize);
     addTearDown(tester.view.resetDevicePixelRatio);
-    await tester.pumpWidget(const TheDitchApp(connectRuntimeOnStart: false));
+    await tester.pumpWidget(_testApp());
 
     await tester.tap(find.byKey(const Key('terminal-expand-horizontal')));
     await tester.pump();
@@ -1079,7 +1105,7 @@ void main() {
     tester.view.devicePixelRatio = 1;
     addTearDown(tester.view.resetPhysicalSize);
     addTearDown(tester.view.resetDevicePixelRatio);
-    await tester.pumpWidget(const TheDitchApp(connectRuntimeOnStart: false));
+    await tester.pumpWidget(_testApp());
 
     await tester.tap(find.byKey(const Key('terminal-maximize')));
     await tester.pump();
@@ -1102,7 +1128,7 @@ void main() {
     tester.view.devicePixelRatio = 1;
     addTearDown(tester.view.resetPhysicalSize);
     addTearDown(tester.view.resetDevicePixelRatio);
-    await tester.pumpWidget(const TheDitchApp(connectRuntimeOnStart: false));
+    await tester.pumpWidget(_testApp());
 
     final projectsBefore = tester.getSize(find.byType(ProjectSidebar)).width;
     final inspectorBefore = tester
@@ -1147,6 +1173,8 @@ void main() {
             selected: false,
             onTap: () => selected = true,
             onReveal: () => revealed = true,
+            onCopyPath: () {},
+            onDelete: () {},
           ),
         ),
       ),
@@ -1159,8 +1187,49 @@ void main() {
     expect(selected, isFalse);
   });
 
+  testWidgets('project right click exposes copy path and delete actions', (
+    tester,
+  ) async {
+    var copied = false;
+    var deleted = false;
+    const path = '/tmp/context-project';
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: ProjectTile(
+            name: 'Context Project',
+            path: path,
+            selected: false,
+            onTap: () {},
+            onReveal: () {},
+            onCopyPath: () => copied = true,
+            onDelete: () => deleted = true,
+          ),
+        ),
+      ),
+    );
+
+    final tile = find.byKey(const ValueKey('project-tile-$path'));
+    await tester.tap(tile, buttons: kSecondaryMouseButton);
+    await tester.pumpAndSettle();
+    expect(find.text('Copy Project Path'), findsOneWidget);
+    expect(find.text('Delete'), findsOneWidget);
+
+    await tester.tap(find.text('Copy Project Path'));
+    await tester.pumpAndSettle();
+    expect(copied, isTrue);
+    expect(deleted, isFalse);
+
+    await tester.tap(tile, buttons: kSecondaryMouseButton);
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Delete'));
+    await tester.pumpAndSettle();
+    expect(deleted, isTrue);
+  });
+
   testWidgets('expanded agent has persistent prompt composer', (tester) async {
-    await tester.pumpWidget(const TheDitchApp(connectRuntimeOnStart: false));
+    await tester.pumpWidget(_testApp());
 
     expect(find.byType(AgentComposer), findsOneWidget);
     expect(find.byType(ThinkingStatusStrip), findsOneWidget);
@@ -1178,7 +1247,7 @@ void main() {
   });
 
   testWidgets('composer accepts typed replacement text', (tester) async {
-    await tester.pumpWidget(const TheDitchApp(connectRuntimeOnStart: false));
+    await tester.pumpWidget(_testApp());
 
     await tester.enterText(find.byType(TextField), 'hello');
     await tester.pumpAndSettle();
@@ -1335,7 +1404,7 @@ void main() {
   testWidgets('empty state does not expose a meaningless stop action', (
     tester,
   ) async {
-    await tester.pumpWidget(const TheDitchApp(connectRuntimeOnStart: false));
+    await tester.pumpWidget(_testApp());
 
     expect(find.widgetWithText(OutlinedButton, 'Stop'), findsNothing);
   });
@@ -1343,7 +1412,7 @@ void main() {
   testWidgets('conversation uses native chat surface instead of terminal', (
     tester,
   ) async {
-    await tester.pumpWidget(const TheDitchApp(connectRuntimeOnStart: false));
+    await tester.pumpWidget(_testApp());
 
     expect(find.byType(AgentChatPanel), findsOneWidget);
     expect(find.textContaining('[39m'), findsNothing);
@@ -1353,7 +1422,7 @@ void main() {
   testWidgets('empty project does not create a synthetic agent session', (
     tester,
   ) async {
-    await tester.pumpWidget(const TheDitchApp(connectRuntimeOnStart: false));
+    await tester.pumpWidget(_testApp());
 
     expect(find.byType(AgentChatPanel), findsOneWidget);
     expect(find.byType(ExpandableAgentPanel), findsNothing);

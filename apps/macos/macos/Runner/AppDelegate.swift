@@ -1,6 +1,8 @@
 import Cocoa
+import Darwin
 import FlutterMacOS
 import ServiceManagement
+import UserNotifications
 
 /// Native shell for the foreground control surface.
 ///
@@ -9,13 +11,19 @@ import ServiceManagement
 /// Terminating this process must never stop The Ditch Runtime or its agents.
 @main
 class AppDelegate: FlutterAppDelegate {
+  private static let runtimeLoginItemIdentifier = "ai.theditch.runtime"
+  private static let obsoleteLoginItemIdentifier = "ai.theditch.status"
+  private static let processTimeoutExitCode: Int32 = 124
+
   private var applicationChannel: FlutterMethodChannel?
   private var pendingAgentNavigation: [String: String]?
+  private var uninstallInProgress = false
 
   override func applicationDidFinishLaunching(_ notification: Notification) {
     applyThemeMode(UserDefaults.standard.string(forKey: "themeMode") ?? "system")
     persistRuntimeEnvironment()
     registerStatusHelper()
+    configureUninstallMenuItem()
   }
 
   /// Login items are launched by launchd and do not inherit the shell that
@@ -44,11 +52,11 @@ class AppDelegate: FlutterAppDelegate {
     if #available(macOS 13.0, *) {
       // Clean up the superseded three-process architecture. Unregistering the
       // obsolete login item does not send a shutdown request to the runtime.
-      let obsolete = SMAppService.loginItem(identifier: "ai.theditch.status")
+      let obsolete = SMAppService.loginItem(identifier: Self.obsoleteLoginItemIdentifier)
       if obsolete.status == .enabled {
         try? obsolete.unregister()
       }
-      let service = SMAppService.loginItem(identifier: "ai.theditch.runtime")
+      let service = SMAppService.loginItem(identifier: Self.runtimeLoginItemIdentifier)
       guard service.status != .enabled else { return }
       do {
         try service.register()
@@ -56,7 +64,167 @@ class AppDelegate: FlutterAppDelegate {
         NSLog("The Ditch could not register its runtime: \(error)")
       }
     } else {
-      _ = SMLoginItemSetEnabled("ai.theditch.runtime" as CFString, true)
+      _ = SMLoginItemSetEnabled(Self.runtimeLoginItemIdentifier as CFString, true)
+    }
+  }
+
+  private func configureUninstallMenuItem() {
+    guard let applicationMenu = NSApp.mainMenu?.items.first?.submenu,
+      !applicationMenu.items.contains(where: { $0.action == #selector(uninstallApplication(_:)) })
+    else { return }
+
+    let item = NSMenuItem(
+      title: "Uninstall The Ditch…",
+      action: #selector(uninstallApplication(_:)),
+      keyEquivalent: "")
+    item.target = self
+    applicationMenu.insertItem(item, at: max(0, applicationMenu.numberOfItems - 2))
+  }
+
+  @objc private func uninstallApplication(_ sender: Any?) {
+    guard !uninstallInProgress else { return }
+
+    let alert = NSAlert()
+    alert.messageText = "Uninstall The Ditch?"
+    alert.informativeText =
+      "This stops all running agents, removes The Ditch's background service and app data, and moves the application to Trash. Your project folders will not be deleted."
+    alert.alertStyle = .critical
+    alert.addButton(withTitle: "Uninstall")
+    alert.addButton(withTitle: "Cancel")
+    guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+    uninstallInProgress = true
+    let applicationURL = Bundle.main.bundleURL.standardizedFileURL
+    DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+      guard let self else { return }
+      _ = Self.runProcess(
+        executable: self.bundledExecutable("ditch_cli"),
+        arguments: ["runtime", "stop"],
+        timeout: 5)
+      DispatchQueue.main.async {
+        do {
+          try self.unregisterRuntimeLoginItems()
+        } catch {
+          self.presentUninstallFailure(
+            "The background service could not be unregistered. \(error.localizedDescription)")
+          return
+        }
+        self.removeNotificationsAndDefaults()
+        DispatchQueue.global(qos: .userInitiated).async {
+          Self.terminateRemainingRuntimeProcesses()
+          let failures = Self.removeOwnedApplicationData()
+          DispatchQueue.main.async {
+            guard failures.isEmpty else {
+              self.presentUninstallFailure(
+                "Some app data could not be removed:\n\n\(failures.joined(separator: "\n"))")
+              return
+            }
+            self.recycleApplication(at: applicationURL)
+          }
+        }
+      }
+    }
+  }
+
+  private func unregisterRuntimeLoginItems() throws {
+    if #available(macOS 13.0, *) {
+      for identifier in [
+        Self.runtimeLoginItemIdentifier,
+        Self.obsoleteLoginItemIdentifier,
+      ] {
+        let service = SMAppService.loginItem(identifier: identifier)
+        if service.status == .enabled || service.status == .requiresApproval {
+          try service.unregister()
+        }
+      }
+    } else {
+      _ = SMLoginItemSetEnabled(Self.runtimeLoginItemIdentifier as CFString, false)
+      _ = SMLoginItemSetEnabled(Self.obsoleteLoginItemIdentifier as CFString, false)
+    }
+  }
+
+  private func removeNotificationsAndDefaults() {
+    let notifications = UNUserNotificationCenter.current()
+    notifications.removeAllDeliveredNotifications()
+    notifications.removeAllPendingNotificationRequests()
+    for identifier in [
+      "ai.theditch.app",
+      Self.runtimeLoginItemIdentifier,
+      Self.obsoleteLoginItemIdentifier,
+    ] {
+      UserDefaults.standard.removePersistentDomain(forName: identifier)
+    }
+  }
+
+  private func recycleApplication(at applicationURL: URL) {
+    guard FileManager.default.fileExists(atPath: applicationURL.path) else {
+      exit(EXIT_SUCCESS)
+    }
+    NSWorkspace.shared.recycle([applicationURL]) { [weak self] _, error in
+      if let error {
+        self?.presentUninstallFailure(
+          "The application could not be moved to Trash. \(error.localizedDescription)")
+        return
+      }
+      exit(EXIT_SUCCESS)
+    }
+  }
+
+  private func presentUninstallFailure(_ message: String) {
+    uninstallInProgress = false
+    let alert = NSAlert()
+    alert.messageText = "The Ditch could not be completely uninstalled"
+    alert.informativeText = message
+    alert.alertStyle = .warning
+    alert.runModal()
+  }
+
+  static func uninstallArtifactURLs(homeDirectory: URL) -> [URL] {
+    let library = homeDirectory.appendingPathComponent("Library", isDirectory: true)
+    let identifiers = [
+      "ai.theditch.app",
+      runtimeLoginItemIdentifier,
+      obsoleteLoginItemIdentifier,
+    ]
+    var urls = [
+      library.appendingPathComponent("Application Support/The Ditch", isDirectory: true),
+    ]
+    for identifier in identifiers {
+      urls.append(
+        contentsOf: [
+          library.appendingPathComponent("Caches/\(identifier)", isDirectory: true),
+          library.appendingPathComponent("Preferences/\(identifier).plist"),
+          library.appendingPathComponent(
+            "Saved Application State/\(identifier).savedState", isDirectory: true),
+          library.appendingPathComponent("HTTPStorages/\(identifier)", isDirectory: true),
+          library.appendingPathComponent("HTTPStorages/\(identifier).binarycookies"),
+          library.appendingPathComponent("Cookies/\(identifier).binarycookies"),
+          library.appendingPathComponent("WebKit/\(identifier)", isDirectory: true),
+        ])
+    }
+    return urls
+  }
+
+  private static func removeOwnedApplicationData() -> [String] {
+    let fileManager = FileManager.default
+    var failures = [String]()
+    for url in uninstallArtifactURLs(homeDirectory: fileManager.homeDirectoryForCurrentUser) {
+      guard fileManager.fileExists(atPath: url.path) else { continue }
+      do {
+        try fileManager.removeItem(at: url)
+      } catch {
+        failures.append("\(url.path): \(error.localizedDescription)")
+      }
+    }
+    return failures
+  }
+
+  private static func terminateRemainingRuntimeProcesses() {
+    for processName in ["ditch_cli", "ditchd"] {
+      _ = runProcess(
+        executable: "/usr/bin/pkill",
+        arguments: ["-x", processName],
+        timeout: 2)
     }
   }
 
@@ -211,50 +379,70 @@ class AppDelegate: FlutterAppDelegate {
       return
     }
     DispatchQueue.global(qos: .utility).async {
-      let process = Process()
-      process.executableURL = URL(fileURLWithPath: cli)
-      process.arguments = ["runtime", "status"]
-      process.standardOutput = FileHandle.nullDevice
-      process.standardError = FileHandle.nullDevice
-      do {
-        try process.run()
-        process.waitUntilExit()
-        if process.terminationStatus == 0 {
+      if Self.runProcess(
+        executable: cli,
+        arguments: ["runtime", "status"],
+        timeout: 2) == 0
+      {
+        DispatchQueue.main.async { completion(true) }
+        return
+      }
+
+      guard self.startRuntimeHost() else {
+        DispatchQueue.main.async { completion(false) }
+        return
+      }
+      for _ in 0..<30 {
+        Thread.sleep(forTimeInterval: 0.1)
+        if self.runtimeResponds(cli: cli) {
           DispatchQueue.main.async { completion(true) }
           return
         }
-
-        guard self.startRuntimeHost() else {
-          DispatchQueue.main.async { completion(false) }
-          return
-        }
-        for _ in 0..<30 {
-          Thread.sleep(forTimeInterval: 0.1)
-          if self.runtimeResponds(cli: cli) {
-            DispatchQueue.main.async { completion(true) }
-            return
-          }
-        }
-        DispatchQueue.main.async { completion(false) }
-      } catch {
-        DispatchQueue.main.async { completion(false) }
       }
+      DispatchQueue.main.async { completion(false) }
     }
   }
 
   private func runtimeResponds(cli: String) -> Bool {
+    Self.runProcess(
+      executable: cli,
+      arguments: ["runtime", "status"],
+      timeout: 2) == 0
+  }
+
+  private static func runProcess(
+    executable: String,
+    arguments: [String],
+    timeout: TimeInterval
+  ) -> Int32 {
+    guard FileManager.default.isExecutableFile(atPath: executable) else {
+      return 127
+    }
     let process = Process()
-    process.executableURL = URL(fileURLWithPath: cli)
-    process.arguments = ["runtime", "status"]
+    let finished = DispatchSemaphore(value: 0)
+    process.executableURL = URL(fileURLWithPath: executable)
+    process.arguments = arguments
     process.standardOutput = FileHandle.nullDevice
     process.standardError = FileHandle.nullDevice
+    process.terminationHandler = { _ in finished.signal() }
     do {
       try process.run()
-      process.waitUntilExit()
-      return process.terminationStatus == 0
     } catch {
-      return false
+      return 1
     }
+
+    if finished.wait(timeout: .now() + timeout) == .success {
+      return process.terminationStatus
+    }
+
+    if process.isRunning {
+      process.terminate()
+    }
+    if finished.wait(timeout: .now() + 0.5) == .timedOut && process.isRunning {
+      Darwin.kill(process.processIdentifier, SIGKILL)
+      _ = finished.wait(timeout: .now() + 0.5)
+    }
+    return processTimeoutExitCode
   }
 
   /// Starts the independent integrated runtime process. The process inherits

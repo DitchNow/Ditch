@@ -1,4 +1,5 @@
 import Cocoa
+import Darwin
 import Foundation
 import UserNotifications
 
@@ -82,6 +83,9 @@ final class StatusHost: NSObject, NSApplicationDelegate, UNUserNotificationCente
   func applicationWillTerminate(_ notification: Notification) {
     timer?.invalidate()
     stopAttentionStream()
+    let notifications = UNUserNotificationCenter.current()
+    notifications.removeAllDeliveredNotifications()
+    notifications.removeAllPendingNotificationRequests()
     if !pidFilePath.isEmpty {
       try? FileManager.default.removeItem(atPath: pidFilePath)
     }
@@ -628,19 +632,47 @@ final class StatusHost: NSObject, NSApplicationDelegate, UNUserNotificationCente
 
     do {
       try process.run()
-      process.waitUntilExit()
     } catch {
       log("ditch_cli \(arguments.joined(separator: " ")) failed to run: \(error)")
       return CommandOutput(exitCode: 1, stdout: "", stderr: "\(error)")
     }
 
-    let stdoutText = String(
-      data: stdout.fileHandleForReading.readDataToEndOfFile(),
-      encoding: .utf8) ?? ""
-    let stderrText = String(
-      data: stderr.fileHandleForReading.readDataToEndOfFile(),
-      encoding: .utf8) ?? ""
-    return CommandOutput(exitCode: process.terminationStatus, stdout: stdoutText, stderr: stderrText)
+    guard waitForProcess(process, timeout: 3) else {
+      stdout.fileHandleForReading.closeFile()
+      stderr.fileHandleForReading.closeFile()
+      log("ditch_cli \(arguments.joined(separator: " ")) timed out")
+      return CommandOutput(exitCode: 124, stdout: "", stderr: "The runtime command timed out.")
+    }
+
+    let stdoutText =
+      String(
+        data: stdout.fileHandleForReading.readDataToEndOfFile(),
+        encoding: .utf8) ?? ""
+    let stderrText =
+      String(
+        data: stderr.fileHandleForReading.readDataToEndOfFile(),
+        encoding: .utf8) ?? ""
+    return CommandOutput(
+      exitCode: process.terminationStatus, stdout: stdoutText, stderr: stderrText)
+  }
+
+  private func waitForProcess(_ process: Process, timeout: TimeInterval) -> Bool {
+    let finished = DispatchSemaphore(value: 0)
+    process.terminationHandler = { _ in finished.signal() }
+    if !process.isRunning {
+      return true
+    }
+    if finished.wait(timeout: .now() + timeout) == .success {
+      return true
+    }
+    if process.isRunning {
+      process.terminate()
+    }
+    if finished.wait(timeout: .now() + 0.5) == .timedOut && process.isRunning {
+      Darwin.kill(process.processIdentifier, SIGKILL)
+      _ = finished.wait(timeout: .now() + 0.5)
+    }
+    return false
   }
 
   @objc private func showTheDitch() {

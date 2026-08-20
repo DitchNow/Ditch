@@ -498,6 +498,7 @@ fn handle_request(request: ClientRequest, state: Arc<Mutex<RuntimeState>>) -> Se
             state.broadcast(ServerEvent::ProjectChanged(project.clone()));
             ServerResponse::ProjectCreated(project)
         }
+        ClientRequest::DeleteProject { project_id } => delete_project(state, project_id),
         ClientRequest::StartCodexSession {
             project_name,
             project_root,
@@ -1530,6 +1531,68 @@ fn delete_agent(state: Arc<Mutex<RuntimeState>>, agent_id: AgentId) -> ServerRes
         .attention
         .retain(|item| item.agent_id != Some(agent_id));
     state.broadcast(ServerEvent::AgentDeleted { agent_id });
+    ServerResponse::Accepted
+}
+
+fn delete_project(
+    state: Arc<Mutex<RuntimeState>>,
+    project_id: ditch_core::ProjectId,
+) -> ServerResponse {
+    let mut state = state
+        .lock()
+        .expect("runtime state lock should not be poisoned");
+    let Some(project_key) = state
+        .projects
+        .iter()
+        .find_map(|(key, project)| (project.id == project_id).then(|| key.clone()))
+    else {
+        return protocol_error("project_not_found", "project was not found");
+    };
+    let has_active_agent = state.agents.values().any(|record| {
+        record.run.project_id == project_id
+            && (record.run.can_stop
+                || state.children.contains_key(&record.run.id)
+                || matches!(
+                    record.run.state,
+                    AgentState::Starting
+                        | AgentState::Working
+                        | AgentState::AwaitingApproval
+                        | AgentState::Blocked
+                ))
+    });
+    if has_active_agent {
+        return protocol_error(
+            "project_active",
+            "Stop this project's active agents before deleting it.",
+        );
+    }
+    if let Err(error) = state.store.delete_project(project_id) {
+        return protocol_error("project_delete_failed", error.to_string());
+    }
+
+    if let Some(terminal_id) = state.terminal_by_project.remove(&project_id) {
+        if let Some(mut terminal) = state.terminals.remove(&terminal_id) {
+            let _ = terminal.child.kill();
+        }
+    }
+    let agent_ids = state
+        .agents
+        .values()
+        .filter(|record| record.run.project_id == project_id)
+        .map(|record| record.run.id)
+        .collect::<Vec<_>>();
+    for agent_id in &agent_ids {
+        state.agents.remove(agent_id);
+        state.children.remove(agent_id);
+    }
+    state.attention.retain(|item| {
+        item.project_id != Some(project_id)
+            && item
+                .agent_id
+                .map_or(true, |agent_id| !agent_ids.contains(&agent_id))
+    });
+    state.projects.remove(&project_key);
+    state.broadcast(ServerEvent::ProjectDeleted { project_id });
     ServerResponse::Accepted
 }
 
@@ -2909,6 +2972,32 @@ mod tests {
         );
         assert!(!state.children.contains_key(&agent_id));
         assert!(state.attention.is_empty());
+    }
+
+    #[test]
+    fn delete_project_removes_runtime_state_but_preserves_user_files() {
+        let mut runtime = test_runtime();
+        let project_root =
+            std::env::temp_dir().join(format!("ditchd-delete-project-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&project_root).unwrap();
+        fs::write(project_root.join("keep-me.txt"), "user data").unwrap();
+        let project = Project::new("Fixture", &project_root);
+        runtime.store.upsert_project(&project).unwrap();
+        runtime.projects.insert(project.root_key(), project.clone());
+        let state = Arc::new(Mutex::new(runtime));
+
+        let response = delete_project(Arc::clone(&state), project.id);
+
+        assert!(matches!(response, ServerResponse::Accepted));
+        let state = state.lock().unwrap();
+        assert!(state.projects.is_empty());
+        assert!(state.store.load().unwrap().projects.is_empty());
+        assert_eq!(
+            fs::read_to_string(project_root.join("keep-me.txt")).unwrap(),
+            "user data"
+        );
+        drop(state);
+        fs::remove_dir_all(project_root).unwrap();
     }
 
     #[test]

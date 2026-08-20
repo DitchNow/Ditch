@@ -51,6 +51,9 @@ pub enum ClientRequest {
         root: String,
         git_policy: ProjectGitPolicy,
     },
+    DeleteProject {
+        project_id: ProjectId,
+    },
     StartCodexSession {
         project_name: String,
         project_root: String,
@@ -306,6 +309,9 @@ pub enum ServerEvent {
     AttentionSnapshotReplaced(Vec<RuntimeAttention>),
     RuntimeStatusChanged(RuntimeStatus),
     ProjectChanged(Project),
+    ProjectDeleted {
+        project_id: ProjectId,
+    },
     TaskChanged(Task),
     AgentChanged(AgentRun),
     AgentDeleted {

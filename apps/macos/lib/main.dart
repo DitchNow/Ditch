@@ -23,9 +23,14 @@ void main() {
 final ditchThemeMode = ValueNotifier<ThemeMode>(ThemeMode.system);
 
 class TheDitchApp extends StatefulWidget {
-  const TheDitchApp({this.connectRuntimeOnStart = true, super.key});
+  const TheDitchApp({
+    this.connectRuntimeOnStart = true,
+    this.initialProjects = const [],
+    super.key,
+  });
 
   final bool connectRuntimeOnStart;
+  final List<DitchProject> initialProjects;
 
   @override
   State<TheDitchApp> createState() => _TheDitchAppState();
@@ -67,6 +72,7 @@ class _TheDitchAppState extends State<TheDitchApp> {
         themeMode: themeMode,
         home: CommandCenterScreen(
           connectRuntimeOnStart: widget.connectRuntimeOnStart,
+          initialProjects: widget.initialProjects,
         ),
       ),
     );
@@ -833,6 +839,12 @@ class DitchRuntimeClient {
     });
   }
 
+  Future<Map<String, dynamic>> deleteProject(String projectId) {
+    return request({
+      'DeleteProject': {'project_id': projectId},
+    });
+  }
+
   Future<Map<String, dynamic>> discoverProjects(String searchRoot) {
     return request({
       'DiscoverProjects': {'search_root': searchRoot},
@@ -1021,9 +1033,14 @@ DitchProject? parseRuntimeProject(Object? value) {
 }
 
 class CommandCenterScreen extends StatefulWidget {
-  const CommandCenterScreen({this.connectRuntimeOnStart = true, super.key});
+  const CommandCenterScreen({
+    this.connectRuntimeOnStart = true,
+    this.initialProjects = const [],
+    super.key,
+  });
 
   final bool connectRuntimeOnStart;
+  final List<DitchProject> initialProjects;
 
   @override
   State<CommandCenterScreen> createState() => _CommandCenterScreenState();
@@ -1037,10 +1054,6 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
   static const _minimumAgentsWidth = 320.0;
   static const _splitterExtent = 9.0;
   static const _defaultStartPrompt = '';
-  static const _bootstrapProject = DitchProject(
-    name: 'The Ditch',
-    path: '/Users/tester/Documents/Personal/The Ditch v2',
-  );
   static const _applicationChannel = MethodChannel('the_ditch/application');
 
   final _idleChatViewport = ConversationViewportController();
@@ -1052,7 +1065,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
   final _presentation = CommandCenterController();
   int _nextAgentSessionId = 1;
   int _nextAttentionId = 1;
-  final _projects = <DitchProject>[_bootstrapProject];
+  late final List<DitchProject> _projects;
   final _attention = <AttentionEvent>[];
   final _readAttentionIds = <String>{};
   final Map<String, ProjectTerminalSession> _projectTerminals = {};
@@ -1066,7 +1079,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
   bool _runtimeSupportsPersistence = true;
   bool _runtimeCompatibilityReported = false;
   String? _effectiveRuntimeCodexHome;
-  bool _legacyRecoveryChecked = false;
+  bool _firstProjectFlowScheduled = false;
   TerminalPresentation _terminalPresentation = TerminalPresentation.docked;
   TerminalPresentation _terminalRestorePresentation =
       TerminalPresentation.docked;
@@ -1075,7 +1088,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
   bool _dockedFilesExpanded = true;
   double _projectSidebarWidth = _defaultProjectSidebarWidth;
   double _inspectorWidth = _defaultInspectorWidth;
-  String _selectedProjectKey = canonicalProjectPath(_bootstrapProject.path);
+  String? _selectedProjectKey;
   String? _expandedAgentLocalId;
   String? _focusedAgentLocalId;
   AgentNotificationTarget? _pendingNotificationTarget;
@@ -1095,16 +1108,20 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
       project.id ?? canonicalProjectPath(project.path);
 
   int get _selectedProjectIndex {
+    if (_projects.isEmpty) return -1;
     final index = _projects.indexWhere(
       (project) => _projectKey(project) == _selectedProjectKey,
     );
     return index < 0 ? 0 : index;
   }
 
-  DitchProject get _selectedProject => _projects[_selectedProjectIndex];
+  DitchProject? get _selectedProjectOrNull =>
+      _projects.isEmpty ? null : _projects[_selectedProjectIndex];
+
+  DitchProject get _selectedProject => _selectedProjectOrNull!;
 
   List<AgentSession> get _visibleSessions {
-    return sessionsForProject(_agentSessions, _selectedProject.id);
+    return sessionsForProject(_agentSessions, _selectedProjectOrNull?.id);
   }
 
   int get _unreadNotificationCount =>
@@ -1116,7 +1133,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
   );
 
   Future<void> _selectProject(int index) async {
-    final currentProjectId = _selectedProject.id;
+    final currentProjectId = _selectedProjectOrNull?.id;
     final currentFiles = currentProjectId == null
         ? null
         : _projectFiles[currentProjectId];
@@ -1281,7 +1298,8 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
   }
 
   Future<void> _ensureSelectedProjectTerminal() async {
-    final project = _selectedProject;
+    final project = _selectedProjectOrNull;
+    if (project == null) return;
     final projectId = project.id;
     if (projectId == null || _projectTerminals.containsKey(projectId)) return;
     try {
@@ -1328,7 +1346,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
   AgentSession _createAgentSession({required bool expand}) {
     final session = AgentSession(
       localId: 'agent-${_nextAgentSessionId++}',
-      projectId: _selectedProject.id,
+      projectId: _selectedProjectOrNull?.id,
       provider: AgentProvider.codex,
       status: AgentStatus.idle,
       messages: [
@@ -1353,20 +1371,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
       await _ensureRuntimeStarted();
       final status = await _runtimeClient.runtimeStatus();
       final instanceId = status.instanceId;
-      var snapshot = await _runtimeClient.snapshot();
-      final snapshotBody = snapshot['Snapshot'];
-      final registeredProjects = snapshotBody is Map<String, dynamic>
-          ? snapshotBody['projects']
-          : null;
-      if (registeredProjects is List && registeredProjects.isEmpty) {
-        final bootstrap = _projects.first;
-        await _runtimeClient.createProject(
-          name: bootstrap.name,
-          root: bootstrap.path,
-          gitPolicy: bootstrap.gitPolicy,
-        );
-        snapshot = await _runtimeClient.snapshot();
-      }
+      final snapshot = await _runtimeClient.snapshot();
       _hydrateRuntimeSnapshot(snapshot);
       _checkRuntimeCapabilities(status);
       _checkRuntimeCodexHome(status);
@@ -1391,9 +1396,6 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
       if (_runtimeInstanceId != confirmedInstanceId) {
         await _runtimeEvents?.cancel();
         _scheduleRuntimeReconnect();
-      } else if (!_legacyRecoveryChecked) {
-        _legacyRecoveryChecked = true;
-        unawaited(_offerLegacyProjectRecovery());
       }
       _presentation.connected();
       unawaited(_ensureSelectedProjectTerminal());
@@ -1457,81 +1459,6 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
           'This runtime cannot persist agent sessions. Rebuild and restart The Ditch before starting Codex.',
       global: true,
     );
-  }
-
-  Future<void> _offerLegacyProjectRecovery() async {
-    if (_projects.isEmpty) {
-      return;
-    }
-    final searchRoot = Directory(_bootstrapProject.path).parent.path;
-    try {
-      final response = await _runtimeClient.discoverProjects(searchRoot);
-      final raw = response['Projects'];
-      if (raw is! List || !mounted) {
-        return;
-      }
-      final existingPaths = _projects.map((project) => project.path).toSet();
-      final discovered = raw
-          .map(_projectFromRuntime)
-          .whereType<DitchProject>()
-          .where((project) => !existingPaths.contains(project.path))
-          .toList();
-      if (discovered.isEmpty) {
-        return;
-      }
-      final shouldRecover = await showDialog<bool>(
-        context: context,
-        builder: (context) => AlertDialog(
-          title: const Text('Recover existing projects?'),
-          content: SizedBox(
-            width: 560,
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                const Text(
-                  'The Ditch found project folders created by an earlier version:',
-                ),
-                const SizedBox(height: 12),
-                for (final project in discovered)
-                  Padding(
-                    padding: const EdgeInsets.only(bottom: 8),
-                    child: Text('• ${project.name}\n  ${project.path}'),
-                  ),
-              ],
-            ),
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.of(context).pop(false),
-              child: const Text('Not Now'),
-            ),
-            FilledButton(
-              onPressed: () => Navigator.of(context).pop(true),
-              child: const Text('Recover Projects'),
-            ),
-          ],
-        ),
-      );
-      if (shouldRecover != true) {
-        return;
-      }
-      for (final project in discovered) {
-        await _runtimeClient.createProject(
-          name: project.name,
-          root: project.path,
-          gitPolicy: project.gitPolicy,
-        );
-      }
-      _hydrateRuntimeSnapshot(await _runtimeClient.snapshot());
-    } on Object catch (error) {
-      _addAttentionRequired(
-        kind: AttentionKind.failed,
-        icon: Icons.error_outline,
-        title: 'Project recovery failed',
-        body: '$error',
-      );
-    }
   }
 
   void _scheduleRuntimeReconnect() {
@@ -1651,12 +1578,14 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
       }
     }
     setState(() {
-      final selectedPath = _projects.isEmpty ? null : _selectedProject.path;
-      if (projects.isNotEmpty) {
-        projects.sort((a, b) => a.name.compareTo(b.name));
-        _projects
-          ..clear()
-          ..addAll(projects);
+      final selectedPath = _selectedProjectOrNull?.path;
+      projects.sort((a, b) => a.name.compareTo(b.name));
+      _projects
+        ..clear()
+        ..addAll(projects);
+      if (_projects.isEmpty) {
+        _selectedProjectKey = null;
+      } else {
         final restoredIndex = selectedPath == null
             ? -1
             : _projects.indexWhere((project) => project.path == selectedPath);
@@ -1705,6 +1634,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
         if (mounted) _openNotificationTarget(pendingTarget);
       });
     }
+    _scheduleFirstProjectFlow();
   }
 
   DitchProject? _projectFromRuntime(Object? value) {
@@ -1714,11 +1644,17 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
   @override
   void initState() {
     super.initState();
+    _projects = List<DitchProject>.of(widget.initialProjects);
+    _selectedProjectKey = _projects.isEmpty
+        ? null
+        : _projectKey(_projects.first);
     _configureNativeNavigation();
     _scheduleStatusBarUpdate();
     unawaited(_loadPaneWidths());
     if (widget.connectRuntimeOnStart) {
       unawaited(_connectRuntime());
+    } else if (_projects.isEmpty) {
+      _scheduleFirstProjectFlow(beforeRuntimeHydration: true);
     }
   }
 
@@ -1897,6 +1833,129 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
         isError: true,
       );
     }
+  }
+
+  Future<void> _copyProjectPath(DitchProject project) async {
+    await Clipboard.setData(ClipboardData(text: project.path));
+    if (!mounted) return;
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(const SnackBar(content: Text('Project path copied.')));
+  }
+
+  Future<void> _deleteProject(DitchProject project) async {
+    final projectId = project.id;
+    if (projectId == null || !mounted) return;
+    final hasActiveAgent = _agentSessions.any(
+      (session) => session.projectId == projectId && session.isActive,
+    );
+    if (hasActiveAgent) {
+      _showProjectSetupResult(
+        title: 'Project has active agents',
+        message: 'Stop this project\'s active agents before deleting it.',
+        isError: true,
+      );
+      return;
+    }
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: Text('Delete ${project.name}?'),
+        content: const Text(
+          'This removes the project, its agents, chat history, and alerts from The Ditch. The project folder and its files will not be deleted.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(context).pop(true),
+            child: const Text('Delete Project'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+    try {
+      await _runtimeClient.deleteProject(projectId);
+      _removeProjectFromUi(projectId);
+    } on Object catch (error) {
+      if (!mounted) return;
+      _showProjectSetupResult(
+        title: 'Project deletion failed',
+        message: '$error',
+        isError: true,
+      );
+    }
+  }
+
+  void _removeProjectFromUi(String projectId) {
+    if (!_projects.any((project) => project.id == projectId)) return;
+    final removedSessionIds = _agentSessions
+        .where((session) => session.projectId == projectId)
+        .map((session) => session.localId)
+        .toSet();
+    final removedViewports = removedSessionIds
+        .map(_chatViewports.remove)
+        .whereType<ConversationViewportController>()
+        .toList();
+    final removedFiles = _projectFiles.remove(projectId);
+    setState(() {
+      _projects.removeWhere((project) => project.id == projectId);
+      _projectTerminals.remove(projectId);
+      _agentSessions.removeWhere((session) => session.projectId == projectId);
+      _attention.removeWhere((event) => event.projectId == projectId);
+      for (final id in removedSessionIds) {
+        _agentHeaderKeys.remove(id);
+      }
+      if (removedSessionIds.contains(_expandedAgentLocalId)) {
+        _expandedAgentLocalId = null;
+      }
+      if (removedSessionIds.contains(_focusedAgentLocalId)) {
+        _focusedAgentLocalId = null;
+      }
+      if (_projects.isEmpty) {
+        _selectedProjectKey = null;
+      } else if (!_projects.any(
+        (project) => _projectKey(project) == _selectedProjectKey,
+      )) {
+        _selectedProjectKey = _projectKey(_projects.first);
+      }
+    });
+    removedFiles?.dispose();
+    if (removedViewports.isNotEmpty) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        for (final viewport in removedViewports) {
+          viewport.dispose();
+        }
+      });
+    }
+    _scheduleStatusBarUpdate();
+    if (_projects.isEmpty) {
+      _firstProjectFlowScheduled = false;
+      _scheduleFirstProjectFlow();
+    } else {
+      unawaited(_ensureSelectedProjectTerminal());
+    }
+  }
+
+  void _scheduleFirstProjectFlow({bool beforeRuntimeHydration = false}) {
+    if (_firstProjectFlowScheduled ||
+        _projects.isNotEmpty ||
+        (!beforeRuntimeHydration && !_runtimeSnapshotHydrated) ||
+        !mounted) {
+      return;
+    }
+    _firstProjectFlowScheduled = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
+      if (!mounted || _projects.isNotEmpty) {
+        _firstProjectFlowScheduled = false;
+        return;
+      }
+      await _addProject();
+      _firstProjectFlowScheduled = false;
+    });
   }
 
   void _showProjectSetupProgress() {
@@ -2243,7 +2302,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
         : _agentSessionByLocalId(sessionLocalId);
     final eventProjectId = global
         ? null
-        : (projectId ?? session?.projectId ?? _selectedProject.id);
+        : (projectId ?? session?.projectId ?? _selectedProjectOrNull?.id);
     final project = _projects
         .where((candidate) => candidate.id == eventProjectId)
         .firstOrNull;
@@ -2400,6 +2459,13 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
       setState(() {
         upsertProject(_projects, project);
       });
+      return;
+    }
+
+    final projectDeleted = eventBody['ProjectDeleted'];
+    if (projectDeleted is Map<String, dynamic>) {
+      final id = _agentIdToString(projectDeleted['project_id']);
+      if (id != null) _removeProjectFromUi(id);
       return;
     }
 
@@ -3001,6 +3067,19 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
         return Scaffold(
           body: LayoutBuilder(
             builder: (context, constraints) {
+              if (_projects.isEmpty) {
+                return ColoredBox(
+                  color: context.ditch.workspace,
+                  child: Center(
+                    child: FilledButton.icon(
+                      key: const Key('first-project-add'),
+                      onPressed: _addProject,
+                      icon: const Icon(Icons.add),
+                      label: const Text('Add Project'),
+                    ),
+                  ),
+                );
+              }
               final compact = constraints.maxWidth < 760;
               final showSidebar =
                   presentation.sidebarVisible && _focusedAgentLocalId == null;
@@ -3258,6 +3337,10 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
                         onSelectProject: _selectProject,
                         onRevealProject: (project) =>
                             unawaited(_revealProjectInFinder(project)),
+                        onCopyProjectPath: (project) =>
+                            unawaited(_copyProjectPath(project)),
+                        onDeleteProject: (project) =>
+                            unawaited(_deleteProject(project)),
                       ),
                       WorkspaceResizeHandle(
                         key: const Key('projects-resize-handle'),
@@ -3844,6 +3927,8 @@ class ProjectSidebar extends StatelessWidget {
     required this.onAddProject,
     required this.onSelectProject,
     required this.onRevealProject,
+    required this.onCopyProjectPath,
+    required this.onDeleteProject,
     super.key,
   });
 
@@ -3853,6 +3938,8 @@ class ProjectSidebar extends StatelessWidget {
   final VoidCallback onAddProject;
   final ValueChanged<int> onSelectProject;
   final ValueChanged<DitchProject> onRevealProject;
+  final ValueChanged<DitchProject> onCopyProjectPath;
+  final ValueChanged<DitchProject> onDeleteProject;
 
   @override
   Widget build(BuildContext context) {
@@ -3889,6 +3976,8 @@ class ProjectSidebar extends StatelessWidget {
                         selected: index == selectedIndex,
                         onTap: () => onSelectProject(index),
                         onReveal: () => onRevealProject(project),
+                        onCopyPath: () => onCopyProjectPath(project),
+                        onDelete: () => onDeleteProject(project),
                       );
                     },
                   ),
@@ -3915,6 +4004,8 @@ class ProjectTile extends StatelessWidget {
     required this.selected,
     required this.onTap,
     required this.onReveal,
+    required this.onCopyPath,
+    required this.onDelete,
     super.key,
   });
 
@@ -3923,14 +4014,53 @@ class ProjectTile extends StatelessWidget {
   final bool selected;
   final VoidCallback onTap;
   final VoidCallback onReveal;
+  final VoidCallback onCopyPath;
+  final VoidCallback onDelete;
+
+  Future<void> _showContextMenu(
+    BuildContext context,
+    TapDownDetails details,
+  ) async {
+    final overlay = Overlay.of(context).context.findRenderObject() as RenderBox;
+    final action = await showMenu<_ProjectMenuAction>(
+      context: context,
+      position: RelativeRect.fromRect(
+        Rect.fromLTWH(
+          details.globalPosition.dx,
+          details.globalPosition.dy,
+          0,
+          0,
+        ),
+        Offset.zero & overlay.size,
+      ),
+      items: const [
+        PopupMenuItem(
+          value: _ProjectMenuAction.copyPath,
+          child: Text('Copy Project Path'),
+        ),
+        PopupMenuDivider(),
+        PopupMenuItem(value: _ProjectMenuAction.delete, child: Text('Delete')),
+      ],
+    );
+    switch (action) {
+      case _ProjectMenuAction.copyPath:
+        onCopyPath();
+      case _ProjectMenuAction.delete:
+        onDelete();
+      case null:
+        break;
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
     final tokens = context.ditch;
 
     return InkWell(
+      key: ValueKey('project-tile-$path'),
       borderRadius: BorderRadius.circular(tokens.radiusSmall),
       onTap: onTap,
+      onSecondaryTapDown: (details) => _showContextMenu(context, details),
       child: DecoratedBox(
         decoration: BoxDecoration(
           color: selected ? tokens.selection : Colors.transparent,
@@ -3976,6 +4106,8 @@ class ProjectTile extends StatelessWidget {
     );
   }
 }
+
+enum _ProjectMenuAction { copyPath, delete }
 
 class AgentsSurface extends StatelessWidget {
   const AgentsSurface({
