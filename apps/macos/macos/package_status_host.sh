@@ -7,6 +7,33 @@ HELPER_MACOS="$HELPER_CONTENTS/MacOS"
 MAIN_MACOS="$TARGET_BUILD_DIR/$CONTENTS_FOLDER_PATH/MacOS"
 WORKSPACE_ROOT="$PROJECT_DIR/../../.."
 
+# Archive builds run outside the user's interactive shell, so Homebrew and
+# rustup are usually absent from PATH. Resolve Cargo explicitly instead of
+# depending on whichever environment happened to launch Xcode.
+CARGO_BIN=""
+for CANDIDATE in \
+  "${CARGO:-}" \
+  "/opt/homebrew/bin/cargo" \
+  "/usr/local/bin/cargo" \
+  "$HOME/.cargo/bin/cargo"
+do
+  if [ -n "$CANDIDATE" ] && [ -x "$CANDIDATE" ]; then
+    CARGO_BIN="$CANDIDATE"
+    break
+  fi
+done
+if [ -z "$CARGO_BIN" ]; then
+  echo "error: Cargo was not found. Install Rust or set CARGO to the cargo executable." >&2
+  exit 1
+fi
+
+# Cargo launches rustc and linker helpers by name. Make the directory that
+# supplied Cargo visible to those child processes in Xcode's restricted
+# Archive environment as well.
+RUST_TOOLCHAIN_BIN="$(dirname "$CARGO_BIN")"
+PATH="$RUST_TOOLCHAIN_BIN:$PATH"
+export PATH
+
 case "${CONFIGURATION:-Debug}" in
   Release|Profile)
     CARGO_PROFILE="release"
@@ -21,7 +48,7 @@ esac
 cd "$WORKSPACE_ROOT"
 # The app must never package whatever happens to be left in target/. Build the
 # runtime used by this exact app build first, and fail if Cargo cannot produce it.
-/usr/bin/env cargo build --locked -p ditchd -p ditch_cli $CARGO_FLAGS
+"$CARGO_BIN" build --locked -p ditchd -p ditch_cli $CARGO_FLAGS
 DITCHD_SOURCE="$WORKSPACE_ROOT/target/$CARGO_PROFILE/ditchd"
 DITCHD_LIBRARY="$WORKSPACE_ROOT/target/$CARGO_PROFILE/libditchd.a"
 DITCH_CLI_SOURCE="$WORKSPACE_ROOT/target/$CARGO_PROFILE/ditch_cli"
@@ -88,12 +115,17 @@ test -x "$MAIN_MACOS/ditch_cli"
 test "$(stat -f %z "$HELPER_MACOS/ditchd")" = "$(stat -f %z "$MAIN_MACOS/ditchd")"
 test "$(stat -f %z "$DITCH_CLI_SOURCE")" = "$(stat -f %z "$MAIN_MACOS/ditch_cli")"
 
-# Rust and Swift linkers already emit ad-hoc-signed Mach-O executables. Avoid
-# asking macOS codesign to replace those signatures repeatedly: clean builds
-# can otherwise fail with an intermittent "internal error in Code Signing
-# subsystem". Seal the nested runtime bundle here; Xcode signs and seals the
-# containing application afterward.
-/usr/bin/codesign --force --sign - "$HELPER_APP"
+# Every executable inside a notarized app must carry a hardened signature.
+# During an Archive, use the identity selected by Xcode; local unsigned builds
+# fall back to an ad-hoc identity while retaining Hardened Runtime flags.
+SIGNING_IDENTITY="${EXPANDED_CODE_SIGN_IDENTITY:--}"
+if [ -z "$SIGNING_IDENTITY" ]; then
+  SIGNING_IDENTITY="-"
+fi
+/usr/bin/codesign --force --sign "$SIGNING_IDENTITY" --options runtime "$MAIN_MACOS/ditchd"
+/usr/bin/codesign --force --sign "$SIGNING_IDENTITY" --options runtime "$MAIN_MACOS/ditch_cli"
+/usr/bin/codesign --force --sign "$SIGNING_IDENTITY" --options runtime "$HELPER_MACOS/ditch_cli"
+/usr/bin/codesign --force --sign "$SIGNING_IDENTITY" --options runtime "$HELPER_APP"
 
 rm -rf "$TARGET_BUILD_DIR/$CONTENTS_FOLDER_PATH/Library/LoginItems/The Ditch Status.app"
 rm -f "$TARGET_BUILD_DIR/$CONTENTS_FOLDER_PATH/MacOS/ditch-status-host"

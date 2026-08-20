@@ -47,6 +47,7 @@ where
             id: ditch_core::AgentId::new(),
             provider: AgentProvider::Codex,
             state: AgentState::Starting,
+            can_stop: false,
             launch_mode: request.mode,
             execution_profile: Default::default(),
             project_id: request.project.id,

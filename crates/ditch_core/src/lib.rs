@@ -186,6 +186,11 @@ pub struct AgentRun {
     pub id: AgentId,
     pub provider: AgentProvider,
     pub state: AgentState,
+    /// True only while this runtime owns a live Codex child for the agent.
+    /// This is deliberately separate from the last semantic turn state: Codex can
+    /// emit `turn.completed` shortly before its process and IO readers finish.
+    #[serde(default)]
+    pub can_stop: bool,
     pub launch_mode: CodexLaunchMode,
     #[serde(default)]
     pub execution_profile: AgentExecutionProfile,

@@ -660,6 +660,7 @@ mod tests {
             id: ditch_core::AgentId::new(),
             provider: ditch_core::AgentProvider::Codex,
             state: AgentState::Working,
+            can_stop: false,
             launch_mode: ditch_core::CodexLaunchMode::Exec,
             execution_profile: Default::default(),
             project_id: project.id,

@@ -294,6 +294,7 @@ class AgentSession {
     this.resumeBlockReason,
     this.exitCode,
     this.finishedAt,
+    this.canStop = false,
     this.messagesLoaded = true,
     this.messagesLoading = false,
     this.hasOlderMessages = false,
@@ -318,6 +319,7 @@ class AgentSession {
   final String? resumeBlockReason;
   final int? exitCode;
   final DateTime? finishedAt;
+  bool canStop;
   DateTime updatedAt;
   final List<AgentChatMessage> messages;
   bool messagesLoaded;
@@ -344,6 +346,8 @@ class AgentSession {
   bool get isWorking {
     return status == AgentStatus.starting || status == AgentStatus.working;
   }
+
+  bool get isActive => isWorking || canStop;
 }
 
 void reconcileAgentSession(List<AgentSession> sessions, AgentSession incoming) {
@@ -362,6 +366,7 @@ void reconcileAgentSession(List<AgentSession> sessions, AgentSession incoming) {
   existing.userTitle = incoming.userTitle;
   existing.currentPrompt = incoming.currentPrompt;
   existing.lastVisibleAction = incoming.lastVisibleAction;
+  existing.canStop = incoming.canStop;
   existing.updatedAt = incoming.updatedAt;
   sessions.removeWhere(
     (session) =>
@@ -2072,7 +2077,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
   }
 
   Future<void> _submitComposer(AgentSession session, String prompt) async {
-    if (session.isWorking) {
+    if (session.isActive) {
       return;
     }
 
@@ -2150,6 +2155,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
       await _runtimeClient.stopAgent(session.localId);
       setState(() {
         session.status = AgentStatus.stopped;
+        session.canStop = false;
         session.updatedAt = DateTime.now();
       });
       _scheduleStatusBarUpdate();
@@ -2163,7 +2169,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
   }
 
   Future<void> _deleteAgent(AgentSession session) async {
-    if (session.isWorking || !mounted) return;
+    if (session.isActive || !mounted) return;
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (context) => AlertDialog(
@@ -2527,6 +2533,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
       finishedAt: agentJson['finished_at'] == null
           ? null
           : _dateTimeFromRuntime(agentJson['finished_at']),
+      canStop: agentJson['can_stop'] == true,
       createdAt: _dateTimeFromRuntime(agentJson['started_at']),
       updatedAt: _dateTimeFromRuntime(agentJson['updated_at']),
     );
@@ -4471,12 +4478,12 @@ class ExpandableAgentPanel extends StatelessWidget {
               ),
             ),
             OutlinedButton.icon(
-              onPressed: session.isWorking ? onStopCodex : null,
+              onPressed: session.canStop ? onStopCodex : null,
               icon: const Icon(Icons.stop_circle_outlined),
               label: const Text('Stop'),
             ),
             IconButton(
-              onPressed: session.isWorking ? null : onDelete,
+              onPressed: session.isActive ? null : onDelete,
               tooltip: 'Delete agent permanently',
               icon: const Icon(Icons.delete_outline),
             ),
@@ -4491,6 +4498,7 @@ class ExpandableAgentPanel extends StatelessWidget {
           initialPrompt: session.hasCodexThread ? '' : initialPrompt,
           hasSession: session.hasCodexThread,
           isWorking: session.isWorking,
+          canStop: session.canStop,
           enabled: !resumeBlocked,
           disabledMessage: resumeBlockedMessage,
           onSubmitPrompt: onSubmitPrompt,
@@ -4588,6 +4596,7 @@ class AgentChatPanel extends StatelessWidget {
     required this.initialPrompt,
     required this.hasSession,
     required this.isWorking,
+    this.canStop = false,
     this.messagesReady = true,
     this.messagesLoading = false,
     this.hasOlderMessages = false,
@@ -4609,6 +4618,7 @@ class AgentChatPanel extends StatelessWidget {
   final String initialPrompt;
   final bool hasSession;
   final bool isWorking;
+  final bool canStop;
   final bool messagesReady;
   final bool messagesLoading;
   final bool hasOlderMessages;
@@ -4659,6 +4669,7 @@ class AgentChatPanel extends StatelessWidget {
         initialText: initialPrompt,
         hasSession: hasSession,
         isWorking: isWorking,
+        canStop: canStop,
         enabled: enabled,
         onSubmit: onSubmitPrompt,
         onStop: onStopCodex,
@@ -5032,6 +5043,7 @@ class AgentComposer extends StatefulWidget {
     required this.initialText,
     required this.hasSession,
     required this.isWorking,
+    this.canStop = false,
     this.enabled = true,
     required this.onSubmit,
     required this.onStop,
@@ -5043,6 +5055,7 @@ class AgentComposer extends StatefulWidget {
   final String initialText;
   final bool hasSession;
   final bool isWorking;
+  final bool canStop;
   final bool enabled;
   final ValueChanged<String> onSubmit;
   final VoidCallback onStop;
@@ -5081,7 +5094,7 @@ class AgentComposerState extends State<AgentComposer> {
   }
 
   Future<void> submit() async {
-    if (!widget.enabled || widget.isWorking) {
+    if (!widget.enabled || widget.isWorking || widget.canStop) {
       return;
     }
 
@@ -5138,7 +5151,7 @@ class AgentComposerState extends State<AgentComposer> {
     final actionLabel = widget.hasSession ? 'Send' : 'Start';
     final actionIcon = widget.hasSession ? Icons.send : Icons.play_arrow;
     final editable = widget.enabled;
-    final canSubmit = widget.enabled && !widget.isWorking;
+    final canSubmit = widget.enabled && !widget.isWorking && !widget.canStop;
 
     return Padding(
       padding: const EdgeInsets.all(12),
@@ -5224,7 +5237,8 @@ class AgentComposerState extends State<AgentComposer> {
                             ],
                           ),
                         ),
-                        if (widget.isWorking) const Text('Applies next turn'),
+                        if (widget.isWorking || widget.canStop)
+                          const Text('Applies next turn'),
                       ],
                     );
                   },
@@ -5252,7 +5266,7 @@ class AgentComposerState extends State<AgentComposer> {
                         ),
                       ),
                       const SizedBox(width: 6),
-                      if (widget.isWorking)
+                      if (widget.canStop)
                         IconButton.filledTonal(
                           onPressed: widget.onStop,
                           tooltip: 'Stop Codex',

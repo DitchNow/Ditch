@@ -67,7 +67,7 @@ struct RuntimeState {
     store: DitchStore,
     projects: HashMap<String, Project>,
     agents: HashMap<AgentId, AgentRecord>,
-    children: HashMap<AgentId, Arc<Mutex<Child>>>,
+    children: HashMap<AgentId, ActiveAgentChild>,
     terminals: HashMap<uuid::Uuid, ProjectTerminalRecord>,
     terminal_by_project: HashMap<ditch_core::ProjectId, uuid::Uuid>,
     subscribers: Vec<Sender<String>>,
@@ -95,6 +95,13 @@ struct AgentRecord {
     terminal_failure: Option<String>,
 }
 
+/// A child belongs to exactly one prompt run. Its token prevents a late exit
+/// watcher from an earlier run from changing the newer run's state.
+struct ActiveAgentChild {
+    run_id: uuid::Uuid,
+    child: Arc<Mutex<Child>>,
+}
+
 impl RuntimeState {
     fn new(paths: AppPaths) -> Result<Self, ditch_store::StoreError> {
         let mut store = DitchStore::open(&paths)?;
@@ -112,10 +119,14 @@ impl RuntimeState {
                 let project = projects
                     .values()
                     .find(|project| project.id == agent.run.project_id)?;
+                let mut run = agent.run;
+                // Child processes are not durable. Never expose a persisted
+                // stop affordance after a runtime restart.
+                run.can_stop = false;
                 Some((
-                    agent.run.id,
+                    run.id,
                     AgentRecord {
-                        run: agent.run,
+                        run,
                         project_root: project.root.clone(),
                         allow_non_git: project.git_policy == ProjectGitPolicy::AllowOutsideGit,
                         messages: agent.messages,
@@ -590,6 +601,7 @@ fn shutdown_runtime(state: Arc<Mutex<RuntimeState>>) -> ServerResponse {
         let children = std::mem::take(&mut state.children);
         for child in children.values() {
             let _ = child
+                .child
                 .lock()
                 .expect("child lock should not be poisoned")
                 .kill();
@@ -948,6 +960,7 @@ fn start_codex_session(
         id: AgentId::new(),
         provider: AgentProvider::Codex,
         state: AgentState::Starting,
+        can_stop: false,
         launch_mode: mode.clone(),
         execution_profile: execution_profile.clone(),
         project_id: project.id,
@@ -1010,7 +1023,9 @@ fn start_codex_session(
         }
     };
 
+    let run_id = uuid::Uuid::new_v4();
     run.state = AgentState::Working;
+    run.can_stop = true;
     run.updated_at = Utc::now();
     run.state_evidence = "Codex process is running under The Ditch Runtime.".to_owned();
 
@@ -1050,13 +1065,19 @@ fn start_codex_session(
                 terminal_failure: None,
             },
         );
-        state.children.insert(run.id, Arc::clone(&child));
+        state.children.insert(
+            run.id,
+            ActiveAgentChild {
+                run_id,
+                child: Arc::clone(&child),
+            },
+        );
         state.broadcast(ServerEvent::ProjectChanged(project));
         state.broadcast(ServerEvent::AgentChanged(run.clone()));
         state.broadcast(ServerEvent::AgentMessageAppended(user_message));
     }
 
-    attach_codex_io(Arc::clone(&state), run.id, child);
+    attach_codex_io(Arc::clone(&state), run.id, run_id, child);
     ServerResponse::AgentStarted(run)
 }
 
@@ -1191,6 +1212,7 @@ fn resume_codex_session(
         id: AgentId::new(),
         provider: AgentProvider::Codex,
         state: AgentState::Starting,
+        can_stop: false,
         launch_mode: CodexLaunchMode::Exec,
         execution_profile: execution_profile.clone(),
         project_id: project.id,
@@ -1253,7 +1275,9 @@ fn resume_codex_session(
         }
     };
 
+    let run_id = uuid::Uuid::new_v4();
     run.state = AgentState::Working;
+    run.can_stop = true;
     run.updated_at = Utc::now();
     run.state_evidence = "Codex resume process is running under The Ditch Runtime.".to_owned();
 
@@ -1293,13 +1317,19 @@ fn resume_codex_session(
                 terminal_failure: None,
             },
         );
-        state.children.insert(run.id, Arc::clone(&child));
+        state.children.insert(
+            run.id,
+            ActiveAgentChild {
+                run_id,
+                child: Arc::clone(&child),
+            },
+        );
         state.broadcast(ServerEvent::ProjectChanged(project));
         state.broadcast(ServerEvent::AgentChanged(run.clone()));
         state.broadcast(ServerEvent::AgentMessageAppended(user_message));
     }
 
-    attach_codex_io(Arc::clone(&state), run.id, child);
+    attach_codex_io(Arc::clone(&state), run.id, run_id, child);
     ServerResponse::AgentStarted(run)
 }
 
@@ -1341,7 +1371,9 @@ fn prompt_agent(
         let Some(record) = state.agents.get(&agent_id) else {
             return protocol_error("agent_not_found", "agent session was not found");
         };
-        if matches!(record.run.state, AgentState::Starting | AgentState::Working) {
+        if state.children.contains_key(&agent_id)
+            || matches!(record.run.state, AgentState::Starting | AgentState::Working)
+        {
             return protocol_error("agent_busy", "agent session is already working");
         }
         if record.run.native_session_id.is_none()
@@ -1374,8 +1406,8 @@ fn prompt_agent(
 
     let Some(binary) = find_binary("codex") else {
         let message = "Codex binary was not found on PATH".to_owned();
-        record_terminal_failure(&state, agent_id, message.clone());
-        finish_agent(&state, agent_id, Some(1));
+        record_terminal_failure(&state, agent_id, message.clone(), None);
+        finish_agent(&state, agent_id, None, Some(1));
         return protocol_error("codex_not_found", message);
     };
 
@@ -1391,8 +1423,8 @@ fn prompt_agent(
         Ok(child) => Arc::new(Mutex::new(child)),
         Err(error) => {
             let message = error.to_string();
-            record_terminal_failure(&state, agent_id, message.clone());
-            finish_agent(&state, agent_id, Some(1));
+            record_terminal_failure(&state, agent_id, message.clone(), None);
+            finish_agent(&state, agent_id, None, Some(1));
             return protocol_error("codex_start_failed", message);
         }
     };
@@ -1403,6 +1435,7 @@ fn prompt_agent(
         text: prompt.clone(),
         created_at: Utc::now(),
     };
+    let run_id = uuid::Uuid::new_v4();
 
     {
         let mut state = state
@@ -1412,6 +1445,7 @@ fn prompt_agent(
             return protocol_error("agent_not_found", "agent session was not found");
         };
         record.run.state = AgentState::Working;
+        record.run.can_stop = true;
         record.run.execution_profile = execution_profile;
         record.run.current_prompt = Some(prompt);
         record.run.last_visible_action = Some("Prompt sent to Codex".to_owned());
@@ -1424,12 +1458,18 @@ fn prompt_agent(
         let run = record.run.clone();
         state.persist_message(&user_message);
         state.persist_agent(agent_id);
-        state.children.insert(agent_id, Arc::clone(&child));
+        state.children.insert(
+            agent_id,
+            ActiveAgentChild {
+                run_id,
+                child: Arc::clone(&child),
+            },
+        );
         state.broadcast(ServerEvent::AgentChanged(run));
         state.broadcast(ServerEvent::AgentMessageAppended(user_message));
     }
 
-    attach_codex_io(Arc::clone(&state), agent_id, child);
+    attach_codex_io(Arc::clone(&state), agent_id, run_id, child);
     ServerResponse::Accepted
 }
 
@@ -1438,11 +1478,12 @@ fn stop_agent(state: Arc<Mutex<RuntimeState>>, agent_id: AgentId) -> ServerRespo
         let mut state = state
             .lock()
             .expect("runtime state lock should not be poisoned");
-        let child = state.children.remove(&agent_id);
+        let child = state.children.remove(&agent_id).map(|active| active.child);
         let Some(record) = state.agents.get_mut(&agent_id) else {
             return protocol_error("agent_not_found", "agent session was not found");
         };
         record.run.state = AgentState::Interrupted;
+        record.run.can_stop = false;
         record.run.last_visible_action = Some("Stopped by user".to_owned());
         record.run.updated_at = Utc::now();
         record.run.finished_at = Some(record.run.updated_at);
@@ -1514,7 +1555,12 @@ fn rename_agent(
     ServerResponse::Accepted
 }
 
-fn attach_codex_io(state: Arc<Mutex<RuntimeState>>, agent_id: AgentId, child: Arc<Mutex<Child>>) {
+fn attach_codex_io(
+    state: Arc<Mutex<RuntimeState>>,
+    agent_id: AgentId,
+    run_id: uuid::Uuid,
+    child: Arc<Mutex<Child>>,
+) {
     let stdout = child
         .lock()
         .expect("child lock should not be poisoned")
@@ -1526,12 +1572,13 @@ fn attach_codex_io(state: Arc<Mutex<RuntimeState>>, agent_id: AgentId, child: Ar
             let reader = BufReader::new(stdout);
             for line in reader.lines() {
                 match line {
-                    Ok(line) => handle_codex_stdout_line(&state, agent_id, &line),
+                    Ok(line) => handle_codex_stdout_line(&state, agent_id, Some(run_id), &line),
                     Err(error) => {
                         record_terminal_failure(
                             &state,
                             agent_id,
                             format!("Failed to read Codex output: {error}"),
+                            Some(run_id),
                         );
                         break;
                     }
@@ -1564,6 +1611,7 @@ fn attach_codex_io(state: Arc<Mutex<RuntimeState>>, agent_id: AgentId, child: Ar
                             &state,
                             agent_id,
                             format!("Failed to read Codex diagnostics: {error}"),
+                            Some(run_id),
                         );
                         break;
                     }
@@ -1592,11 +1640,16 @@ fn attach_codex_io(state: Arc<Mutex<RuntimeState>>, agent_id: AgentId, child: Ar
         if let Some(reader) = stderr_thread {
             let _ = reader.join();
         }
-        finish_agent(&state, agent_id, code);
+        finish_agent(&state, agent_id, Some(run_id), code);
     });
 }
 
-fn handle_codex_stdout_line(state: &Arc<Mutex<RuntimeState>>, agent_id: AgentId, line: &str) {
+fn handle_codex_stdout_line(
+    state: &Arc<Mutex<RuntimeState>>,
+    agent_id: AgentId,
+    run_id: Option<uuid::Uuid>,
+    line: &str,
+) {
     let Ok(value) = serde_json::from_str::<Value>(line) else {
         let text = line.trim();
         if looks_like_diagnostic(text) {
@@ -1609,7 +1662,7 @@ fn handle_codex_stdout_line(state: &Arc<Mutex<RuntimeState>>, agent_id: AgentId,
     };
 
     match event_type {
-        "turn.started" => start_agent_turn(state, agent_id),
+        "turn.started" => start_agent_turn(state, agent_id, run_id),
         "thread.started" => {
             if let Some(thread_id) = value.get("thread_id").and_then(Value::as_str) {
                 let codex_title =
@@ -1617,6 +1670,9 @@ fn handle_codex_stdout_line(state: &Arc<Mutex<RuntimeState>>, agent_id: AgentId,
                 let mut state = state
                     .lock()
                     .expect("runtime state lock should not be poisoned");
+                if run_id.is_some_and(|run_id| !is_current_run(&state, agent_id, run_id)) {
+                    return;
+                }
                 let Some(record) = state.agents.get_mut(&agent_id) else {
                     return;
                 };
@@ -1636,6 +1692,9 @@ fn handle_codex_stdout_line(state: &Arc<Mutex<RuntimeState>>, agent_id: AgentId,
                 let mut state = state
                     .lock()
                     .expect("runtime state lock should not be poisoned");
+                if run_id.is_some_and(|run_id| !is_current_run(&state, agent_id, run_id)) {
+                    return;
+                }
                 let Some(record) = state.agents.get_mut(&agent_id) else {
                     return;
                 };
@@ -1657,7 +1716,7 @@ fn handle_codex_stdout_line(state: &Arc<Mutex<RuntimeState>>, agent_id: AgentId,
                     _ => "Processing",
                 })
                 .unwrap_or("Processing");
-            update_agent_action(state, agent_id, action);
+            update_agent_action(state, agent_id, action, run_id);
         }
         "item.completed" => {
             let Some(item) = value.get("item") else {
@@ -1671,6 +1730,7 @@ fn handle_codex_stdout_line(state: &Arc<Mutex<RuntimeState>>, agent_id: AgentId,
                             agent_id,
                             AgentChatRole::Assistant,
                             text.trim().to_owned(),
+                            run_id,
                         );
                     }
                 }
@@ -1681,12 +1741,13 @@ fn handle_codex_stdout_line(state: &Arc<Mutex<RuntimeState>>, agent_id: AgentId,
                             agent_id,
                             AgentChatRole::Tool,
                             command.trim().to_owned(),
+                            run_id,
                         );
                     }
                 }
                 Some("error") => {
                     if let Some(message) = extract_diagnostic_message(&value) {
-                        record_terminal_failure(state, agent_id, message);
+                        record_terminal_failure(state, agent_id, message, run_id);
                     }
                 }
                 _ => {}
@@ -1706,6 +1767,9 @@ fn handle_codex_stdout_line(state: &Arc<Mutex<RuntimeState>>, agent_id: AgentId,
             let mut state = state
                 .lock()
                 .expect("runtime state lock should not be poisoned");
+            if run_id.is_some_and(|run_id| !is_current_run(&state, agent_id, run_id)) {
+                return;
+            }
             let Some(record) = state.agents.get_mut(&agent_id) else {
                 return;
             };
@@ -1724,14 +1788,14 @@ fn handle_codex_stdout_line(state: &Arc<Mutex<RuntimeState>>, agent_id: AgentId,
             let message = extract_diagnostic_message(&value)
                 .unwrap_or_else(|| format!("Codex reported {event_type}"));
             if is_transient_reconnect(&message) {
-                append_message(state, agent_id, AgentChatRole::System, message);
+                append_message(state, agent_id, AgentChatRole::System, message, run_id);
             } else {
-                record_terminal_failure(state, agent_id, message);
+                record_terminal_failure(state, agent_id, message, run_id);
             }
         }
         _ => {
             if let Some(message) = extract_explicit_error(&value) {
-                record_terminal_failure(state, agent_id, message);
+                record_terminal_failure(state, agent_id, message, run_id);
             }
         }
     }
@@ -1845,7 +1909,19 @@ fn extract_explicit_error(value: &Value) -> Option<String> {
     }
 }
 
-fn record_terminal_failure(state: &Arc<Mutex<RuntimeState>>, agent_id: AgentId, message: String) {
+fn is_current_run(state: &RuntimeState, agent_id: AgentId, run_id: uuid::Uuid) -> bool {
+    state
+        .children
+        .get(&agent_id)
+        .is_some_and(|active| active.run_id == run_id)
+}
+
+fn record_terminal_failure(
+    state: &Arc<Mutex<RuntimeState>>,
+    agent_id: AgentId,
+    message: String,
+    run_id: Option<uuid::Uuid>,
+) {
     let message = message.trim().to_owned();
     if message.is_empty() {
         return;
@@ -1854,13 +1930,22 @@ fn record_terminal_failure(state: &Arc<Mutex<RuntimeState>>, agent_id: AgentId, 
         let mut state = state
             .lock()
             .expect("runtime state lock should not be poisoned");
+        if run_id.is_some_and(|run_id| !is_current_run(&state, agent_id, run_id)) {
+            return;
+        }
         let Some(record) = state.agents.get_mut(&agent_id) else {
             return;
         };
         record.terminal_failure = Some(message.clone());
         record.run.state = AgentState::Failed;
     }
-    append_message(state, agent_id, AgentChatRole::System, message.clone());
+    append_message(
+        state,
+        agent_id,
+        AgentChatRole::System,
+        message.clone(),
+        run_id,
+    );
     if is_workspace_permission_denial(&message) {
         raise_workspace_permission_attention(state, agent_id, message);
     }
@@ -1921,10 +2006,18 @@ fn raise_workspace_permission_attention(
     state.broadcast(ServerEvent::AttentionRaised(attention));
 }
 
-fn update_agent_action(state: &Arc<Mutex<RuntimeState>>, agent_id: AgentId, action: &str) {
+fn update_agent_action(
+    state: &Arc<Mutex<RuntimeState>>,
+    agent_id: AgentId,
+    action: &str,
+    run_id: Option<uuid::Uuid>,
+) {
     let mut state = state
         .lock()
         .expect("runtime state lock should not be poisoned");
+    if run_id.is_some_and(|run_id| !is_current_run(&state, agent_id, run_id)) {
+        return;
+    }
     let Some(record) = state.agents.get_mut(&agent_id) else {
         return;
     };
@@ -1935,10 +2028,17 @@ fn update_agent_action(state: &Arc<Mutex<RuntimeState>>, agent_id: AgentId, acti
     state.broadcast(ServerEvent::AgentChanged(run));
 }
 
-fn start_agent_turn(state: &Arc<Mutex<RuntimeState>>, agent_id: AgentId) {
+fn start_agent_turn(
+    state: &Arc<Mutex<RuntimeState>>,
+    agent_id: AgentId,
+    run_id: Option<uuid::Uuid>,
+) {
     let mut state = state
         .lock()
         .expect("runtime state lock should not be poisoned");
+    if run_id.is_some_and(|run_id| !is_current_run(&state, agent_id, run_id)) {
+        return;
+    }
     let Some(record) = state.agents.get_mut(&agent_id) else {
         return;
     };
@@ -1974,6 +2074,7 @@ fn append_message(
     agent_id: AgentId,
     role: AgentChatRole,
     text: String,
+    run_id: Option<uuid::Uuid>,
 ) {
     if text.trim().is_empty() {
         return;
@@ -1989,6 +2090,9 @@ fn append_message(
     let mut state = state
         .lock()
         .expect("runtime state lock should not be poisoned");
+    if run_id.is_some_and(|run_id| !is_current_run(&state, agent_id, run_id)) {
+        return;
+    }
     let Some(record) = state.agents.get_mut(&agent_id) else {
         return;
     };
@@ -1999,10 +2103,20 @@ fn append_message(
     state.broadcast(ServerEvent::AgentMessageAppended(message));
 }
 
-fn finish_agent(state: &Arc<Mutex<RuntimeState>>, agent_id: AgentId, code: Option<i32>) {
+fn finish_agent(
+    state: &Arc<Mutex<RuntimeState>>,
+    agent_id: AgentId,
+    run_id: Option<uuid::Uuid>,
+    code: Option<i32>,
+) {
     let mut state = state
         .lock()
         .expect("runtime state lock should not be poisoned");
+    if let Some(run_id) = run_id {
+        if !is_current_run(&state, agent_id, run_id) {
+            return;
+        }
+    }
     state.children.remove(&agent_id);
     let (run, attention) = {
         let has_blocked_attention = state.attention.iter().any(|attention| {
@@ -2024,6 +2138,7 @@ fn finish_agent(state: &Arc<Mutex<RuntimeState>>, agent_id: AgentId, code: Optio
             return;
         };
         let interrupted = matches!(record.run.state, AgentState::Interrupted);
+        record.run.can_stop = false;
         if !interrupted {
             record.run.state = if record.terminal_failure.is_some() {
                 AgentState::Failed
@@ -2736,6 +2851,7 @@ mod tests {
                     id: agent_id,
                     provider: AgentProvider::Codex,
                     state: AgentState::Working,
+                    can_stop: false,
                     launch_mode: CodexLaunchMode::Exec,
                     execution_profile: AgentExecutionProfile::default(),
                     project_id: project.id,
@@ -2767,9 +2883,17 @@ mod tests {
                 .spawn()
                 .expect("fixture child should start"),
         ));
-        runtime.children.insert(agent_id, Arc::clone(&child));
+        let run_id = uuid::Uuid::new_v4();
+        runtime.agents.get_mut(&agent_id).unwrap().run.can_stop = true;
+        runtime.children.insert(
+            agent_id,
+            ActiveAgentChild {
+                run_id,
+                child: Arc::clone(&child),
+            },
+        );
         let state = Arc::new(Mutex::new(runtime));
-        attach_codex_io(Arc::clone(&state), agent_id, child);
+        attach_codex_io(Arc::clone(&state), agent_id, run_id, child);
 
         let started = std::time::Instant::now();
         let response = stop_agent(Arc::clone(&state), agent_id);
@@ -2802,6 +2926,7 @@ mod tests {
                     id: agent_id,
                     provider: AgentProvider::Codex,
                     state: AgentState::Working,
+                    can_stop: false,
                     launch_mode: CodexLaunchMode::Exec,
                     execution_profile: AgentExecutionProfile::default(),
                     project_id: project.id,
@@ -2834,7 +2959,7 @@ mod tests {
         );
         let state = Arc::new(Mutex::new(runtime));
 
-        finish_agent(&state, agent_id, Some(1));
+        finish_agent(&state, agent_id, None, Some(1));
 
         let response = prompt_agent(
             Arc::clone(&state),
@@ -2883,6 +3008,7 @@ mod tests {
                     id: agent_id,
                     provider: AgentProvider::Codex,
                     state: AgentState::Working,
+                    can_stop: false,
                     launch_mode: CodexLaunchMode::Exec,
                     execution_profile: AgentExecutionProfile::default(),
                     project_id: project.id,
@@ -2910,7 +3036,7 @@ mod tests {
         );
         let state = Arc::new(Mutex::new(runtime));
 
-        finish_agent(&state, agent_id, Some(0));
+        finish_agent(&state, agent_id, None, Some(0));
 
         let state = state.lock().expect("fixture state should lock");
         assert_eq!(state.agents[&agent_id].run.state, AgentState::Completed);
@@ -2943,6 +3069,7 @@ mod tests {
                     id: agent_id,
                     provider: AgentProvider::Codex,
                     state: AgentState::Working,
+                    can_stop: false,
                     launch_mode: CodexLaunchMode::Exec,
                     execution_profile: AgentExecutionProfile::default(),
                     project_id: project.id,
@@ -2973,15 +3100,17 @@ mod tests {
         handle_codex_stdout_line(
             &state,
             agent_id,
+            None,
             r#"{"type":"item.completed","item":{"type":"command_execution","command":"patch source containing writing is blocked by a read-only sandbox and block"}}"#,
         );
         handle_codex_stdout_line(
             &state,
             agent_id,
+            None,
             r#"{"type":"item.completed","item":{"type":"agent_message","text":"This answer discusses workspace_permission_denial and writing is blocked, but reports no failure."}}"#,
         );
-        handle_codex_stdout_line(&state, agent_id, r#"{"type":"turn.completed"}"#);
-        finish_agent(&state, agent_id, Some(0));
+        handle_codex_stdout_line(&state, agent_id, None, r#"{"type":"turn.completed"}"#);
+        finish_agent(&state, agent_id, None, Some(0));
 
         let state = state.lock().expect("fixture state should lock");
         assert_eq!(state.agents[&agent_id].run.state, AgentState::Completed);
@@ -3016,6 +3145,7 @@ mod tests {
                     id: agent_id,
                     provider: AgentProvider::Codex,
                     state: AgentState::Working,
+                    can_stop: false,
                     launch_mode: CodexLaunchMode::Exec,
                     execution_profile: AgentExecutionProfile::default(),
                     project_id: project.id,
@@ -3046,9 +3176,10 @@ mod tests {
         handle_codex_stdout_line(
             &state,
             agent_id,
+            None,
             r#"{"type":"task_complete","payload":{"error":{"message":"You've hit your usage limit.","code":"usage_limit_exceeded"}}}"#,
         );
-        finish_agent(&state, agent_id, Some(1));
+        finish_agent(&state, agent_id, None, Some(1));
 
         let state = state.lock().expect("fixture state should lock");
         assert_eq!(state.agents[&agent_id].messages.len(), 1);
@@ -3077,6 +3208,7 @@ mod tests {
                     id: agent_id,
                     provider: AgentProvider::Codex,
                     state: AgentState::Failed,
+                    can_stop: false,
                     launch_mode: CodexLaunchMode::Exec,
                     execution_profile: AgentExecutionProfile::default(),
                     project_id: project.id,
