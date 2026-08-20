@@ -128,6 +128,10 @@ pub enum ClientRequest {
     DismissAttention {
         attention_id: Uuid,
     },
+    MarkAttentionRead {
+        attention_ids: Vec<Uuid>,
+    },
+    MarkAllAttentionRead,
     ApprovePermission {
         request_id: Uuid,
     },
@@ -244,6 +248,8 @@ pub struct RuntimeStatus {
     #[serde(default)]
     pub attention_count: usize,
     #[serde(default)]
+    pub unread_attention_count: usize,
+    #[serde(default)]
     pub instance_id: Uuid,
     #[serde(default)]
     pub codex_home: Option<String>,
@@ -301,6 +307,8 @@ pub struct RuntimeAttention {
     pub title: String,
     pub body: String,
     pub created_at: DateTime<Utc>,
+    #[serde(default)]
+    pub read_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -321,6 +329,9 @@ pub enum ServerEvent {
     AttentionRaised(RuntimeAttention),
     AttentionDismissed {
         attention_id: Uuid,
+    },
+    AttentionRead {
+        attention_ids: Vec<Uuid>,
     },
     PermissionRequested(PermissionRequest),
     Bell {

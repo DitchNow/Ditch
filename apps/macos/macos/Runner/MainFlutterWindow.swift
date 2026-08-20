@@ -56,10 +56,12 @@ class NativeComposerTextViewFactory: NSObject, FlutterPlatformViewFactory {
 
 class NativeComposerTextView: NSView, NSTextViewDelegate {
   private let channel: FlutterMethodChannel
+  private let platformViewsChannel: FlutterMethodChannel
   private let scrollView = NSScrollView()
   private let textView = ComposerTextView()
   private let placeholderLabel = NSTextField(labelWithString: "")
   private var isApplyingFlutterText = false
+  private var lastReportedContentHeight: CGFloat = 0
 
   init(
     frame: NSRect,
@@ -69,6 +71,9 @@ class NativeComposerTextView: NSView, NSTextViewDelegate {
   ) {
     channel = FlutterMethodChannel(
       name: "the_ditch/composer_text_view/\(viewId)",
+      binaryMessenger: messenger)
+    platformViewsChannel = FlutterMethodChannel(
+      name: "flutter/platform_views",
       binaryMessenger: messenger)
     super.init(frame: frame)
 
@@ -84,6 +89,7 @@ class NativeComposerTextView: NSView, NSTextViewDelegate {
 
     scrollView.translatesAutoresizingMaskIntoConstraints = false
     scrollView.hasVerticalScroller = true
+    scrollView.autohidesScrollers = true
     scrollView.drawsBackground = false
     scrollView.borderType = .noBorder
 
@@ -100,9 +106,12 @@ class NativeComposerTextView: NSView, NSTextViewDelegate {
     textView.textContainerInset = textContainerInset
     textView.textColor = Self.color(arguments?["textColor"], fallback: NSColor.labelColor)
     textView.insertionPointColor = Self.color(arguments?["caretColor"], fallback: NSColor.labelColor)
+    ComposerTextView.configureAsPlainText(textView)
     textView.allowsUndo = true
     textView.isAutomaticQuoteSubstitutionEnabled = false
     textView.isAutomaticDashSubstitutionEnabled = false
+    textView.isAutomaticLinkDetectionEnabled = false
+    textView.isAutomaticDataDetectionEnabled = false
     textView.string = initialText
     textView.isEditable = enabled
     textView.isSelectable = true
@@ -113,6 +122,19 @@ class NativeComposerTextView: NSView, NSTextViewDelegate {
     }
     textView.onSubmit = { [weak self] in
       self?.channel.invokeMethod("submitRequested", arguments: nil)
+    }
+    textView.onFocusClaimed = { [weak self] in
+      guard let self else { return }
+      // AppKit owns the real first responder, while Flutter separately tracks
+      // logical focus. Notify Flutter through its platform-view protocol so the
+      // AppKitView focus node can evict stale focus from widgets such as xterm.
+      self.platformViewsChannel.invokeMethod(
+        "viewFocused",
+        arguments: NSNumber(value: viewId))
+      self.channel.invokeMethod("focusChanged", arguments: true)
+    }
+    textView.onFocusLost = { [weak self] in
+      self?.channel.invokeMethod("focusChanged", arguments: false)
     }
     if escapeEnabled {
       textView.onEscape = { [weak self] in
@@ -151,6 +173,14 @@ class NativeComposerTextView: NSView, NSTextViewDelegate {
         constant: textContainerInset.height),
     ])
 
+    applyPlainTextAppearance(
+      font: textView.font ?? NSFont.systemFont(ofSize: fontSize),
+      color: textView.textColor ?? NSColor.labelColor)
+
+    DispatchQueue.main.async { [weak self] in
+      self?.reportContentHeight(force: true)
+    }
+
     channel.setMethodCallHandler { [weak self] call, result in
       guard let self else {
         result(nil)
@@ -165,6 +195,8 @@ class NativeComposerTextView: NSView, NSTextViewDelegate {
           self.textView.string = text
           self.isApplyingFlutterText = false
           self.placeholderLabel.isHidden = !text.isEmpty
+          self.applyPlainTextAppearance()
+          self.reportContentHeight()
         }
         result(nil)
       case "getText":
@@ -175,6 +207,8 @@ class NativeComposerTextView: NSView, NSTextViewDelegate {
           self.textView.string = ""
           self.isApplyingFlutterText = false
           self.placeholderLabel.isHidden = false
+          self.applyPlainTextAppearance()
+          self.reportContentHeight()
         }
         result(nil)
       case "setEnabled":
@@ -192,15 +226,23 @@ class NativeComposerTextView: NSView, NSTextViewDelegate {
         self.textView.font = NSFont(name: fontName, size: fontSize)
           ?? NSFont.systemFont(ofSize: fontSize)
         self.placeholderLabel.font = self.textView.font
+        self.applyPlainTextAppearance()
+        self.reportContentHeight()
         result(nil)
       case "focus":
-        self.window?.makeFirstResponder(self.textView)
-        result(nil)
+        let wasFirstResponder = self.window?.firstResponder === self.textView
+        let accepted = self.window?.makeFirstResponder(self.textView) ?? false
+        if accepted && wasFirstResponder {
+          self.textView.reassertFocusClaim()
+        }
+        result(accepted)
       case "blur":
         if self.window?.firstResponder == self.textView {
           self.window?.makeFirstResponder(nil)
         }
         result(nil)
+      case "hasFocus":
+        result(self.window?.firstResponder == self.textView)
       default:
         result(FlutterMethodNotImplemented)
       }
@@ -221,19 +263,101 @@ class NativeComposerTextView: NSView, NSTextViewDelegate {
       alpha: CGFloat((argb >> 24) & 0xff) / 255)
   }
 
+  override func layout() {
+    super.layout()
+    reportContentHeight()
+  }
+
+  private func applyPlainTextAppearance(font: NSFont? = nil, color: NSColor? = nil) {
+    let resolvedFont = font ?? textView.font ?? NSFont.systemFont(ofSize: NSFont.systemFontSize)
+    let resolvedColor = color ?? textView.textColor ?? NSColor.labelColor
+    textView.font = resolvedFont
+    textView.textColor = resolvedColor
+    textView.typingAttributes = [
+      .font: resolvedFont,
+      .foregroundColor: resolvedColor,
+    ]
+    guard let storage = textView.textStorage, storage.length > 0 else { return }
+    storage.setAttributes(
+      [.font: resolvedFont, .foregroundColor: resolvedColor],
+      range: NSRange(location: 0, length: storage.length))
+  }
+
+  private func reportContentHeight(force: Bool = false) {
+    guard let layoutManager = textView.layoutManager,
+      let textContainer = textView.textContainer
+    else { return }
+    layoutManager.ensureLayout(for: textContainer)
+    let usedHeight = layoutManager.usedRect(for: textContainer).height
+    let height = ceil(max(textView.font?.boundingRectForFont.height ?? 0, usedHeight)
+      + (textView.textContainerInset.height * 2))
+    guard force || abs(height - lastReportedContentHeight) >= 1 else { return }
+    lastReportedContentHeight = height
+    channel.invokeMethod("contentHeightChanged", arguments: Double(height))
+  }
+
   func textDidChange(_ notification: Notification) {
     placeholderLabel.isHidden = !textView.string.isEmpty
+    reportContentHeight()
     if isApplyingFlutterText {
       return
     }
     channel.invokeMethod("textChanged", arguments: textView.string)
   }
+
 }
 
 final class ComposerTextView: NSTextView {
   var onEnlarge: (() -> Void)?
   var onEscape: (() -> Void)?
+  var onFocusClaimed: (() -> Void)?
+  var onFocusLost: (() -> Void)?
   var onSubmit: (() -> Void)?
+
+  static func configureAsPlainText(_ textView: NSTextView) {
+    textView.isRichText = false
+    textView.importsGraphics = false
+  }
+
+  static func plainText(from pasteboard: NSPasteboard) -> String? {
+    pasteboard.string(forType: .string)
+  }
+
+  override func becomeFirstResponder() -> Bool {
+    let accepted = super.becomeFirstResponder()
+    if accepted {
+      onFocusClaimed?()
+    }
+    return accepted
+  }
+
+  override func resignFirstResponder() -> Bool {
+    let accepted = super.resignFirstResponder()
+    if accepted {
+      onFocusLost?()
+    }
+    return accepted
+  }
+
+  func reassertFocusClaim() {
+    if window?.firstResponder === self {
+      onFocusClaimed?()
+    }
+  }
+
+  override func mouseDown(with event: NSEvent) {
+    let wasFirstResponder = window?.firstResponder === self
+    let accepted = window?.makeFirstResponder(self) ?? false
+    if accepted && wasFirstResponder {
+      reassertFocusClaim()
+    }
+    super.mouseDown(with: event)
+  }
+
+  override func paste(_ sender: Any?) {
+    guard let plainText = Self.plainText(from: .general) else { return }
+    insertText(plainText, replacementRange: selectedRange())
+  }
 
   override func keyDown(with event: NSEvent) {
     guard event.keyCode == 123 || event.keyCode == 124 else {
@@ -265,6 +389,10 @@ final class ComposerTextView: NSTextView {
 
   override func doCommand(by selector: Selector) {
     if selector == #selector(insertNewline(_:)) {
+      if hasMarkedText() {
+        super.doCommand(by: selector)
+        return
+      }
       let modifiers = NSApp.currentEvent?.modifierFlags.intersection(.deviceIndependentFlagsMask)
       if modifiers?.contains(.shift) == true {
         super.doCommand(by: selector)
@@ -277,7 +405,8 @@ final class ComposerTextView: NSTextView {
   }
 
   override func performKeyEquivalent(with event: NSEvent) -> Bool {
-    let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+    let rawModifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+    let modifiers = rawModifiers.subtracting([.capsLock, .numericPad, .function])
     if modifiers == [.command, .shift],
       event.charactersIgnoringModifiers?.lowercased() == "f"
     {
@@ -287,6 +416,35 @@ final class ComposerTextView: NSTextView {
     if event.keyCode == 53, let onEscape {
       onEscape()
       return true
+    }
+    guard window?.firstResponder == self,
+      modifiers.contains(.command),
+      let character = event.charactersIgnoringModifiers?.lowercased()
+    else {
+      return super.performKeyEquivalent(with: event)
+    }
+    switch character {
+    case "v":
+      paste(nil)
+      return true
+    case "c":
+      copy(nil)
+      return true
+    case "x":
+      cut(nil)
+      return true
+    case "a":
+      selectAll(nil)
+      return true
+    case "z":
+      if modifiers.contains(.shift) {
+        undoManager?.redo()
+      } else {
+        undoManager?.undo()
+      }
+      return true
+    default:
+      break
     }
     return super.performKeyEquivalent(with: event)
   }

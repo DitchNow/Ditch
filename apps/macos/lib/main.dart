@@ -441,6 +441,7 @@ class AttentionEvent {
     this.projectId,
     this.projectName,
     this.agentName,
+    this.isRead = false,
   });
 
   final String id;
@@ -453,11 +454,69 @@ class AttentionEvent {
   final String? projectId;
   final String? projectName;
   final String? agentName;
+  final bool isRead;
 
   bool get canOpenSession => sessionLocalId != null;
 }
 
 enum AgentStatus { idle, starting, working, completed, failed, stopped }
+
+class ProjectAgentSummary {
+  const ProjectAgentSummary({
+    required this.runningCount,
+    required this.stoppedCount,
+    required this.hasUnreadResult,
+  });
+
+  final int runningCount;
+  final int stoppedCount;
+  final bool hasUnreadResult;
+}
+
+ProjectAgentSummary summarizeProjectAgents({
+  required Iterable<AgentSession> sessions,
+  required Iterable<AttentionEvent> attention,
+  required String? projectId,
+  Set<String> readAttentionIds = const {},
+}) {
+  final projectSessions = sessions.where(
+    (session) => session.projectId == projectId,
+  );
+  return ProjectAgentSummary(
+    runningCount: projectSessions.where((session) => session.isActive).length,
+    stoppedCount: projectSessions.where((session) {
+      return session.status == AgentStatus.completed ||
+          session.status == AgentStatus.failed ||
+          session.status == AgentStatus.stopped;
+    }).length,
+    hasUnreadResult: attention.any(
+      (event) =>
+          event.projectId == projectId &&
+          !event.isRead &&
+          !readAttentionIds.contains(event.id) &&
+          (event.kind == AttentionKind.completed ||
+              event.kind == AttentionKind.failed),
+    ),
+  );
+}
+
+Set<String> unreadResultAttentionIdsForAgent({
+  required Iterable<AttentionEvent> attention,
+  required String agentId,
+  Set<String> readAttentionIds = const {},
+}) {
+  return attention
+      .where(
+        (event) =>
+            event.sessionLocalId == agentId &&
+            !event.isRead &&
+            !readAttentionIds.contains(event.id) &&
+            (event.kind == AttentionKind.completed ||
+                event.kind == AttentionKind.failed),
+      )
+      .map((event) => event.id)
+      .toSet();
+}
 
 enum ChatMessageRole { user, assistant, system, tool }
 
@@ -772,6 +831,7 @@ List<AgentSession> sessionsForProject(
 
 void _ignoreAgentSession(AgentSession _) {}
 void _ignoreCallback() {}
+bool _neverUnreadAgentResult(AgentSession _) => false;
 
 List<AttentionEvent> attentionForProject(
   Iterable<AttentionEvent> events,
@@ -1008,6 +1068,16 @@ class DitchRuntimeClient {
       'DismissAttention': {'attention_id': attentionId},
     });
   }
+
+  Future<Map<String, dynamic>> markAllAttentionRead() {
+    return request('MarkAllAttentionRead');
+  }
+
+  Future<Map<String, dynamic>> markAttentionRead(List<String> attentionIds) {
+    return request({
+      'MarkAttentionRead': {'attention_ids': attentionIds},
+    });
+  }
 }
 
 DitchProject? parseRuntimeProject(Object? value) {
@@ -1059,8 +1129,8 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
   final _idleChatViewport = ConversationViewportController();
   final _chatViewports = <String, ConversationViewportController>{};
   final _agentListController = ScrollController();
-  final _composerKey = GlobalKey<AgentComposerState>();
-  final _agentHeaderKeys = <String, GlobalKey>{};
+  final _idleComposerKey = GlobalKey<AgentComposerState>();
+  final _composerKeys = <String, GlobalKey<AgentComposerState>>{};
   final _runtimeClient = DitchRuntimeClient();
   final _presentation = CommandCenterController();
   int _nextAgentSessionId = 1;
@@ -1127,10 +1197,20 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
   int get _unreadNotificationCount =>
       _attention.where((event) => !_readAttentionIds.contains(event.id)).length;
 
-  GlobalKey _agentHeaderKey(String agentId) => _agentHeaderKeys.putIfAbsent(
-    agentId,
-    () => GlobalKey(debugLabel: 'agent-header-$agentId'),
-  );
+  Key _agentHeaderKey(String agentId) => ValueKey('agent-header-$agentId');
+
+  GlobalKey<AgentComposerState> _composerKeyForAgent(String agentId) =>
+      _composerKeys.putIfAbsent(
+        agentId,
+        () => GlobalKey<AgentComposerState>(
+          debugLabel: 'agent-composer-$agentId',
+        ),
+      );
+
+  GlobalKey<AgentComposerState> get _activeComposerKey {
+    final agentId = _focusedAgentLocalId ?? _expandedAgentLocalId;
+    return agentId == null ? _idleComposerKey : _composerKeyForAgent(agentId);
+  }
 
   Future<void> _selectProject(int index) async {
     final currentProjectId = _selectedProjectOrNull?.id;
@@ -1554,7 +1634,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
         .map(_chatViewports.remove)
         .whereType<ConversationViewportController>()
         .toList();
-    final removedHeaderKeyIds = _agentHeaderKeys.keys
+    final removedComposerKeyIds = _composerKeys.keys
         .where((agentId) => !sessionsById.containsKey(agentId))
         .toList();
     final attentionJson = snapshot['attention'];
@@ -1596,13 +1676,17 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
       _agentSessions
         ..clear()
         ..addAll(sessions);
-      for (final agentId in removedHeaderKeyIds) {
-        _agentHeaderKeys.remove(agentId);
+      for (final agentId in removedComposerKeyIds) {
+        _composerKeys.remove(agentId);
       }
       _attention
         ..clear()
         ..addAll(attention);
-      _readAttentionIds.retainAll(attention.map((event) => event.id).toSet());
+      _readAttentionIds
+        ..clear()
+        ..addAll(
+          attention.where((event) => event.isRead).map((event) => event.id),
+        );
       final visibleSessions = _visibleSessions;
       if (visibleSessions.isNotEmpty) {
         _expandedAgentLocalId =
@@ -1746,18 +1830,6 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
     if (attentionId != null) {
       unawaited(_runtimeClient.dismissAttention(attentionId));
     }
-    WidgetsBinding.instance.addPostFrameCallback((_) async {
-      if (!mounted) return;
-      final headerContext = _agentHeaderKey(session.localId).currentContext;
-      if (headerContext != null) {
-        await Scrollable.ensureVisible(
-          headerContext,
-          alignment: 0,
-          duration: const Duration(milliseconds: 180),
-          curve: Curves.easeOut,
-        );
-      }
-    });
   }
 
   Future<void> _addProject() async {
@@ -1907,7 +1979,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
       _agentSessions.removeWhere((session) => session.projectId == projectId);
       _attention.removeWhere((event) => event.projectId == projectId);
       for (final id in removedSessionIds) {
-        _agentHeaderKeys.remove(id);
+        _composerKeys.remove(id);
       }
       if (removedSessionIds.contains(_expandedAgentLocalId)) {
         _expandedAgentLocalId = null;
@@ -2000,7 +2072,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
 
   Future<void> _startCodex() async {
     FocusManager.instance.primaryFocus?.unfocus();
-    await _composerKey.currentState?.blur();
+    await _activeComposerKey.currentState?.blur();
     if (!mounted) {
       return;
     }
@@ -2340,13 +2412,13 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
       if (project != null) _selectedProjectKey = _projectKey(project);
       _expandedAgentLocalId = sessionLocalId;
       _focusedAgentLocalId = null;
-      _readAttentionIds.add(event.id);
     });
     _chatViewports
         .putIfAbsent(sessionLocalId, ConversationViewportController.new)
         .beginOpening(onInitialPositioned: _focusComposerAfterLayout);
     final session = _agentSessionByLocalId(sessionLocalId);
     if (session != null) unawaited(_loadAgentMessages(session));
+    _markAttentionIdsRead({event.id});
     _scheduleStatusBarUpdate();
   }
 
@@ -2360,8 +2432,57 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
   }
 
   void _markNotificationsRead() {
-    setState(
-      () => _readAttentionIds.addAll(_attention.map((event) => event.id)),
+    final newlyRead = _attention
+        .where((event) => !_readAttentionIds.contains(event.id))
+        .map((event) => event.id)
+        .toSet();
+    if (newlyRead.isEmpty) return;
+    setState(() => _readAttentionIds.addAll(newlyRead));
+    unawaited(
+      _runtimeClient.markAllAttentionRead().catchError((Object error) {
+        if (!mounted) return <String, dynamic>{};
+        setState(() => _readAttentionIds.removeAll(newlyRead));
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Could not mark notifications read: $error')),
+        );
+        return <String, dynamic>{};
+      }),
+    );
+  }
+
+  void _markAttentionIdsRead(Set<String> attentionIds) {
+    final newlyRead = attentionIds
+        .where(
+          (id) =>
+              _attention.any((event) => event.id == id && !event.isRead) &&
+              !_readAttentionIds.contains(id),
+        )
+        .toSet();
+    if (newlyRead.isEmpty) return;
+    setState(() => _readAttentionIds.addAll(newlyRead));
+    final persistedIds = newlyRead
+        .where((id) => !id.startsWith('attention-'))
+        .toList();
+    if (persistedIds.isEmpty) return;
+    unawaited(
+      _runtimeClient.markAttentionRead(persistedIds).catchError((Object error) {
+        if (!mounted) return <String, dynamic>{};
+        setState(() => _readAttentionIds.removeAll(persistedIds));
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Could not mark agent result read: $error')),
+        );
+        return <String, dynamic>{};
+      }),
+    );
+  }
+
+  void _markAgentResultsRead(AgentSession session) {
+    _markAttentionIdsRead(
+      unreadResultAttentionIdsForAgent(
+        attention: _attention,
+        agentId: session.localId,
+        readAttentionIds: _readAttentionIds,
+      ),
     );
   }
 
@@ -2493,7 +2614,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
         final removedViewport = _chatViewports.remove(id);
         setState(() {
           _agentSessions.removeWhere((session) => session.localId == id);
-          _agentHeaderKeys.remove(id);
+          _composerKeys.remove(id);
           _attention.removeWhere((event) => event.sessionLocalId == id);
           if (_expandedAgentLocalId == id) _expandedAgentLocalId = null;
           if (_focusedAgentLocalId == id) _focusedAgentLocalId = null;
@@ -2538,6 +2659,17 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
       }
       setState(() => _attention.insert(0, attention));
       _scheduleStatusBarUpdate();
+      return;
+    }
+
+    final attentionRead = eventBody['AttentionRead'];
+    if (attentionRead is Map<String, dynamic>) {
+      final values = attentionRead['attention_ids'];
+      if (values is List) {
+        setState(() {
+          _readAttentionIds.addAll(values.map((value) => value.toString()));
+        });
+      }
       return;
     }
 
@@ -2637,6 +2769,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
       projectName: value['project_name']?.toString(),
       agentName: value['agent_name']?.toString(),
       createdAt: _dateTimeFromRuntime(value['created_at']),
+      isRead: value['read_at'] != null,
     );
   }
 
@@ -2809,12 +2942,13 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
 
   void _focusComposerAfterLayout() {
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (mounted) _composerKey.currentState?.focus();
+      if (mounted) _activeComposerKey.currentState?.focus();
     });
   }
 
   void _toggleExpandedAgent(AgentSession session) {
     final collapsing = _expandedAgentLocalId == session.localId;
+    _markAgentResultsRead(session);
     setState(() {
       _expandedAgentLocalId = collapsing ? null : session.localId;
     });
@@ -3104,7 +3238,8 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
                 focusedAgentLocalId: _focusedAgentLocalId,
                 chatViewport: _chatViewport,
                 agentListController: _agentListController,
-                composerKey: _composerKey,
+                composerKey: _idleComposerKey,
+                composerKeyForAgent: _composerKeyForAgent,
                 headerKeyForAgent: _agentHeaderKey,
                 initialPrompt: _defaultStartPrompt,
                 effectiveCodexHome: _effectiveRuntimeCodexHome,
@@ -3115,14 +3250,20 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
                 onStopCodex: _stopCodex,
                 onDeleteAgent: _deleteAgent,
                 onRenameAgent: _renameAgent,
+                hasUnreadResult: (session) => unreadResultAttentionIdsForAgent(
+                  attention: _attention,
+                  agentId: session.localId,
+                  readAttentionIds: _readAttentionIds,
+                ).isNotEmpty,
                 onFocusAgent: (session) {
+                  if (session != null) _markAgentResultsRead(session);
                   setState(() {
                     _focusedAgentLocalId = session?.localId;
                     if (session != null) {
                       _expandedAgentLocalId = session.localId;
                     }
                   });
-                  if (session != null) _focusComposerAfterLayout();
+                  _focusComposerAfterLayout();
                 },
                 onToggleExpanded: _toggleExpandedAgent,
               );
@@ -3341,6 +3482,12 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
                             unawaited(_copyProjectPath(project)),
                         onDeleteProject: (project) =>
                             unawaited(_deleteProject(project)),
+                        summaryForProject: (project) => summarizeProjectAgents(
+                          sessions: _agentSessions,
+                          attention: _attention,
+                          projectId: project.id,
+                          readAttentionIds: _readAttentionIds,
+                        ),
                       ),
                       WorkspaceResizeHandle(
                         key: const Key('projects-resize-handle'),
@@ -3929,6 +4076,7 @@ class ProjectSidebar extends StatelessWidget {
     required this.onRevealProject,
     required this.onCopyProjectPath,
     required this.onDeleteProject,
+    required this.summaryForProject,
     super.key,
   });
 
@@ -3940,6 +4088,7 @@ class ProjectSidebar extends StatelessWidget {
   final ValueChanged<DitchProject> onRevealProject;
   final ValueChanged<DitchProject> onCopyProjectPath;
   final ValueChanged<DitchProject> onDeleteProject;
+  final ProjectAgentSummary Function(DitchProject) summaryForProject;
 
   @override
   Widget build(BuildContext context) {
@@ -3970,6 +4119,7 @@ class ProjectSidebar extends StatelessWidget {
                     separatorBuilder: (_, _) => const SizedBox(height: 8),
                     itemBuilder: (context, index) {
                       final project = projects[index];
+                      final summary = summaryForProject(project);
                       return ProjectTile(
                         name: project.name,
                         path: project.path,
@@ -3978,6 +4128,9 @@ class ProjectSidebar extends StatelessWidget {
                         onReveal: () => onRevealProject(project),
                         onCopyPath: () => onCopyProjectPath(project),
                         onDelete: () => onDeleteProject(project),
+                        runningCount: summary.runningCount,
+                        stoppedCount: summary.stoppedCount,
+                        hasUnreadResult: summary.hasUnreadResult,
                       );
                     },
                   ),
@@ -4006,6 +4159,9 @@ class ProjectTile extends StatelessWidget {
     required this.onReveal,
     required this.onCopyPath,
     required this.onDelete,
+    this.runningCount = 0,
+    this.stoppedCount = 0,
+    this.hasUnreadResult = false,
     super.key,
   });
 
@@ -4016,6 +4172,9 @@ class ProjectTile extends StatelessWidget {
   final VoidCallback onReveal;
   final VoidCallback onCopyPath;
   final VoidCallback onDelete;
+  final int runningCount;
+  final int stoppedCount;
+  final bool hasUnreadResult;
 
   Future<void> _showContextMenu(
     BuildContext context,
@@ -4076,12 +4235,43 @@ class ProjectTile extends StatelessWidget {
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    Text(name, maxLines: 1, overflow: TextOverflow.ellipsis),
+                    Row(
+                      children: [
+                        Expanded(
+                          child: Text(
+                            name,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                        ),
+                        if (hasUnreadResult)
+                          Tooltip(
+                            message: 'New agent result',
+                            child: Container(
+                              key: ValueKey('project-unread-$path'),
+                              width: 8,
+                              height: 8,
+                              decoration: BoxDecoration(
+                                color: context.ditch.accent,
+                                shape: BoxShape.circle,
+                              ),
+                            ),
+                          ),
+                      ],
+                    ),
                     Text(
                       path,
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,
                       style: Theme.of(context).textTheme.bodySmall,
+                    ),
+                    const SizedBox(height: 3),
+                    Text(
+                      '$runningCount running · $stoppedCount stopped',
+                      key: ValueKey('project-counts-$path'),
+                      style: Theme.of(context).textTheme.labelSmall?.copyWith(
+                        color: context.ditch.mutedText,
+                      ),
                     ),
                   ],
                 ),
@@ -4117,6 +4307,7 @@ class AgentsSurface extends StatelessWidget {
     required this.chatViewport,
     required this.agentListController,
     required this.composerKey,
+    this.composerKeyForAgent,
     required this.headerKeyForAgent,
     required this.initialPrompt,
     this.effectiveCodexHome,
@@ -4127,6 +4318,7 @@ class AgentsSurface extends StatelessWidget {
     required this.onStopCodex,
     required this.onDeleteAgent,
     required this.onRenameAgent,
+    this.hasUnreadResult = _neverUnreadAgentResult,
     required this.onFocusAgent,
     required this.onToggleExpanded,
     super.key,
@@ -4138,7 +4330,9 @@ class AgentsSurface extends StatelessWidget {
   final ConversationViewportController chatViewport;
   final ScrollController agentListController;
   final GlobalKey<AgentComposerState> composerKey;
-  final GlobalKey Function(String agentId) headerKeyForAgent;
+  final GlobalKey<AgentComposerState> Function(String agentId)?
+  composerKeyForAgent;
+  final Key Function(String agentId) headerKeyForAgent;
   final String initialPrompt;
   final String? effectiveCodexHome;
   final VoidCallback onStartCodex;
@@ -4148,6 +4342,7 @@ class AgentsSurface extends StatelessWidget {
   final ValueChanged<AgentSession> onStopCodex;
   final ValueChanged<AgentSession> onDeleteAgent;
   final void Function(AgentSession session, String? title) onRenameAgent;
+  final bool Function(AgentSession session) hasUnreadResult;
   final ValueChanged<AgentSession?> onFocusAgent;
   final ValueChanged<AgentSession> onToggleExpanded;
 
@@ -4187,6 +4382,7 @@ class AgentsSurface extends StatelessWidget {
                 chatViewport: chatViewport,
                 agentListController: agentListController,
                 composerKey: composerKey,
+                composerKeyForAgent: composerKeyForAgent,
                 headerKeyForAgent: headerKeyForAgent,
                 initialPrompt: initialPrompt,
                 effectiveCodexHome: effectiveCodexHome,
@@ -4197,6 +4393,7 @@ class AgentsSurface extends StatelessWidget {
                 onStopCodex: onStopCodex,
                 onDeleteAgent: onDeleteAgent,
                 onRenameAgent: onRenameAgent,
+                hasUnreadResult: hasUnreadResult,
                 onFocusAgent: onFocusAgent,
               ),
             ),
@@ -4215,6 +4412,7 @@ class AgentSessionList extends StatelessWidget {
     required this.chatViewport,
     required this.agentListController,
     required this.composerKey,
+    this.composerKeyForAgent,
     required this.headerKeyForAgent,
     required this.initialPrompt,
     this.effectiveCodexHome,
@@ -4225,6 +4423,7 @@ class AgentSessionList extends StatelessWidget {
     required this.onStopCodex,
     required this.onDeleteAgent,
     required this.onRenameAgent,
+    this.hasUnreadResult = _neverUnreadAgentResult,
     required this.onFocusAgent,
     super.key,
   });
@@ -4235,7 +4434,9 @@ class AgentSessionList extends StatelessWidget {
   final ConversationViewportController chatViewport;
   final ScrollController agentListController;
   final GlobalKey<AgentComposerState> composerKey;
-  final GlobalKey Function(String agentId) headerKeyForAgent;
+  final GlobalKey<AgentComposerState> Function(String agentId)?
+  composerKeyForAgent;
+  final Key Function(String agentId) headerKeyForAgent;
   final String initialPrompt;
   final String? effectiveCodexHome;
   final ValueChanged<String> onStartPrompt;
@@ -4245,10 +4446,14 @@ class AgentSessionList extends StatelessWidget {
   final ValueChanged<AgentSession> onStopCodex;
   final ValueChanged<AgentSession> onDeleteAgent;
   final void Function(AgentSession session, String? title) onRenameAgent;
+  final bool Function(AgentSession session) hasUnreadResult;
   final ValueChanged<AgentSession?> onFocusAgent;
 
   @override
   Widget build(BuildContext context) {
+    GlobalKey<AgentComposerState> keyForAgent(AgentSession session) =>
+        composerKeyForAgent?.call(session.localId) ?? composerKey;
+
     if (sessions.isEmpty) {
       return DitchSurface(
         key: const Key('ready-agent-card'),
@@ -4307,10 +4512,11 @@ class AgentSessionList extends StatelessWidget {
               key: ValueKey('focused-${focusedSession.localId}'),
               headerKey: headerKeyForAgent(focusedSession.localId),
               session: focusedSession,
+              hasUnreadResult: hasUnreadResult(focusedSession),
               expanded: true,
               enlarged: true,
               chatViewport: chatViewport,
-              composerKey: composerKey,
+              composerKey: keyForAgent(focusedSession),
               initialPrompt: initialPrompt,
               effectiveCodexHome: effectiveCodexHome,
               onTap: () {},
@@ -4326,24 +4532,22 @@ class AgentSessionList extends StatelessWidget {
         ),
       );
     }
-    AgentSession? expandedSession;
-    var expandedIndex = -1;
-    if (expandedAgentLocalId != null) {
-      expandedIndex = sessions.indexWhere(
-        (session) => session.localId == expandedAgentLocalId,
-      );
-      if (expandedIndex >= 0) expandedSession = sessions[expandedIndex];
-    }
-    if (expandedSession != null) {
-      final session = expandedSession;
+    final expandedIndex = expandedAgentLocalId == null
+        ? -1
+        : sessions.indexWhere(
+            (session) => session.localId == expandedAgentLocalId,
+          );
+    if (expandedIndex >= 0) {
+      final session = sessions[expandedIndex];
       return ExpandableAgentPanel(
-        key: ValueKey('expanded-${session.localId}'),
+        key: ValueKey(session.localId),
         headerKey: headerKeyForAgent(session.localId),
         session: session,
+        hasUnreadResult: hasUnreadResult(session),
         expanded: true,
         enlarged: false,
         chatViewport: chatViewport,
-        composerKey: composerKey,
+        composerKey: keyForAgent(session),
         initialPrompt: initialPrompt,
         effectiveCodexHome: effectiveCodexHome,
         onTap: () => onToggleExpanded(session),
@@ -4356,7 +4560,7 @@ class AgentSessionList extends StatelessWidget {
       );
     }
     return LayoutBuilder(
-      builder: (context, constraints) => Scrollbar(
+      builder: (context, _) => Scrollbar(
         controller: agentListController,
         interactive: true,
         child: ListView.separated(
@@ -4367,15 +4571,15 @@ class AgentSessionList extends StatelessWidget {
           separatorBuilder: (_, _) => const SizedBox(height: 10),
           itemBuilder: (context, index) {
             final session = sessions[index];
-            final expanded = expandedAgentLocalId == session.localId;
-            final panel = ExpandableAgentPanel(
+            return ExpandableAgentPanel(
               key: ValueKey(session.localId),
               headerKey: headerKeyForAgent(session.localId),
               session: session,
-              expanded: expanded,
+              hasUnreadResult: hasUnreadResult(session),
+              expanded: false,
               enlarged: false,
-              chatViewport: expanded ? chatViewport : null,
-              composerKey: expanded ? composerKey : null,
+              chatViewport: null,
+              composerKey: null,
               initialPrompt: initialPrompt,
               effectiveCodexHome: effectiveCodexHome,
               onTap: () => onToggleExpanded(session),
@@ -4386,8 +4590,6 @@ class AgentSessionList extends StatelessWidget {
               onLoadMessages: () => onLoadMessages(session),
               onStopCodex: () => onStopCodex(session),
             );
-            if (!expanded) return panel;
-            return SizedBox(height: constraints.maxHeight, child: panel);
           },
         ),
       ),
@@ -4509,6 +4711,7 @@ class ExpandableAgentPanel extends StatelessWidget {
   const ExpandableAgentPanel({
     required this.headerKey,
     required this.session,
+    this.hasUnreadResult = false,
     required this.expanded,
     required this.enlarged,
     required this.chatViewport,
@@ -4526,7 +4729,8 @@ class ExpandableAgentPanel extends StatelessWidget {
   });
 
   final AgentSession session;
-  final GlobalKey headerKey;
+  final bool hasUnreadResult;
+  final Key headerKey;
   final bool expanded;
   final bool enlarged;
   final ConversationViewportController? chatViewport;
@@ -4559,13 +4763,35 @@ class ExpandableAgentPanel extends StatelessWidget {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  EditableAgentTitle(
-                    title: session.displayName,
-                    hasOverride: session.userTitle?.trim().isNotEmpty ?? false,
-                    onRename: onRename,
+                  Row(
+                    children: [
+                      Flexible(
+                        child: EditableAgentTitle(
+                          title: session.displayName,
+                          hasOverride:
+                              session.userTitle?.trim().isNotEmpty ?? false,
+                          onRename: onRename,
+                        ),
+                      ),
+                      if (hasUnreadResult) ...[
+                        const SizedBox(width: 8),
+                        Tooltip(
+                          message: 'New agent result',
+                          child: Container(
+                            key: ValueKey('agent-unread-${session.localId}'),
+                            width: 8,
+                            height: 8,
+                            decoration: BoxDecoration(
+                              color: context.ditch.accent,
+                              shape: BoxShape.circle,
+                            ),
+                          ),
+                        ),
+                      ],
+                    ],
                   ),
                   const SizedBox(height: 2),
-                  Text(_statusLabel(session.status)),
+                  AgentStatusChip(status: session.status),
                   if (session.lastVisibleAction != null) ...[
                     const SizedBox(height: 2),
                     Text(
@@ -4654,7 +4880,6 @@ class ExpandableAgentPanel extends StatelessWidget {
               const SingleActivator(LogicalKeyboardKey.escape): onEnlarge,
           },
           child: Focus(
-            autofocus: enlarged,
             child: DitchSurface(
               padding: const EdgeInsets.all(12),
               bordered: false,
@@ -4705,16 +4930,57 @@ class ExpandableAgentPanel extends StatelessWidget {
       AgentProvider.codex => Icons.memory,
     };
   }
+}
 
-  String _statusLabel(AgentStatus status) {
-    return switch (status) {
-      AgentStatus.idle => 'No active run yet',
-      AgentStatus.starting => 'Starting',
-      AgentStatus.working => 'Working',
-      AgentStatus.completed => 'Completed',
-      AgentStatus.failed => 'Failed',
-      AgentStatus.stopped => 'Stopped',
+class AgentStatusChip extends StatelessWidget {
+  const AgentStatusChip({required this.status, super.key});
+
+  final AgentStatus status;
+
+  @override
+  Widget build(BuildContext context) {
+    final dark = Theme.of(context).brightness == Brightness.dark;
+    final (label, color) = switch (status) {
+      AgentStatus.starting || AgentStatus.working => (
+        'Running',
+        dark ? Colors.blue.shade300 : Colors.blue.shade700,
+      ),
+      AgentStatus.completed => (
+        'Completed',
+        dark ? Colors.green.shade300 : Colors.green.shade700,
+      ),
+      AgentStatus.failed => (
+        'Failed',
+        dark ? Colors.red.shade300 : Colors.red.shade700,
+      ),
+      AgentStatus.stopped => (
+        'Stopped',
+        dark ? Colors.blueGrey.shade200 : Colors.blueGrey.shade700,
+      ),
+      AgentStatus.idle => (
+        'Ready',
+        dark ? Colors.grey.shade300 : Colors.grey.shade700,
+      ),
     };
+    return Align(
+      alignment: Alignment.centerLeft,
+      child: Container(
+        key: ValueKey('agent-status-${status.name}'),
+        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+        decoration: BoxDecoration(
+          color: color.withValues(alpha: dark ? 0.20 : 0.12),
+          borderRadius: BorderRadius.circular(6),
+          border: Border.all(color: color.withValues(alpha: 0.28)),
+        ),
+        child: Text(
+          label,
+          style: Theme.of(context).textTheme.labelSmall?.copyWith(
+            color: color,
+            fontWeight: FontWeight.w700,
+          ),
+        ),
+      ),
+    );
   }
 }
 
@@ -5200,7 +5466,11 @@ class AgentComposer extends StatefulWidget {
 
 class AgentComposerState extends State<AgentComposer> {
   final _nativeComposerKey = GlobalKey<NativeComposerTextViewState>();
+  static const _minimumEditorHeight = 48.0;
+  static const _maximumEditorHeight = 160.0;
   late String _draftText;
+  double _editorHeight = _minimumEditorHeight;
+  bool _composerHasFocus = false;
 
   @override
   void initState() {
@@ -5250,6 +5520,19 @@ class AgentComposerState extends State<AgentComposer> {
     setState(() => _draftText = text);
   }
 
+  void _handleFocusChanged(bool focused) {
+    if (_composerHasFocus == focused) return;
+    setState(() => _composerHasFocus = focused);
+  }
+
+  void _handleContentHeightChanged(double height) {
+    final nextHeight = height
+        .clamp(_minimumEditorHeight, _maximumEditorHeight)
+        .toDouble();
+    if ((_editorHeight - nextHeight).abs() < 1) return;
+    setState(() => _editorHeight = nextHeight);
+  }
+
   Future<void> _selectApproval(AgentApprovalPreset value) async {
     if (value == AgentApprovalPreset.fullAccess) {
       final confirmed = await showDialog<bool>(
@@ -5291,6 +5574,11 @@ class AgentComposerState extends State<AgentComposer> {
         decoration: BoxDecoration(
           color: context.ditch.surfaceHover,
           borderRadius: BorderRadius.circular(context.ditch.radiusMedium),
+          border: Border.all(
+            color: _composerHasFocus
+                ? context.ditch.accent.withValues(alpha: 0.72)
+                : context.ditch.separator.withValues(alpha: 0.72),
+          ),
         ),
         child: Padding(
           padding: const EdgeInsets.all(10),
@@ -5299,6 +5587,60 @@ class AgentComposerState extends State<AgentComposer> {
             builder: (context, _) => Column(
               mainAxisSize: MainAxisSize.min,
               children: [
+                LayoutBuilder(
+                  builder: (context, constraints) => Row(
+                    crossAxisAlignment: CrossAxisAlignment.end,
+                    children: [
+                      Expanded(
+                        child: AnimatedContainer(
+                          key: const Key('composer-editor-shell'),
+                          duration: MediaQuery.disableAnimationsOf(context)
+                              ? const Duration(milliseconds: 1)
+                              : const Duration(milliseconds: 120),
+                          curve: Curves.easeOut,
+                          height: _editorHeight,
+                          child: NativeComposerTextView(
+                            key: _nativeComposerKey,
+                            initialText: widget.initialText,
+                            enabled: editable,
+                            placeholder: widget.hasSession
+                                ? 'Send a follow-up to Codex'
+                                : 'Tell Codex what to do',
+                            onChanged: _handleChanged,
+                            onFocusChanged: _handleFocusChanged,
+                            onContentHeightChanged: _handleContentHeightChanged,
+                            onSubmitRequested: submit,
+                            onEnlarge: widget.onEnlarge,
+                            onEscape: widget.onEscape,
+                          ),
+                        ),
+                      ),
+                      const SizedBox(width: 6),
+                      if (widget.canStop)
+                        IconButton.filledTonal(
+                          onPressed: widget.onStop,
+                          tooltip: 'Stop Codex',
+                          icon: const Icon(Icons.stop_circle_outlined),
+                        )
+                      else if (constraints.maxWidth < 190)
+                        FilledButton.icon(
+                          onPressed: hasText && canSubmit ? submit : null,
+                          icon: Icon(actionIcon),
+                          label: Text(actionLabel),
+                          style: FilledButton.styleFrom(
+                            padding: const EdgeInsets.symmetric(horizontal: 10),
+                          ),
+                        )
+                      else
+                        FilledButton.icon(
+                          onPressed: hasText && canSubmit ? submit : null,
+                          icon: Icon(actionIcon),
+                          label: Text(actionLabel),
+                        ),
+                    ],
+                  ),
+                ),
+                const SizedBox(height: 8),
                 LayoutBuilder(
                   builder: (context, constraints) {
                     final controlWidth = constraints.maxWidth < 220
@@ -5375,53 +5717,6 @@ class AgentComposerState extends State<AgentComposer> {
                     );
                   },
                 ),
-                const SizedBox(height: 8),
-                LayoutBuilder(
-                  builder: (context, constraints) => Row(
-                    crossAxisAlignment: CrossAxisAlignment.end,
-                    children: [
-                      Expanded(
-                        child: SizedBox(
-                          height: 72,
-                          child: NativeComposerTextView(
-                            key: _nativeComposerKey,
-                            initialText: widget.initialText,
-                            enabled: editable,
-                            placeholder: widget.hasSession
-                                ? 'Send a follow-up to Codex'
-                                : 'Tell Codex what to do',
-                            onChanged: _handleChanged,
-                            onSubmitRequested: submit,
-                            onEnlarge: widget.onEnlarge,
-                            onEscape: widget.onEscape,
-                          ),
-                        ),
-                      ),
-                      const SizedBox(width: 6),
-                      if (widget.canStop)
-                        IconButton.filledTonal(
-                          onPressed: widget.onStop,
-                          tooltip: 'Stop Codex',
-                          icon: const Icon(Icons.stop_circle_outlined),
-                        )
-                      else if (constraints.maxWidth < 190)
-                        FilledButton.icon(
-                          onPressed: hasText && canSubmit ? submit : null,
-                          icon: Icon(actionIcon),
-                          label: Text(actionLabel),
-                          style: FilledButton.styleFrom(
-                            padding: const EdgeInsets.symmetric(horizontal: 10),
-                          ),
-                        )
-                      else
-                        FilledButton.icon(
-                          onPressed: hasText && canSubmit ? submit : null,
-                          icon: Icon(actionIcon),
-                          label: Text(actionLabel),
-                        ),
-                    ],
-                  ),
-                ),
               ],
             ),
           ),
@@ -5486,6 +5781,8 @@ class NativeComposerTextView extends StatefulWidget {
     required this.enabled,
     required this.placeholder,
     required this.onChanged,
+    required this.onFocusChanged,
+    required this.onContentHeightChanged,
     required this.onSubmitRequested,
     this.onEnlarge,
     this.onEscape,
@@ -5496,6 +5793,8 @@ class NativeComposerTextView extends StatefulWidget {
   final bool enabled;
   final String placeholder;
   final ValueChanged<String> onChanged;
+  final ValueChanged<bool> onFocusChanged;
+  final ValueChanged<double> onContentHeightChanged;
   final VoidCallback onSubmitRequested;
   final VoidCallback? onEnlarge;
   final VoidCallback? onEscape;
@@ -5517,6 +5816,7 @@ class NativeComposerTextViewState extends State<NativeComposerTextView> {
     super.initState();
     _fallbackController = TextEditingController(text: widget.initialText);
     _fallbackFocusNode = FocusNode();
+    _fallbackFocusNode.addListener(_handleFallbackFocusChanged);
   }
 
   @override
@@ -5525,15 +5825,28 @@ class NativeComposerTextViewState extends State<NativeComposerTextView> {
     if (oldWidget.initialText != widget.initialText &&
         _fallbackController.text.trim().isEmpty) {
       _fallbackController.text = widget.initialText;
+      final channel = _channel;
+      if (channel != null &&
+          !kIsWeb &&
+          defaultTargetPlatform == TargetPlatform.macOS) {
+        unawaited(channel.invokeMethod<void>('setText', widget.initialText));
+      }
     }
     _syncNativeEnabled();
   }
 
   @override
   void dispose() {
+    _fallbackFocusNode.removeListener(_handleFallbackFocusChanged);
+    _channel?.setMethodCallHandler(null);
+    _channel = null;
     _fallbackController.dispose();
     _fallbackFocusNode.dispose();
     super.dispose();
+  }
+
+  void _handleFallbackFocusChanged() {
+    widget.onFocusChanged(_fallbackFocusNode.hasFocus);
   }
 
   Future<void> focus() async {
@@ -5546,7 +5859,14 @@ class NativeComposerTextViewState extends State<NativeComposerTextView> {
     if (channel == null) return;
 
     try {
-      await channel.invokeMethod<void>('focus');
+      final focused = await channel.invokeMethod<bool>('focus') ?? false;
+      if (!focused && mounted && _focusRequested) {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (mounted && _focusRequested && identical(_channel, channel)) {
+            unawaited(channel.invokeMethod<bool>('focus'));
+          }
+        });
+      }
     } on MissingPluginException {
       return;
     }
@@ -5662,7 +5982,7 @@ class NativeComposerTextViewState extends State<NativeComposerTextView> {
     return AppKitView(
       viewType: 'the_ditch/composer_text_view',
       creationParams: {
-        'text': widget.initialText,
+        'text': _fallbackController.text,
         'enabled': widget.enabled,
         'placeholder': widget.placeholder,
         'fontSize': 14.0,
@@ -5678,7 +5998,20 @@ class NativeComposerTextViewState extends State<NativeComposerTextView> {
         channel.setMethodCallHandler((call) async {
           if (call.method == 'textChanged') {
             final text = call.arguments as String? ?? '';
+            if (_fallbackController.text != text) {
+              _fallbackController.value = TextEditingValue(
+                text: text,
+                selection: TextSelection.collapsed(offset: text.length),
+              );
+            }
             widget.onChanged(text);
+          } else if (call.method == 'focusChanged') {
+            final focused = call.arguments as bool? ?? false;
+            _focusRequested = focused;
+            widget.onFocusChanged(focused);
+          } else if (call.method == 'contentHeightChanged') {
+            final height = (call.arguments as num?)?.toDouble();
+            if (height != null) widget.onContentHeightChanged(height);
           } else if (call.method == 'enlargeRequested') {
             widget.onEnlarge?.call();
           } else if (call.method == 'escapePressed') {

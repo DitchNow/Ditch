@@ -175,6 +175,11 @@ impl RuntimeState {
                 })
                 .count(),
             attention_count: self.attention.len(),
+            unread_attention_count: self
+                .attention
+                .iter()
+                .filter(|attention| attention.read_at.is_none())
+                .count(),
             instance_id: self.instance_id,
             codex_home: self
                 .codex_home
@@ -188,6 +193,7 @@ impl RuntimeState {
                 "attention_stream_v1".to_owned(),
                 "transcript_pagination_v1".to_owned(),
                 "project_files_v1".to_owned(),
+                "persistent_attention_read_v1".to_owned(),
             ],
         }
     }
@@ -209,7 +215,9 @@ impl RuntimeState {
     fn broadcast(&mut self, event: ServerEvent) {
         let is_attention_event = matches!(
             event,
-            ServerEvent::AttentionRaised(_) | ServerEvent::AttentionDismissed { .. }
+            ServerEvent::AttentionRaised(_)
+                | ServerEvent::AttentionDismissed { .. }
+                | ServerEvent::AttentionRead { .. }
         );
         let envelope = Envelope::new(SequencedEvent {
             sequence: self.next_sequence,
@@ -583,6 +591,10 @@ fn handle_request(request: ClientRequest, state: Arc<Mutex<RuntimeState>>) -> Se
             state.broadcast(ServerEvent::AttentionDismissed { attention_id });
             ServerResponse::Accepted
         }
+        ClientRequest::MarkAttentionRead { attention_ids } => {
+            mark_attention_read(state, Some(&attention_ids))
+        }
+        ClientRequest::MarkAllAttentionRead => mark_attention_read(state, None),
         ClientRequest::StartCodex { .. }
         | ClientRequest::ApprovePermission { .. }
         | ClientRequest::DenyPermission { .. }
@@ -592,6 +604,41 @@ fn handle_request(request: ClientRequest, state: Arc<Mutex<RuntimeState>>) -> Se
             "request is not implemented by this runtime",
         ),
     }
+}
+
+fn mark_attention_read(
+    state: Arc<Mutex<RuntimeState>>,
+    attention_ids: Option<&[uuid::Uuid]>,
+) -> ServerResponse {
+    let mut state = state
+        .lock()
+        .expect("runtime state lock should not be poisoned");
+    let now = Utc::now();
+    let mut changed = Vec::new();
+    for attention in &mut state.attention {
+        let selected = attention_ids
+            .map(|ids| ids.contains(&attention.id))
+            .unwrap_or(true);
+        if selected && attention.read_at.is_none() {
+            attention.read_at = Some(now);
+            changed.push(attention.clone());
+        }
+    }
+    if changed.is_empty() {
+        return ServerResponse::Accepted;
+    }
+    if let Err(error) = state.store.mark_attention_read(&changed) {
+        for attention in &mut state.attention {
+            if changed.iter().any(|item| item.id == attention.id) {
+                attention.read_at = None;
+            }
+        }
+        return protocol_error("attention_read_failed", error.to_string());
+    }
+    state.broadcast(ServerEvent::AttentionRead {
+        attention_ids: changed.iter().map(|attention| attention.id).collect(),
+    });
+    ServerResponse::Accepted
 }
 
 fn shutdown_runtime(state: Arc<Mutex<RuntimeState>>) -> ServerResponse {
@@ -1115,6 +1162,7 @@ fn persist_launch_failure(
         title: "Codex failed to start".to_owned(),
         body: notification_summary(&error),
         created_at: Utc::now(),
+        read_at: None,
     };
     let mut state = state
         .lock()
@@ -2061,6 +2109,7 @@ fn raise_workspace_permission_attention(
         title: "Codex cannot write this project".to_owned(),
         body: notification_summary(&body),
         created_at: Utc::now(),
+        read_at: None,
     };
     if let Err(error) = state.store.upsert_attention(&attention) {
         eprintln!("{RUNTIME_IDENTITY} failed to persist attention: {error}");
@@ -2255,6 +2304,7 @@ fn finish_agent(
                     title: "Agent failed".to_owned(),
                     body: notification_summary(&body),
                     created_at: Utc::now(),
+                    read_at: None,
                 })
             }
             AgentState::Completed => Some(RuntimeAttention {
@@ -2267,6 +2317,7 @@ fn finish_agent(
                 title: "Agent finished".to_owned(),
                 body: "Task completed successfully.".to_owned(),
                 created_at: Utc::now(),
+                read_at: None,
             }),
             _ => None,
         };
@@ -2745,6 +2796,79 @@ mod tests {
             .join()
             .expect("subscription thread should stop")
             .expect("subscription should close cleanly");
+    }
+
+    #[test]
+    fn marking_attention_read_updates_status_and_persists() {
+        let mut runtime = test_runtime();
+        let attention = RuntimeAttention {
+            id: uuid::Uuid::new_v4(),
+            kind: AttentionKind::Completed,
+            agent_id: None,
+            project_id: None,
+            project_name: None,
+            agent_name: None,
+            title: "Finished".to_owned(),
+            body: "The agent completed".to_owned(),
+            created_at: Utc::now(),
+            read_at: None,
+        };
+        let other_attention = RuntimeAttention {
+            id: uuid::Uuid::new_v4(),
+            title: "Another result".to_owned(),
+            ..attention.clone()
+        };
+        runtime.store.upsert_attention(&attention).unwrap();
+        runtime.store.upsert_attention(&other_attention).unwrap();
+        runtime.attention.push(attention.clone());
+        runtime.attention.push(other_attention.clone());
+        assert_eq!(runtime.runtime_status().unread_attention_count, 2);
+        let state = Arc::new(Mutex::new(runtime));
+
+        let response = handle_request(
+            ClientRequest::MarkAttentionRead {
+                attention_ids: vec![attention.id],
+            },
+            Arc::clone(&state),
+        );
+
+        assert!(matches!(response, ServerResponse::Accepted));
+        {
+            let state = state.lock().expect("fixture state should lock");
+            assert_eq!(state.runtime_status().unread_attention_count, 1);
+            assert!(state.attention[0].read_at.is_some());
+            assert!(state.attention[1].read_at.is_none());
+            let persisted = state.store.load().expect("persisted state should load");
+            assert!(
+                persisted
+                    .attention
+                    .iter()
+                    .find(|item| item.id == attention.id)
+                    .unwrap()
+                    .read_at
+                    .is_some()
+            );
+            assert!(
+                persisted
+                    .attention
+                    .iter()
+                    .find(|item| item.id == other_attention.id)
+                    .unwrap()
+                    .read_at
+                    .is_none()
+            );
+        }
+
+        let response = handle_request(ClientRequest::MarkAllAttentionRead, Arc::clone(&state));
+        assert!(matches!(response, ServerResponse::Accepted));
+        assert_eq!(
+            state
+                .lock()
+                .expect("fixture state should lock")
+                .runtime_status()
+                .unread_attention_count,
+            0
+        );
     }
 
     #[test]

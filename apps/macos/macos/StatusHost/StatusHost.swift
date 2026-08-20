@@ -241,7 +241,7 @@ final class StatusHost: NSObject, NSApplicationDelegate, UNUserNotificationCente
     codexHomeItem.title = "Codex home: \(status.codexHome ?? "Default (~/.codex)")"
     updateStatusButton(
       activeSessionCount: status.activeSessionCount,
-      attentionCount: status.attentionCount)
+      attentionCount: status.unreadAttentionCount)
     statusItem?.button?.toolTip =
       "The Ditch Runtime • \(status.activeSessionCount) active"
     startAttentionStream()
@@ -347,6 +347,10 @@ final class StatusHost: NSObject, NSApplicationDelegate, UNUserNotificationCente
       let center = UNUserNotificationCenter.current()
       center.removeDeliveredNotifications(withIdentifiers: [notificationId])
       center.removePendingNotificationRequests(withIdentifiers: [notificationId])
+      return
+    }
+    if event["AttentionRead"] != nil {
+      refreshRuntimeStatus()
     }
   }
 
@@ -611,6 +615,7 @@ final class StatusHost: NSObject, NSApplicationDelegate, UNUserNotificationCente
       pid: Int32(pid),
       activeSessionCount: activeSessionCount,
       attentionCount: attentionCount,
+      unreadAttentionCount: status["unread_attention_count"] as? Int ?? attentionCount,
       instanceId: instanceId,
       codexHome: status["codex_home"] as? String)
   }
@@ -785,6 +790,7 @@ private struct RuntimeStatus {
   let pid: Int32
   let activeSessionCount: Int
   let attentionCount: Int
+  let unreadAttentionCount: Int
   let instanceId: String
   let codexHome: String?
 }

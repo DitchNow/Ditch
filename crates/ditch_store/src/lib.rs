@@ -407,6 +407,21 @@ impl DitchStore {
         Ok(())
     }
 
+    pub fn mark_attention_read(
+        &mut self,
+        attention: &[RuntimeAttention],
+    ) -> Result<(), StoreError> {
+        let tx = self.connection.transaction()?;
+        for item in attention {
+            tx.execute(
+                "UPDATE attention_events SET attention_json=?2 WHERE id=?1 AND dismissed_at IS NULL",
+                params![item.id.to_string(), to_json(item)?],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn delete_agent(&mut self, agent_id: ditch_core::AgentId) -> Result<(), StoreError> {
         let tx = self.connection.transaction()?;
         let id = agent_id.0.to_string();
@@ -794,6 +809,46 @@ mod tests {
             assert!(deleted.agents.is_empty());
             assert!(deleted.attention.is_empty());
         }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn persists_attention_read_state() {
+        let root = std::env::temp_dir().join(format!(
+            "ditch-store-attention-read-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let paths = AppPaths {
+            data_dir: root.clone(),
+            database_path: root.join("ditch.sqlite3"),
+            socket_path: root.join("ditchd.sock"),
+            logs_dir: root.join("logs"),
+            scrollback_dir: root.join("scrollback"),
+        };
+        ensure_app_dirs(&paths).unwrap();
+        let now = Utc::now();
+        let mut attention = RuntimeAttention {
+            id: uuid::Uuid::new_v4(),
+            kind: ditch_core::AttentionKind::Completed,
+            agent_id: None,
+            project_id: None,
+            project_name: None,
+            agent_name: None,
+            title: "Finished".into(),
+            body: "Done".into(),
+            created_at: now,
+            read_at: None,
+        };
+
+        {
+            let mut store = DitchStore::open(&paths).unwrap();
+            store.upsert_attention(&attention).unwrap();
+            attention.read_at = Some(now);
+            store.mark_attention_read(&[attention.clone()]).unwrap();
+        }
+
+        let restored = DitchStore::open(&paths).unwrap().load().unwrap();
+        assert_eq!(restored.attention, vec![attention]);
         fs::remove_dir_all(root).unwrap();
     }
 

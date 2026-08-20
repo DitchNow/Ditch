@@ -1,3 +1,4 @@
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/gestures.dart';
 import 'package:flutter/services.dart';
@@ -68,6 +69,7 @@ void main() {
         'socket_path': '/tmp/ditchd.sock',
         'active_session_count': 2,
         'attention_count': 1,
+        'unread_attention_count': 1,
         'instance_id': 'instance-1',
         'codex_home': '/tmp/codex',
         'build_version': '1.0.0',
@@ -77,6 +79,7 @@ void main() {
 
     expect(status.pid, 42);
     expect(status.activeSessionCount, 2);
+    expect(status.unreadAttentionCount, 1);
     expect(status.supportsPersistentSessions, isTrue);
   });
 
@@ -325,6 +328,127 @@ void main() {
     expect(attentionForProject(attention, 'project-b').map((item) => item.id), [
       'global',
     ]);
+  });
+
+  test('project summaries count agents and unread terminal results', () {
+    final sessions = [
+      AgentSession(
+        localId: 'working',
+        projectId: 'project-a',
+        provider: AgentProvider.codex,
+        status: AgentStatus.working,
+        messages: const [],
+      ),
+      AgentSession(
+        localId: 'completed',
+        projectId: 'project-a',
+        provider: AgentProvider.codex,
+        status: AgentStatus.completed,
+        messages: const [],
+      ),
+      AgentSession(
+        localId: 'other',
+        projectId: 'project-b',
+        provider: AgentProvider.codex,
+        status: AgentStatus.failed,
+        messages: const [],
+      ),
+    ];
+    final attention = [
+      AttentionEvent(
+        id: 'finished-a',
+        sessionLocalId: 'completed',
+        projectId: 'project-a',
+        kind: AttentionKind.completed,
+        icon: Icons.check_circle_outline,
+        title: 'Finished',
+        body: 'Done',
+        createdAt: DateTime(2026),
+      ),
+    ];
+
+    final unread = summarizeProjectAgents(
+      sessions: sessions,
+      attention: attention,
+      projectId: 'project-a',
+    );
+    expect(unread.runningCount, 1);
+    expect(unread.stoppedCount, 1);
+    expect(unread.hasUnreadResult, isTrue);
+
+    final read = summarizeProjectAgents(
+      sessions: sessions,
+      attention: attention,
+      projectId: 'project-a',
+      readAttentionIds: {'finished-a'},
+    );
+    expect(read.hasUnreadResult, isFalse);
+
+    expect(
+      unreadResultAttentionIdsForAgent(
+        attention: attention,
+        agentId: 'completed',
+      ),
+      {'finished-a'},
+    );
+    expect(
+      unreadResultAttentionIdsForAgent(
+        attention: attention,
+        agentId: 'working',
+      ),
+      isEmpty,
+    );
+  });
+
+  test('reading one agent result leaves other project results unread', () {
+    final attention = [
+      AttentionEvent(
+        id: 'result-a',
+        sessionLocalId: 'agent-a',
+        projectId: 'project-a',
+        kind: AttentionKind.completed,
+        icon: Icons.check_circle_outline,
+        title: 'A finished',
+        body: 'Done',
+        createdAt: DateTime(2026),
+      ),
+      AttentionEvent(
+        id: 'result-b',
+        sessionLocalId: 'agent-b',
+        projectId: 'project-a',
+        kind: AttentionKind.failed,
+        icon: Icons.error_outline,
+        title: 'B failed',
+        body: 'Failed',
+        createdAt: DateTime(2026),
+      ),
+    ];
+
+    expect(
+      summarizeProjectAgents(
+        sessions: const [],
+        attention: attention,
+        projectId: 'project-a',
+        readAttentionIds: {'result-a'},
+      ).hasUnreadResult,
+      isTrue,
+    );
+    expect(
+      unreadResultAttentionIdsForAgent(
+        attention: attention,
+        agentId: 'agent-a',
+        readAttentionIds: {'result-a'},
+      ),
+      isEmpty,
+    );
+    expect(
+      unreadResultAttentionIdsForAgent(
+        attention: attention,
+        agentId: 'agent-b',
+        readAttentionIds: {'result-a'},
+      ),
+      {'result-b'},
+    );
   });
 
   test('notification navigation preserves exact project and agent ids', () {
@@ -1187,6 +1311,256 @@ void main() {
     expect(selected, isFalse);
   });
 
+  testWidgets('project tile renders agent counts and an unread result dot', (
+    tester,
+  ) async {
+    const path = '/tmp/project-summary';
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: ProjectTile(
+            name: 'Summary Project',
+            path: path,
+            selected: false,
+            runningCount: 2,
+            stoppedCount: 3,
+            hasUnreadResult: true,
+            onTap: () {},
+            onReveal: () {},
+            onCopyPath: () {},
+            onDelete: () {},
+          ),
+        ),
+      ),
+    );
+
+    expect(find.text('2 running · 3 stopped'), findsOneWidget);
+    expect(find.byKey(const ValueKey('project-unread-$path')), findsOneWidget);
+  });
+
+  testWidgets('agent terminal states render as colored status chips', (
+    tester,
+  ) async {
+    await tester.pumpWidget(
+      const MaterialApp(
+        home: Scaffold(
+          body: Column(
+            children: [
+              AgentStatusChip(status: AgentStatus.working),
+              AgentStatusChip(status: AgentStatus.completed),
+              AgentStatusChip(status: AgentStatus.failed),
+            ],
+          ),
+        ),
+      ),
+    );
+
+    expect(find.text('Running'), findsOneWidget);
+    expect(find.text('Completed'), findsOneWidget);
+    expect(find.text('Failed'), findsOneWidget);
+    expect(
+      find.byKey(const ValueKey('agent-status-completed')),
+      findsOneWidget,
+    );
+    expect(find.byKey(const ValueKey('agent-status-failed')), findsOneWidget);
+  });
+
+  testWidgets(
+    'unread result dot identifies the exact agent and clears on open',
+    (tester) async {
+      final sessions = [
+        AgentSession(
+          localId: 'new-result',
+          provider: AgentProvider.codex,
+          status: AgentStatus.completed,
+          messages: const [],
+        ),
+        AgentSession(
+          localId: 'old-result',
+          provider: AgentProvider.codex,
+          status: AgentStatus.completed,
+          messages: const [],
+        ),
+      ];
+      final unreadAgents = {'new-result'};
+
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: StatefulBuilder(
+              builder: (context, setState) => AgentsSurface(
+                sessions: sessions,
+                expandedAgentLocalId: null,
+                focusedAgentLocalId: null,
+                chatViewport: ConversationViewportController(),
+                agentListController: ScrollController(),
+                composerKey: GlobalKey<AgentComposerState>(),
+                headerKeyForAgent: _testAgentHeaderKey,
+                initialPrompt: '',
+                onStartCodex: () {},
+                onSubmitPrompt: (_, _) {},
+                onStopCodex: (_) {},
+                onDeleteAgent: (_) {},
+                onRenameAgent: (_, _) {},
+                hasUnreadResult: (session) =>
+                    unreadAgents.contains(session.localId),
+                onFocusAgent: (_) {},
+                onToggleExpanded: (session) {
+                  setState(() => unreadAgents.remove(session.localId));
+                },
+              ),
+            ),
+          ),
+        ),
+      );
+
+      expect(
+        find.byKey(const ValueKey('agent-unread-new-result')),
+        findsOneWidget,
+      );
+      expect(
+        find.byKey(const ValueKey('agent-unread-old-result')),
+        findsNothing,
+      );
+
+      await tester.tap(find.byKey(_testAgentHeaderKey('new-result')));
+      await tester.pump();
+      expect(
+        find.byKey(const ValueKey('agent-unread-new-result')),
+        findsNothing,
+      );
+    },
+  );
+
+  testWidgets('collapsing an expanded agent preserves the element tree', (
+    tester,
+  ) async {
+    final sessions = [
+      AgentSession(
+        localId: 'collapse-regression-a',
+        provider: AgentProvider.codex,
+        status: AgentStatus.completed,
+        messages: const [],
+      ),
+      AgentSession(
+        localId: 'collapse-regression-b',
+        provider: AgentProvider.codex,
+        status: AgentStatus.completed,
+        messages: const [],
+      ),
+    ];
+    String? expandedAgentId = sessions.first.localId;
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: StatefulBuilder(
+            builder: (context, setState) => AgentsSurface(
+              sessions: sessions,
+              expandedAgentLocalId: expandedAgentId,
+              focusedAgentLocalId: null,
+              chatViewport: ConversationViewportController(),
+              agentListController: ScrollController(),
+              composerKey: GlobalKey<AgentComposerState>(),
+              headerKeyForAgent: _testAgentHeaderKey,
+              initialPrompt: '',
+              onStartCodex: () {},
+              onSubmitPrompt: (_, _) {},
+              onStopCodex: (_) {},
+              onDeleteAgent: (_) {},
+              onRenameAgent: (_, _) {},
+              hasUnreadResult: (_) => true,
+              onFocusAgent: (_) {},
+              onToggleExpanded: (_) {
+                setState(() => expandedAgentId = null);
+              },
+            ),
+          ),
+        ),
+      ),
+    );
+
+    await tester.tap(find.byKey(_testAgentHeaderKey('collapse-regression-a')));
+    await tester.pump();
+
+    expect(tester.takeException(), isNull);
+    expect(find.byKey(const ValueKey('collapse-regression-a')), findsOneWidget);
+    expect(find.byKey(const ValueKey('collapse-regression-b')), findsOneWidget);
+  });
+
+  testWidgets(
+    'switching projects replaces expanded agents without a blank UI',
+    (tester) async {
+      final projectA = AgentSession(
+        localId: 'project-switch-a',
+        provider: AgentProvider.codex,
+        status: AgentStatus.completed,
+        messages: const [],
+      );
+      final projectB = AgentSession(
+        localId: 'project-switch-b',
+        provider: AgentProvider.codex,
+        status: AgentStatus.completed,
+        messages: const [],
+      );
+      var sessions = [projectA];
+      String? expandedAgentId = projectA.localId;
+      final composerKeys = <String, GlobalKey<AgentComposerState>>{};
+
+      await tester.pumpWidget(
+        MaterialApp(
+          home: StatefulBuilder(
+            builder: (context, setState) => Scaffold(
+              appBar: AppBar(
+                actions: [
+                  TextButton(
+                    key: const Key('switch-project-regression'),
+                    onPressed: () {
+                      setState(() {
+                        sessions = [projectB];
+                        expandedAgentId = projectB.localId;
+                      });
+                    },
+                    child: const Text('Switch'),
+                  ),
+                ],
+              ),
+              body: AgentsSurface(
+                sessions: sessions,
+                expandedAgentLocalId: expandedAgentId,
+                focusedAgentLocalId: null,
+                chatViewport: ConversationViewportController(),
+                agentListController: ScrollController(),
+                composerKey: GlobalKey<AgentComposerState>(),
+                composerKeyForAgent: (agentId) => composerKeys.putIfAbsent(
+                  agentId,
+                  GlobalKey<AgentComposerState>.new,
+                ),
+                headerKeyForAgent: _testAgentHeaderKey,
+                initialPrompt: '',
+                onStartCodex: () {},
+                onSubmitPrompt: (_, _) {},
+                onStopCodex: (_) {},
+                onDeleteAgent: (_) {},
+                onRenameAgent: (_, _) {},
+                onFocusAgent: (_) {},
+                onToggleExpanded: (_) {},
+              ),
+            ),
+          ),
+        ),
+      );
+
+      await tester.tap(find.byKey(const Key('switch-project-regression')));
+      await tester.pump();
+
+      expect(tester.takeException(), isNull);
+      expect(find.byKey(const ValueKey('project-switch-a')), findsNothing);
+      expect(find.byKey(const ValueKey('project-switch-b')), findsOneWidget);
+      expect(find.text('Agents'), findsOneWidget);
+    },
+  );
+
   testWidgets('project right click exposes copy path and delete actions', (
     tester,
   ) async {
@@ -1253,6 +1627,100 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(find.text('hello'), findsOneWidget);
+  });
+
+  testWidgets('composer starts compact and keeps controls below the editor', (
+    tester,
+  ) async {
+    await tester.pumpWidget(_testApp());
+
+    final editorShell = tester.widget<AnimatedContainer>(
+      find.byKey(const Key('composer-editor-shell')),
+    );
+    expect(editorShell.constraints?.maxHeight, 48);
+
+    final editorTop = tester.getTopLeft(
+      find.byKey(const Key('composer-editor-shell')),
+    );
+    final approvalTop = tester.getTopLeft(find.text('Approve for me'));
+    expect(approvalTop.dy, greaterThan(editorTop.dy));
+  });
+
+  testWidgets('native composer focus evicts stale Flutter widget focus', (
+    tester,
+  ) async {
+    debugDefaultTargetPlatformOverride = TargetPlatform.macOS;
+    addTearDown(() => debugDefaultTargetPlatformOverride = null);
+
+    int? platformViewId;
+    tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+      SystemChannels.platform_views,
+      (call) async {
+        if (call.method == 'create') {
+          final arguments = call.arguments as Map<dynamic, dynamic>;
+          platformViewId = arguments['id'] as int;
+        }
+        return null;
+      },
+    );
+    addTearDown(() {
+      tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+        SystemChannels.platform_views,
+        null,
+      );
+    });
+
+    final staleTerminalFocus = FocusNode(debugLabel: 'stale-terminal-focus');
+    addTearDown(staleTerminalFocus.dispose);
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Column(
+          children: [
+            const SizedBox(
+              width: 320,
+              height: 80,
+              child: AppKitView(
+                viewType: 'the_ditch/composer_text_view',
+                layoutDirection: TextDirection.ltr,
+              ),
+            ),
+            Focus(
+              focusNode: staleTerminalFocus,
+              child: const SizedBox(width: 100, height: 40),
+            ),
+          ],
+        ),
+      ),
+    );
+    await tester.pump();
+
+    final platformViewFocus = tester
+        .widget<Focus>(
+          find.descendant(
+            of: find.byType(AppKitView),
+            matching: find.byType(Focus),
+          ),
+        )
+        .focusNode!;
+    staleTerminalFocus.requestFocus();
+    await tester.pump();
+    expect(staleTerminalFocus.hasFocus, isTrue);
+    expect(platformViewFocus.hasFocus, isFalse);
+    expect(platformViewId, isNotNull);
+
+    final message = SystemChannels.platform_views.codec.encodeMethodCall(
+      MethodCall('viewFocused', platformViewId),
+    );
+    tester.binding.defaultBinaryMessenger.handlePlatformMessage(
+      SystemChannels.platform_views.name,
+      message,
+      (_) {},
+    );
+    await tester.pump();
+
+    expect(staleTerminalFocus.hasFocus, isFalse);
+    expect(platformViewFocus.hasFocus, isTrue);
+    debugDefaultTargetPlatformOverride = null;
   });
 
   testWidgets('composer sends with Enter and keeps focus', (tester) async {

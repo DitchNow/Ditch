@@ -8,6 +8,7 @@ class RuntimeStatusDto {
     required this.socketPath,
     required this.activeSessionCount,
     required this.attentionCount,
+    required this.unreadAttentionCount,
     required this.instanceId,
     required this.capabilities,
     this.codexHome,
@@ -42,6 +43,9 @@ class RuntimeStatusDto {
       socketPath: string('socket_path'),
       activeSessionCount: integer('active_session_count'),
       attentionCount: integer('attention_count'),
+      unreadAttentionCount: body['unread_attention_count'] is int
+          ? body['unread_attention_count'] as int
+          : integer('attention_count'),
       instanceId: string('instance_id'),
       codexHome: body['codex_home']?.toString(),
       buildVersion: body['build_version']?.toString() ?? '',
@@ -56,6 +60,7 @@ class RuntimeStatusDto {
   final String socketPath;
   final int activeSessionCount;
   final int attentionCount;
+  final int unreadAttentionCount;
   final String instanceId;
   final String? codexHome;
   final String buildVersion;
