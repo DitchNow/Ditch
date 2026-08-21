@@ -128,8 +128,6 @@ pub struct AgentExecutionProfile {
     pub reasoning_effort: Option<String>,
     #[serde(default)]
     pub approval: AgentApprovalPreset,
-    #[serde(default)]
-    pub network_access: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

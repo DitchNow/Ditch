@@ -212,7 +212,7 @@ impl RuntimeState {
                 "transcript_pagination_v1".to_owned(),
                 "project_files_v1".to_owned(),
                 "persistent_attention_read_v1".to_owned(),
-                "network_access_profile_v1".to_owned(),
+                "always_on_web_access_v1".to_owned(),
             ],
         }
     }
@@ -2725,14 +2725,18 @@ fn codex_child_args(
             args.push("--dangerously-bypass-approvals-and-sandbox".to_owned())
         }
     }
-    if execution_profile.network_access
-        && execution_profile.approval != AgentApprovalPreset::FullAccess
-    {
+    if execution_profile.approval != AgentApprovalPreset::FullAccess {
         args.extend([
             "--config".to_owned(),
             "sandbox_workspace_write.network_access=true".to_owned(),
         ]);
     }
+    args.extend([
+        "--config".to_owned(),
+        "web_search=\"live\"".to_owned(),
+        "--config".to_owned(),
+        "tools.web_search=true".to_owned(),
+    ]);
     if let Some(model) = execution_profile.model.as_deref() {
         args.extend(["--model".to_owned(), model.to_owned()]);
     }
@@ -3092,6 +3096,10 @@ fn check_codex_readiness(binary: Option<&str>) -> CodexReadiness {
                 "never",
                 "--config",
                 "sandbox_workspace_write.network_access=true",
+                "--config",
+                "web_search=\"live\"",
+                "--config",
+                "tools.web_search=true",
                 "exec",
                 "--help",
             ],
@@ -3770,6 +3778,12 @@ esac
                 "workspace-write",
                 "--ask-for-approval",
                 "never",
+                "--config",
+                "sandbox_workspace_write.network_access=true",
+                "--config",
+                "web_search=\"live\"",
+                "--config",
+                "tools.web_search=true",
                 "--cd",
                 "/tmp/project",
                 "exec",
@@ -3798,6 +3812,12 @@ esac
                 "workspace-write",
                 "--ask-for-approval",
                 "never",
+                "--config",
+                "sandbox_workspace_write.network_access=true",
+                "--config",
+                "web_search=\"live\"",
+                "--config",
+                "tools.web_search=true",
                 "exec",
                 "resume",
                 "--json",
@@ -3841,7 +3861,6 @@ esac
             model: Some("gpt-test".to_owned()),
             reasoning_effort: Some("high".to_owned()),
             approval: AgentApprovalPreset::Ask,
-            network_access: true,
         };
         let ask_args = codex_child_args(
             Path::new("/tmp/project"),
@@ -3870,6 +3889,13 @@ esac
                 args == ["--config", "sandbox_workspace_write.network_access=true"]
             })
         );
+        for setting in ["web_search=\"live\"", "tools.web_search=true"] {
+            assert!(
+                ask_args
+                    .windows(2)
+                    .any(|args| args == ["--config", setting])
+            );
+        }
         let ask_exec = ask_args.iter().position(|arg| arg == "exec").unwrap();
         for global in ["--ask-for-approval", "--sandbox", "--model", "--config"] {
             assert!(ask_args.iter().position(|arg| arg == global).unwrap() < ask_exec);
@@ -3891,6 +3917,13 @@ esac
                 .iter()
                 .any(|arg| arg == "--dangerously-bypass-approvals-and-sandbox")
         );
+        for setting in ["web_search=\"live\"", "tools.web_search=true"] {
+            assert!(
+                full_access_args
+                    .windows(2)
+                    .any(|args| args == ["--config", setting])
+            );
+        }
         assert!(
             full_access_args
                 .iter()

@@ -1,12 +1,12 @@
 # The Ditch
 
-The Ditch is a local macOS workspace for running, following, and returning to coding agent sessions across multiple projects.
+**Ditch Community Edition** is a local macOS workspace for running, following, and returning to Codex sessions across multiple projects.
 
 [Download](https://theditch.dev/#beta) · [Website](https://theditch.dev)
 
 ## Status
 
-The Ditch is pre-release software under active development. It currently supports macOS 11 or later and Codex CLI. The macOS beta is distributed as a `.dmg` through [theditch.dev](https://theditch.dev/#beta), and the app can also be built from source.
+Ditch Community Edition is pre-release software under active development. It currently supports macOS 11 or later and Codex CLI. The macOS beta is distributed as a `.dmg` through [theditch.dev](https://theditch.dev/#beta), and the app can also be built from source.
 
 Today it can register multiple local projects, run concurrent Codex sessions, preserve their transcripts and Codex thread IDs, resume completed threads, post local completion and failure notifications, and provide a project shell and small text-file editor. The background runtime remains alive when the main window closes.
 
@@ -16,7 +16,7 @@ Current limitations are:
 - Codex runs through a separate `codex exec` process for each turn. Interactive approval requests are not supported; the UI disables **Ask for approval**.
 - Closing the foreground window preserves work, but explicitly quitting the menu-bar runtime stops active agents. After an unexpected runtime restart, previously active runs are marked stale and can only be continued when Codex supplied a resumable thread ID.
 - The repository contains types and placeholder directories for other providers, hooks, MCP, tasks, and worktrees, but those are not complete user-facing features.
-- There is no GitHub release workflow, CI workflow, contribution policy, security policy, or open-source license in the repository yet.
+- There is no GitHub release workflow, CI workflow, contribution policy, or security policy in the repository yet.
 
 ## Why The Ditch
 
@@ -112,15 +112,13 @@ Authentication remains with Codex. The Ditch locates compatible executables, run
 
 The in-app **Uninstall The Ditch…** command stops active agents, unregisters the helper, removes The Ditch-owned application data and preferences, and moves the app to Trash. It does not delete registered project directories or their `.ditch` metadata.
 
-## Open Source & Commercial Development
+## Open Source
 
-The source is currently visible in this repository, and the product is being developed commercially. The repository does not define separate community and commercial editions or an implemented free/paid feature boundary.
-
-This repository is **not currently licensed as open source**: the Rust workspace is marked `UNLICENSED`, the app metadata states “All rights reserved,” and there is no `LICENSE` file. Source availability alone does not grant rights to use, modify, or redistribute the code. No future licensing commitment should be inferred from the repository's current state.
+This repository contains Ditch Community Edition: the complete current local product described above, including the macOS application, local runtime, Codex integration, persistence, terminal, file tools, and notifications. It is open-source software licensed under the GNU Affero General Public License v3.0.
 
 ## Build From Source
 
-Building The Ditch requires Flutter with macOS desktop support and a Dart SDK compatible with `^3.10.4`, Rust 1.85 or later, Xcode and its macOS command-line build tools, and Git.
+Building Ditch Community Edition requires Flutter with macOS desktop support and a Dart SDK compatible with `^3.10.4`, Rust 1.85 or later, Xcode and its macOS command-line build tools, and Git.
 
 Fetch the dependencies and run the app from the Flutter project:
 
@@ -177,8 +175,6 @@ There is not yet a public issue tracker or other published roadmap channel to li
 
 There is no `CONTRIBUTING.md`, public issue tracker, or documented pull-request policy yet.
 
-Because the repository is currently unlicensed and has no documented contribution terms, clarify those terms with the maintainers before submitting a substantive code contribution.
-
 ## Security
 
 The Ditch can execute processes and read or write files inside registered projects, and **Full Access** deliberately removes Codex's sandbox restrictions. Review the selected project, execution profile, and prompt before starting a turn.
@@ -194,4 +190,6 @@ No public bug tracker, Discord, Slack, Discussions forum, or other maintained su
 
 ## License
 
-No `LICENSE` file is present. The Rust workspace declares `license = "UNLICENSED"`, and the macOS app metadata states “All rights reserved.” This repository should not be described or treated as open source unless and until its maintainers add an applicable license.
+Ditch Community Edition is open-source software licensed under the [GNU Affero General Public License v3.0](LICENSE) (`AGPL-3.0-only`).
+
+See [LICENSE](LICENSE) for the full license text.

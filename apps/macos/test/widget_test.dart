@@ -24,14 +24,11 @@ Widget _testApp() => const TheDitchApp(
 );
 
 void main() {
-  test('agent execution settings expose scoped network access', () {
+  test('agent execution settings expose model and approval controls', () {
     final settings = AgentExecutionSettings();
 
-    expect(settings.networkAccess, isTrue);
-    expect(settings.protocolValue['network_access'], isTrue);
-
-    settings.setNetworkAccess(false);
-    expect(settings.protocolValue['network_access'], isFalse);
+    expect(settings.approval, AgentApprovalPreset.approveForMe);
+    expect(settings.protocolValue.containsKey('network_access'), isFalse);
   });
 
   test('presentation controller publishes immutable connection states', () {
@@ -85,7 +82,10 @@ void main() {
         'codex_home': '/tmp/codex',
         'codex_binary': '/opt/homebrew/bin/codex',
         'build_version': '1.0.0',
-        'capabilities': ['persistent_sessions_v1', 'network_access_profile_v1'],
+        'capabilities': [
+          'persistent_sessions_v1',
+          'always_on_web_access_v1',
+        ],
       },
     });
 
@@ -94,7 +94,7 @@ void main() {
     expect(status.unreadAttentionCount, 1);
     expect(status.codexBinary, '/opt/homebrew/bin/codex');
     expect(status.supportsPersistentSessions, isTrue);
-    expect(status.supportsNetworkAccessProfile, isTrue);
+    expect(status.supportsAlwaysOnWebAccess, isTrue);
   });
 
   test('Codex readiness requires compatibility and authentication', () {

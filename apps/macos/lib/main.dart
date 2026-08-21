@@ -331,14 +331,12 @@ class NotificationReadiness {
 
 class AgentExecutionSettings extends ChangeNotifier {
   AgentApprovalPreset approval = AgentApprovalPreset.approveForMe;
-  bool networkAccess = true;
   String? model;
   List<AgentModelOption> models = const [];
 
   Map<String, dynamic> get protocolValue => {
     'model': model,
     'reasoning_effort': null,
-    'network_access': networkAccess,
     'approval': switch (approval) {
       AgentApprovalPreset.ask => 'Ask',
       AgentApprovalPreset.approveForMe => 'ApproveForMe',
@@ -348,11 +346,6 @@ class AgentExecutionSettings extends ChangeNotifier {
 
   void setApproval(AgentApprovalPreset value) {
     approval = value;
-    notifyListeners();
-  }
-
-  void setNetworkAccess(bool value) {
-    networkAccess = value;
     notifyListeners();
   }
 
@@ -1302,7 +1295,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
   bool _runtimeHomeMismatchReported = false;
   bool _runtimeCodexHomeMatches = true;
   bool _runtimeSupportsPersistence = true;
-  bool _runtimeSupportsNetworkAccess = true;
+  bool _runtimeSupportsAlwaysOnWebAccess = true;
   bool _runtimeCompatibilityReported = false;
   String? _effectiveRuntimeCodexHome;
   String? _codexBinary;
@@ -1935,8 +1928,8 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
 
   void _checkRuntimeCapabilities(RuntimeStatusDto status) {
     _runtimeSupportsPersistence = status.supportsPersistentSessions;
-    _runtimeSupportsNetworkAccess = status.supportsNetworkAccessProfile;
-    if (_runtimeSupportsPersistence && _runtimeSupportsNetworkAccess) {
+    _runtimeSupportsAlwaysOnWebAccess = status.supportsAlwaysOnWebAccess;
+    if (_runtimeSupportsPersistence && _runtimeSupportsAlwaysOnWebAccess) {
       _runtimeCompatibilityReported = false;
       return;
     }
@@ -2544,11 +2537,11 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
       }
     }
     if (!mounted) return false;
-    if (!_runtimeSupportsPersistence || !_runtimeSupportsNetworkAccess) {
+    if (!_runtimeSupportsPersistence || !_runtimeSupportsAlwaysOnWebAccess) {
       _showProjectSetupResult(
         title: 'Outdated Ditch Runtime',
         message:
-            'This runtime cannot persist agent sessions. Rebuild and restart The Ditch, then try again.',
+            'This runtime does not support the current agent launch policy. Rebuild and restart The Ditch, then try again.',
         isError: true,
       );
       return false;
@@ -6595,28 +6588,6 @@ class AgentComposerState extends State<AgentComposer> {
                               const SizedBox(width: 6),
                               ContextWindowIndicator(
                                 model: agentExecutionSettings.selectedModel,
-                              ),
-                            ],
-                          ),
-                        ),
-                        SizedBox(
-                          width: controlWidth,
-                          child: Row(
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                              const Icon(Icons.public, size: 18),
-                              const SizedBox(width: 8),
-                              const Expanded(child: Text('Internet access')),
-                              Switch(
-                                value:
-                                    agentExecutionSettings.approval ==
-                                        AgentApprovalPreset.fullAccess ||
-                                    agentExecutionSettings.networkAccess,
-                                onChanged:
-                                    agentExecutionSettings.approval ==
-                                        AgentApprovalPreset.fullAccess
-                                    ? null
-                                    : agentExecutionSettings.setNetworkAccess,
                               ),
                             ],
                           ),

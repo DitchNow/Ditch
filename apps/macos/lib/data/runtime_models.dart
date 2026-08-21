@@ -72,6 +72,6 @@ class RuntimeStatusDto {
   bool get supportsPersistentSessions =>
       capabilities.contains('persistent_sessions_v1');
 
-  bool get supportsNetworkAccessProfile =>
-      capabilities.contains('network_access_profile_v1');
+  bool get supportsAlwaysOnWebAccess =>
+      capabilities.contains('always_on_web_access_v1');
 }
