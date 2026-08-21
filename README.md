@@ -2,11 +2,11 @@
 
 The Ditch is a local macOS workspace for running, following, and returning to coding agent sessions across multiple projects.
 
-[Architecture](docs/adr/0001-runtime-supervision.md)
+[Download](https://theditch.dev/#beta) · [Website](https://theditch.dev) · [Architecture](docs/adr/0001-runtime-supervision.md)
 
 ## Status
 
-The Ditch is pre-release software under active development. It currently supports macOS 11 or later and Codex CLI; it can be downloaded as a standalone app or can be built from source.
+The Ditch is pre-release software under active development. It currently supports macOS 11 or later and Codex CLI. The macOS beta is distributed as a `.dmg` through [theditch.dev](https://theditch.dev/#beta), and the app can also be built from source.
 
 Today it can register multiple local projects, run concurrent Codex sessions, preserve their transcripts and Codex thread IDs, resume completed threads, post local completion and failure notifications, and provide a project shell and small text-file editor. The background runtime remains alive when the main window closes.
 
@@ -16,7 +16,7 @@ Current limitations are:
 - Codex runs through a separate `codex exec` process for each turn. Interactive approval requests are not supported; the UI disables **Ask for approval**.
 - Closing the foreground window preserves work, but explicitly quitting the menu-bar runtime stops active agents. After an unexpected runtime restart, previously active runs are marked stale and can only be continued when Codex supplied a resumable thread ID.
 - The repository contains types and placeholder directories for other providers, hooks, MCP, tasks, and worktrees, but those are not complete user-facing features.
-- There is no release channel, CI workflow, contribution policy, security policy, or open-source license in the repository yet.
+- There is no GitHub release workflow, CI workflow, contribution policy, security policy, or open-source license in the repository yet.
 
 ## Why The Ditch
 
@@ -32,34 +32,14 @@ A terminal remains the most direct way to run one Codex session. The Ditch is us
 
 - macOS 11 or later
 - A compatible [Codex CLI](https://learn.chatgpt.com/docs/codex/cli) installation, signed in with `codex login`
-- Flutter with macOS desktop support and a Dart SDK compatible with `^3.10.4`
-- Rust 1.85 or later (the workspace uses Rust 2024 edition)
-- Xcode and its macOS command-line build tools
-- Git
 
 The Ditch does not pin a minimum Codex version. On first run it checks the selected executable for the `codex exec` JSON/resume behavior and command-line options it needs.
 
 ### Install
 
-Build the application from the repository:
+Download the macOS beta from [theditch.dev](https://theditch.dev/#beta). The website sends the `.dmg` download link by email. Open the downloaded disk image and install The Ditch, then launch the app.
 
-```sh
-git clone https://github.com/DitchNow/TheDitch.git
-cd TheDitch/apps/macos
-flutter pub get
-```
-
-```sh
-flutter build macos
-open "build/macos/Build/Products/Release/The Ditch.app"
-```
-or 
-
-```sh
-flutter run -d macos
-```
-
-The Flutter/Xcode build invokes Cargo and packages `ditchd`, `ditch_cli`, and the menu-bar runtime helper inside the application bundle. Depending on the local Xcode configuration, macOS code-signing setup may be required.
+To compile the application yourself, follow [Build From Source](#build-from-source).
 
 ### First run
 
@@ -122,6 +102,8 @@ Projects, session metadata, transcripts, attention state, and selected runtime s
 
 The application, runtime, socket, database, project access, and notification processing run on the Mac. The repository contains no Ditch-hosted prompt proxy, analytics SDK, or crash-reporting integration.
 
+The download website is a separate boundary: its beta form collects an email address to send access and states that it records whether the download link is opened.
+
 The Ditch stores its application data under `~/Library/Application Support/The Ditch/`, including `ditch.sqlite3`, the local sockets, runtime logs, the runtime PID, and an optional persisted `CODEX_HOME` path. UI preferences use the normal macOS preferences store. Each registered project receives the `.ditch` metadata described above.
 
 Prompts and parsed Codex output are stored in the local SQLite database. The Ditch passes prompts to the locally installed Codex CLI and launches it in the selected project directory, so Codex can read or modify files according to the chosen sandbox and network settings. Codex itself communicates with OpenAI and is subject to the user's Codex configuration, account, and OpenAI data handling; “local-first” does not mean that model execution is offline.
@@ -138,7 +120,9 @@ This repository is **not currently licensed as open source**: the Rust workspace
 
 ## Build From Source
 
-Install the prerequisites from [Quick Start](#quick-start), then fetch dependencies and run the app from the Flutter project:
+Building The Ditch requires Flutter with macOS desktop support and a Dart SDK compatible with `^3.10.4`, Rust 1.85 or later, Xcode and its macOS command-line build tools, and Git.
+
+Fetch the dependencies and run the app from the Flutter project:
 
 ```sh
 git clone https://github.com/DitchNow/TheDitch.git
@@ -204,6 +188,7 @@ There is no `SECURITY.md` and no documented private vulnerability-reporting chan
 
 ## Community / Support
 
+- Product website and beta download: [theditch.dev](https://theditch.dev)
 - Runtime architecture: [ADR 0001](docs/adr/0001-runtime-supervision.md)
 - Codex installation and authentication: [Codex CLI documentation](https://learn.chatgpt.com/docs/codex/cli)
 
