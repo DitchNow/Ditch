@@ -2,7 +2,7 @@
 
 The Ditch is a local macOS workspace for running, following, and returning to coding agent sessions across multiple projects.
 
-[Download](https://theditch.dev/#beta) · [Website](https://theditch.dev) · [Architecture](docs/adr/0001-runtime-supervision.md)
+[Download](https://theditch.dev/#beta) · [Website](https://theditch.dev)
 
 ## Status
 
@@ -96,7 +96,7 @@ The runtime is compiled as a Rust static library into the menu-bar login-item he
 
 For Codex work, `ditchd` starts `codex exec --json` in a dedicated process group for each turn and sends the prompt over stdin. Follow-ups use `codex exec resume` with the persisted native thread ID. Dedicated process groups allow Stop to interrupt and, if necessary, terminate the full child tree instead of leaving helper processes behind.
 
-Projects, session metadata, transcripts, attention state, and selected runtime settings are durable. Project terminals are PTYs owned by the running daemon, not by Flutter. File reads and writes also pass through the daemon, which enforces project-root and revision checks. See [ADR 0001](docs/adr/0001-runtime-supervision.md) for the foreground/helper/runtime lifecycle decision.
+Projects, session metadata, transcripts, attention state, and selected runtime settings are durable. Project terminals are PTYs owned by the running daemon, not by Flutter. File reads and writes also pass through the daemon, which enforces project-root and revision checks.
 
 ## Local-First & Privacy
 
@@ -163,7 +163,6 @@ crates/ditch_cli/           Local command-line client used by the helper and dia
 crates/ditch_agents/        Early provider adapter abstractions
 crates/ditch_runtime/       Early generic runtime/PTY abstractions
 crates/ditch_orchestrator/  Early orchestration abstractions
-docs/adr/                   Accepted architectural decisions
 ```
 
 The production path currently concentrates in `apps/macos`, `ditchd`, `ditch_protocol`, and `ditch_store`. Some generic crates describe a broader architecture but are not yet the path used by the shipped UI.
@@ -176,7 +175,7 @@ There is not yet a public issue tracker or other published roadmap channel to li
 
 ## Contributing
 
-There is no `CONTRIBUTING.md`, public issue tracker, or documented pull-request policy yet. Before changing runtime ownership or process lifecycle, read [ADR 0001](docs/adr/0001-runtime-supervision.md).
+There is no `CONTRIBUTING.md`, public issue tracker, or documented pull-request policy yet.
 
 Because the repository is currently unlicensed and has no documented contribution terms, clarify those terms with the maintainers before submitting a substantive code contribution.
 
@@ -189,7 +188,6 @@ There is no `SECURITY.md` and no documented private vulnerability-reporting chan
 ## Community / Support
 
 - Product website and beta download: [theditch.dev](https://theditch.dev)
-- Runtime architecture: [ADR 0001](docs/adr/0001-runtime-supervision.md)
 - Codex installation and authentication: [Codex CLI documentation](https://learn.chatgpt.com/docs/codex/cli)
 
 No public bug tracker, Discord, Slack, Discussions forum, or other maintained support channel is documented in the repository.
