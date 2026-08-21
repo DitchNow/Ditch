@@ -17,6 +17,10 @@ final class StatusHost: NSObject, NSApplicationDelegate, UNUserNotificationCente
   private let sessionsItem = NSMenuItem(title: "0 active sessions", action: nil, keyEquivalent: "")
   private let attentionItem = NSMenuItem(title: "0 alerts", action: nil, keyEquivalent: "")
   private let codexHomeItem = NSMenuItem(title: "Codex home: Unknown", action: nil, keyEquivalent: "")
+  private let notificationItem = NSMenuItem(
+    title: "Notifications: Checking", action: nil, keyEquivalent: "")
+  private let notificationActionItem = NSMenuItem(
+    title: "Enable Notifications…", action: #selector(manageNotifications), keyEquivalent: "")
   private var timer: Timer?
   private var refreshInFlight = false
   private var runtimeStartInFlight = false
@@ -32,6 +36,8 @@ final class StatusHost: NSObject, NSApplicationDelegate, UNUserNotificationCente
   private var helperDirectory = ""
   private var pidFilePath = ""
   private var logFilePath = ""
+  private var notificationAuthorizationStatus: UNAuthorizationStatus = .notDetermined
+  private let notificationControlServer = NotificationControlServer()
 
   static func main() {
     let app = NSApplication.shared
@@ -53,6 +59,15 @@ final class StatusHost: NSObject, NSApplicationDelegate, UNUserNotificationCente
       .appendingPathComponent("Library/Application Support/The Ditch/ditch-status-host.pid").path
     try? FileManager.default.removeItem(atPath: obsoletePid)
     log("launch integrated ditchd appPath=\(appPath) helperDirectory=\(helperDirectory)")
+    guard notificationControlServer.start(handler: { [weak self] command, reply in
+      DispatchQueue.main.async {
+        self?.handleNotificationControlCommand(command, reply: reply)
+      }
+    }) else {
+      log("another runtime helper already owns notification control")
+      NSApp.terminate(nil)
+      return
+    }
     writePidFile()
     configureNotifications()
     configureStatusItem()
@@ -78,11 +93,13 @@ final class StatusHost: NSObject, NSApplicationDelegate, UNUserNotificationCente
     ])
     notifiedAttentionIds = Set(
       UserDefaults.standard.stringArray(forKey: Self.notifiedAttentionDefaultsKey) ?? [])
+    refreshNotificationAuthorizationStatus()
   }
 
   func applicationWillTerminate(_ notification: Notification) {
     timer?.invalidate()
     stopAttentionStream()
+    notificationControlServer.stop()
     let notifications = UNUserNotificationCenter.current()
     notifications.removeAllDeliveredNotifications()
     notifications.removeAllPendingNotificationRequests()
@@ -182,14 +199,18 @@ final class StatusHost: NSObject, NSApplicationDelegate, UNUserNotificationCente
     sessionsItem.isEnabled = false
     attentionItem.isEnabled = false
     codexHomeItem.isEnabled = false
+    notificationItem.isEnabled = false
     menu.addItem(stateItem)
     menu.addItem(sessionsItem)
     menu.addItem(attentionItem)
     menu.addItem(codexHomeItem)
+    menu.addItem(notificationItem)
+    notificationActionItem.target = self
+    menu.addItem(notificationActionItem)
     menu.addItem(NSMenuItem.separator())
 
     let quitItem = NSMenuItem(
-      title: "Quit The Ditch Runtime",
+      title: "Quit The Ditch",
       action: #selector(quitRuntime),
       keyEquivalent: "q")
     quitItem.target = self
@@ -405,18 +426,142 @@ final class StatusHost: NSObject, NSApplicationDelegate, UNUserNotificationCente
       guard let self else { return }
       switch settings.authorizationStatus {
       case .notDetermined:
-        center.requestAuthorization(options: [.alert, .sound]) { granted, error in
-          if let error { self.log("notification authorization failed: \(error)") }
-          if granted { self.postNotifications(newAttention) }
-        }
+        self.log("notification delivery skipped: authorization not requested yet")
       case .authorized, .provisional, .ephemeral:
         self.postNotifications(newAttention)
       case .denied:
-        break
+        self.log("notification delivery skipped: authorization denied")
       @unknown default:
         break
       }
     }
+  }
+
+  private func refreshNotificationAuthorizationStatus() {
+    UNUserNotificationCenter.current().getNotificationSettings { [weak self] settings in
+      DispatchQueue.main.async {
+        self?.applyNotificationSettings(settings)
+      }
+    }
+  }
+
+  private func handleNotificationControlCommand(
+    _ command: String,
+    reply: @escaping ([String: Any]) -> Void
+  ) {
+    let center = UNUserNotificationCenter.current()
+    switch command {
+    case "status":
+      center.getNotificationSettings { [weak self] settings in
+        DispatchQueue.main.async { self?.applyNotificationSettings(settings) }
+        reply(Self.notificationSettingsPayload(settings))
+      }
+    case "requestAuthorization":
+      center.getNotificationSettings { [weak self] settings in
+        guard settings.authorizationStatus == .notDetermined else {
+          DispatchQueue.main.async { self?.applyNotificationSettings(settings) }
+          reply(Self.notificationSettingsPayload(settings))
+          return
+        }
+        center.requestAuthorization(options: [.alert, .sound]) { _, error in
+          center.getNotificationSettings { updated in
+            DispatchQueue.main.async { self?.applyNotificationSettings(updated) }
+            reply(Self.notificationSettingsPayload(updated, error: error))
+          }
+        }
+      }
+    default:
+      reply([
+        "error": [
+          "domain": "ai.theditch.runtime.notification-control",
+          "code": 400,
+          "message": "Unknown notification control command.",
+        ]
+      ])
+    }
+  }
+
+  private static func notificationSettingsPayload(
+    _ settings: UNNotificationSettings,
+    error: Error? = nil
+  ) -> [String: Any] {
+    var values: [String: Any] = [
+      "authorizationStatus": notificationAuthorizationName(settings.authorizationStatus),
+      "alertsEnabled": settings.alertSetting == .enabled,
+      "notificationCenterEnabled": settings.notificationCenterSetting == .enabled,
+      "soundsEnabled": settings.soundSetting == .enabled,
+      "bundleIdentifier": Bundle.main.bundleIdentifier ?? "unknown",
+      "pid": ProcessInfo.processInfo.processIdentifier,
+    ]
+    if let error {
+      let native = error as NSError
+      values["error"] = [
+        "domain": native.domain,
+        "code": native.code,
+        "message": native.localizedDescription,
+      ]
+    }
+    return values
+  }
+
+  private func applyNotificationSettings(_ settings: UNNotificationSettings) {
+    notificationAuthorizationStatus = settings.authorizationStatus
+    let authorized = Self.isNotificationAuthorized(settings.authorizationStatus)
+    let alertsEnabled = settings.alertSetting == .enabled
+      || settings.notificationCenterSetting == .enabled
+
+    if authorized && alertsEnabled {
+      notificationItem.title = "Notifications: Enabled"
+      notificationActionItem.title = "Notification Settings…"
+    } else if settings.authorizationStatus == .denied {
+      notificationItem.title = "Notifications: Disabled"
+      notificationActionItem.title = "Open Notification Settings…"
+    } else if authorized {
+      notificationItem.title = "Notifications: Alerts Disabled"
+      notificationActionItem.title = "Open Notification Settings…"
+    } else {
+      notificationItem.title = "Notifications: Not Enabled"
+      notificationActionItem.title = "Enable Notifications…"
+    }
+    notificationActionItem.isEnabled = true
+  }
+
+  @objc private func manageNotifications() {
+    if notificationAuthorizationStatus == .notDetermined {
+      handleNotificationControlCommand("requestAuthorization") { [weak self] values in
+        if let error = values["error"] {
+          self?.log("notification authorization failed: \(error)")
+        }
+      }
+    } else {
+      openNotificationSettings()
+    }
+  }
+
+  private static func isNotificationAuthorized(_ status: UNAuthorizationStatus) -> Bool {
+    switch status {
+    case .authorized, .provisional, .ephemeral: return true
+    case .notDetermined, .denied: return false
+    @unknown default: return false
+    }
+  }
+
+  private static func notificationAuthorizationName(_ status: UNAuthorizationStatus) -> String {
+    switch status {
+    case .notDetermined: return "notDetermined"
+    case .denied: return "denied"
+    case .authorized: return "authorized"
+    case .provisional: return "provisional"
+    case .ephemeral: return "ephemeral"
+    @unknown default: return "unknown"
+    }
+  }
+
+  private func openNotificationSettings() {
+    guard let url = URL(
+      string: "x-apple.systempreferences:com.apple.Notifications-Settings.extension")
+    else { return }
+    NSWorkspace.shared.open(url)
   }
 
   private func postNotifications(_ attention: [AgentAttention]) {
@@ -699,9 +844,9 @@ final class StatusHost: NSObject, NSApplicationDelegate, UNUserNotificationCente
   @objc private func quitRuntime() {
     if let status = lastRuntimeStatus, status.activeSessionCount > 0 {
       let alert = NSAlert()
-      alert.messageText = "Quit The Ditch Runtime?"
+      alert.messageText = "Quit The Ditch?"
       alert.informativeText =
-        "This will stop \(status.activeSessionCount) active agent session(s). The Ditch window may remain open but will disconnect."
+        "This will close The Ditch and stop \(status.activeSessionCount) active agent session(s)."
       alert.addButton(withTitle: "Quit and Stop Agents")
       alert.addButton(withTitle: "Cancel")
       alert.alertStyle = .warning
@@ -720,7 +865,21 @@ final class StatusHost: NSObject, NSApplicationDelegate, UNUserNotificationCente
       alert.runModal()
       return
     }
+    terminateForegroundApplication()
     NSApp.terminate(nil)
+  }
+
+  /// The foreground UI automatically reconnects and starts the integrated
+  /// runtime when its event stream closes. Close it as part of an explicit
+  /// status-item quit so that reconnect loop cannot immediately revive us.
+  private func terminateForegroundApplication() {
+    for application in NSRunningApplication.runningApplications(
+      withBundleIdentifier: "ai.theditch.app"
+    ) where !application.isTerminated {
+      if !application.terminate() {
+        log("foreground application refused termination pid=\(application.processIdentifier)")
+      }
+    }
   }
 
   private func statusImage() -> NSImage {
@@ -783,6 +942,207 @@ final class StatusHost: NSObject, NSApplicationDelegate, UNUserNotificationCente
     image.isTemplate = true
     image.accessibilityDescription = "The Ditch Runtime"
     return image
+  }
+}
+
+/// A private control plane for AppKit-owned operations. The Rust runtime has
+/// its own socket and protocol; keeping notification authorization here avoids
+/// pushing macOS UI work across the Rust/Swift boundary.
+private final class NotificationControlServer {
+  private static let maximumMessageSize = 64 * 1024
+  private let acceptQueue = DispatchQueue(
+    label: "ai.theditch.runtime.notification-control", qos: .utility)
+  private let workerQueue = DispatchQueue(
+    label: "ai.theditch.runtime.notification-control.client",
+    qos: .userInitiated,
+    attributes: .concurrent)
+  private var descriptor: Int32 = -1
+  private var ownsSocket = false
+  private var handler: ((String, @escaping ([String: Any]) -> Void) -> Void)?
+
+  private static var socketPath: String {
+    FileManager.default.homeDirectoryForCurrentUser
+      .appendingPathComponent("Library/Application Support/The Ditch", isDirectory: true)
+      .appendingPathComponent("notification-control.sock")
+      .path
+  }
+
+  func start(
+    handler: @escaping (String, @escaping ([String: Any]) -> Void) -> Void
+  ) -> Bool {
+    let path = Self.socketPath
+    let directory = URL(fileURLWithPath: path).deletingLastPathComponent()
+    do {
+      try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    } catch {
+      return false
+    }
+
+    if FileManager.default.fileExists(atPath: path) {
+      if Self.hasLiveOwner(path: path) {
+        return false
+      }
+      guard unlink(path) == 0 || errno == ENOENT else { return false }
+    }
+
+    let server = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
+    guard server >= 0 else { return false }
+    var noSigPipe: Int32 = 1
+    let noSigPipeSize = socklen_t(MemoryLayout.size(ofValue: noSigPipe))
+    _ = withUnsafePointer(to: &noSigPipe) {
+      setsockopt(
+        server, SOL_SOCKET, SO_NOSIGPIPE, $0,
+        noSigPipeSize)
+    }
+    guard Self.withAddress(path: path, body: { address, length in
+      Darwin.bind(server, address, length)
+    }) == 0,
+      chmod(path, mode_t(S_IRUSR | S_IWUSR)) == 0,
+      Darwin.listen(server, 8) == 0
+    else {
+      Darwin.close(server)
+      unlink(path)
+      return false
+    }
+
+    self.handler = handler
+    descriptor = server
+    ownsSocket = true
+    acceptQueue.async { [weak self] in self?.acceptConnections() }
+    return true
+  }
+
+  func stop() {
+    let server = descriptor
+    descriptor = -1
+    if server >= 0 { Darwin.close(server) }
+    if ownsSocket {
+      ownsSocket = false
+      unlink(Self.socketPath)
+    }
+  }
+
+  private func acceptConnections() {
+    while descriptor >= 0 {
+      let client = Darwin.accept(descriptor, nil, nil)
+      if client < 0 {
+        if errno == EINTR { continue }
+        return
+      }
+      workerQueue.async { [weak self] in self?.serve(client: client) }
+    }
+  }
+
+  private func serve(client: Int32) {
+    defer { Darwin.close(client) }
+    var peerUser: uid_t = 0
+    var peerGroup: gid_t = 0
+    guard getpeereid(client, &peerUser, &peerGroup) == 0,
+      peerUser == geteuid()
+    else { return }
+
+    var receiveTimeout = timeval(tv_sec: 5, tv_usec: 0)
+    let receiveTimeoutSize = socklen_t(MemoryLayout.size(ofValue: receiveTimeout))
+    _ = withUnsafePointer(to: &receiveTimeout) {
+      setsockopt(
+        client, SOL_SOCKET, SO_RCVTIMEO, $0,
+        receiveTimeoutSize)
+    }
+    guard let request = Self.readMessage(from: client),
+      let root = try? JSONSerialization.jsonObject(with: request) as? [String: Any],
+      let command = root["command"] as? String,
+      let handler
+    else {
+      Self.writeMessage([
+        "error": [
+          "domain": "ai.theditch.runtime.notification-control",
+          "code": 400,
+          "message": "Invalid notification control request.",
+        ]
+      ], to: client)
+      return
+    }
+
+    let completed = DispatchSemaphore(value: 0)
+    var response: [String: Any]?
+    handler(command) { values in
+      response = values
+      completed.signal()
+    }
+    guard completed.wait(timeout: .now() + 125) == .success,
+      let response
+    else {
+      Self.writeMessage([
+        "error": [
+          "domain": "ai.theditch.runtime.notification-control",
+          "code": 408,
+          "message": "Notification control timed out.",
+        ]
+      ], to: client)
+      return
+    }
+    Self.writeMessage(response, to: client)
+  }
+
+  private static func readMessage(from descriptor: Int32) -> Data? {
+    var result = Data()
+    var buffer = [UInt8](repeating: 0, count: 4096)
+    while result.count <= maximumMessageSize {
+      let count = Darwin.read(descriptor, &buffer, buffer.count)
+      guard count > 0 else { return nil }
+      result.append(contentsOf: buffer.prefix(count))
+      if let newline = result.firstIndex(of: 0x0A) {
+        return Data(result[..<newline])
+      }
+    }
+    return nil
+  }
+
+  private static func writeMessage(_ value: [String: Any], to descriptor: Int32) {
+    guard var data = try? JSONSerialization.data(withJSONObject: value) else { return }
+    data.append(0x0A)
+    data.withUnsafeBytes { bytes in
+      var offset = 0
+      while offset < bytes.count {
+        let written = Darwin.write(
+          descriptor, bytes.baseAddress!.advanced(by: offset), bytes.count - offset)
+        if written <= 0 { return }
+        offset += written
+      }
+    }
+  }
+
+  private static func hasLiveOwner(path: String) -> Bool {
+    let client = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
+    guard client >= 0 else { return false }
+    defer { Darwin.close(client) }
+    return withAddress(path: path) { address, length in
+      Darwin.connect(client, address, length)
+    } == 0
+  }
+
+  private static func withAddress<T>(
+    path: String,
+    body: (UnsafePointer<sockaddr>, socklen_t) -> T
+  ) -> T? {
+    var address = sockaddr_un()
+    address.sun_family = sa_family_t(AF_UNIX)
+    guard path.utf8.count < MemoryLayout.size(ofValue: address.sun_path) else { return nil }
+    withUnsafeMutablePointer(to: &address.sun_path) { pointer in
+      path.withCString { source in
+        _ = strcpy(UnsafeMutableRawPointer(pointer).assumingMemoryBound(to: CChar.self), source)
+      }
+    }
+    let length = socklen_t(MemoryLayout<sa_family_t>.size + path.utf8.count + 1)
+    return withUnsafePointer(to: &address) { pointer in
+      pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+        body($0, length)
+      }
+    }
+  }
+
+  deinit {
+    stop()
   }
 }
 

@@ -6,6 +6,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:the_ditch/main.dart';
 import 'package:the_ditch/application/command_center_controller.dart';
 import 'package:the_ditch/data/runtime_models.dart';
+import 'package:the_ditch/design_system/ditch_theme.dart';
 
 final _testAgentHeaderKeys = <String, GlobalKey>{};
 
@@ -23,6 +24,16 @@ Widget _testApp() => const TheDitchApp(
 );
 
 void main() {
+  test('agent execution settings expose scoped network access', () {
+    final settings = AgentExecutionSettings();
+
+    expect(settings.networkAccess, isTrue);
+    expect(settings.protocolValue['network_access'], isTrue);
+
+    settings.setNetworkAccess(false);
+    expect(settings.protocolValue['network_access'], isFalse);
+  });
+
   test('presentation controller publishes immutable connection states', () {
     final controller = CommandCenterController();
     addTearDown(controller.dispose);
@@ -72,15 +83,37 @@ void main() {
         'unread_attention_count': 1,
         'instance_id': 'instance-1',
         'codex_home': '/tmp/codex',
+        'codex_binary': '/opt/homebrew/bin/codex',
         'build_version': '1.0.0',
-        'capabilities': ['persistent_sessions_v1'],
+        'capabilities': ['persistent_sessions_v1', 'network_access_profile_v1'],
       },
     });
 
     expect(status.pid, 42);
     expect(status.activeSessionCount, 2);
     expect(status.unreadAttentionCount, 1);
+    expect(status.codexBinary, '/opt/homebrew/bin/codex');
     expect(status.supportsPersistentSessions, isTrue);
+    expect(status.supportsNetworkAccessProfile, isTrue);
+  });
+
+  test('Codex readiness requires compatibility and authentication', () {
+    final report = CodexReadinessReport.fromResponse({
+      'CodexReadiness': {
+        'path': '/opt/homebrew/bin/codex',
+        'version': 'codex-cli 1.2.3',
+        'compatible': true,
+        'authenticated': false,
+        'update_supported': true,
+        'doctor_supported': true,
+        'issues': ['Codex is not signed in for this user.'],
+        'diagnostics': '{}',
+      },
+    });
+
+    expect(report.ready, isFalse);
+    expect(report.updateSupported, isTrue);
+    expect(report.issues, hasLength(1));
   });
 
   test('runtime project parser restores path and Git policy', () {
@@ -479,19 +512,117 @@ void main() {
     expect(find.text('New Agent'), findsOneWidget);
   });
 
-  testWidgets('fresh install opens the add project flow without a bootstrap', (
+  testWidgets('fresh install starts with Codex readiness onboarding', (
     tester,
   ) async {
     await tester.pumpWidget(const TheDitchApp(connectRuntimeOnStart: false));
     await tester.pumpAndSettle();
 
-    expect(find.widgetWithText(AlertDialog, 'Add Project'), findsOneWidget);
-    expect(find.byKey(const Key('first-project-add')), findsOneWidget);
+    expect(find.text('Welcome to The Ditch'), findsOneWidget);
+    expect(find.byKey(const Key('onboarding-continue')), findsOneWidget);
+    expect(find.byKey(const Key('first-project-add')), findsNothing);
+    expect(find.widgetWithText(AlertDialog, 'Add Project'), findsNothing);
     expect(
       find.text('/Users/tester/Documents/Personal/The Ditch v2'),
       findsNothing,
     );
     expect(find.text('PROJECTS'), findsNothing);
+  });
+
+  testWidgets('first project action remains gated until Codex is ready', (
+    tester,
+  ) async {
+    var addCalls = 0;
+    await tester.pumpWidget(
+      MaterialApp(
+        theme: DitchTheme.light(),
+        home: CodexOnboardingView(
+          introduced: true,
+          checking: false,
+          updating: false,
+          readiness: const CodexReadinessReport(
+            path: '/opt/homebrew/bin/codex',
+            version: 'codex-cli 1.2.3',
+            compatible: true,
+            authenticated: true,
+            updateSupported: true,
+            doctorSupported: true,
+            issues: [],
+            diagnostics: '{}',
+          ),
+          error: null,
+          notificationReadiness: const NotificationReadiness(
+            authorization: NotificationAuthorizationState.authorized,
+            alertsEnabled: true,
+            notificationCenterEnabled: true,
+            soundsEnabled: true,
+          ),
+          notificationChecking: false,
+          notificationError: null,
+          onContinue: () {},
+          onCheckAgain: () {},
+          onChooseInstallation: () {},
+          onUpdate: () {},
+          onSignIn: () {},
+          onOpenInstallInstructions: () {},
+          onManageNotifications: () {},
+          onCheckNotifications: () {},
+          onAddProject: () => addCalls += 1,
+        ),
+      ),
+    );
+
+    expect(find.text('Codex is ready'), findsOneWidget);
+    await tester.tap(find.byKey(const Key('first-project-add')));
+    expect(addCalls, 1);
+  });
+
+  testWidgets('first project remains gated until notifications are enabled', (
+    tester,
+  ) async {
+    var notificationCalls = 0;
+    await tester.pumpWidget(
+      MaterialApp(
+        theme: DitchTheme.light(),
+        home: CodexOnboardingView(
+          introduced: true,
+          checking: false,
+          updating: false,
+          readiness: const CodexReadinessReport(
+            path: '/opt/homebrew/bin/codex',
+            version: 'codex-cli 1.2.3',
+            compatible: true,
+            authenticated: true,
+            updateSupported: true,
+            doctorSupported: true,
+            issues: [],
+            diagnostics: '{}',
+          ),
+          error: null,
+          notificationReadiness: const NotificationReadiness(
+            authorization: NotificationAuthorizationState.notDetermined,
+            alertsEnabled: false,
+            notificationCenterEnabled: false,
+            soundsEnabled: false,
+          ),
+          notificationChecking: false,
+          notificationError: null,
+          onContinue: () {},
+          onCheckAgain: () {},
+          onChooseInstallation: () {},
+          onUpdate: () {},
+          onSignIn: () {},
+          onOpenInstallInstructions: () {},
+          onManageNotifications: () => notificationCalls += 1,
+          onCheckNotifications: () {},
+          onAddProject: () {},
+        ),
+      ),
+    );
+
+    expect(find.byKey(const Key('first-project-add')), findsNothing);
+    await tester.tap(find.byKey(const Key('enable-notifications')));
+    expect(notificationCalls, 1);
   });
 
   testWidgets('runtime failure has a dedicated recovery surface', (
@@ -1347,6 +1478,7 @@ void main() {
           body: Column(
             children: [
               AgentStatusChip(status: AgentStatus.working),
+              AgentStatusChip(status: AgentStatus.stopping),
               AgentStatusChip(status: AgentStatus.completed),
               AgentStatusChip(status: AgentStatus.failed),
             ],
@@ -1356,6 +1488,7 @@ void main() {
     );
 
     expect(find.text('Running'), findsOneWidget);
+    expect(find.text('Stopping'), findsOneWidget);
     expect(find.text('Completed'), findsOneWidget);
     expect(find.text('Failed'), findsOneWidget);
     expect(
@@ -1363,6 +1496,49 @@ void main() {
       findsOneWidget,
     );
     expect(find.byKey(const ValueKey('agent-status-failed')), findsOneWidget);
+  });
+
+  testWidgets('stopping agent cannot be reprompted until shutdown finishes', (
+    tester,
+  ) async {
+    final session = AgentSession(
+      localId: 'stopping-agent',
+      provider: AgentProvider.codex,
+      status: AgentStatus.stopping,
+      messages: const [],
+      codexThreadId: 'thread-stopping',
+    );
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: ExpandableAgentPanel(
+            headerKey: const ValueKey('stopping-agent-header'),
+            session: session,
+            expanded: true,
+            enlarged: false,
+            chatViewport: ConversationViewportController(),
+            composerKey: GlobalKey<AgentComposerState>(),
+            initialPrompt: '',
+            onTap: () {},
+            onEnlarge: () {},
+            onDelete: () {},
+            onRename: (_) {},
+            onSubmitPrompt: (_) {},
+            onStopCodex: () {},
+          ),
+        ),
+      ),
+    );
+
+    expect(find.textContaining('waiting for the thread'), findsOneWidget);
+    expect(
+      tester
+          .widget<NativeComposerTextView>(find.byType(NativeComposerTextView))
+          .enabled,
+      isFalse,
+    );
+    expect(find.byKey(const ValueKey('agent-status-stopping')), findsOneWidget);
   });
 
   testWidgets(

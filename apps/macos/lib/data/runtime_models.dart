@@ -12,6 +12,7 @@ class RuntimeStatusDto {
     required this.instanceId,
     required this.capabilities,
     this.codexHome,
+    this.codexBinary,
     this.buildVersion = '',
   });
 
@@ -48,6 +49,7 @@ class RuntimeStatusDto {
           : integer('attention_count'),
       instanceId: string('instance_id'),
       codexHome: body['codex_home']?.toString(),
+      codexBinary: body['codex_binary']?.toString(),
       buildVersion: body['build_version']?.toString() ?? '',
       capabilities: rawCapabilities is List
           ? rawCapabilities.map((value) => value.toString()).toSet()
@@ -63,9 +65,13 @@ class RuntimeStatusDto {
   final int unreadAttentionCount;
   final String instanceId;
   final String? codexHome;
+  final String? codexBinary;
   final String buildVersion;
   final Set<String> capabilities;
 
   bool get supportsPersistentSessions =>
       capabilities.contains('persistent_sessions_v1');
+
+  bool get supportsNetworkAccessProfile =>
+      capabilities.contains('network_access_profile_v1');
 }

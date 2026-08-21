@@ -170,6 +170,7 @@ dependencies = [
  "ditch_core",
  "ditch_protocol",
  "ditch_store",
+ "libc",
  "portable-pty",
  "rusqlite",
  "serde",

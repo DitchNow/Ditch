@@ -6,6 +6,17 @@ HELPER_CONTENTS="$HELPER_APP/Contents"
 HELPER_MACOS="$HELPER_CONTENTS/MacOS"
 MAIN_MACOS="$TARGET_BUILD_DIR/$CONTENTS_FOLDER_PATH/MacOS"
 WORKSPACE_ROOT="$PROJECT_DIR/../../.."
+DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-11.0}"
+BUILD_ARCH="${CURRENT_ARCH:-}"
+case "$BUILD_ARCH" in
+  ""|undefined_arch) BUILD_ARCH="$(uname -m)" ;;
+esac
+
+# Keep every object linked into the nested helper on the same explicit minimum
+# OS version. Without this, a newer Xcode stamps its own host OS as the Swift
+# executable's minimum even when the enclosing Flutter app supports older Macs.
+MACOSX_DEPLOYMENT_TARGET="$DEPLOYMENT_TARGET"
+export MACOSX_DEPLOYMENT_TARGET
 
 # Archive builds run outside the user's interactive shell, so Homebrew and
 # rustup are usually absent from PATH. Resolve Cargo explicitly instead of
@@ -65,7 +76,9 @@ mkdir -p "$SWIFT_CACHE"
 export SWIFT_MODULECACHE_PATH="$SWIFT_CACHE"
 export CLANG_MODULE_CACHE_PATH="$SWIFT_CACHE"
 
-/usr/bin/swiftc -parse-as-library "$PROJECT_DIR/StatusHost/StatusHost.swift" \
+/usr/bin/swiftc -parse-as-library \
+  -target "$BUILD_ARCH-apple-macos$DEPLOYMENT_TARGET" \
+  "$PROJECT_DIR/StatusHost/StatusHost.swift" \
   "$DITCHD_LIBRARY" \
   -framework Cocoa \
   -framework UserNotifications \
@@ -94,8 +107,10 @@ cat > "$HELPER_CONTENTS/Info.plist" <<'PLIST'
   <key>CFBundleVersion</key>
   <string>1</string>
   <key>LSMinimumSystemVersion</key>
-  <string>10.15</string>
+  <string>11.0</string>
   <key>LSUIElement</key>
+  <true/>
+  <key>LSMultipleInstancesProhibited</key>
   <true/>
   <key>NSPrincipalClass</key>
   <string>NSApplication</string>

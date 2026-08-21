@@ -224,14 +224,121 @@ class AgentModelOption {
   final int? contextWindowTokens;
 }
 
+class CodexInstallationOption {
+  const CodexInstallationOption({
+    required this.path,
+    required this.version,
+    required this.selected,
+  });
+
+  final String path;
+  final String version;
+  final bool selected;
+}
+
+class CodexReadinessReport {
+  const CodexReadinessReport({
+    required this.path,
+    required this.version,
+    required this.compatible,
+    required this.authenticated,
+    required this.updateSupported,
+    required this.doctorSupported,
+    required this.issues,
+    required this.diagnostics,
+  });
+
+  factory CodexReadinessReport.fromResponse(Map<String, dynamic> response) {
+    final value = response['CodexReadiness'];
+    if (value is! Map) {
+      throw const FormatException('Runtime returned invalid Codex readiness.');
+    }
+    final rawIssues = value['issues'];
+    return CodexReadinessReport(
+      path: value['path']?.toString(),
+      version: value['version']?.toString(),
+      compatible: value['compatible'] == true,
+      authenticated: value['authenticated'] == true,
+      updateSupported: value['update_supported'] == true,
+      doctorSupported: value['doctor_supported'] == true,
+      issues: rawIssues is List
+          ? rawIssues.map((item) => item.toString()).toList()
+          : const [],
+      diagnostics: value['diagnostics']?.toString(),
+    );
+  }
+
+  final String? path;
+  final String? version;
+  final bool compatible;
+  final bool authenticated;
+  final bool updateSupported;
+  final bool doctorSupported;
+  final List<String> issues;
+  final String? diagnostics;
+
+  bool get ready => path != null && compatible && authenticated;
+}
+
+enum NotificationAuthorizationState {
+  notDetermined,
+  denied,
+  authorized,
+  provisional,
+  ephemeral,
+  unknown,
+}
+
+class NotificationReadiness {
+  const NotificationReadiness({
+    required this.authorization,
+    required this.alertsEnabled,
+    required this.notificationCenterEnabled,
+    required this.soundsEnabled,
+  });
+
+  factory NotificationReadiness.fromMap(Map<Object?, Object?> value) {
+    final authorization = switch (value['authorizationStatus']?.toString()) {
+      'notDetermined' => NotificationAuthorizationState.notDetermined,
+      'denied' => NotificationAuthorizationState.denied,
+      'authorized' => NotificationAuthorizationState.authorized,
+      'provisional' => NotificationAuthorizationState.provisional,
+      'ephemeral' => NotificationAuthorizationState.ephemeral,
+      _ => NotificationAuthorizationState.unknown,
+    };
+    return NotificationReadiness(
+      authorization: authorization,
+      alertsEnabled: value['alertsEnabled'] == true,
+      notificationCenterEnabled: value['notificationCenterEnabled'] == true,
+      soundsEnabled: value['soundsEnabled'] == true,
+    );
+  }
+
+  final NotificationAuthorizationState authorization;
+  final bool alertsEnabled;
+  final bool notificationCenterEnabled;
+  final bool soundsEnabled;
+
+  bool get authorized => switch (authorization) {
+    NotificationAuthorizationState.authorized ||
+    NotificationAuthorizationState.provisional ||
+    NotificationAuthorizationState.ephemeral => true,
+    _ => false,
+  };
+
+  bool get ready => authorized && (alertsEnabled || notificationCenterEnabled);
+}
+
 class AgentExecutionSettings extends ChangeNotifier {
   AgentApprovalPreset approval = AgentApprovalPreset.approveForMe;
+  bool networkAccess = true;
   String? model;
   List<AgentModelOption> models = const [];
 
   Map<String, dynamic> get protocolValue => {
     'model': model,
     'reasoning_effort': null,
+    'network_access': networkAccess,
     'approval': switch (approval) {
       AgentApprovalPreset.ask => 'Ask',
       AgentApprovalPreset.approveForMe => 'ApproveForMe',
@@ -241,6 +348,11 @@ class AgentExecutionSettings extends ChangeNotifier {
 
   void setApproval(AgentApprovalPreset value) {
     approval = value;
+    notifyListeners();
+  }
+
+  void setNetworkAccess(bool value) {
+    networkAccess = value;
     notifyListeners();
   }
 
@@ -353,7 +465,7 @@ class AgentSession {
     return status == AgentStatus.starting || status == AgentStatus.working;
   }
 
-  bool get isActive => isWorking || canStop;
+  bool get isActive => isWorking || status == AgentStatus.stopping || canStop;
 }
 
 void reconcileAgentSession(List<AgentSession> sessions, AgentSession incoming) {
@@ -459,7 +571,15 @@ class AttentionEvent {
   bool get canOpenSession => sessionLocalId != null;
 }
 
-enum AgentStatus { idle, starting, working, completed, failed, stopped }
+enum AgentStatus {
+  idle,
+  starting,
+  working,
+  stopping,
+  completed,
+  failed,
+  stopped,
+}
 
 class ProjectAgentSummary {
   const ProjectAgentSummary({
@@ -976,6 +1096,41 @@ class DitchRuntimeClient {
     }).toList();
   }
 
+  Future<List<CodexInstallationOption>> discoverCodexInstallations() async {
+    final response = await request('DiscoverCodexInstallations');
+    final values = response['CodexInstallations'];
+    if (values is! List) return const [];
+    return values
+        .whereType<Map>()
+        .map((value) {
+          return CodexInstallationOption(
+            path: value['path']?.toString() ?? '',
+            version: value['version']?.toString() ?? 'Unknown version',
+            selected: value['selected'] == true,
+          );
+        })
+        .where((installation) => installation.path.isNotEmpty)
+        .toList();
+  }
+
+  Future<CodexReadinessReport> checkCodexReadiness() async {
+    return CodexReadinessReport.fromResponse(
+      await request('CheckCodexReadiness'),
+    );
+  }
+
+  Future<CodexReadinessReport> updateSelectedCodex() async {
+    return CodexReadinessReport.fromResponse(
+      await request('UpdateSelectedCodex'),
+    );
+  }
+
+  Future<Map<String, dynamic>> selectCodexBinary(String path) {
+    return request({
+      'SelectCodexBinary': {'path': path},
+    });
+  }
+
   Future<Map<String, dynamic>> openProjectTerminal({
     required String projectId,
     required int columns,
@@ -1147,9 +1302,18 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
   bool _runtimeHomeMismatchReported = false;
   bool _runtimeCodexHomeMatches = true;
   bool _runtimeSupportsPersistence = true;
+  bool _runtimeSupportsNetworkAccess = true;
   bool _runtimeCompatibilityReported = false;
   String? _effectiveRuntimeCodexHome;
-  bool _firstProjectFlowScheduled = false;
+  String? _codexBinary;
+  CodexReadinessReport? _codexReadiness;
+  bool _codexSetupChecking = false;
+  bool _codexSetupUpdating = false;
+  bool _onboardingIntroduced = false;
+  String? _codexSetupError;
+  NotificationReadiness? _notificationReadiness;
+  bool _notificationSetupChecking = false;
+  String? _notificationSetupError;
   TerminalPresentation _terminalPresentation = TerminalPresentation.docked;
   TerminalPresentation _terminalRestorePresentation =
       TerminalPresentation.docked;
@@ -1450,6 +1614,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
     try {
       await _ensureRuntimeStarted();
       final status = await _runtimeClient.runtimeStatus();
+      _codexBinary = status.codexBinary;
       final instanceId = status.instanceId;
       final snapshot = await _runtimeClient.snapshot();
       _hydrateRuntimeSnapshot(snapshot);
@@ -1479,12 +1644,8 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
       }
       _presentation.connected();
       unawaited(_ensureSelectedProjectTerminal());
-      unawaited(
-        _runtimeClient
-            .listCodexModels()
-            .then(agentExecutionSettings.setModels)
-            .onError((_, _) {}),
-      );
+      unawaited(_refreshNotificationReadiness());
+      await _refreshCodexReadiness();
     } on Object catch (error) {
       _presentation.unavailable(error);
       _addAttentionRequired(
@@ -1494,6 +1655,182 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
         body: '$error',
         global: true,
       );
+    }
+  }
+
+  Future<void> _refreshCodexReadiness() async {
+    if (_codexSetupChecking) return;
+    if (mounted) {
+      setState(() {
+        _codexSetupChecking = true;
+        _codexSetupError = null;
+      });
+    }
+    try {
+      final report = await _runtimeClient.checkCodexReadiness();
+      if (!mounted) return;
+      setState(() {
+        _codexReadiness = report;
+        _codexBinary = report.path;
+        _codexSetupChecking = false;
+      });
+      if (report.ready) {
+        unawaited(
+          _runtimeClient
+              .listCodexModels()
+              .then(agentExecutionSettings.setModels)
+              .onError((_, _) {}),
+        );
+      }
+    } on Object catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _codexSetupChecking = false;
+        _codexSetupError = '$error';
+      });
+    }
+  }
+
+  Future<void> _refreshNotificationReadiness({bool request = false}) async {
+    if (_notificationSetupChecking || !mounted) return;
+    setState(() {
+      _notificationSetupChecking = true;
+      _notificationSetupError = null;
+    });
+    try {
+      final values = await _applicationChannel
+          .invokeMapMethod<Object?, Object?>(
+            request
+                ? 'requestNotificationAuthorization'
+                : 'notificationAuthorizationStatus',
+          );
+      if (!mounted) return;
+      if (values == null) {
+        throw const FormatException(
+          'The Ditch Runtime returned no notification status.',
+        );
+      }
+      setState(() {
+        _notificationReadiness = NotificationReadiness.fromMap(values);
+        _notificationSetupChecking = false;
+      });
+    } on MissingPluginException {
+      if (mounted) setState(() => _notificationSetupChecking = false);
+    } on Object catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _notificationSetupChecking = false;
+        _notificationSetupError = '$error';
+      });
+    }
+  }
+
+  Future<void> _manageNotificationSetup() async {
+    final state = _notificationReadiness?.authorization;
+    if (state == NotificationAuthorizationState.denied ||
+        (_notificationReadiness?.authorized == true &&
+            _notificationReadiness?.ready == false)) {
+      try {
+        await _applicationChannel.invokeMethod<bool>(
+          'openNotificationSettings',
+        );
+      } on Object catch (error) {
+        if (mounted) setState(() => _notificationSetupError = '$error');
+      }
+      return;
+    }
+    await _refreshNotificationReadiness(request: true);
+  }
+
+  Future<void> _updateCodex() async {
+    final report = _codexReadiness;
+    if (report == null || !report.updateSupported || !mounted) return;
+    final approved = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        icon: const Icon(Icons.system_update_alt),
+        title: const Text('Update Codex?'),
+        content: Text(
+          'The Ditch will run `codex update` using your selected installation.\n\n${report.path}\n${report.version ?? "Unknown version"}\n\nIt will not modify PATH, Homebrew, npm, or another installation.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(context).pop(true),
+            child: const Text('Update Codex'),
+          ),
+        ],
+      ),
+    );
+    if (approved != true || !mounted) return;
+    setState(() {
+      _codexSetupUpdating = true;
+      _codexSetupError = null;
+    });
+    try {
+      final updated = await _runtimeClient.updateSelectedCodex();
+      if (!mounted) return;
+      setState(() {
+        _codexReadiness = updated;
+        _codexBinary = updated.path;
+        _codexSetupUpdating = false;
+      });
+    } on Object catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _codexSetupUpdating = false;
+        _codexSetupError = '$error';
+      });
+    }
+  }
+
+  Future<void> _startCodexLogin() async {
+    final binary = _codexReadiness?.path;
+    if (binary == null) return;
+    try {
+      final opened =
+          await _applicationChannel.invokeMethod<bool>(
+            'openCodexLogin',
+            binary,
+          ) ??
+          false;
+      if (!opened && mounted) {
+        setState(() => _codexSetupError = 'Could not open Codex sign-in.');
+        return;
+      }
+      for (var attempt = 0; attempt < 60 && mounted; attempt += 1) {
+        await Future<void>.delayed(const Duration(seconds: 2));
+        if (!mounted) return;
+        await _refreshCodexReadiness();
+        if (_codexReadiness?.authenticated == true) return;
+      }
+    } on Object catch (error) {
+      if (mounted) setState(() => _codexSetupError = '$error');
+    }
+  }
+
+  Future<void> _openCodexInstallInstructions() async {
+    try {
+      await _applicationChannel.invokeMethod<bool>(
+        'openURL',
+        'https://learn.chatgpt.com/docs/codex/cli',
+      );
+    } on Object catch (error) {
+      if (mounted) setState(() => _codexSetupError = '$error');
+    }
+  }
+
+  void _repairCodexSetup() {
+    final report = _codexReadiness;
+    if (report != null && !report.compatible && report.updateSupported) {
+      unawaited(_updateCodex());
+    } else if (report != null && report.compatible && !report.authenticated) {
+      unawaited(_startCodexLogin());
+    } else {
+      unawaited(_openCodexSettings());
     }
   }
 
@@ -1521,9 +1858,85 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
     );
   }
 
+  Future<void> _openCodexSettings() async {
+    try {
+      final installations = await _runtimeClient.discoverCodexInstallations();
+      if (!mounted) return;
+      final selected = await showDialog<String>(
+        context: context,
+        builder: (context) => AlertDialog(
+          icon: const Icon(Icons.terminal),
+          title: const Text('Codex installation'),
+          content: SizedBox(
+            width: 560,
+            child: installations.isEmpty
+                ? const Text(
+                    'No working Codex CLI installation was found. Install Codex for your user account, then reopen this window.',
+                  )
+                : ConstrainedBox(
+                    constraints: const BoxConstraints(maxHeight: 420),
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        const Text(
+                          'The Ditch uses one of your existing Codex installations. It never creates a private toolchain or changes your shell PATH.',
+                        ),
+                        const SizedBox(height: 12),
+                        Flexible(
+                          child: ListView(
+                            shrinkWrap: true,
+                            children: installations.map((installation) {
+                              return ListTile(
+                                contentPadding: EdgeInsets.zero,
+                                leading: Icon(
+                                  installation.path == _codexBinary ||
+                                          installation.selected
+                                      ? Icons.check_circle
+                                      : Icons.circle_outlined,
+                                ),
+                                title: Text(installation.version),
+                                subtitle: SelectableText(installation.path),
+                                onTap: () => Navigator.of(
+                                  context,
+                                ).pop(installation.path),
+                              );
+                            }).toList(),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(),
+              child: const Text('Close'),
+            ),
+          ],
+        ),
+      );
+      if (selected == null || selected == _codexBinary) return;
+      await _runtimeClient.selectCodexBinary(selected);
+      if (!mounted) return;
+      setState(() => _codexBinary = selected);
+      await _refreshCodexReadiness();
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Codex installation updated.')),
+      );
+    } on Object catch (error) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Could not load Codex installations: $error')),
+      );
+    }
+  }
+
   void _checkRuntimeCapabilities(RuntimeStatusDto status) {
     _runtimeSupportsPersistence = status.supportsPersistentSessions;
-    if (_runtimeSupportsPersistence) {
+    _runtimeSupportsNetworkAccess = status.supportsNetworkAccessProfile;
+    if (_runtimeSupportsPersistence && _runtimeSupportsNetworkAccess) {
       _runtimeCompatibilityReported = false;
       return;
     }
@@ -1536,7 +1949,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
       icon: Icons.system_update_alt_outlined,
       title: 'Outdated Ditch Runtime',
       body:
-          'This runtime cannot persist agent sessions. Rebuild and restart The Ditch before starting Codex.',
+          'This runtime does not support the current agent execution profile. Rebuild and restart The Ditch before starting Codex.',
       global: true,
     );
   }
@@ -1718,7 +2131,6 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
         if (mounted) _openNotificationTarget(pendingTarget);
       });
     }
-    _scheduleFirstProjectFlow();
   }
 
   DitchProject? _projectFromRuntime(Object? value) {
@@ -1737,8 +2149,6 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
     unawaited(_loadPaneWidths());
     if (widget.connectRuntimeOnStart) {
       unawaited(_connectRuntime());
-    } else if (_projects.isEmpty) {
-      _scheduleFirstProjectFlow(beforeRuntimeHydration: true);
     }
   }
 
@@ -2004,30 +2414,9 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
       });
     }
     _scheduleStatusBarUpdate();
-    if (_projects.isEmpty) {
-      _firstProjectFlowScheduled = false;
-      _scheduleFirstProjectFlow();
-    } else {
+    if (_projects.isNotEmpty) {
       unawaited(_ensureSelectedProjectTerminal());
     }
-  }
-
-  void _scheduleFirstProjectFlow({bool beforeRuntimeHydration = false}) {
-    if (_firstProjectFlowScheduled ||
-        _projects.isNotEmpty ||
-        (!beforeRuntimeHydration && !_runtimeSnapshotHydrated) ||
-        !mounted) {
-      return;
-    }
-    _firstProjectFlowScheduled = true;
-    WidgetsBinding.instance.addPostFrameCallback((_) async {
-      if (!mounted || _projects.isNotEmpty) {
-        _firstProjectFlowScheduled = false;
-        return;
-      }
-      await _addProject();
-      _firstProjectFlowScheduled = false;
-    });
   }
 
   void _showProjectSetupProgress() {
@@ -2140,7 +2529,22 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
   }
 
   Future<bool> _prepareSelectedProjectForCodex() async {
-    if (!_runtimeSupportsPersistence) {
+    if (_codexReadiness?.ready != true) {
+      await _refreshCodexReadiness();
+      if (_codexReadiness?.ready != true) {
+        _showProjectSetupResult(
+          title: 'Codex setup required',
+          message:
+              _codexReadiness?.issues.join('\n') ??
+              _codexSetupError ??
+              'Complete Codex setup before starting an agent.',
+          isError: true,
+        );
+        return false;
+      }
+    }
+    if (!mounted) return false;
+    if (!_runtimeSupportsPersistence || !_runtimeSupportsNetworkAccess) {
       _showProjectSetupResult(
         title: 'Outdated Ditch Runtime',
         message:
@@ -2282,6 +2686,11 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
 
   Future<void> _stopCodex(AgentSession session) async {
     _addChatMessage(session, ChatMessageRole.system, 'Stopping Codex...');
+    setState(() {
+      session.status = AgentStatus.stopping;
+      session.canStop = false;
+      session.updatedAt = DateTime.now();
+    });
     try {
       await _runtimeClient.stopAgent(session.localId);
       setState(() {
@@ -2827,6 +3236,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
     return switch (state) {
       'Starting' => AgentStatus.starting,
       'Working' || 'AwaitingApproval' || 'Blocked' => AgentStatus.working,
+      'Stopping' => AgentStatus.stopping,
       'Completed' => AgentStatus.completed,
       'Failed' || 'Stale' || 'Unknown' => AgentStatus.failed,
       'Interrupted' => AgentStatus.stopped,
@@ -3202,16 +3612,27 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
           body: LayoutBuilder(
             builder: (context, constraints) {
               if (_projects.isEmpty) {
-                return ColoredBox(
-                  color: context.ditch.workspace,
-                  child: Center(
-                    child: FilledButton.icon(
-                      key: const Key('first-project-add'),
-                      onPressed: _addProject,
-                      icon: const Icon(Icons.add),
-                      label: const Text('Add Project'),
-                    ),
-                  ),
+                return CodexOnboardingView(
+                  introduced: _onboardingIntroduced,
+                  checking: _codexSetupChecking,
+                  updating: _codexSetupUpdating,
+                  readiness: _codexReadiness,
+                  error: _codexSetupError,
+                  notificationReadiness: _notificationReadiness,
+                  notificationChecking: _notificationSetupChecking,
+                  notificationError: _notificationSetupError,
+                  onContinue: () {
+                    setState(() => _onboardingIntroduced = true);
+                    unawaited(_refreshCodexReadiness());
+                  },
+                  onCheckAgain: _refreshCodexReadiness,
+                  onChooseInstallation: _openCodexSettings,
+                  onUpdate: _updateCodex,
+                  onSignIn: _startCodexLogin,
+                  onOpenInstallInstructions: _openCodexInstallInstructions,
+                  onManageNotifications: _manageNotificationSetup,
+                  onCheckNotifications: _refreshNotificationReadiness,
+                  onAddProject: _addProject,
                 );
               }
               final compact = constraints.maxWidth < 760;
@@ -3533,9 +3954,36 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
                       onOpenNotification: _openAttentionSession,
                       onDismissNotification: _dismissAttention,
                       onDismissAllNotifications: _dismissAllNotifications,
+                      onOpenCodexSettings: _openCodexSettings,
+                      codexAvailable: _codexBinary != null,
                       onToggleSidebar: _presentation.toggleSidebar,
                       onToggleInspector: _presentation.toggleInspector,
                     ),
+                    if (_codexReadiness != null &&
+                        _codexReadiness!.ready == false)
+                      CodexSetupBanner(
+                        report: _codexReadiness!,
+                        onRepair: _repairCodexSetup,
+                        onCheckAgain: _refreshCodexReadiness,
+                      ),
+                    if ((_notificationReadiness != null &&
+                            _notificationReadiness!.ready == false) ||
+                        _notificationSetupError != null)
+                      NotificationSetupBanner(
+                        readiness:
+                            _notificationReadiness ??
+                            const NotificationReadiness(
+                              authorization:
+                                  NotificationAuthorizationState.unknown,
+                              alertsEnabled: false,
+                              notificationCenterEnabled: false,
+                              soundsEnabled: false,
+                            ),
+                        checking: _notificationSetupChecking,
+                        error: _notificationSetupError,
+                        onManage: _manageNotificationSetup,
+                        onCheckAgain: _refreshNotificationReadiness,
+                      ),
                     const Divider(height: 1),
                     Expanded(
                       child:
@@ -3563,6 +4011,421 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
   }
 }
 
+class CodexOnboardingView extends StatelessWidget {
+  const CodexOnboardingView({
+    required this.introduced,
+    required this.checking,
+    required this.updating,
+    required this.readiness,
+    required this.error,
+    required this.notificationReadiness,
+    required this.notificationChecking,
+    required this.notificationError,
+    required this.onContinue,
+    required this.onCheckAgain,
+    required this.onChooseInstallation,
+    required this.onUpdate,
+    required this.onSignIn,
+    required this.onOpenInstallInstructions,
+    required this.onManageNotifications,
+    required this.onCheckNotifications,
+    required this.onAddProject,
+    super.key,
+  });
+
+  final bool introduced;
+  final bool checking;
+  final bool updating;
+  final CodexReadinessReport? readiness;
+  final String? error;
+  final NotificationReadiness? notificationReadiness;
+  final bool notificationChecking;
+  final String? notificationError;
+  final VoidCallback onContinue;
+  final VoidCallback onCheckAgain;
+  final VoidCallback onChooseInstallation;
+  final VoidCallback onUpdate;
+  final VoidCallback onSignIn;
+  final VoidCallback onOpenInstallInstructions;
+  final VoidCallback onManageNotifications;
+  final VoidCallback onCheckNotifications;
+  final VoidCallback onAddProject;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return ColoredBox(
+      color: context.ditch.workspace,
+      child: Center(
+        child: SingleChildScrollView(
+          padding: const EdgeInsets.all(32),
+          child: ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 620),
+            child: Card(
+              child: Padding(
+                padding: const EdgeInsets.all(32),
+                child: !introduced
+                    ? Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Icon(
+                            Icons.hub_outlined,
+                            size: 46,
+                            color: theme.colorScheme.primary,
+                          ),
+                          const SizedBox(height: 20),
+                          Text(
+                            'Welcome to The Ditch',
+                            style: theme.textTheme.headlineSmall,
+                          ),
+                          const SizedBox(height: 10),
+                          const Text(
+                            'The Ditch runs your existing Codex CLI. First, it will verify the installation, required capabilities, authentication, and diagnostics. It will not create a private Codex installation or change your PATH.',
+                            textAlign: TextAlign.center,
+                          ),
+                          const SizedBox(height: 24),
+                          FilledButton(
+                            key: const Key('onboarding-continue'),
+                            onPressed: onContinue,
+                            child: const Text('Check Codex Setup'),
+                          ),
+                        ],
+                      )
+                    : _buildSetup(context),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildSetup(BuildContext context) {
+    final report = readiness;
+    final busy = checking || updating || notificationChecking;
+    if (report == null && error == null) {
+      return const Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          CircularProgressIndicator(),
+          SizedBox(height: 18),
+          Text('Checking your Codex setup…'),
+        ],
+      );
+    }
+    final theme = Theme.of(context);
+    final ready = report?.ready == true;
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Text(
+          ready ? 'Codex is ready' : 'Finish Codex setup',
+          style: theme.textTheme.headlineSmall,
+          textAlign: TextAlign.center,
+        ),
+        const SizedBox(height: 22),
+        _SetupCheckRow(
+          label: 'Installation found',
+          complete: report?.path != null,
+          detail: report?.path ?? 'No Codex CLI found',
+        ),
+        _SetupCheckRow(
+          label: 'Compatible CLI',
+          complete: report?.compatible == true,
+          detail: report?.version ?? 'Version unavailable',
+        ),
+        _SetupCheckRow(
+          label: 'Signed in',
+          complete: report?.authenticated == true,
+          detail: report?.authenticated == true
+              ? 'Codex authentication is active'
+              : 'Sign in is required',
+        ),
+        if (report?.doctorSupported == true)
+          const _SetupCheckRow(
+            label: 'Diagnostics',
+            complete: true,
+            detail: 'Codex diagnostic command is available',
+          ),
+        if (ready) ...[
+          _SetupCheckRow(
+            label: 'Notifications',
+            complete: notificationReadiness?.ready == true,
+            detail: _notificationDetail,
+          ),
+          if (notificationError != null)
+            Padding(
+              padding: const EdgeInsets.only(top: 6),
+              child: SelectableText(
+                notificationError!,
+                style: TextStyle(color: theme.colorScheme.error),
+              ),
+            ),
+        ],
+        if (report != null && report.issues.isNotEmpty) ...[
+          const SizedBox(height: 12),
+          ...report.issues.map(
+            (issue) => Padding(
+              padding: const EdgeInsets.only(bottom: 6),
+              child: Text(
+                issue,
+                style: TextStyle(color: theme.colorScheme.error),
+              ),
+            ),
+          ),
+        ],
+        if (error != null) ...[
+          const SizedBox(height: 10),
+          SelectableText(
+            error!,
+            style: TextStyle(color: theme.colorScheme.error),
+          ),
+        ],
+        if (busy) ...[
+          const SizedBox(height: 18),
+          const LinearProgressIndicator(),
+          const SizedBox(height: 8),
+          Text(updating ? 'Updating Codex…' : 'Checking Codex…'),
+        ],
+        const SizedBox(height: 24),
+        Wrap(
+          alignment: WrapAlignment.end,
+          spacing: 10,
+          runSpacing: 10,
+          children: [
+            if (!ready)
+              OutlinedButton(
+                onPressed: busy ? null : onCheckAgain,
+                child: const Text('Check Again'),
+              ),
+            if (report?.path == null)
+              OutlinedButton(
+                onPressed: busy ? null : onOpenInstallInstructions,
+                child: const Text('Codex Install Instructions'),
+              ),
+            if (report != null &&
+                report.path != null &&
+                !report.compatible &&
+                !report.updateSupported)
+              OutlinedButton(
+                onPressed: busy ? null : onOpenInstallInstructions,
+                child: const Text('Update Instructions'),
+              ),
+            if (report?.path != null && !ready)
+              OutlinedButton(
+                onPressed: busy ? null : onChooseInstallation,
+                child: const Text('Choose Installation'),
+              ),
+            if (report != null && !report.compatible && report.updateSupported)
+              FilledButton.tonal(
+                onPressed: busy ? null : onUpdate,
+                child: const Text('Update Codex'),
+              ),
+            if (report != null && report.compatible && !report.authenticated)
+              FilledButton.tonal(
+                onPressed: busy ? null : onSignIn,
+                child: const Text('Sign In to Codex'),
+              ),
+            if (ready && notificationReadiness?.ready != true)
+              FilledButton.tonalIcon(
+                key: const Key('enable-notifications'),
+                onPressed: busy ? null : onManageNotifications,
+                icon: const Icon(Icons.notifications_active_outlined),
+                label: Text(
+                  notificationReadiness?.authorization ==
+                          NotificationAuthorizationState.denied
+                      ? 'Open Notification Settings'
+                      : 'Enable Notifications',
+                ),
+              ),
+            if (ready &&
+                notificationReadiness != null &&
+                notificationReadiness?.ready != true)
+              OutlinedButton(
+                onPressed: busy ? null : onCheckNotifications,
+                child: const Text('Check Notifications Again'),
+              ),
+            if (ready && notificationReadiness?.ready == true)
+              FilledButton.icon(
+                key: const Key('first-project-add'),
+                onPressed: onAddProject,
+                icon: const Icon(Icons.add),
+                label: const Text('Add Your First Project'),
+              ),
+          ],
+        ),
+      ],
+    );
+  }
+
+  String get _notificationDetail {
+    final value = notificationReadiness;
+    if (value == null) {
+      return notificationChecking
+          ? 'Checking The Ditch Runtime…'
+          : 'Notification status has not been checked';
+    }
+    if (value.ready) {
+      return value.soundsEnabled
+          ? 'Alerts and sounds are enabled'
+          : 'Alerts are enabled; sounds are disabled';
+    }
+    return switch (value.authorization) {
+      NotificationAuthorizationState.denied =>
+        'Permission was denied. Enable The Ditch in System Settings.',
+      NotificationAuthorizationState.authorized ||
+      NotificationAuthorizationState.provisional ||
+      NotificationAuthorizationState.ephemeral =>
+        'Permission exists, but alerts are disabled in System Settings.',
+      NotificationAuthorizationState.notDetermined =>
+        'Allow the runtime helper to notify you when agents finish.',
+      NotificationAuthorizationState.unknown =>
+        'The runtime helper returned an unknown notification status.',
+    };
+  }
+}
+
+class _SetupCheckRow extends StatelessWidget {
+  const _SetupCheckRow({
+    required this.label,
+    required this.complete,
+    required this.detail,
+  });
+
+  final String label;
+  final bool complete;
+  final String detail;
+
+  @override
+  Widget build(BuildContext context) {
+    final color = complete
+        ? context.ditch.success
+        : Theme.of(context).colorScheme.error;
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 6),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Icon(
+            complete ? Icons.check_circle : Icons.cancel_outlined,
+            color: color,
+            size: 20,
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  label,
+                  style: const TextStyle(fontWeight: FontWeight.w600),
+                ),
+                Text(detail, style: Theme.of(context).textTheme.bodySmall),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class CodexSetupBanner extends StatelessWidget {
+  const CodexSetupBanner({
+    required this.report,
+    required this.onRepair,
+    required this.onCheckAgain,
+    super.key,
+  });
+
+  final CodexReadinessReport report;
+  final VoidCallback onRepair;
+  final VoidCallback onCheckAgain;
+
+  @override
+  Widget build(BuildContext context) {
+    return Material(
+      color: Theme.of(context).colorScheme.errorContainer,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+        child: Row(
+          children: [
+            Icon(
+              Icons.warning_amber_rounded,
+              color: Theme.of(context).colorScheme.onErrorContainer,
+            ),
+            const SizedBox(width: 10),
+            const Expanded(
+              child: Text(
+                'Codex setup needs attention. New agents are disabled until it is repaired.',
+              ),
+            ),
+            TextButton(onPressed: onCheckAgain, child: const Text('Recheck')),
+            FilledButton.tonal(
+              onPressed: onRepair,
+              child: const Text('Repair'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class NotificationSetupBanner extends StatelessWidget {
+  const NotificationSetupBanner({
+    required this.readiness,
+    required this.checking,
+    required this.error,
+    required this.onManage,
+    required this.onCheckAgain,
+    super.key,
+  });
+
+  final NotificationReadiness readiness;
+  final bool checking;
+  final String? error;
+  final VoidCallback onManage;
+  final VoidCallback onCheckAgain;
+
+  @override
+  Widget build(BuildContext context) {
+    final denied =
+        readiness.authorization == NotificationAuthorizationState.denied;
+    return Material(
+      color: Theme.of(context).colorScheme.secondaryContainer,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+        child: Row(
+          children: [
+            Icon(
+              Icons.notifications_off_outlined,
+              color: Theme.of(context).colorScheme.onSecondaryContainer,
+            ),
+            const SizedBox(width: 10),
+            Expanded(
+              child: Text(
+                error ??
+                    'Enable macOS notifications to know when an agent completes, fails, or needs attention.',
+              ),
+            ),
+            TextButton(
+              onPressed: checking ? null : onCheckAgain,
+              child: const Text('Recheck'),
+            ),
+            FilledButton.tonal(
+              key: const Key('notification-setup-action'),
+              onPressed: checking ? null : onManage,
+              child: Text(denied ? 'Open Settings' : 'Enable Notifications'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
 class DitchToolbar extends StatelessWidget {
   const DitchToolbar({
     required this.projectName,
@@ -3577,6 +4440,8 @@ class DitchToolbar extends StatelessWidget {
     required this.onOpenNotification,
     required this.onDismissNotification,
     required this.onDismissAllNotifications,
+    required this.onOpenCodexSettings,
+    required this.codexAvailable,
     super.key,
   });
 
@@ -3592,6 +4457,8 @@ class DitchToolbar extends StatelessWidget {
   final ValueChanged<AttentionEvent> onOpenNotification;
   final ValueChanged<AttentionEvent> onDismissNotification;
   final VoidCallback onDismissAllNotifications;
+  final VoidCallback onOpenCodexSettings;
+  final bool codexAvailable;
 
   @override
   Widget build(BuildContext context) {
@@ -3655,6 +4522,20 @@ class DitchToolbar extends StatelessWidget {
                 PopupMenuItem(value: ThemeMode.light, child: Text('Light')),
                 PopupMenuItem(value: ThemeMode.dark, child: Text('Dark')),
               ],
+            ),
+            IconButton(
+              tooltip: codexAvailable
+                  ? 'Codex installation'
+                  : 'Codex not found — choose an installation',
+              onPressed: onOpenCodexSettings,
+              icon: Icon(
+                codexAvailable
+                    ? Icons.settings_outlined
+                    : Icons.warning_amber_rounded,
+                color: codexAvailable
+                    ? null
+                    : Theme.of(context).colorScheme.error,
+              ),
             ),
             NotificationCenterButton(
               notifications: notifications,
@@ -4748,6 +5629,7 @@ class ExpandableAgentPanel extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final resumeBlocked = !_canResumeSession(session, effectiveCodexHome);
+    final stopping = session.status == AgentStatus.stopping;
     final resumeBlockedMessage = _resumeBlockedMessage(
       session,
       effectiveCodexHome,
@@ -4857,8 +5739,10 @@ class ExpandableAgentPanel extends StatelessWidget {
           hasSession: session.hasCodexThread,
           isWorking: session.isWorking,
           canStop: session.canStop,
-          enabled: !resumeBlocked,
-          disabledMessage: resumeBlockedMessage,
+          enabled: !resumeBlocked && !stopping,
+          disabledMessage: stopping
+              ? 'Stopping Codex and waiting for the thread to be released…'
+              : resumeBlockedMessage,
           onSubmitPrompt: onSubmitPrompt,
           messagesReady: session.messagesLoaded,
           messagesLoading: session.messagesLoading,
@@ -4944,6 +5828,10 @@ class AgentStatusChip extends StatelessWidget {
       AgentStatus.starting || AgentStatus.working => (
         'Running',
         dark ? Colors.blue.shade300 : Colors.blue.shade700,
+      ),
+      AgentStatus.stopping => (
+        'Stopping',
+        dark ? Colors.orange.shade200 : Colors.orange.shade800,
       ),
       AgentStatus.completed => (
         'Completed',
@@ -5707,6 +6595,28 @@ class AgentComposerState extends State<AgentComposer> {
                               const SizedBox(width: 6),
                               ContextWindowIndicator(
                                 model: agentExecutionSettings.selectedModel,
+                              ),
+                            ],
+                          ),
+                        ),
+                        SizedBox(
+                          width: controlWidth,
+                          child: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              const Icon(Icons.public, size: 18),
+                              const SizedBox(width: 8),
+                              const Expanded(child: Text('Internet access')),
+                              Switch(
+                                value:
+                                    agentExecutionSettings.approval ==
+                                        AgentApprovalPreset.fullAccess ||
+                                    agentExecutionSettings.networkAccess,
+                                onChanged:
+                                    agentExecutionSettings.approval ==
+                                        AgentApprovalPreset.fullAccess
+                                    ? null
+                                    : agentExecutionSettings.setNetworkAccess,
                               ),
                             ],
                           ),

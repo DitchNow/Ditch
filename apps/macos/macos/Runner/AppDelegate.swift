@@ -14,6 +14,7 @@ class AppDelegate: FlutterAppDelegate {
   private static let runtimeLoginItemIdentifier = "ai.theditch.runtime"
   private static let obsoleteLoginItemIdentifier = "ai.theditch.status"
   private static let processTimeoutExitCode: Int32 = 124
+  private static let notificationControlSocketName = "notification-control.sock"
 
   private var applicationChannel: FlutterMethodChannel?
   private var pendingAgentNavigation: [String: String]?
@@ -286,12 +287,268 @@ class AppDelegate: FlutterAppDelegate {
         NSWorkspace.shared.openApplication(at: url, configuration: configuration) { _, error in
           result(error == nil)
         }
+      case "openURL":
+        guard let rawURL = call.arguments as? String,
+          let url = URL(string: rawURL),
+          url.scheme == "https"
+        else {
+          result(false)
+          return
+        }
+        result(NSWorkspace.shared.open(url))
+      case "openCodexLogin":
+        guard let binary = call.arguments as? String else {
+          result(false)
+          return
+        }
+        result(self.openCodexLogin(binary: binary))
+      case "notificationAuthorizationStatus":
+        self.notificationAuthorizationStatus(requestAuthorization: false, result: result)
+      case "requestNotificationAuthorization":
+        self.notificationAuthorizationStatus(requestAuthorization: true, result: result)
+      case "openNotificationSettings":
+        result(self.openNotificationSettings())
       case "quitUI":
         result(true)
         NSApp.terminate(nil)
       default:
         result(FlutterMethodNotImplemented)
       }
+    }
+  }
+
+  private func notificationAuthorizationStatus(
+    requestAuthorization: Bool,
+    result: @escaping FlutterResult
+  ) {
+    let command = requestAuthorization
+      ? "requestAuthorization"
+      : "status"
+    let timeout: TimeInterval = requestAuthorization ? 120 : 10
+    requestNotificationControl(command: command, timeout: timeout, result: result)
+  }
+
+  private func requestNotificationControl(
+    command: String,
+    timeout: TimeInterval,
+    result: @escaping FlutterResult
+  ) {
+    DispatchQueue.global(qos: .userInitiated).async {
+      do {
+        let values = try Self.sendNotificationControlCommand(command, timeout: timeout)
+        DispatchQueue.main.async { self.finishNotificationControl(values, result: result) }
+        return
+      } catch {
+        // The helper can still be starting after login-item registration. If it
+        // is not running, launch the app bundle through LaunchServices so macOS
+        // gives it a real application identity. Never execute its Mach-O file
+        // directly for notification authorization.
+      }
+      DispatchQueue.main.async {
+        self.launchRuntimeApplication { launchError in
+          if let launchError {
+            result(FlutterError(
+              code: "notification_helper_unavailable",
+              message: "The notification runtime could not be started.",
+              details: launchError.localizedDescription))
+            return
+          }
+          DispatchQueue.global(qos: .userInitiated).async {
+            let deadline = Date().addingTimeInterval(5)
+            var lastError: Error?
+            repeat {
+              do {
+                let values = try Self.sendNotificationControlCommand(
+                  command, timeout: timeout)
+                DispatchQueue.main.async {
+                  self.finishNotificationControl(values, result: result)
+                }
+                return
+              } catch {
+                lastError = error
+                Thread.sleep(forTimeInterval: 0.1)
+              }
+            } while Date() < deadline
+            DispatchQueue.main.async {
+              result(FlutterError(
+                code: "notification_helper_unavailable",
+                message: "The notification runtime did not become ready.",
+                details: lastError?.localizedDescription))
+            }
+          }
+        }
+      }
+    }
+  }
+
+  private func finishNotificationControl(
+    _ values: [String: Any],
+    result: @escaping FlutterResult
+  ) {
+    if let error = values["error"] as? [String: Any] {
+      result(FlutterError(
+        code: "notification_authorization_failed",
+        message: "macOS could not update notification permission.",
+        details: error))
+      return
+    }
+    guard values["bundleIdentifier"] as? String == Self.runtimeLoginItemIdentifier else {
+      result(FlutterError(
+        code: "notification_helper_identity_mismatch",
+        message: "The notification response did not come from The Ditch Runtime.",
+        details: values["bundleIdentifier"]))
+      return
+    }
+    result(values)
+  }
+
+  private func launchRuntimeApplication(completion: @escaping (Error?) -> Void) {
+    if !NSRunningApplication.runningApplications(
+      withBundleIdentifier: Self.runtimeLoginItemIdentifier
+    ).isEmpty {
+      completion(nil)
+      return
+    }
+    let helper = Bundle.main.bundleURL.appendingPathComponent(
+      "Contents/Library/LoginItems/The Ditch Runtime.app", isDirectory: true)
+    let configuration = NSWorkspace.OpenConfiguration()
+    configuration.activates = false
+    NSWorkspace.shared.openApplication(
+      at: helper,
+      configuration: configuration
+    ) { _, error in
+      completion(error)
+    }
+  }
+
+  private static func notificationControlSocketPath() -> String {
+    FileManager.default.homeDirectoryForCurrentUser
+      .appendingPathComponent("Library/Application Support/The Ditch", isDirectory: true)
+      .appendingPathComponent(notificationControlSocketName)
+      .path
+  }
+
+  private static func sendNotificationControlCommand(
+    _ command: String,
+    timeout: TimeInterval
+  ) throws -> [String: Any] {
+    let descriptor = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
+    guard descriptor >= 0 else {
+      throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+    }
+    defer { Darwin.close(descriptor) }
+
+    var noSigPipe: Int32 = 1
+    let noSigPipeSize = socklen_t(MemoryLayout.size(ofValue: noSigPipe))
+    _ = withUnsafePointer(to: &noSigPipe) {
+      setsockopt(descriptor, SOL_SOCKET, SO_NOSIGPIPE, $0, noSigPipeSize)
+    }
+    var socketTimeout = timeval(
+      tv_sec: Int(timeout),
+      tv_usec: Int32((timeout.truncatingRemainder(dividingBy: 1)) * 1_000_000))
+    let socketTimeoutSize = socklen_t(MemoryLayout.size(ofValue: socketTimeout))
+    _ = withUnsafePointer(to: &socketTimeout) {
+      setsockopt(descriptor, SOL_SOCKET, SO_RCVTIMEO, $0, socketTimeoutSize)
+    }
+
+    var address = sockaddr_un()
+    address.sun_family = sa_family_t(AF_UNIX)
+    let path = notificationControlSocketPath()
+    guard path.utf8.count < MemoryLayout.size(ofValue: address.sun_path) else {
+      throw CocoaError(.fileWriteInvalidFileName)
+    }
+    withUnsafeMutablePointer(to: &address.sun_path) { pointer in
+      path.withCString { source in
+        _ = strcpy(UnsafeMutableRawPointer(pointer).assumingMemoryBound(to: CChar.self), source)
+      }
+    }
+    let addressLength = socklen_t(MemoryLayout<sa_family_t>.size + path.utf8.count + 1)
+    let connected = withUnsafePointer(to: &address) { pointer in
+      pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+        Darwin.connect(descriptor, $0, addressLength)
+      }
+    }
+    guard connected == 0 else {
+      throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+    }
+
+    let request = try JSONSerialization.data(withJSONObject: ["command": command]) + Data([0x0A])
+    try request.withUnsafeBytes { bytes in
+      var offset = 0
+      while offset < bytes.count {
+        let written = Darwin.write(descriptor, bytes.baseAddress!.advanced(by: offset), bytes.count - offset)
+        guard written > 0 else {
+          throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        offset += written
+      }
+    }
+
+    var response = Data()
+    var buffer = [UInt8](repeating: 0, count: 4096)
+    while response.count <= 64 * 1024 {
+      let count = Darwin.read(descriptor, &buffer, buffer.count)
+      guard count > 0 else {
+        throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+      }
+      response.append(buffer, count: count)
+      if let newline = response.firstIndex(of: 0x0A) {
+        response = response[..<newline]
+        break
+      }
+    }
+    guard response.count <= 64 * 1024,
+      let values = try JSONSerialization.jsonObject(with: response) as? [String: Any]
+    else {
+      throw CocoaError(.fileReadCorruptFile)
+    }
+    return values
+  }
+
+  private func openNotificationSettings() -> Bool {
+    guard let url = URL(
+      string: "x-apple.systempreferences:com.apple.Notifications-Settings.extension")
+    else { return false }
+    return NSWorkspace.shared.open(url)
+  }
+
+  private func openCodexLogin(binary: String) -> Bool {
+    guard binary.hasPrefix("/"),
+      FileManager.default.isExecutableFile(atPath: binary)
+    else { return false }
+
+    let support = FileManager.default.homeDirectoryForCurrentUser
+      .appendingPathComponent("Library/Application Support/The Ditch", isDirectory: true)
+    let script = support.appendingPathComponent("Sign in to Codex.command")
+    let quotedBinary = "'" + binary.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    let contents = """
+      #!/bin/zsh
+      clear
+      echo "The Ditch is opening your selected Codex CLI:"
+      echo \(quotedBinary)
+      echo
+      \(quotedBinary) login
+      status=$?
+      echo
+      if [ $status -eq 0 ]; then
+        echo "Codex sign-in completed. Return to The Ditch."
+      else
+        echo "Codex sign-in failed with exit code $status."
+      fi
+      echo "Press any key to close this window."
+      read -k 1
+      exit $status
+      """
+    do {
+      try FileManager.default.createDirectory(at: support, withIntermediateDirectories: true)
+      try contents.write(to: script, atomically: true, encoding: .utf8)
+      try FileManager.default.setAttributes(
+        [.posixPermissions: NSNumber(value: 0o700)],
+        ofItemAtPath: script.path)
+      return NSWorkspace.shared.open(script)
+    } catch {
+      NSLog("The Ditch could not open Codex sign-in: \(error)")
+      return false
     }
   }
 
@@ -445,25 +702,21 @@ class AppDelegate: FlutterAppDelegate {
     return processTimeoutExitCode
   }
 
-  /// Starts the independent integrated runtime process. The process inherits
-  /// CODEX_HOME from this UI launch but has no lifecycle dependency on the UI.
+  /// Starts the independent integrated runtime as an application. Launching
+  /// the nested bundle through LaunchServices preserves its macOS identity for
+  /// login-item and notification services.
   private func startRuntimeHost() -> Bool {
-    let executable = Bundle.main.bundleURL
-      .appendingPathComponent("Contents/Library/LoginItems/The Ditch Runtime.app/Contents/MacOS/ditchd")
-    guard FileManager.default.isExecutableFile(atPath: executable.path) else {
+    let helper = Bundle.main.bundleURL.appendingPathComponent(
+      "Contents/Library/LoginItems/The Ditch Runtime.app", isDirectory: true)
+    guard FileManager.default.fileExists(atPath: helper.path) else {
       return false
     }
-    let process = Process()
-    process.executableURL = executable
-    process.currentDirectoryURL = Bundle.main.bundleURL
-    process.environment = ProcessInfo.processInfo.environment
-    do {
-      try process.run()
-      return true
-    } catch {
-      NSLog("The Ditch could not start its runtime: \(error)")
-      return false
+    var opened = false
+    DispatchQueue.main.sync {
+      opened = NSWorkspace.shared.open(helper)
     }
+    if !opened { NSLog("The Ditch could not start its runtime application") }
+    return opened
   }
 
   private func bundledExecutable(_ name: String) -> String {

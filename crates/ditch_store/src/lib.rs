@@ -247,6 +247,27 @@ impl DitchStore {
         })
     }
 
+    pub fn setting(&self, key: &str) -> Result<Option<String>, StoreError> {
+        match self.connection.query_row(
+            "SELECT value FROM app_settings WHERE key=?1",
+            params![key],
+            |row| row.get(0),
+        ) {
+            Ok(value) => Ok(Some(value)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    pub fn set_setting(&mut self, key: &str, value: &str) -> Result<(), StoreError> {
+        self.connection.execute(
+            "INSERT INTO app_settings(key,value) VALUES(?1,?2)
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            params![key, value],
+        )?;
+        Ok(())
+    }
+
     pub fn upsert_project(&mut self, project: &Project) -> Result<(), StoreError> {
         self.connection.execute(
             "INSERT INTO projects(id,name,root,created_at,archived_at,git_policy) VALUES(?1,?2,?3,?4,?5,?6)
@@ -446,6 +467,7 @@ impl DitchStore {
                 agent.run.state,
                 AgentState::Starting
                     | AgentState::Working
+                    | AgentState::Stopping
                     | AgentState::AwaitingApproval
                     | AgentState::Blocked
             ) {
@@ -978,5 +1000,10 @@ CREATE TABLE IF NOT EXISTS permission_requests (
   command TEXT,
   created_at TEXT NOT NULL,
   expires_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS app_settings (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL
 );
 "#;

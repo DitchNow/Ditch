@@ -84,6 +84,12 @@ pub enum ClientRequest {
     ListAgentModels {
         provider: ditch_core::AgentProvider,
     },
+    DiscoverCodexInstallations,
+    CheckCodexReadiness,
+    UpdateSelectedCodex,
+    SelectCodexBinary {
+        path: String,
+    },
     OpenProjectTerminal {
         project_id: ProjectId,
         columns: u16,
@@ -148,6 +154,8 @@ pub enum ServerResponse {
     Snapshot(Snapshot),
     Projects(Vec<Project>),
     AgentModels(Vec<AgentModel>),
+    CodexInstallations(Vec<CodexInstallation>),
+    CodexReadiness(CodexReadiness),
     ProjectTerminal(ProjectTerminal),
     ProjectDirectory(ProjectDirectory),
     ProjectFile(ProjectFile),
@@ -157,6 +165,25 @@ pub enum ServerResponse {
     AgentMessages(AgentMessagePage),
     Accepted,
     Error(ProtocolError),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CodexInstallation {
+    pub path: String,
+    pub version: String,
+    pub selected: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CodexReadiness {
+    pub path: Option<String>,
+    pub version: Option<String>,
+    pub compatible: bool,
+    pub authenticated: bool,
+    pub update_supported: bool,
+    pub doctor_supported: bool,
+    pub issues: Vec<String>,
+    pub diagnostics: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

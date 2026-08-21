@@ -30,3 +30,4 @@ serde_json = "1.0.145"
 thiserror = "2.0.17"
 uuid = { version = "1.19.0", features = ["serde", "v4"] }
 rusqlite = { version = "0.38.0", features = ["bundled"] }
+libc = "0.2.189"

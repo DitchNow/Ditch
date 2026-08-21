@@ -5,10 +5,10 @@ use ditch_core::{
     ProjectId,
 };
 use ditch_protocol::{
-    AgentChatMessage, AgentChatRole, AgentModel, ClientRequest, Envelope, HealthResponse,
-    ProjectDirectory, ProjectFile, ProjectFileEntry, ProjectFileKind, ProjectFileSaved,
-    ProjectTerminal, ProtocolError, RuntimeAttention, RuntimeStatus, ServerEvent, ServerResponse,
-    Snapshot,
+    AgentChatMessage, AgentChatRole, AgentModel, ClientRequest, CodexInstallation, CodexReadiness,
+    Envelope, HealthResponse, ProjectDirectory, ProjectFile, ProjectFileEntry, ProjectFileKind,
+    ProjectFileSaved, ProjectTerminal, ProtocolError, RuntimeAttention, RuntimeStatus, ServerEvent,
+    ServerResponse, Snapshot,
 };
 use ditch_store::{
     DitchStore, discover_legacy_projects, ensure_app_dirs, ensure_project_metadata,
@@ -16,19 +16,28 @@ use ditch_store::{
 };
 use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 use serde_json::Value;
-use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
+use std::collections::{BTreeSet, HashMap};
+use std::ffi::OsString;
 use std::fs;
 use std::hash::{Hash, Hasher};
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
+use std::time::{Duration, Instant};
 
 const RUNTIME_IDENTITY: &str = "The Ditch Runtime";
+const CODEX_BINARY_SETTING: &str = "codex_binary";
+const STOP_INTERRUPT_GRACE: Duration = Duration::from_millis(1500);
+const STOP_TERMINATE_GRACE: Duration = Duration::from_millis(500);
+const STOP_KILL_GRACE: Duration = Duration::from_millis(1500);
+static LOGIN_SHELL_PATH: OnceLock<Option<OsString>> = OnceLock::new();
 
 #[allow(dead_code)]
 fn main() {
@@ -97,8 +106,10 @@ struct AgentRecord {
 
 /// A child belongs to exactly one prompt run. Its token prevents a late exit
 /// watcher from an earlier run from changing the newer run's state.
+#[derive(Clone)]
 struct ActiveAgentChild {
     run_id: uuid::Uuid,
+    process_group_id: i32,
     child: Arc<Mutex<Child>>,
 }
 
@@ -136,7 +147,13 @@ impl RuntimeState {
             })
             .collect();
         let codex_home = std::env::var_os("CODEX_HOME").map(PathBuf::from);
-        let codex_binary = find_binary("codex");
+        let selected_codex = store.setting(CODEX_BINARY_SETTING)?;
+        let codex_binary = resolve_codex_binary(selected_codex.as_deref());
+        if selected_codex.as_deref() != codex_binary.as_deref()
+            && let Some(binary) = codex_binary.as_deref()
+        {
+            store.set_setting(CODEX_BINARY_SETTING, binary)?;
+        }
         Ok(Self {
             paths,
             store,
@@ -169,6 +186,7 @@ impl RuntimeState {
                         record.run.state,
                         AgentState::Starting
                             | AgentState::Working
+                            | AgentState::Stopping
                             | AgentState::AwaitingApproval
                             | AgentState::Blocked
                     )
@@ -194,6 +212,7 @@ impl RuntimeState {
                 "transcript_pagination_v1".to_owned(),
                 "project_files_v1".to_owned(),
                 "persistent_attention_read_v1".to_owned(),
+                "network_access_profile_v1".to_owned(),
             ],
         }
     }
@@ -411,7 +430,7 @@ fn handle_request(request: ClientRequest, state: Arc<Mutex<RuntimeState>>) -> Se
             ServerResponse::Health(HealthResponse {
                 version: env!("CARGO_PKG_VERSION").to_owned(),
                 app_paths: state.paths.clone(),
-                codex_binary: find_binary("codex"),
+                codex_binary: state.codex_binary.clone(),
                 claude_binary: find_binary("claude"),
             })
         }
@@ -420,6 +439,95 @@ fn handle_request(request: ClientRequest, state: Arc<Mutex<RuntimeState>>) -> Se
                 .lock()
                 .expect("runtime state lock should not be poisoned");
             ServerResponse::RuntimeStatus(state.runtime_status())
+        }
+        ClientRequest::DiscoverCodexInstallations => {
+            let mut state = state
+                .lock()
+                .expect("runtime state lock should not be poisoned");
+            let installations = discover_codex_installations(state.codex_binary.as_deref());
+            let selected_is_available = state.codex_binary.as_deref().is_some_and(|selected| {
+                installations
+                    .iter()
+                    .any(|installation| installation.path == selected)
+            });
+            if !selected_is_available && let Some(installation) = installations.first() {
+                state.codex_binary = Some(installation.path.clone());
+                if let Err(error) = state
+                    .store
+                    .set_setting(CODEX_BINARY_SETTING, &installation.path)
+                {
+                    return protocol_error("codex_selection_failed", error.to_string());
+                }
+            }
+            ServerResponse::CodexInstallations(
+                installations
+                    .into_iter()
+                    .map(|mut installation| {
+                        installation.selected =
+                            state.codex_binary.as_deref() == Some(installation.path.as_str());
+                        installation
+                    })
+                    .collect(),
+            )
+        }
+        ClientRequest::CheckCodexReadiness => {
+            let binary = active_codex_binary(&state);
+            ServerResponse::CodexReadiness(check_codex_readiness(binary.as_deref()))
+        }
+        ClientRequest::UpdateSelectedCodex => {
+            let Some(binary) = active_codex_binary(&state) else {
+                return protocol_error(
+                    "codex_not_found",
+                    "No working Codex CLI installation was found for this user",
+                );
+            };
+            let readiness = check_codex_readiness(Some(&binary));
+            if !readiness.update_supported {
+                return protocol_error(
+                    "codex_update_unsupported",
+                    "This Codex installation does not support `codex update`. The Ditch will not guess or alter its package manager.",
+                );
+            }
+            let path = effective_path_for_binary(Path::new(&binary));
+            let Some(output) = command_output_with_timeout(
+                Path::new(&binary),
+                &["update"],
+                Duration::from_secs(180),
+                path,
+            ) else {
+                return protocol_error(
+                    "codex_update_failed",
+                    "Codex update did not finish within three minutes",
+                );
+            };
+            if !output.status.success() {
+                let detail = command_output_detail(&output);
+                return protocol_error("codex_update_failed", detail);
+            }
+            ServerResponse::CodexReadiness(check_codex_readiness(Some(&binary)))
+        }
+        ClientRequest::SelectCodexBinary { path } => {
+            let installations = discover_codex_installations(Some(&path));
+            let Some(selected) = installations
+                .iter()
+                .find(|installation| installation.path == path)
+            else {
+                return protocol_error(
+                    "invalid_codex_binary",
+                    "The selected Codex executable is unavailable or did not report a version",
+                );
+            };
+            let mut state = state
+                .lock()
+                .expect("runtime state lock should not be poisoned");
+            if let Err(error) = state
+                .store
+                .set_setting(CODEX_BINARY_SETTING, &selected.path)
+            {
+                return protocol_error("codex_selection_failed", error.to_string());
+            }
+            state.codex_binary = Some(selected.path.clone());
+            ServerResponse::Accepted
         }
         ClientRequest::Snapshot => {
             let state = state
@@ -648,6 +756,7 @@ fn shutdown_runtime(state: Arc<Mutex<RuntimeState>>) -> ServerResponse {
             .expect("runtime state lock should not be poisoned");
         let children = std::mem::take(&mut state.children);
         for child in children.values() {
+            signal_process_group(child.process_group_id, libc::SIGKILL);
             let _ = child
                 .child
                 .lock()
@@ -660,6 +769,7 @@ fn shutdown_runtime(state: Arc<Mutex<RuntimeState>>) -> ServerResponse {
                 record.run.state,
                 AgentState::Starting
                     | AgentState::Working
+                    | AgentState::Stopping
                     | AgentState::AwaitingApproval
                     | AgentState::Blocked
             ) {
@@ -688,13 +798,12 @@ fn list_agent_models(state: Arc<Mutex<RuntimeState>>, provider: AgentProvider) -
     if provider != AgentProvider::Codex {
         return ServerResponse::AgentModels(Vec::new());
     }
-    let binary = state
-        .lock()
-        .expect("runtime state lock should not be poisoned")
-        .codex_binary
-        .clone();
+    let binary = active_codex_binary(&state);
     let Some(binary) = binary else {
-        return protocol_error("codex_not_found", "Codex binary was not found on PATH");
+        return protocol_error(
+            "codex_not_found",
+            "No working Codex CLI installation was found for this user",
+        );
     };
     match discover_codex_models(&binary) {
         Ok(models) => ServerResponse::AgentModels(models),
@@ -899,8 +1008,12 @@ fn close_project_terminal(
 }
 
 fn discover_codex_models(binary: &str) -> io::Result<Vec<AgentModel>> {
-    let mut child = Command::new(binary)
-        .args(["app-server", "--stdio"])
+    let mut command = Command::new(binary);
+    command.args(["app-server", "--stdio"]);
+    if let Some(path) = effective_path_for_binary(Path::new(binary)) {
+        command.env("PATH", path);
+    }
+    let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -1039,14 +1152,15 @@ fn start_codex_session(
         text: prompt.clone(),
         created_at: Utc::now(),
     };
-    let Some(binary) = find_binary("codex") else {
+    let binary = active_codex_binary(&state);
+    let Some(binary) = binary else {
         return persist_launch_failure(
             &state,
             project,
             run,
             user_message,
             allow_non_git,
-            "Codex binary was not found on PATH".to_owned(),
+            "No working Codex CLI installation was found. Choose an existing installation in The Ditch settings.".to_owned(),
         );
     };
     let child = match spawn_codex_child(
@@ -1070,6 +1184,10 @@ fn start_codex_session(
             );
         }
     };
+    let process_group_id = child
+        .lock()
+        .expect("child lock should not be poisoned")
+        .id() as i32;
 
     let run_id = uuid::Uuid::new_v4();
     run.state = AgentState::Working;
@@ -1117,6 +1235,7 @@ fn start_codex_session(
             run.id,
             ActiveAgentChild {
                 run_id,
+                process_group_id,
                 child: Arc::clone(&child),
             },
         );
@@ -1292,14 +1411,15 @@ fn resume_codex_session(
         text: prompt.clone(),
         created_at: Utc::now(),
     };
-    let Some(binary) = find_binary("codex") else {
+    let binary = active_codex_binary(&state);
+    let Some(binary) = binary else {
         return persist_launch_failure(
             &state,
             project,
             run,
             user_message,
             allow_non_git,
-            "Codex binary was not found on PATH".to_owned(),
+            "No working Codex CLI installation was found. Choose an existing installation in The Ditch settings.".to_owned(),
         );
     };
     let child = match spawn_codex_child(
@@ -1323,6 +1443,10 @@ fn resume_codex_session(
             );
         }
     };
+    let process_group_id = child
+        .lock()
+        .expect("child lock should not be poisoned")
+        .id() as i32;
 
     let run_id = uuid::Uuid::new_v4();
     run.state = AgentState::Working;
@@ -1370,6 +1494,7 @@ fn resume_codex_session(
             run.id,
             ActiveAgentChild {
                 run_id,
+                process_group_id,
                 child: Arc::clone(&child),
             },
         );
@@ -1421,7 +1546,10 @@ fn prompt_agent(
             return protocol_error("agent_not_found", "agent session was not found");
         };
         if state.children.contains_key(&agent_id)
-            || matches!(record.run.state, AgentState::Starting | AgentState::Working)
+            || matches!(
+                record.run.state,
+                AgentState::Starting | AgentState::Working | AgentState::Stopping
+            )
         {
             return protocol_error("agent_busy", "agent session is already working");
         }
@@ -1453,8 +1581,9 @@ fn prompt_agent(
         )
     };
 
-    let Some(binary) = find_binary("codex") else {
-        let message = "Codex binary was not found on PATH".to_owned();
+    let binary = active_codex_binary(&state);
+    let Some(binary) = binary else {
+        let message = "No working Codex CLI installation was found. Choose an existing installation in The Ditch settings.".to_owned();
         record_terminal_failure(&state, agent_id, message.clone(), None);
         finish_agent(&state, agent_id, None, Some(1));
         return protocol_error("codex_not_found", message);
@@ -1485,6 +1614,10 @@ fn prompt_agent(
         created_at: Utc::now(),
     };
     let run_id = uuid::Uuid::new_v4();
+    let process_group_id = child
+        .lock()
+        .expect("child lock should not be poisoned")
+        .id() as i32;
 
     {
         let mut state = state
@@ -1511,6 +1644,7 @@ fn prompt_agent(
             agent_id,
             ActiveAgentChild {
                 run_id,
+                process_group_id,
                 child: Arc::clone(&child),
             },
         );
@@ -1523,37 +1657,169 @@ fn prompt_agent(
 }
 
 fn stop_agent(state: Arc<Mutex<RuntimeState>>, agent_id: AgentId) -> ServerResponse {
-    let child = {
+    let active = {
         let mut state = state
             .lock()
             .expect("runtime state lock should not be poisoned");
-        let child = state.children.remove(&agent_id).map(|active| active.child);
+        let active = state.children.get(&agent_id).cloned();
         let Some(record) = state.agents.get_mut(&agent_id) else {
             return protocol_error("agent_not_found", "agent session was not found");
         };
-        record.run.state = AgentState::Interrupted;
+        record.run.state = if active.is_some() {
+            AgentState::Stopping
+        } else {
+            AgentState::Interrupted
+        };
         record.run.can_stop = false;
-        record.run.last_visible_action = Some("Stopped by user".to_owned());
+        record.run.last_visible_action = Some(if active.is_some() {
+            "Stopping Codex".to_owned()
+        } else {
+            "Stopped by user".to_owned()
+        });
         record.run.updated_at = Utc::now();
-        record.run.finished_at = Some(record.run.updated_at);
-        record.run.resume_block_reason = record
-            .run
-            .native_session_id
-            .is_none()
-            .then_some(AgentResumeBlockReason::NoCodexThread);
+        if active.is_none() {
+            record.run.finished_at = Some(record.run.updated_at);
+            record.run.resume_block_reason = record
+                .run
+                .native_session_id
+                .is_none()
+                .then_some(AgentResumeBlockReason::NoCodexThread);
+        }
         let run = record.run.clone();
         state.persist_agent(agent_id);
         state.broadcast(ServerEvent::AgentChanged(run));
-        child
+        active
     };
 
-    if let Some(child) = child {
-        let _ = child
+    let Some(active) = active else {
+        return ServerResponse::Accepted;
+    };
+
+    signal_process(active.process_group_id, libc::SIGINT);
+    let mut group_stopped = wait_for_process_group_exit(&active, STOP_INTERRUPT_GRACE);
+    if !group_stopped {
+        signal_process_group(active.process_group_id, libc::SIGTERM);
+        group_stopped = wait_for_process_group_exit(&active, STOP_TERMINATE_GRACE);
+    }
+    if !group_stopped {
+        signal_process_group(active.process_group_id, libc::SIGKILL);
+        let _ = active
+            .child
             .lock()
             .expect("child lock should not be poisoned")
             .kill();
+        group_stopped = wait_for_process_group_exit(&active, STOP_KILL_GRACE);
+    }
+
+    if !group_stopped {
+        return protocol_error(
+            "agent_stop_failed",
+            "Codex did not release its process group; this session is not safe to resume yet.",
+        );
+    }
+
+    // The exit watcher drains stdout before finalizing, which preserves a
+    // thread.started event that was already in flight when Stop was clicked.
+    if !wait_for_run_finalization(&state, agent_id, active.run_id, Duration::from_secs(1)) {
+        finalize_stopped_run(&state, agent_id, active.run_id);
     }
     ServerResponse::Accepted
+}
+
+fn signal_process_group(process_group_id: i32, signal: i32) {
+    if process_group_id > 0 {
+        // SAFETY: kill with a negative PID targets the process group created
+        // for this Codex launch. No pointers or shared memory are involved.
+        unsafe {
+            libc::kill(-process_group_id, signal);
+        }
+    }
+}
+
+fn signal_process(process_id: i32, signal: i32) {
+    if process_id > 0 {
+        // SAFETY: the PID is read directly from the Child created for this run.
+        unsafe {
+            libc::kill(process_id, signal);
+        }
+    }
+}
+
+fn process_group_exists(process_group_id: i32) -> bool {
+    if process_group_id <= 0 {
+        return false;
+    }
+    // SAFETY: signal 0 performs existence/permission checking only.
+    let result = unsafe { libc::kill(-process_group_id, 0) };
+    result == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+fn wait_for_process_group_exit(active: &ActiveAgentChild, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let _ = active
+            .child
+            .lock()
+            .expect("child lock should not be poisoned")
+            .try_wait();
+        if !process_group_exists(active.process_group_id) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn wait_for_run_finalization(
+    state: &Arc<Mutex<RuntimeState>>,
+    agent_id: AgentId,
+    run_id: uuid::Uuid,
+    timeout: Duration,
+) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let current = state
+            .lock()
+            .expect("runtime state lock should not be poisoned")
+            .children
+            .get(&agent_id)
+            .is_some_and(|active| active.run_id == run_id);
+        if !current {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn finalize_stopped_run(state: &Arc<Mutex<RuntimeState>>, agent_id: AgentId, run_id: uuid::Uuid) {
+    let mut state = state
+        .lock()
+        .expect("runtime state lock should not be poisoned");
+    if !is_current_run(&state, agent_id, run_id) {
+        return;
+    }
+    state.children.remove(&agent_id);
+    let Some(record) = state.agents.get_mut(&agent_id) else {
+        return;
+    };
+    record.run.state = AgentState::Interrupted;
+    record.run.can_stop = false;
+    record.run.last_visible_action = Some("Stopped by user".to_owned());
+    record.run.updated_at = Utc::now();
+    record.run.finished_at = Some(record.run.updated_at);
+    record.run.resume_block_reason = record
+        .run
+        .native_session_id
+        .is_none()
+        .then_some(AgentResumeBlockReason::NoCodexThread);
+    let run = record.run.clone();
+    state.persist_agent(agent_id);
+    state.broadcast(ServerEvent::AgentChanged(run));
 }
 
 fn delete_agent(state: Arc<Mutex<RuntimeState>>, agent_id: AgentId) -> ServerResponse {
@@ -1563,8 +1829,10 @@ fn delete_agent(state: Arc<Mutex<RuntimeState>>, agent_id: AgentId) -> ServerRes
     let Some(record) = state.agents.get(&agent_id) else {
         return protocol_error("agent_not_found", "agent session was not found");
     };
-    if matches!(record.run.state, AgentState::Starting | AgentState::Working)
-        || state.children.contains_key(&agent_id)
+    if matches!(
+        record.run.state,
+        AgentState::Starting | AgentState::Working | AgentState::Stopping
+    ) || state.children.contains_key(&agent_id)
     {
         return protocol_error(
             "agent_active",
@@ -1604,6 +1872,7 @@ fn delete_project(
                     record.run.state,
                     AgentState::Starting
                         | AgentState::Working
+                        | AgentState::Stopping
                         | AgentState::AwaitingApproval
                         | AgentState::Blocked
                 ))
@@ -1715,6 +1984,14 @@ fn attach_codex_io(
                         let text = line.trim();
                         if !text.is_empty() {
                             log_codex_diagnostic(&state, agent_id, "stderr", text);
+                            if is_terminal_codex_stderr(text) {
+                                record_terminal_failure(
+                                    &state,
+                                    agent_id,
+                                    text.to_owned(),
+                                    Some(run_id),
+                                );
+                            }
                         }
                     }
                     Err(error) => {
@@ -1884,6 +2161,9 @@ fn handle_codex_stdout_line(
             let Some(record) = state.agents.get_mut(&agent_id) else {
                 return;
             };
+            if record.run.state == AgentState::Stopping {
+                return;
+            }
             record.run.state = AgentState::Completed;
             record.terminal_failure = None;
             record.run.last_visible_action = Some("Turn completed".to_owned());
@@ -1956,6 +2236,12 @@ fn looks_like_diagnostic(text: &str) -> bool {
         || lower.starts_with("warning")
         || lower.contains("failed")
         || lower.contains("usage limit")
+}
+
+fn is_terminal_codex_stderr(text: &str) -> bool {
+    text.starts_with("Error:")
+        || text.starts_with("Failed to create session:")
+        || text.starts_with("failed to initialize thread persistence:")
 }
 
 fn is_transient_reconnect(message: &str) -> bool {
@@ -2047,6 +2333,9 @@ fn record_terminal_failure(
         let Some(record) = state.agents.get_mut(&agent_id) else {
             return;
         };
+        if record.run.state == AgentState::Stopping {
+            return;
+        }
         record.terminal_failure = Some(message.clone());
         record.run.state = AgentState::Failed;
     }
@@ -2133,6 +2422,9 @@ fn update_agent_action(
     let Some(record) = state.agents.get_mut(&agent_id) else {
         return;
     };
+    if record.run.state == AgentState::Stopping {
+        return;
+    }
     record.run.last_visible_action = Some(action.to_owned());
     record.run.updated_at = Utc::now();
     let run = record.run.clone();
@@ -2154,6 +2446,9 @@ fn start_agent_turn(
     let Some(record) = state.agents.get_mut(&agent_id) else {
         return;
     };
+    if record.run.state == AgentState::Stopping {
+        return;
+    }
     record.terminal_failure = None;
     record.run.state = AgentState::Working;
     record.run.last_visible_action = Some("Codex is working".to_owned());
@@ -2249,9 +2544,13 @@ fn finish_agent(
         let Some(record) = state.agents.get_mut(&agent_id) else {
             return;
         };
-        let interrupted = matches!(record.run.state, AgentState::Interrupted);
+        let stopping = record.run.state == AgentState::Stopping;
+        let interrupted = record.run.state == AgentState::Interrupted;
         record.run.can_stop = false;
-        if !interrupted {
+        if stopping {
+            record.run.state = AgentState::Interrupted;
+            record.run.last_visible_action = Some("Stopped by user".to_owned());
+        } else if !interrupted {
             record.run.state = if record.terminal_failure.is_some() {
                 AgentState::Failed
             } else {
@@ -2369,6 +2668,10 @@ fn spawn_codex_child(
     execution_profile: &AgentExecutionProfile,
 ) -> io::Result<Child> {
     let mut command = Command::new(binary);
+    // A dedicated process group lets Stop terminate Codex and every helper it
+    // launches. Killing only the direct CLI process can orphan the app-server
+    // process that owns the thread-store writer lock.
+    command.process_group(0);
     command.args(codex_child_args(
         cwd,
         mode,
@@ -2378,6 +2681,9 @@ fn spawn_codex_child(
     ));
     command.current_dir(cwd);
     command.env("TERM", "xterm-256color");
+    if let Some(path) = effective_path_for_binary(Path::new(binary)) {
+        command.env("PATH", path);
+    }
     if let Some(codex_home) = std::env::var_os("CODEX_HOME") {
         command.env("CODEX_HOME", codex_home);
     }
@@ -2401,43 +2707,47 @@ fn codex_child_args(
     allow_non_git: bool,
     execution_profile: &AgentExecutionProfile,
 ) -> Vec<String> {
-    let mut args = match (resume_thread, mode) {
-        (Some(_), _) => vec!["exec".to_owned()],
-        (None, CodexLaunchMode::Exec) | (None, CodexLaunchMode::InteractiveTui) => vec![
-            "exec".to_owned(),
-            "--json".to_owned(),
-            "--color".to_owned(),
-            "never".to_owned(),
-            "--cd".to_owned(),
-            cwd.to_string_lossy().into_owned(),
-            "-".to_owned(),
-        ],
-    };
-    let mut profile_args = Vec::new();
+    let mut args = Vec::new();
     match execution_profile.approval {
-        AgentApprovalPreset::Ask => profile_args.extend([
+        AgentApprovalPreset::Ask => args.extend([
             "--sandbox".to_owned(),
             "workspace-write".to_owned(),
             "--ask-for-approval".to_owned(),
             "on-request".to_owned(),
         ]),
-        AgentApprovalPreset::ApproveForMe => profile_args.push("--approve-for-me".to_owned()),
+        AgentApprovalPreset::ApproveForMe => args.extend([
+            "--sandbox".to_owned(),
+            "workspace-write".to_owned(),
+            "--ask-for-approval".to_owned(),
+            "never".to_owned(),
+        ]),
         AgentApprovalPreset::FullAccess => {
-            profile_args.push("--dangerously-bypass-approvals-and-sandbox".to_owned())
+            args.push("--dangerously-bypass-approvals-and-sandbox".to_owned())
         }
     }
+    if execution_profile.network_access
+        && execution_profile.approval != AgentApprovalPreset::FullAccess
+    {
+        args.extend([
+            "--config".to_owned(),
+            "sandbox_workspace_write.network_access=true".to_owned(),
+        ]);
+    }
     if let Some(model) = execution_profile.model.as_deref() {
-        profile_args.extend(["--model".to_owned(), model.to_owned()]);
+        args.extend(["--model".to_owned(), model.to_owned()]);
     }
     if let Some(effort) = execution_profile.reasoning_effort.as_deref() {
-        profile_args.extend([
+        args.extend([
             "--config".to_owned(),
             format!("model_reasoning_effort=\"{effort}\""),
         ]);
     }
-    args.splice(1..1, profile_args);
+    if resume_thread.is_none() {
+        args.extend(["--cd".to_owned(), cwd.to_string_lossy().into_owned()]);
+    }
+    args.push("exec".to_owned());
     if allow_non_git {
-        args.insert(1, "--skip-git-repo-check".to_owned());
+        args.push("--skip-git-repo-check".to_owned());
     }
     if let Some(thread_id) = resume_thread {
         args.extend([
@@ -2446,6 +2756,15 @@ fn codex_child_args(
             thread_id.to_owned(),
             "-".to_owned(),
         ]);
+    } else {
+        match mode {
+            CodexLaunchMode::Exec | CodexLaunchMode::InteractiveTui => args.extend([
+                "--json".to_owned(),
+                "--color".to_owned(),
+                "never".to_owned(),
+                "-".to_owned(),
+            ]),
+        }
     }
     args
 }
@@ -2664,6 +2983,475 @@ fn file_revision(bytes: &[u8]) -> String {
     format!("{:016x}", hasher.finish())
 }
 
+fn resolve_codex_binary(preferred: Option<&str>) -> Option<String> {
+    discover_codex_installations(preferred)
+        .into_iter()
+        .find(|installation| installation.selected)
+        .or_else(|| discover_codex_installations(None).into_iter().next())
+        .map(|installation| installation.path)
+}
+
+fn check_codex_readiness(binary: Option<&str>) -> CodexReadiness {
+    let Some(binary) = binary else {
+        return CodexReadiness {
+            path: None,
+            version: None,
+            compatible: false,
+            authenticated: false,
+            update_supported: false,
+            doctor_supported: false,
+            issues: vec![
+                "Codex CLI was not found. Install Codex for this macOS user, then check again."
+                    .to_owned(),
+            ],
+            diagnostics: None,
+        };
+    };
+    let executable = Path::new(binary);
+    let version = executable_version(executable);
+    let path = effective_path_for_binary(executable);
+    let root_help = command_text(
+        executable,
+        &["--help"],
+        Duration::from_secs(5),
+        path.clone(),
+    );
+    let exec_help = command_text(
+        executable,
+        &["exec", "--help"],
+        Duration::from_secs(5),
+        path.clone(),
+    );
+    let resume_help = command_text(
+        executable,
+        &["exec", "resume", "--help"],
+        Duration::from_secs(5),
+        path.clone(),
+    );
+    let update_supported = root_help
+        .as_deref()
+        .is_some_and(|help| help.contains("update"));
+    let doctor_supported = root_help
+        .as_deref()
+        .is_some_and(|help| help.contains("doctor"));
+    let mut issues = Vec::new();
+    if version.is_none() {
+        issues.push("The selected executable did not report a Codex version.".to_owned());
+    }
+    let required_global_flags = [
+        "--ask-for-approval",
+        "--sandbox",
+        "--cd",
+        "--model",
+        "--config",
+        "--dangerously-bypass-approvals-and-sandbox",
+    ];
+    match root_help.as_deref() {
+        Some(help) => {
+            let missing = required_global_flags
+                .iter()
+                .filter(|flag| !help.contains(**flag))
+                .copied()
+                .collect::<Vec<_>>();
+            if !missing.is_empty() {
+                issues.push(format!(
+                    "This Codex CLI is missing required global options: {}.",
+                    missing.join(", ")
+                ));
+            }
+        }
+        None => issues.push("The selected Codex CLI does not provide command help.".to_owned()),
+    }
+    let required_exec_flags = ["--json", "--color", "--skip-git-repo-check"];
+    match exec_help.as_deref() {
+        Some(help) => {
+            let missing = required_exec_flags
+                .iter()
+                .filter(|flag| !help.contains(**flag))
+                .copied()
+                .collect::<Vec<_>>();
+            if !missing.is_empty() {
+                issues.push(format!(
+                    "This Codex CLI is missing required exec options: {}.",
+                    missing.join(", ")
+                ));
+            }
+        }
+        None => issues.push("The selected Codex CLI does not provide `codex exec`.".to_owned()),
+    }
+    if resume_help.is_none() {
+        issues.push("The selected Codex CLI does not support resumable exec sessions.".to_owned());
+    }
+    let launch_probes: [(&str, &[&str]); 3] = [
+        (
+            "automatic workspace launch",
+            &[
+                "--sandbox",
+                "workspace-write",
+                "--ask-for-approval",
+                "never",
+                "--config",
+                "sandbox_workspace_write.network_access=true",
+                "exec",
+                "--help",
+            ],
+        ),
+        (
+            "approval-based resumed launch",
+            &[
+                "--sandbox",
+                "workspace-write",
+                "--ask-for-approval",
+                "on-request",
+                "exec",
+                "resume",
+                "--help",
+            ],
+        ),
+        (
+            "full-access launch",
+            &[
+                "--dangerously-bypass-approvals-and-sandbox",
+                "exec",
+                "--help",
+            ],
+        ),
+    ];
+    for (label, args) in launch_probes {
+        if let Err(detail) = codex_argument_probe(executable, args, path.clone()) {
+            issues.push(format!("Codex rejected The Ditch's {label}: {detail}"));
+        }
+    }
+    if !root_help
+        .as_deref()
+        .is_some_and(|help| help.contains("app-server"))
+    {
+        issues.push(
+            "The selected Codex CLI cannot provide the model catalog required by The Ditch."
+                .to_owned(),
+        );
+    }
+
+    let authenticated = command_output_with_timeout(
+        executable,
+        &["login", "status"],
+        Duration::from_secs(10),
+        path.clone(),
+    )
+    .is_some_and(|output| output.status.success());
+    if !authenticated {
+        issues.push("Codex is not signed in for this user.".to_owned());
+    }
+
+    let diagnostics = (doctor_supported && authenticated).then(|| {
+        command_text(
+            executable,
+            &["doctor", "--json"],
+            Duration::from_secs(30),
+            path,
+        )
+        .unwrap_or_else(|| "Codex diagnostics could not be completed.".to_owned())
+    });
+    let compatible = version.is_some()
+        && exec_help.is_some()
+        && resume_help.is_some()
+        && !issues.iter().any(|issue| !issue.contains("not signed in"));
+
+    CodexReadiness {
+        path: Some(binary.to_owned()),
+        version,
+        compatible,
+        authenticated,
+        update_supported,
+        doctor_supported,
+        issues,
+        diagnostics,
+    }
+}
+
+fn codex_argument_probe(
+    executable: &Path,
+    args: &[&str],
+    path: Option<OsString>,
+) -> Result<(), String> {
+    let output = command_output_with_timeout(executable, args, Duration::from_secs(5), path)
+        .ok_or_else(|| format!("`codex {}` did not complete", args.join(" ")))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "`codex {}` failed: {}",
+            args.join(" "),
+            command_output_detail(&output)
+        ))
+    }
+}
+
+fn command_text(
+    executable: &Path,
+    args: &[&str],
+    timeout: Duration,
+    path: Option<OsString>,
+) -> Option<String> {
+    let output = command_output_with_timeout(executable, args, timeout, path)?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    match (stdout.is_empty(), stderr.is_empty()) {
+        (false, false) => Some(format!("{stdout}\n{stderr}")),
+        (false, true) => Some(stdout),
+        (true, false) => Some(stderr),
+        (true, true) => Some(String::new()),
+    }
+}
+
+fn command_output_detail(output: &std::process::Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if !stderr.is_empty() {
+        stderr
+    } else if !stdout.is_empty() {
+        stdout
+    } else {
+        format!("Codex exited with {}", output.status)
+    }
+}
+
+fn active_codex_binary(state: &Arc<Mutex<RuntimeState>>) -> Option<String> {
+    let preferred = state
+        .lock()
+        .expect("runtime state lock should not be poisoned")
+        .codex_binary
+        .clone();
+    if let Some(path) = preferred.as_deref()
+        && is_executable_file(Path::new(path))
+        && executable_version(Path::new(path)).is_some()
+    {
+        return preferred;
+    }
+
+    let replacement = resolve_codex_binary(preferred.as_deref());
+    let mut state = state
+        .lock()
+        .expect("runtime state lock should not be poisoned");
+    state.codex_binary = replacement.clone();
+    if let Some(path) = replacement.as_deref()
+        && let Err(error) = state.store.set_setting(CODEX_BINARY_SETTING, path)
+    {
+        eprintln!("{RUNTIME_IDENTITY} failed to persist Codex selection: {error}");
+    }
+    replacement
+}
+
+fn discover_codex_installations(preferred: Option<&str>) -> Vec<CodexInstallation> {
+    let mut candidates = Vec::new();
+    if let Some(path) = preferred {
+        candidates.push(PathBuf::from(path));
+    }
+    if let Some(path) = login_shell_binary("codex") {
+        candidates.push(path);
+    }
+    if let Some(path) = find_binary("codex") {
+        candidates.push(PathBuf::from(path));
+    }
+
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        candidates.extend([
+            home.join(".volta/bin/codex"),
+            home.join(".asdf/shims/codex"),
+            home.join(".local/share/mise/shims/codex"),
+            home.join(".local/bin/codex"),
+            home.join(".npm-global/bin/codex"),
+            home.join(".bun/bin/codex"),
+            home.join(".nix-profile/bin/codex"),
+            home.join(".yarn/bin/codex"),
+            home.join("Library/pnpm/codex"),
+            home.join(".local/share/pnpm/codex"),
+        ]);
+        collect_nested_binary(
+            &home.join(".nvm/versions/node"),
+            "bin/codex",
+            &mut candidates,
+        );
+        collect_nested_binary(
+            &home.join(".local/share/fnm/node-versions"),
+            "installation/bin/codex",
+            &mut candidates,
+        );
+    }
+    candidates.extend([
+        PathBuf::from("/opt/homebrew/bin/codex"),
+        PathBuf::from("/usr/local/bin/codex"),
+        PathBuf::from("/opt/local/bin/codex"),
+        PathBuf::from("/usr/bin/codex"),
+    ]);
+
+    let mut seen = BTreeSet::new();
+    let mut installations = Vec::new();
+    for candidate in candidates {
+        if !is_executable_file(&candidate) {
+            continue;
+        }
+        let identity = fs::canonicalize(&candidate).unwrap_or_else(|_| candidate.clone());
+        if !seen.insert(identity) {
+            continue;
+        }
+        let Some(version) = executable_version(&candidate) else {
+            continue;
+        };
+        let path = candidate.to_string_lossy().into_owned();
+        installations.push(CodexInstallation {
+            selected: preferred == Some(path.as_str()),
+            path,
+            version,
+        });
+    }
+    installations
+}
+
+fn collect_nested_binary(root: &Path, suffix: &str, candidates: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        candidates.push(entry.path().join(suffix));
+    }
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    fs::metadata(path)
+        .map(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+fn executable_version(path: &Path) -> Option<String> {
+    let output = command_output_with_timeout(
+        path,
+        &["--version"],
+        Duration::from_secs(2),
+        effective_path_for_binary(path),
+    )?;
+    if !output.status.success() {
+        return None;
+    }
+    let version = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    (!version.is_empty()).then_some(version)
+}
+
+fn login_shell_binary(name: &str) -> Option<PathBuf> {
+    let shell = std::env::var_os("SHELL")
+        .map(PathBuf::from)
+        .filter(|path| is_executable_file(path))
+        .unwrap_or_else(|| PathBuf::from("/bin/zsh"));
+    let command = format!("command -v {name}");
+    let output =
+        command_output_with_timeout(&shell, &["-lic", &command], Duration::from_secs(3), None)?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .rev()
+        .map(str::trim)
+        .filter(|line| line.starts_with('/'))
+        .map(PathBuf::from)
+        .find(|path| is_executable_file(path))
+}
+
+fn command_output_with_timeout(
+    executable: &Path,
+    args: &[&str],
+    timeout: Duration,
+    path: Option<OsString>,
+) -> Option<std::process::Output> {
+    let mut command = Command::new(executable);
+    command.args(args);
+    if let Some(path) = path {
+        command.env("PATH", path);
+    }
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .ok()?;
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let stdout_reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        if let Some(mut stdout) = stdout {
+            let _ = stdout.read_to_end(&mut bytes);
+        }
+        bytes
+    });
+    let stderr_reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        if let Some(mut stderr) = stderr {
+            let _ = stderr.read_to_end(&mut bytes);
+        }
+        bytes
+    });
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(20)),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            Err(_) => return None,
+        }
+    };
+    Some(std::process::Output {
+        status,
+        stdout: stdout_reader.join().unwrap_or_default(),
+        stderr: stderr_reader.join().unwrap_or_default(),
+    })
+}
+
+fn effective_path_for_binary(binary: &Path) -> Option<OsString> {
+    let mut paths = Vec::new();
+    if let Some(parent) = binary.parent() {
+        paths.push(parent.to_path_buf());
+    }
+    if let Some(login_path) = LOGIN_SHELL_PATH.get_or_init(login_shell_path).as_ref() {
+        paths.extend(std::env::split_paths(login_path));
+    }
+    if let Some(current_path) = std::env::var_os("PATH") {
+        paths.extend(std::env::split_paths(&current_path));
+    }
+    let mut seen = BTreeSet::new();
+    paths.retain(|path| seen.insert(path.clone()));
+    std::env::join_paths(paths).ok()
+}
+
+fn login_shell_path() -> Option<OsString> {
+    let shell = std::env::var_os("SHELL")
+        .map(PathBuf::from)
+        .filter(|path| is_executable_file(path))
+        .unwrap_or_else(|| PathBuf::from("/bin/zsh"));
+    let output = command_output_with_timeout(
+        &shell,
+        &["-lic", "printf '%s\\n' \"$PATH\""],
+        Duration::from_secs(3),
+        None,
+    )?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| line.contains('/') && line.contains(':'))
+        .filter(|line| !line.is_empty())
+        .map(OsString::from)
+}
+
 fn find_binary(name: &str) -> Option<String> {
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let static_candidates = [
@@ -2712,6 +3500,83 @@ impl ProjectRootKey for Project {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn codex_readiness_checks_capabilities_and_authentication() {
+        let root = std::env::temp_dir().join(format!("ditch-codex-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let binary = root.join("codex");
+        fs::write(
+            &binary,
+            r#"#!/bin/sh
+case "$1 $2 $3" in
+  "--version  ") echo "codex-cli 1.2.3" ;;
+  "--help  ") echo "exec app-server doctor update login --ask-for-approval --sandbox --cd --model --config --dangerously-bypass-approvals-and-sandbox" ;;
+  "exec --help ") echo "--json --color --skip-git-repo-check" ;;
+  "exec resume --help") echo "resume" ;;
+  "--sandbox workspace-write --ask-for-approval") echo "accepted" ;;
+  "--dangerously-bypass-approvals-and-sandbox exec --help") echo "accepted" ;;
+  "login status ") echo "Logged in" ;;
+  "doctor --json ") echo '{}' ;;
+  *) exit 2 ;;
+esac
+"#,
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&binary).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&binary, permissions).unwrap();
+
+        let readiness = check_codex_readiness(Some(&binary.to_string_lossy()));
+
+        assert!(readiness.compatible);
+        assert!(readiness.authenticated);
+        assert!(readiness.update_supported);
+        assert!(readiness.doctor_supported);
+        assert!(readiness.issues.is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn codex_readiness_rejects_a_genuinely_incompatible_cli() {
+        let root = std::env::temp_dir().join(format!("ditch-codex-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let binary = root.join("codex");
+        fs::write(
+            &binary,
+            r#"#!/bin/sh
+case "$1 $2 $3" in
+  "--version  ") echo "codex-cli 0.1.0" ;;
+  "--help  ") echo "exec app-server login" ;;
+  "exec --help ") echo "--json --color --skip-git-repo-check" ;;
+  "exec resume --help") echo "resume" ;;
+  "login status ") echo "Logged in" ;;
+  *) echo "unexpected argument" >&2; exit 2 ;;
+esac
+"#,
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&binary).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&binary, permissions).unwrap();
+
+        let readiness = check_codex_readiness(Some(&binary.to_string_lossy()));
+
+        assert!(!readiness.compatible);
+        assert!(
+            readiness
+                .issues
+                .iter()
+                .any(|issue| issue.contains("missing required global options"))
+        );
+        assert!(
+            readiness
+                .issues
+                .iter()
+                .any(|issue| issue.contains("unexpected argument"))
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
 
     fn test_runtime() -> RuntimeState {
         let root = std::env::temp_dir().join(format!("ditchd-test-{}", uuid::Uuid::new_v4()));
@@ -2901,13 +3766,16 @@ mod tests {
         assert_eq!(
             args,
             vec![
-                "exec",
-                "--approve-for-me",
-                "--json",
-                "--color",
+                "--sandbox",
+                "workspace-write",
+                "--ask-for-approval",
                 "never",
                 "--cd",
                 "/tmp/project",
+                "exec",
+                "--json",
+                "--color",
+                "never",
                 "-"
             ]
         );
@@ -2926,8 +3794,11 @@ mod tests {
         assert_eq!(
             args,
             vec![
+                "--sandbox",
+                "workspace-write",
+                "--ask-for-approval",
+                "never",
                 "exec",
-                "--approve-for-me",
                 "resume",
                 "--json",
                 "thread-123",
@@ -2954,8 +3825,14 @@ mod tests {
             &AgentExecutionProfile::default(),
         );
 
-        assert_eq!(fresh[1], "--skip-git-repo-check");
-        assert_eq!(resumed[1], "--skip-git-repo-check");
+        assert_eq!(
+            fresh[fresh.iter().position(|arg| arg == "exec").unwrap() + 1],
+            "--skip-git-repo-check"
+        );
+        assert_eq!(
+            resumed[resumed.iter().position(|arg| arg == "exec").unwrap() + 1],
+            "--skip-git-repo-check"
+        );
     }
 
     #[test]
@@ -2964,6 +3841,7 @@ mod tests {
             model: Some("gpt-test".to_owned()),
             reasoning_effort: Some("high".to_owned()),
             approval: AgentApprovalPreset::Ask,
+            network_access: true,
         };
         let ask_args = codex_child_args(
             Path::new("/tmp/project"),
@@ -2987,6 +3865,15 @@ mod tests {
                 .windows(2)
                 .any(|args| args == ["--ask-for-approval", "on-request"])
         );
+        assert!(
+            ask_args.windows(2).any(|args| {
+                args == ["--config", "sandbox_workspace_write.network_access=true"]
+            })
+        );
+        let ask_exec = ask_args.iter().position(|arg| arg == "exec").unwrap();
+        for global in ["--ask-for-approval", "--sandbox", "--model", "--config"] {
+            assert!(ask_args.iter().position(|arg| arg == global).unwrap() < ask_exec);
+        }
 
         let full_access = AgentExecutionProfile {
             approval: AgentApprovalPreset::FullAccess,
@@ -3003,6 +3890,16 @@ mod tests {
             full_access_args
                 .iter()
                 .any(|arg| arg == "--dangerously-bypass-approvals-and-sandbox")
+        );
+        assert!(
+            full_access_args
+                .iter()
+                .position(|arg| arg == "--dangerously-bypass-approvals-and-sandbox")
+                .unwrap()
+                < full_access_args
+                    .iter()
+                    .position(|arg| arg == "exec")
+                    .unwrap()
         );
         assert!(!full_access_args.iter().any(|arg| arg == "--approve-for-me"));
     }
@@ -3024,7 +3921,98 @@ mod tests {
     }
 
     #[test]
-    fn stop_agent_interrupts_a_running_child_without_waiting_for_natural_exit() {
+    fn active_writer_stderr_is_promoted_to_a_visible_terminal_failure() {
+        assert!(is_terminal_codex_stderr(
+            "Error: thread/resume: thread 123 already has an active writer"
+        ));
+        assert!(!is_terminal_codex_stderr(
+            "2026-08-20 ERROR codex_core::tools::router: apply_patch failed"
+        ));
+    }
+
+    #[test]
+    fn stopping_run_still_accepts_an_in_flight_thread_id() {
+        let mut runtime = test_runtime();
+        let project = Project::new("Fixture", "/tmp/fixture-stopping-thread");
+        runtime.store.upsert_project(&project).unwrap();
+        runtime.projects.insert(project.root_key(), project.clone());
+        let agent_id = AgentId::new();
+        let now = Utc::now();
+        runtime.agents.insert(
+            agent_id,
+            AgentRecord {
+                run: AgentRun {
+                    id: agent_id,
+                    provider: AgentProvider::Codex,
+                    state: AgentState::Stopping,
+                    can_stop: false,
+                    launch_mode: CodexLaunchMode::Exec,
+                    execution_profile: AgentExecutionProfile::default(),
+                    project_id: project.id,
+                    task_id: None,
+                    pane_id: None,
+                    native_session_id: None,
+                    codex_title: None,
+                    user_title: None,
+                    origin_codex_home: None,
+                    current_prompt: Some("start".to_owned()),
+                    last_visible_action: Some("Stopping Codex".to_owned()),
+                    state_confidence: 1.0,
+                    state_evidence: "fixture".to_owned(),
+                    started_at: now,
+                    updated_at: now,
+                    finished_at: None,
+                    exit_code: None,
+                    resume_block_reason: None,
+                },
+                project_root: project.root,
+                allow_non_git: false,
+                messages: Vec::new(),
+                terminal_failure: None,
+            },
+        );
+        let mut command = Command::new("sleep");
+        command.arg("30");
+        command.process_group(0);
+        let child = Arc::new(Mutex::new(command.spawn().unwrap()));
+        let process_group_id = child.lock().unwrap().id() as i32;
+        let run_id = uuid::Uuid::new_v4();
+        runtime.children.insert(
+            agent_id,
+            ActiveAgentChild {
+                run_id,
+                process_group_id,
+                child: Arc::clone(&child),
+            },
+        );
+        let state = Arc::new(Mutex::new(runtime));
+
+        handle_codex_stdout_line(
+            &state,
+            agent_id,
+            Some(run_id),
+            r#"{"type":"thread.started","thread_id":"thread-arrived-during-stop"}"#,
+        );
+
+        let state_guard = state.lock().unwrap();
+        assert_eq!(
+            state_guard.agents[&agent_id]
+                .run
+                .native_session_id
+                .as_deref(),
+            Some("thread-arrived-during-stop")
+        );
+        assert_eq!(
+            state_guard.agents[&agent_id].run.state,
+            AgentState::Stopping
+        );
+        drop(state_guard);
+        signal_process_group(process_group_id, libc::SIGKILL);
+        let _ = child.lock().unwrap().wait();
+    }
+
+    #[test]
+    fn stop_agent_waits_until_the_codex_process_group_exits() {
         let mut runtime = test_runtime();
         let project = Project::new("Fixture", "/tmp/fixture-stop");
         runtime.store.upsert_project(&project).unwrap();
@@ -3064,18 +4052,20 @@ mod tests {
                 terminal_failure: None,
             },
         );
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 30 & wait"]);
+        command.process_group(0);
         let child = Arc::new(Mutex::new(
-            Command::new("sleep")
-                .arg("30")
-                .spawn()
-                .expect("fixture child should start"),
+            command.spawn().expect("fixture child should start"),
         ));
+        let process_group_id = child.lock().unwrap().id() as i32;
         let run_id = uuid::Uuid::new_v4();
         runtime.agents.get_mut(&agent_id).unwrap().run.can_stop = true;
         runtime.children.insert(
             agent_id,
             ActiveAgentChild {
                 run_id,
+                process_group_id,
                 child: Arc::clone(&child),
             },
         );
@@ -3086,8 +4076,7 @@ mod tests {
         let response = stop_agent(Arc::clone(&state), agent_id);
 
         assert!(matches!(response, ServerResponse::Accepted));
-        assert!(started.elapsed() < std::time::Duration::from_secs(2));
-        thread::sleep(std::time::Duration::from_millis(100));
+        assert!(started.elapsed() < std::time::Duration::from_secs(4));
         let state = state.lock().expect("fixture state should lock");
         assert_eq!(state.agents[&agent_id].run.state, AgentState::Interrupted);
         assert_eq!(
@@ -3096,6 +4085,7 @@ mod tests {
         );
         assert!(!state.children.contains_key(&agent_id));
         assert!(state.attention.is_empty());
+        assert!(!process_group_exists(process_group_id));
     }
 
     #[test]
