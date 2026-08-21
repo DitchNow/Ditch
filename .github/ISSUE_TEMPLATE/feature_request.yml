@@ -1,0 +1,52 @@
+name: Feature request
+description: Propose a focused improvement to Ditch Community Edition.
+title: "[Feature] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Start with the problem and workflow. Concrete behavior is easier to evaluate than a broad solution or a comparison with another product.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What is difficult or impossible in the current product, and who encounters it?
+    validations:
+      required: true
+
+  - type: textarea
+    id: workaround
+    attributes:
+      label: Current workaround
+      description: How do you handle this today, if at all?
+
+  - type: textarea
+    id: behavior
+    attributes:
+      label: Proposed behavior
+      description: Describe the concrete user-visible behavior, not only an implementation choice.
+    validations:
+      required: true
+
+  - type: textarea
+    id: community-edition-fit
+    attributes:
+      label: Why this belongs in Ditch Community Edition
+      description: Explain how this improves the current local Codex workflow.
+    validations:
+      required: true
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Add examples, sketches, or technical constraints if useful. Do not include sensitive information.
+
+  - type: checkboxes
+    id: existing-issues
+    attributes:
+      label: Existing issues
+      options:
+        - label: I searched existing issues for the same request.
+          required: true

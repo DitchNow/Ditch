@@ -16,7 +16,7 @@ Current limitations are:
 - Codex runs through a separate `codex exec` process for each turn. Interactive approval requests are not supported; the UI disables **Ask for approval**.
 - Closing the foreground window preserves work, but explicitly quitting the menu-bar runtime stops active agents. After an unexpected runtime restart, previously active runs are marked stale and can only be continued when Codex supplied a resumable thread ID.
 - The repository contains types and placeholder directories for other providers, hooks, MCP, tasks, and worktrees, but those are not complete user-facing features.
-- There is no GitHub release workflow, CI workflow, contribution policy, or security policy in the repository yet.
+- There is no GitHub release workflow, CI workflow, or private security-reporting channel in the repository yet.
 
 ## Why The Ditch
 
@@ -169,11 +169,13 @@ The production path currently concentrates in `apps/macos`, `ditchd`, `ditch_pro
 
 The repository does not maintain a committed public roadmap. Current implementation notes focus on replacing the process-per-turn Codex transport with a long-lived integration capable of interactive approvals, and on making per-turn prompt/model controls more complete. These are active design directions, not shipped features or release commitments.
 
-There is not yet a public issue tracker or other published roadmap channel to link here.
+Use [GitHub Issues](https://github.com/DitchNow/TheDitch/issues) for concrete bugs and feature proposals.
 
 ## Contributing
 
-There is no `CONTRIBUTING.md`, public issue tracker, or documented pull-request policy yet.
+Bug reports, focused fixes, and well-scoped improvements are welcome. Before proposing a large feature or architectural change, open an issue so the direction can be discussed first.
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, issue guidelines, architectural constraints, and pull-request expectations.
 
 ## Security
 
@@ -184,9 +186,10 @@ There is no `SECURITY.md` and no documented private vulnerability-reporting chan
 ## Community / Support
 
 - Product website and beta download: [theditch.dev](https://theditch.dev)
+- Bugs and feature proposals: [GitHub Issues](https://github.com/DitchNow/TheDitch/issues)
 - Codex installation and authentication: [Codex CLI documentation](https://learn.chatgpt.com/docs/codex/cli)
 
-No public bug tracker, Discord, Slack, Discussions forum, or other maintained support channel is documented in the repository.
+No Discord, Slack, Discussions forum, or other maintained community channel is documented in the repository.
 
 ## License
 
