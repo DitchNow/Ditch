@@ -322,7 +322,7 @@ fn remove_stale_socket(path: &Path) -> io::Result<()> {
             Ok(_) => {
                 return Err(io::Error::new(
                     io::ErrorKind::AddrInUse,
-                    "The Ditch Runtime is already running",
+                    "Ditch Runtime is already running",
                 ));
             }
             Err(error)
@@ -485,7 +485,7 @@ fn handle_request(request: ClientRequest, state: Arc<Mutex<RuntimeState>>) -> Se
             if !readiness.update_supported {
                 return protocol_error(
                     "codex_update_unsupported",
-                    "This Codex installation does not support `codex update`. The Ditch will not guess or alter its package manager.",
+                    "This Codex installation does not support `codex update`. Ditch will not guess or alter its package manager.",
                 );
             }
             let path = effective_path_for_binary(Path::new(&binary));
@@ -1134,7 +1134,7 @@ fn start_codex_session(
         current_prompt: Some(prompt.clone()),
         last_visible_action: Some("Starting Codex".to_owned()),
         state_confidence: 0.8,
-        state_evidence: "The Ditch Runtime accepted the session and is launching Codex.".to_owned(),
+        state_evidence: "Ditch Runtime accepted the session and is launching Codex.".to_owned(),
         started_at: now,
         updated_at: now,
         finished_at: None,
@@ -1160,7 +1160,7 @@ fn start_codex_session(
             run,
             user_message,
             allow_non_git,
-            "No working Codex CLI installation was found. Choose an existing installation in The Ditch settings.".to_owned(),
+            "No working Codex CLI installation was found. Choose an existing installation in Ditch settings.".to_owned(),
         );
     };
     let child = match spawn_codex_child(
@@ -1193,7 +1193,7 @@ fn start_codex_session(
     run.state = AgentState::Working;
     run.can_stop = true;
     run.updated_at = Utc::now();
-    run.state_evidence = "Codex process is running under The Ditch Runtime.".to_owned();
+    run.state_evidence = "Codex process is running under Ditch Runtime.".to_owned();
 
     {
         let mut state = state
@@ -1393,7 +1393,7 @@ fn resume_codex_session(
         current_prompt: Some(prompt.clone()),
         last_visible_action: Some("Resuming Codex".to_owned()),
         state_confidence: 0.8,
-        state_evidence: "The Ditch Runtime accepted the session and is resuming Codex.".to_owned(),
+        state_evidence: "Ditch Runtime accepted the session and is resuming Codex.".to_owned(),
         started_at: now,
         updated_at: now,
         finished_at: None,
@@ -1419,7 +1419,7 @@ fn resume_codex_session(
             run,
             user_message,
             allow_non_git,
-            "No working Codex CLI installation was found. Choose an existing installation in The Ditch settings.".to_owned(),
+            "No working Codex CLI installation was found. Choose an existing installation in Ditch settings.".to_owned(),
         );
     };
     let child = match spawn_codex_child(
@@ -1452,7 +1452,7 @@ fn resume_codex_session(
     run.state = AgentState::Working;
     run.can_stop = true;
     run.updated_at = Utc::now();
-    run.state_evidence = "Codex resume process is running under The Ditch Runtime.".to_owned();
+    run.state_evidence = "Codex resume process is running under Ditch Runtime.".to_owned();
 
     {
         let mut state = state
@@ -1583,7 +1583,7 @@ fn prompt_agent(
 
     let binary = active_codex_binary(&state);
     let Some(binary) = binary else {
-        let message = "No working Codex CLI installation was found. Choose an existing installation in The Ditch settings.".to_owned();
+        let message = "No working Codex CLI installation was found. Choose an existing installation in Ditch settings.".to_owned();
         record_terminal_failure(&state, agent_id, message.clone(), None);
         finish_agent(&state, agent_id, None, Some(1));
         return protocol_error("codex_not_found", message);
@@ -3127,7 +3127,7 @@ fn check_codex_readiness(binary: Option<&str>) -> CodexReadiness {
     ];
     for (label, args) in launch_probes {
         if let Err(detail) = codex_argument_probe(executable, args, path.clone()) {
-            issues.push(format!("Codex rejected The Ditch's {label}: {detail}"));
+            issues.push(format!("Codex rejected Ditch's {label}: {detail}"));
         }
     }
     if !root_help
@@ -3135,8 +3135,7 @@ fn check_codex_readiness(binary: Option<&str>) -> CodexReadiness {
         .is_some_and(|help| help.contains("app-server"))
     {
         issues.push(
-            "The selected Codex CLI cannot provide the model catalog required by The Ditch."
-                .to_owned(),
+            "The selected Codex CLI cannot provide the model catalog required by Ditch.".to_owned(),
         );
     }
 

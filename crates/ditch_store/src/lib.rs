@@ -277,7 +277,7 @@ impl DitchStore {
         Ok(())
     }
 
-    /// Removes only The Ditch's persisted state for a project. The project
+    /// Removes only Ditch's persisted state for a project. The project
     /// directory and its `.ditch` metadata are deliberately never touched.
     pub fn delete_project(&mut self, project_id: ProjectId) -> Result<(), StoreError> {
         let tx = self.connection.transaction()?;
@@ -487,7 +487,7 @@ impl DitchStore {
                     agent.terminal_failure.as_deref(),
                     agent.codex_home.as_deref(),
                 )?;
-                self.append_message(&AgentChatMessage { agent_id: agent.run.id, role: ditch_protocol::AgentChatRole::System, text: "The Ditch Runtime restarted while this session was active. Start a new prompt to resume it safely.".to_owned(), created_at: Utc::now() })?;
+                self.append_message(&AgentChatMessage { agent_id: agent.run.id, role: ditch_protocol::AgentChatRole::System, text: "Ditch Runtime restarted while this session was active. Start a new prompt to resume it safely.".to_owned(), created_at: Utc::now() })?;
                 count += 1;
             }
         }

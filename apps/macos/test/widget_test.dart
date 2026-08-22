@@ -14,7 +14,7 @@ GlobalKey _testAgentHeaderKey(String agentId) =>
     _testAgentHeaderKeys.putIfAbsent(agentId, GlobalKey.new);
 
 const _testProject = DitchProject(
-  name: 'The Ditch',
+  name: 'Ditch',
   path: '/tmp/the-ditch-test-project',
 );
 
@@ -504,7 +504,7 @@ void main() {
   testWidgets('renders command center shell', (tester) async {
     await tester.pumpWidget(_testApp());
 
-    expect(find.text('The Ditch'), findsWidgets);
+    expect(find.text('Ditch'), findsWidgets);
     expect(find.text('PROJECTS'), findsOneWidget);
     expect(find.text('Agents'), findsOneWidget);
     expect(find.text('Attention'), findsNothing);
@@ -518,7 +518,7 @@ void main() {
     await tester.pumpWidget(const TheDitchApp(connectRuntimeOnStart: false));
     await tester.pumpAndSettle();
 
-    expect(find.text('Welcome to The Ditch'), findsOneWidget);
+    expect(find.text('Welcome to Ditch'), findsOneWidget);
     expect(find.byKey(const Key('onboarding-continue')), findsOneWidget);
     expect(find.byKey(const Key('first-project-add')), findsNothing);
     expect(find.widgetWithText(AlertDialog, 'Add Project'), findsNothing);
@@ -640,7 +640,7 @@ void main() {
       ),
     );
 
-    expect(find.text('The Ditch Runtime is not responding'), findsOneWidget);
+    expect(find.text('Ditch Runtime is not responding'), findsOneWidget);
     expect(find.text('Retry Connection'), findsOneWidget);
     expect(find.text('Open Activity Monitor'), findsOneWidget);
     expect(find.text('Quit UI'), findsOneWidget);

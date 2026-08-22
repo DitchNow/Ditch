@@ -1,4 +1,4 @@
-Implement one bounded, production-quality vertical slice in the current The Ditch codebase: rebuild the per-agent chat viewport and scroll lifecycle so it behaves like a modern ChatGPT-style conversation while preserving The Ditch’s existing architecture, brand, message model, runtime boundary, and overall visual language.
+Implement one bounded, production-quality vertical slice in the current Ditch codebase: rebuild the per-agent chat viewport and scroll lifecycle so it behaves like a modern ChatGPT-style conversation while preserving Ditch’s existing architecture, brand, message model, runtime boundary, and overall visual language.
 
 The current behavior is unacceptable: opening an agent can begin at old messages, scrolling jumps unpredictably, message updates disturb the viewport, the agent-list and transcript scroll domains interfere, and long conversations do not behave like a stable modern chat.
 
@@ -261,7 +261,7 @@ Adapt to the current visual system and avoid covering selected text or critical 
 
 The control must:
 
-* use The Ditch’s existing accent color and surface/border/shadow tokens;
+* use Ditch’s existing accent color and surface/border/shadow tokens;
 * work in light and dark themes;
 * include a downward arrow;
 * use compact modern typography;
@@ -424,7 +424,7 @@ Document any unavoidable platform-view limitation.
 
 ## Modern visual treatment
 
-Keep The Ditch’s existing brand colors and design language intact.
+Keep Ditch’s existing brand colors and design language intact.
 
 Do not make the chat look like a generic clone of ChatGPT, Claude, Slack, or Discord. Copy interaction quality, not branding.
 
@@ -646,7 +646,7 @@ Report measured observations honestly. Do not invent frame-rate numbers.
 
 Run and record this exact journey:
 
-1. Start The Ditch with an agent containing a long conversation.
+1. Start Ditch with an agent containing a long conversation.
 2. Open the agent row.
 3. Confirm the latest message appears immediately without visible top-to-bottom travel.
 4. Scroll slowly with a trackpad.
@@ -729,7 +729,7 @@ This task is complete only when:
 * per-agent viewport state cannot leak;
 * rapid updates do not queue scroll animations;
 * active conversations never render as an unbounded message `Column`;
-* the implementation preserves The Ditch’s existing brand and design system;
+* the implementation preserves Ditch’s existing brand and design system;
 * existing runtime and composer behavior remain intact;
 * automated tests cover the critical lifecycle;
 * all available verification commands pass;

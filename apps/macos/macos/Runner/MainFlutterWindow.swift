@@ -27,6 +27,13 @@ class MainFlutterWindow: NSWindow {
     (NSApp.delegate as? AppDelegate)?.configureProjectPickerChannel(messenger: registrar.messenger)
 
     super.awakeFromNib()
+
+    // Keep the native window identity aligned with the bundle's visible name.
+    // AppKit may otherwise retain the nib or restored-state title across a
+    // product rename even though Flutter and Info.plist already use the new name.
+    self.title =
+      Bundle.main.object(forInfoDictionaryKey: "CFBundleName") as? String
+      ?? "Ditch"
   }
 }
 

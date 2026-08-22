@@ -126,7 +126,7 @@ final class StatusHost: NSObject, NSApplicationDelegate, UNUserNotificationCente
     var candidate = Bundle.main.bundleURL
     while candidate.path != "/" {
       if candidate.pathExtension == "app",
-        candidate.lastPathComponent == "The Ditch.app"
+        Bundle(url: candidate)?.bundleIdentifier == "ai.theditch.app"
       {
         return candidate.path
       }
@@ -182,13 +182,13 @@ final class StatusHost: NSObject, NSApplicationDelegate, UNUserNotificationCente
       button.image = statusImage()
       button.imagePosition = .imageLeft
       button.title = ""
-      button.toolTip = "The Ditch Runtime"
+      button.toolTip = "Ditch Runtime"
     }
 
     menu.autoenablesItems = false
 
     let showItem = NSMenuItem(
-      title: "Show The Ditch",
+      title: "Show Ditch",
       action: #selector(showTheDitch),
       keyEquivalent: "")
     showItem.target = self
@@ -210,7 +210,7 @@ final class StatusHost: NSObject, NSApplicationDelegate, UNUserNotificationCente
     menu.addItem(NSMenuItem.separator())
 
     let quitItem = NSMenuItem(
-      title: "Quit The Ditch",
+      title: "Quit Ditch",
       action: #selector(quitRuntime),
       keyEquivalent: "q")
     quitItem.target = self
@@ -248,7 +248,7 @@ final class StatusHost: NSObject, NSApplicationDelegate, UNUserNotificationCente
       attentionItem.title = "0 alerts"
       codexHomeItem.title = "Codex home: Unknown"
       updateStatusButton(activeSessionCount: 0, attentionCount: 0)
-      statusItem?.button?.toolTip = "The Ditch Runtime • Offline"
+      statusItem?.button?.toolTip = "Ditch Runtime • Offline"
       return
     }
 
@@ -264,7 +264,7 @@ final class StatusHost: NSObject, NSApplicationDelegate, UNUserNotificationCente
       activeSessionCount: status.activeSessionCount,
       attentionCount: status.unreadAttentionCount)
     statusItem?.button?.toolTip =
-      "The Ditch Runtime • \(status.activeSessionCount) active"
+      "Ditch Runtime • \(status.activeSessionCount) active"
     startAttentionStream()
   }
 
@@ -583,7 +583,7 @@ final class StatusHost: NSObject, NSApplicationDelegate, UNUserNotificationCente
         default: title = "Agent “\(agentName)” — \(item.title)"
         }
         content.title = title
-        content.subtitle = "Project: \(Self.nonEmpty(item.projectName) ?? "The Ditch")"
+        content.subtitle = "Project: \(Self.nonEmpty(item.projectName) ?? "Ditch")"
         content.body = Self.notificationSummary(item.body)
         content.sound = .default
         content.categoryIdentifier = Self.agentEventCategory
@@ -844,9 +844,9 @@ final class StatusHost: NSObject, NSApplicationDelegate, UNUserNotificationCente
   @objc private func quitRuntime() {
     if let status = lastRuntimeStatus, status.activeSessionCount > 0 {
       let alert = NSAlert()
-      alert.messageText = "Quit The Ditch?"
+      alert.messageText = "Quit Ditch?"
       alert.informativeText =
-        "This will close The Ditch and stop \(status.activeSessionCount) active agent session(s)."
+        "This will close Ditch and stop \(status.activeSessionCount) active agent session(s)."
       alert.addButton(withTitle: "Quit and Stop Agents")
       alert.addButton(withTitle: "Cancel")
       alert.alertStyle = .warning
@@ -858,7 +858,7 @@ final class StatusHost: NSObject, NSApplicationDelegate, UNUserNotificationCente
     if output.exitCode != 0 && lastRuntimeStatus != nil {
       shutdownRequested = false
       let alert = NSAlert()
-      alert.messageText = "The Ditch Runtime could not be stopped"
+      alert.messageText = "Ditch Runtime could not be stopped"
       alert.informativeText = output.stderr.isEmpty
         ? "The runtime may still be running."
         : output.stderr
@@ -896,7 +896,7 @@ final class StatusHost: NSObject, NSApplicationDelegate, UNUserNotificationCente
     scale.translateX(by: -9, yBy: -9)
     scale.concat()
 
-    // A compact, clean rendering of The Ditch's chip-shaped D mark. Drawing it
+    // A compact, clean rendering of Ditch's chip-shaped D mark. Drawing it
     // here keeps the login-item helper self-contained and resolution independent.
     let mark = NSBezierPath()
     mark.windingRule = .evenOdd
@@ -940,7 +940,7 @@ final class StatusHost: NSObject, NSApplicationDelegate, UNUserNotificationCente
 
     image.unlockFocus()
     image.isTemplate = true
-    image.accessibilityDescription = "The Ditch Runtime"
+    image.accessibilityDescription = "Ditch Runtime"
     return image
   }
 }

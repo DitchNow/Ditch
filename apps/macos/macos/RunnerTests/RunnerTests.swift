@@ -2,7 +2,7 @@ import Cocoa
 import FlutterMacOS
 import XCTest
 
-@testable import The_Ditch
+@testable import Ditch
 
 class RunnerTests: XCTestCase {
 

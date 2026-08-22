@@ -6,7 +6,7 @@
         <mxCell id="0"/>
         <mxCell id="1" parent="0"/>
 
-        <mxCell id="title" value="The Ditch — High-Level Runtime Architecture" style="text;html=1;strokeColor=none;fillColor=none;align=left;verticalAlign=middle;fontSize=26;fontStyle=1;fontColor=#1D1D1F;" vertex="1" parent="1">
+        <mxCell id="title" value="Ditch — High-Level Runtime Architecture" style="text;html=1;strokeColor=none;fillColor=none;align=left;verticalAlign=middle;fontSize=26;fontStyle=1;fontColor=#1D1D1F;" vertex="1" parent="1">
           <mxGeometry x="40" y="25" width="780" height="40" as="geometry"/>
         </mxCell>
         <mxCell id="subtitle" value="Independent macOS processes, Codex execution, state flow, persistence, and failure isolation" style="text;html=1;strokeColor=none;fillColor=none;align=left;verticalAlign=middle;fontSize=13;fontColor=#6E6E73;" vertex="1" parent="1">
@@ -20,7 +20,7 @@
         <mxCell id="macosBoundary" value="macOS Application Layer" style="swimlane;html=1;rounded=1;startSize=32;horizontal=1;fillColor=#F5F5F7;strokeColor=#A1A1A6;strokeWidth=1.5;fontStyle=1;fontColor=#1D1D1F;arcSize=10;" vertex="1" parent="1">
           <mxGeometry x="290" y="105" width="1240" height="310" as="geometry"/>
         </mxCell>
-        <mxCell id="uiProcess" value="&lt;b&gt;The Ditch UI process&lt;/b&gt;&lt;br&gt;&lt;font color='#6E6E73'&gt;Flutter command center&lt;/font&gt;&lt;br&gt;&lt;br&gt;• Projects and agent rows&lt;br&gt;• Conversation rendering&lt;br&gt;• Prompts and attention actions&lt;br&gt;• Snapshot reconciliation&lt;br&gt;• Runtime connection state" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#007AFF;strokeWidth=2;fontColor=#1D1D1F;align=left;spacingLeft=14;spacingTop=10;arcSize=12;" vertex="1" parent="macosBoundary">
+        <mxCell id="uiProcess" value="&lt;b&gt;Ditch UI process&lt;/b&gt;&lt;br&gt;&lt;font color='#6E6E73'&gt;Flutter command center&lt;/font&gt;&lt;br&gt;&lt;br&gt;• Projects and agent rows&lt;br&gt;• Conversation rendering&lt;br&gt;• Prompts and attention actions&lt;br&gt;• Snapshot reconciliation&lt;br&gt;• Runtime connection state" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#007AFF;strokeWidth=2;fontColor=#1D1D1F;align=left;spacingLeft=14;spacingTop=10;arcSize=12;" vertex="1" parent="macosBoundary">
           <mxGeometry x="25" y="55" width="270" height="210" as="geometry"/>
         </mxCell>
         <mxCell id="appkit" value="&lt;b&gt;Native AppKit shell&lt;/b&gt;&lt;br&gt;&lt;br&gt;• Window lifecycle&lt;br&gt;• Native prompt editor&lt;br&gt;• Focus and keyboard handling&lt;br&gt;• Enter = Send&lt;br&gt;• Shift+Enter = newline" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#5AC8FA;strokeWidth=1.5;fontColor=#1D1D1F;align=left;spacingLeft=14;spacingTop=10;arcSize=12;" vertex="1" parent="macosBoundary">
@@ -59,7 +59,7 @@
         <mxCell id="dataBoundary" value="Persistent Data and Workspaces" style="swimlane;html=1;rounded=1;startSize=32;horizontal=1;fillColor=#F5F5F7;strokeColor=#A1A1A6;strokeWidth=1.5;fontStyle=1;fontColor=#1D1D1F;arcSize=10;" vertex="1" parent="1">
           <mxGeometry x="290" y="965" width="1240" height="165" as="geometry"/>
         </mxCell>
-        <mxCell id="ditchStore" value="&lt;b&gt;The Ditch SQLite store&lt;/b&gt;&lt;br&gt;Projects, agent runs, messages,&lt;br&gt;attention, recovery, user titles" style="shape=cylinder3;whiteSpace=wrap;html=1;boundedLbl=1;backgroundOutline=1;fillColor=#FFFFFF;strokeColor=#AF52DE;strokeWidth=1.5;fontColor=#1D1D1F;" vertex="1" parent="dataBoundary">
+        <mxCell id="ditchStore" value="&lt;b&gt;Ditch SQLite store&lt;/b&gt;&lt;br&gt;Projects, agent runs, messages,&lt;br&gt;attention, recovery, user titles" style="shape=cylinder3;whiteSpace=wrap;html=1;boundedLbl=1;backgroundOutline=1;fillColor=#FFFFFF;strokeColor=#AF52DE;strokeWidth=1.5;fontColor=#1D1D1F;" vertex="1" parent="dataBoundary">
           <mxGeometry x="25" y="45" width="260" height="95" as="geometry"/>
         </mxCell>
         <mxCell id="codexStore" value="&lt;b&gt;Codex-owned state&lt;/b&gt;&lt;br&gt;state_5.sqlite titles and names;&lt;br&gt;session rollout history" style="shape=cylinder3;whiteSpace=wrap;html=1;boundedLbl=1;backgroundOutline=1;fillColor=#FFFFFF;strokeColor=#FF9500;strokeWidth=1.5;fontColor=#1D1D1F;" vertex="1" parent="dataBoundary">

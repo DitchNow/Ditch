@@ -65,7 +65,7 @@ class _TheDitchAppState extends State<TheDitchApp> {
     return ValueListenableBuilder<ThemeMode>(
       valueListenable: ditchThemeMode,
       builder: (context, themeMode, _) => MaterialApp(
-        title: 'The Ditch',
+        title: 'Ditch',
         debugShowCheckedModeBanner: false,
         theme: DitchTheme.light(),
         darkTheme: DitchTheme.dark(),
@@ -1692,7 +1692,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
       if (!mounted) return;
       if (values == null) {
         throw const FormatException(
-          'The Ditch Runtime returned no notification status.',
+          'Ditch Runtime returned no notification status.',
         );
       }
       setState(() {
@@ -1736,7 +1736,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
         icon: const Icon(Icons.system_update_alt),
         title: const Text('Update Codex?'),
         content: Text(
-          'The Ditch will run `codex update` using your selected installation.\n\n${report.path}\n${report.version ?? "Unknown version"}\n\nIt will not modify PATH, Homebrew, npm, or another installation.',
+          'Ditch will run `codex update` using your selected installation.\n\n${report.path}\n${report.version ?? "Unknown version"}\n\nIt will not modify PATH, Homebrew, npm, or another installation.',
         ),
         actions: [
           TextButton(
@@ -1865,7 +1865,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
                       crossAxisAlignment: CrossAxisAlignment.stretch,
                       children: [
                         const Text(
-                          'The Ditch uses one of your existing Codex installations. It never creates a private toolchain or changes your shell PATH.',
+                          'Ditch uses one of your existing Codex installations. It never creates a private toolchain or changes your shell PATH.',
                         ),
                         const SizedBox(height: 12),
                         Flexible(
@@ -1934,7 +1934,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
       icon: Icons.system_update_alt_outlined,
       title: 'Outdated Ditch Runtime',
       body:
-          'This runtime does not support the current agent execution profile. Rebuild and restart The Ditch before starting Codex.',
+          'This runtime does not support the current agent execution profile. Rebuild and restart Ditch before starting Codex.',
       global: true,
     );
   }
@@ -1966,7 +1966,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
       return;
     } on Object catch (error) {
       throw StateError(
-        'The Ditch Runtime is unavailable. Use the status menu to restart it, then retry. $error',
+        'Ditch Runtime is unavailable. Use the status menu to restart it, then retry. $error',
       );
     }
   }
@@ -2287,7 +2287,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
       _showProjectSetupResult(
         title: 'Project ready',
         message:
-            'The Ditch verified agents, hooks, and MCP directories in ${configuredProject.path}/.ditch.',
+            'Ditch verified agents, hooks, and MCP directories in ${configuredProject.path}/.ditch.',
       );
     } on Object catch (error) {
       if (!mounted) {
@@ -2329,7 +2329,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
       builder: (context) => AlertDialog(
         title: Text('Delete ${project.name}?'),
         content: const Text(
-          'This removes the project, its agents, chat history, and alerts from The Ditch. The project folder and its files will not be deleted.',
+          'This removes the project, its agents, chat history, and alerts from Ditch. The project folder and its files will not be deleted.',
         ),
         actions: [
           TextButton(
@@ -2501,7 +2501,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
       _addChatMessage(
         session,
         ChatMessageRole.system,
-        'Failed to start Codex through The Ditch Runtime: $error',
+        'Failed to start Codex through Ditch Runtime: $error',
       );
       _addAttentionRequired(
         kind: AttentionKind.failed,
@@ -2533,7 +2533,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
       _showProjectSetupResult(
         title: 'Outdated Ditch Runtime',
         message:
-            'This runtime does not support the current agent launch policy. Rebuild and restart The Ditch, then try again.',
+            'This runtime does not support the current agent launch policy. Rebuild and restart Ditch, then try again.',
         isError: true,
       );
       return false;
@@ -2657,7 +2657,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
       _addChatMessage(
         session,
         ChatMessageRole.system,
-        'Failed to send prompt through The Ditch Runtime: $error',
+        'Failed to send prompt through Ditch Runtime: $error',
       );
       _addAttentionRequired(
         kind: AttentionKind.failed,
@@ -2688,7 +2688,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
       _addChatMessage(
         session,
         ChatMessageRole.system,
-        'Failed to stop Codex through The Ditch Runtime: $error',
+        'Failed to stop Codex through Ditch Runtime: $error',
       );
     }
   }
@@ -2700,7 +2700,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
       builder: (context) => AlertDialog(
         title: const Text('Delete this agent?'),
         content: const Text(
-          'This permanently removes the agent, its chat history, and its alerts from The Ditch. Project files are not deleted.',
+          'This permanently removes the agent, its chat history, and its alerts from Ditch. Project files are not deleted.',
         ),
         actions: [
           TextButton(
@@ -4060,12 +4060,12 @@ class CodexOnboardingView extends StatelessWidget {
                           ),
                           const SizedBox(height: 20),
                           Text(
-                            'Welcome to The Ditch',
+                            'Welcome to Ditch',
                             style: theme.textTheme.headlineSmall,
                           ),
                           const SizedBox(height: 10),
                           const Text(
-                            'The Ditch runs your existing Codex CLI. First, it will verify the installation, required capabilities, authentication, and diagnostics. It will not create a private Codex installation or change your PATH.',
+                            'Ditch runs your existing Codex CLI. First, it will verify the installation, required capabilities, authentication, and diagnostics. It will not create a private Codex installation or change your PATH.',
                             textAlign: TextAlign.center,
                           ),
                           const SizedBox(height: 24),
@@ -4248,7 +4248,7 @@ class CodexOnboardingView extends StatelessWidget {
     final value = notificationReadiness;
     if (value == null) {
       return notificationChecking
-          ? 'Checking The Ditch Runtime…'
+          ? 'Checking Ditch Runtime…'
           : 'Notification status has not been checked';
     }
     if (value.ready) {
@@ -4258,7 +4258,7 @@ class CodexOnboardingView extends StatelessWidget {
     }
     return switch (value.authorization) {
       NotificationAuthorizationState.denied =>
-        'Permission was denied. Enable The Ditch in System Settings.',
+        'Permission was denied. Enable Ditch in System Settings.',
       NotificationAuthorizationState.authorized ||
       NotificationAuthorizationState.provisional ||
       NotificationAuthorizationState.ephemeral =>
@@ -4572,8 +4572,8 @@ class RuntimeConnectionBanner extends StatelessWidget {
             Expanded(
               child: Text(
                 message == null
-                    ? 'The Ditch Runtime is not responding. Agents may still be running.'
-                    : 'The Ditch Runtime is not responding. Agents may still be running. $message',
+                    ? 'Ditch Runtime is not responding. Agents may still be running.'
+                    : 'Ditch Runtime is not responding. Agents may still be running. $message',
                 maxLines: 2,
                 overflow: TextOverflow.ellipsis,
               ),
@@ -4621,12 +4621,12 @@ class RuntimeRecoveryView extends StatelessWidget {
                 ),
                 const SizedBox(height: 16),
                 Text(
-                  'The Ditch Runtime is not responding',
+                  'Ditch Runtime is not responding',
                   style: Theme.of(context).textTheme.headlineSmall,
                 ),
                 const SizedBox(height: 8),
                 const Text(
-                  'Agent processes may still be running. The Ditch could not reconnect to its local runtime service.',
+                  'Agent processes may still be running. Ditch could not reconnect to its local runtime service.',
                 ),
                 const SizedBox(height: 20),
                 Text(
@@ -4634,7 +4634,7 @@ class RuntimeRecoveryView extends StatelessWidget {
                   style: Theme.of(context).textTheme.labelLarge,
                 ),
                 const SizedBox(height: 4),
-                const SelectableText('The Ditch Runtime'),
+                const SelectableText('Ditch Runtime'),
                 const SizedBox(height: 12),
                 Text('Socket', style: Theme.of(context).textTheme.labelLarge),
                 const SizedBox(height: 4),
@@ -4650,7 +4650,7 @@ class RuntimeRecoveryView extends StatelessWidget {
                 ],
                 const SizedBox(height: 20),
                 const Text(
-                  'Search for “The Ditch Runtime” in Activity Monitor. Force Quit Applications does not list macOS background services.',
+                  'Search for “Ditch Runtime” in Activity Monitor. Force Quit Applications does not list macOS background services.',
                 ),
                 const SizedBox(height: 20),
                 Wrap(
@@ -7104,7 +7104,7 @@ class AgentChatBubble extends StatelessWidget {
         Alignment.centerLeft,
       ),
       ChatMessageRole.system => (
-        'The Ditch',
+        'Ditch',
         Icons.info_outline,
         colors.onSecondaryContainer,
         colors.secondaryContainer,
@@ -8098,7 +8098,7 @@ class _AddProjectDialogState extends State<AddProjectDialog> {
             const Align(
               alignment: Alignment.centerLeft,
               child: Text(
-                'The Ditch will create and verify:\n.ditch/agents  •  .ditch/hooks  •  .ditch/mcp',
+                'Ditch will create and verify:\n.ditch/agents  •  .ditch/hooks  •  .ditch/mcp',
               ),
             ),
           ],

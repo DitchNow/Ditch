@@ -1,4 +1,4 @@
-Implement one bounded vertical feature in the current The Ditch codebase: prompt-control actions for the existing Codex chat composer.
+Implement one bounded vertical feature in the current Ditch codebase: prompt-control actions for the existing Codex chat composer.
 
 Do not redesign the application, replace the composer, introduce a second state architecture, or create a parallel message model. First inspect the repository and read all applicable `AGENTS.md`, product, architecture, design-system, state-management, persistence, daemon/IPC, session, and testing documentation. Locate the current chat composer, message submission flow, Codex input boundary, transcript rendering, session persistence, theme tokens, reusable buttons/chips, and existing tests.
 
@@ -31,7 +31,7 @@ Modifier:
 
 The user writes the substantive prompt normally. Selecting an action adds a visible chip/token to the composer, but does not insert or display the predefined expansion inside the editable text field.
 
-When the user submits, The Ditch constructs the expanded outbound prompt internally and sends it through the existing Codex submission path. The normal chat transcript shows the user’s original text and selected action metadata, not the hidden expansion.
+When the user submits, Ditch constructs the expanded outbound prompt internally and sends it through the existing Codex submission path. The normal chat transcript shows the user’s original text and selected action metadata, not the hidden expansion.
 
 ## Architectural constraints
 

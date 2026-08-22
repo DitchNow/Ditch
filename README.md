@@ -18,13 +18,13 @@ Current limitations are:
 - The repository contains types and placeholder directories for other providers, hooks, MCP, tasks, and worktrees, but those are not complete user-facing features.
 - There is no GitHub release workflow, CI workflow, or private security-reporting channel in the repository yet.
 
-## Why The Ditch
+## Why Ditch
 
 Once several coding sessions are active, starting Codex is no longer the difficult part. The operational work is remembering which project each session belongs to, finding the right transcript, noticing that a run finished or failed, and returning to it without reconstructing context from terminal windows.
 
-The Ditch gives that work a project-oriented home. It keeps session history and status together, routes prompts back to the correct Codex thread, and raises local attention when a run reaches a result or encounters a problem.
+Ditch gives that work a project-oriented home. It keeps session history and status together, routes prompts back to the correct Codex thread, and raises local attention when a run reaches a result or encounters a problem.
 
-A terminal remains the most direct way to run one Codex session. The Ditch is useful when the surrounding workflow matters: several projects, concurrent runs, a durable conversation list, notifications, and quick access to each repository's shell and files. It operates around the installed Codex CLI rather than replacing it.
+A terminal remains the most direct way to run one Codex session. Ditch is useful when the surrounding workflow matters: several projects, concurrent runs, a durable conversation list, notifications, and quick access to each repository's shell and files. It operates around the installed Codex CLI rather than replacing it.
 
 ## Quick Start
 
@@ -33,17 +33,17 @@ A terminal remains the most direct way to run one Codex session. The Ditch is us
 - macOS 11 or later
 - A compatible [Codex CLI](https://learn.chatgpt.com/docs/codex/cli) installation, signed in with `codex login`
 
-The Ditch does not pin a minimum Codex version. On first run it checks the selected executable for the `codex exec` JSON/resume behavior and command-line options it needs.
+Ditch does not pin a minimum Codex version. On first run it checks the selected executable for the `codex exec` JSON/resume behavior and command-line options it needs.
 
 ### Install
 
-Download the macOS beta from [theditch.dev](https://theditch.dev/#beta). The website sends the `.dmg` download link by email. Open the downloaded disk image and install The Ditch, then launch the app.
+Download the macOS beta from [theditch.dev](https://theditch.dev/#beta). The website sends the `.dmg` download link by email. Open the downloaded disk image and install Ditch, then launch the app.
 
 To compile the application yourself, follow [Build From Source](#build-from-source).
 
 ### First run
 
-1. Open The Ditch and let the setup screen check the available Codex installations, authentication, and notification permission.
+1. Open Ditch and let the setup screen check the available Codex installations, authentication, and notification permission.
 2. Add a repository. The default policy requires an existing Git repository; the add-project dialog can instead initialize Git or explicitly allow Codex outside Git.
 3. Select the project, choose **New Agent**, enter a prompt, and start the session.
 4. Open another project or start another agent while the first one runs.
@@ -59,7 +59,7 @@ Register local repositories and run more than one Codex agent at a time. Each se
 
 ### Return to prior work
 
-The Ditch stores prompts, assistant output, tool activity, run state, and Codex thread IDs. Conversations survive foreground-app restarts, earlier messages can be paged into the chat, and a follow-up resumes the original Codex thread when its identity and `CODEX_HOME` still match.
+Ditch stores prompts, assistant output, tool activity, run state, and Codex thread IDs. Conversations survive foreground-app restarts, earlier messages can be paged into the chat, and a follow-up resumes the original Codex thread when its identity and `CODEX_HOME` still match.
 
 ### Notice results without watching every window
 
@@ -79,7 +79,7 @@ The composer discovers available models from the selected Codex installation and
 
 ## How It Works
 
-The Ditch does not replace Codex and does not send prompts to a separate Ditch agent service. The foreground Flutter application is a client of a local Rust runtime. That runtime owns session state and child processes, invokes the user's selected Codex CLI, parses its JSON event stream, and publishes typed events back to the UI.
+Ditch does not replace Codex and does not send prompts to a separate Ditch agent service. The foreground Flutter application is a client of a local Rust runtime. That runtime owns session state and child processes, invokes the user's selected Codex CLI, parses its JSON event stream, and publishes typed events back to the UI.
 
 ```mermaid
 flowchart TD
@@ -104,13 +104,13 @@ The application, runtime, socket, database, project access, and notification pro
 
 The download website is a separate boundary: its beta form collects an email address to send access and states that it records whether the download link is opened.
 
-The Ditch stores its application data under `~/Library/Application Support/The Ditch/`, including `ditch.sqlite3`, the local sockets, runtime logs, the runtime PID, and an optional persisted `CODEX_HOME` path. UI preferences use the normal macOS preferences store. Each registered project receives the `.ditch` metadata described above.
+Ditch stores its application data under the compatibility path `~/Library/Application Support/The Ditch/`, including `ditch.sqlite3`, the local sockets, runtime logs, the runtime PID, and an optional persisted `CODEX_HOME` path. UI preferences use the normal macOS preferences store. Each registered project receives the `.ditch` metadata described above.
 
-Prompts and parsed Codex output are stored in the local SQLite database. The Ditch passes prompts to the locally installed Codex CLI and launches it in the selected project directory, so Codex can read or modify files according to the chosen sandbox and network settings. Codex itself communicates with OpenAI and is subject to the user's Codex configuration, account, and OpenAI data handling; “local-first” does not mean that model execution is offline.
+Prompts and parsed Codex output are stored in the local SQLite database. Ditch passes prompts to the locally installed Codex CLI and launches it in the selected project directory, so Codex can read or modify files according to the chosen sandbox and network settings. Codex itself communicates with OpenAI and is subject to the user's Codex configuration, account, and OpenAI data handling; “local-first” does not mean that model execution is offline.
 
-Authentication remains with Codex. The Ditch locates compatible executables, runs `codex login status` to check readiness, and can open `codex login` in Terminal. It does not implement an OpenAI sign-in flow or store Codex credentials. Codex's own thread data remains in the active `CODEX_HOME` (normally `~/.codex`), outside The Ditch's database.
+Authentication remains with Codex. Ditch locates compatible executables, runs `codex login status` to check readiness, and can open `codex login` in Terminal. It does not implement an OpenAI sign-in flow or store Codex credentials. Codex's own thread data remains in the active `CODEX_HOME` (normally `~/.codex`), outside Ditch's database.
 
-The in-app **Uninstall The Ditch…** command stops active agents, unregisters the helper, removes The Ditch-owned application data and preferences, and moves the app to Trash. It does not delete registered project directories or their `.ditch` metadata.
+The in-app **Uninstall Ditch…** command stops active agents, unregisters the helper, removes Ditch-owned application data and preferences, and moves the app to Trash. It does not delete registered project directories or their `.ditch` metadata.
 
 ## Open Source
 
@@ -179,7 +179,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, issue guidelines, 
 
 ## Security
 
-The Ditch can execute processes and read or write files inside registered projects, and **Full Access** deliberately removes Codex's sandbox restrictions. Review the selected project, execution profile, and prompt before starting a turn.
+Ditch can execute processes and read or write files inside registered projects, and **Full Access** deliberately removes Codex's sandbox restrictions. Review the selected project, execution profile, and prompt before starting a turn.
 
 There is no `SECURITY.md` and no documented private vulnerability-reporting channel. Do not put exploit details or local secrets in a public discussion; the repository needs to publish a private reporting path before it can give complete reporting instructions here.
 

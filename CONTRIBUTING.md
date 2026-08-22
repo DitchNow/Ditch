@@ -34,7 +34,7 @@ Use the bug report issue form and include:
 - relevant logs or error output; and
 - whether the problem occurs consistently.
 
-The Ditch runtime writes logs under `~/Library/Application Support/The Ditch/logs/`. Logs, screenshots, transcripts, and diagnostics may contain repository paths, prompts, commands, or source text. Inspect and redact them before posting.
+Ditch runtime writes logs under `~/Library/Application Support/The Ditch/logs/`. Logs, screenshots, transcripts, and diagnostics may contain repository paths, prompts, commands, or source text. Inspect and redact them before posting.
 
 Do not include secrets, API credentials, authentication tokens, private source code, personal data, or other sensitive information in a public issue.
 

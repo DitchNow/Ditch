@@ -45,7 +45,7 @@ class AppDelegate: FlutterAppDelegate {
         atomically: true,
         encoding: .utf8)
     } catch {
-      NSLog("The Ditch could not persist CODEX_HOME: \(error)")
+      NSLog("Ditch could not persist CODEX_HOME: \(error)")
     }
   }
 
@@ -62,7 +62,7 @@ class AppDelegate: FlutterAppDelegate {
       do {
         try service.register()
       } catch {
-        NSLog("The Ditch could not register its runtime: \(error)")
+        NSLog("Ditch could not register its runtime: \(error)")
       }
     } else {
       _ = SMLoginItemSetEnabled(Self.runtimeLoginItemIdentifier as CFString, true)
@@ -75,7 +75,7 @@ class AppDelegate: FlutterAppDelegate {
     else { return }
 
     let item = NSMenuItem(
-      title: "Uninstall The Ditch…",
+      title: "Uninstall Ditch…",
       action: #selector(uninstallApplication(_:)),
       keyEquivalent: "")
     item.target = self
@@ -86,9 +86,9 @@ class AppDelegate: FlutterAppDelegate {
     guard !uninstallInProgress else { return }
 
     let alert = NSAlert()
-    alert.messageText = "Uninstall The Ditch?"
+    alert.messageText = "Uninstall Ditch?"
     alert.informativeText =
-      "This stops all running agents, removes The Ditch's background service and app data, and moves the application to Trash. Your project folders will not be deleted."
+      "This stops all running agents, removes Ditch's background service and app data, and moves the application to Trash. Your project folders will not be deleted."
     alert.alertStyle = .critical
     alert.addButton(withTitle: "Uninstall")
     alert.addButton(withTitle: "Cancel")
@@ -174,7 +174,7 @@ class AppDelegate: FlutterAppDelegate {
   private func presentUninstallFailure(_ message: String) {
     uninstallInProgress = false
     let alert = NSAlert()
-    alert.messageText = "The Ditch could not be completely uninstalled"
+    alert.messageText = "Ditch could not be completely uninstalled"
     alert.informativeText = message
     alert.alertStyle = .warning
     alert.runModal()
@@ -395,7 +395,7 @@ class AppDelegate: FlutterAppDelegate {
     guard values["bundleIdentifier"] as? String == Self.runtimeLoginItemIdentifier else {
       result(FlutterError(
         code: "notification_helper_identity_mismatch",
-        message: "The notification response did not come from The Ditch Runtime.",
+        message: "The notification response did not come from Ditch Runtime.",
         details: values["bundleIdentifier"]))
       return
     }
@@ -524,14 +524,14 @@ class AppDelegate: FlutterAppDelegate {
     let contents = """
       #!/bin/zsh
       clear
-      echo "The Ditch is opening your selected Codex CLI:"
+      echo "Ditch is opening your selected Codex CLI:"
       echo \(quotedBinary)
       echo
       \(quotedBinary) login
       status=$?
       echo
       if [ $status -eq 0 ]; then
-        echo "Codex sign-in completed. Return to The Ditch."
+        echo "Codex sign-in completed. Return to Ditch."
       else
         echo "Codex sign-in failed with exit code $status."
       fi
@@ -547,7 +547,7 @@ class AppDelegate: FlutterAppDelegate {
         ofItemAtPath: script.path)
       return NSWorkspace.shared.open(script)
     } catch {
-      NSLog("The Ditch could not open Codex sign-in: \(error)")
+      NSLog("Ditch could not open Codex sign-in: \(error)")
       return false
     }
   }
@@ -715,7 +715,7 @@ class AppDelegate: FlutterAppDelegate {
     DispatchQueue.main.sync {
       opened = NSWorkspace.shared.open(helper)
     }
-    if !opened { NSLog("The Ditch could not start its runtime application") }
+    if !opened { NSLog("Ditch could not start its runtime application") }
     return opened
   }
 

@@ -2,21 +2,21 @@
 
 ## Outcome
 
-The Ditch must provide a complete Codex approval experience equivalent in capability to the Codex VS Code extension:
+Ditch must provide a complete Codex approval experience equivalent in capability to the Codex VS Code extension:
 
 1. The composer lets the user select a Codex model and approval preset.
 2. Selecting `Ask for approval` makes Codex pause when it needs approval.
-3. The Ditch receives each live approval request and presents it in the in-app attention surface.
+3. Ditch receives each live approval request and presents it in the in-app attention surface.
 4. macOS also displays a native notification in the usual top-right notification area.
 5. The native notification identifies the project, agent, and requested command or action and offers `Approve` and `Deny` actions.
 6. Selecting an action from the app or notification sends the matching live decision back to Codex.
-7. The relevant Codex turn resumes or is declined, and The Ditch records the result.
+7. The relevant Codex turn resumes or is declined, and Ditch records the result.
 
 The product language must be provider-neutral so a future Claude Code adapter can expose the same product-level controls when its native capabilities permit them.
 
 ## Current state and why `Ask for approval` is unavailable
 
-The current runtime launches every Codex request through non-interactive `codex exec` processes. That transport supports launch flags such as `--model` and `--approve-for-me`, but it does not provide The Ditch with a bidirectional live protocol for receiving and resolving user approval requests.
+The current runtime launches every Codex request through non-interactive `codex exec` processes. That transport supports launch flags such as `--model` and `--approve-for-me`, but it does not provide Ditch with a bidirectional live protocol for receiving and resolving user approval requests.
 
 The codebase already contains partial permission protocol types:
 
@@ -48,7 +48,7 @@ On runtime startup or first Codex use:
 
 1. Locate the Codex binary as today.
 2. Launch `codex app-server --stdio` with piped stdin/stdout/stderr.
-3. Send JSON-RPC `initialize` with client metadata identifying The Ditch.
+3. Send JSON-RPC `initialize` with client metadata identifying Ditch.
 4. Send `initialized`.
 5. Start a dedicated stdout reader that parses every JSON-RPC response, notification, and server-initiated request.
 6. Serialize outbound JSON-RPC writes behind a mutex/queue and allocate monotonically increasing request IDs.
@@ -113,7 +113,7 @@ Store the requested preset and the fully resolved effective profile. A user can 
 
 The initial product presets map to App Server settings as follows:
 
-| The Ditch selection | `approvalPolicy` | `approvalsReviewer` | `sandboxPolicy` |
+| Ditch selection | `approvalPolicy` | `approvalsReviewer` | `sandboxPolicy` |
 | --- | --- | --- | --- |
 | Ask for approval | `on-request` | `user` | `workspaceWrite` |
 | Approve for me | `on-request` | `auto_review` | `workspaceWrite` |
@@ -153,7 +153,7 @@ Handle every App Server approval surface explicitly.
 | `mcpServer/elicitation/request` | MCP elicitation | Accept, decline, or cancel; collect required form/url result when applicable |
 | `tool/requestUserInput` | Tool input/approval | Render the provider-supplied choices and resolve the request |
 
-Do not collapse these into a boolean `ApprovePermission` API. The Ditch protocol must preserve the server's `availableDecisions` and all IDs necessary to resolve the exact pending request.
+Do not collapse these into a boolean `ApprovePermission` API. Ditch protocol must preserve the server's `availableDecisions` and all IDs necessary to resolve the exact pending request.
 
 ### Protocol changes
 
@@ -204,7 +204,7 @@ For each notification, include the Ditch approval request ID in `userInfo`.
 
 - `Approve` resolves the request with the safest offered affirmative decision: normally approve once.
 - `Deny` resolves with decline.
-- Opening the notification activates The Ditch, selects the relevant project/agent, and opens the in-app approval details where any richer decision can be chosen.
+- Opening the notification activates Ditch, selects the relevant project/agent, and opens the in-app approval details where any richer decision can be chosen.
 
 Do not expose `Approve for session` from the native notification unless the notification text makes the persistence scope unmistakable. Keep it available in the full in-app approval card.
 
@@ -267,7 +267,7 @@ Requirements:
 
 ## Persistence and recovery
 
-The App Server owns canonical Codex thread/turn history. The Ditch database stores presentation indexes and Ditch-owned metadata.
+The App Server owns canonical Codex thread/turn history. Ditch database stores presentation indexes and Ditch-owned metadata.
 
 Persist:
 
@@ -298,7 +298,7 @@ AgentProviderAdapter
   streamEvents()
 ```
 
-Codex App Server is the first implementation. A future Claude Code adapter maps The Ditch's product-level presets to Claude's supported model, permission, and tool-confirmation controls, and reports unavailable capabilities rather than pretending parity.
+Codex App Server is the first implementation. A future Claude Code adapter maps Ditch's product-level presets to Claude's supported model, permission, and tool-confirmation controls, and reports unavailable capabilities rather than pretending parity.
 
 ## Migration plan
 

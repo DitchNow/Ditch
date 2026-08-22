@@ -99,7 +99,7 @@ cat > "$HELPER_CONTENTS/Info.plist" <<'PLIST'
   <key>CFBundleInfoDictionaryVersion</key>
   <string>6.0</string>
   <key>CFBundleName</key>
-  <string>The Ditch</string>
+  <string>Ditch Runtime</string>
   <key>CFBundlePackageType</key>
   <string>APPL</string>
   <key>CFBundleShortVersionString</key>

@@ -8,13 +8,13 @@ Do not assume that `ditchd`, a `LaunchAgent`, a `LaunchDaemon`, an `SMAppService
 
 Do not repackage the runtime as a normal foreground application solely to force it into that window.
 
-The normal The Ditch application may appear in Force Quit if its existing macOS application configuration permits it. Force-quitting the UI application is not proof that the user intended to stop active agents. `ditchd` must not terminate agents merely because the UI process disappeared unexpectedly.
+The normal Ditch application may appear in Force Quit if its existing macOS application configuration permits it. Force-quitting the UI application is not proof that the user intended to stop active agents. `ditchd` must not terminate agents merely because the UI process disappeared unexpectedly.
 
 ### Required process structure
 
 Use these responsibilities:
 
-#### The Ditch macOS application
+#### Ditch macOS application
 
 Owns:
 
@@ -31,7 +31,7 @@ Does not own:
 * agent process groups;
 * authoritative runtime state.
 
-#### `ditchd` / The Ditch Runtime
+#### `ditchd` / Ditch Runtime
 
 Owns:
 
@@ -47,7 +47,7 @@ Package and register it using the repository’s appropriate supported macOS ser
 
 The process and packaged executable must have a recognizable name, preferably:
 
-`The Ditch Runtime`
+`Ditch Runtime`
 
 It must be identifiable in Activity Monitor and diagnostics. Do not leave the user looking for a generic process such as `main`, `runner`, or an opaque hash.
 
@@ -58,23 +58,23 @@ If the main UI process crashes or is force-quit:
 * `ditchd` continues running;
 * active owned agents continue running;
 * UI disconnection is recorded separately from runtime termination;
-* relaunching The Ditch attempts to reconnect and hydrate an authoritative snapshot;
+* relaunching Ditch attempts to reconnect and hydrate an authoritative snapshot;
 * agent sessions are not duplicated;
 * UI disappearance never projects agent success, failure, or cancellation by itself.
 
 ### Reconnection failure behavior
 
-If The Ditch launches but cannot connect to an existing registered runtime, do not show the ordinary empty state and do not silently launch a second daemon.
+If Ditch launches but cannot connect to an existing registered runtime, do not show the ordinary empty state and do not silently launch a second daemon.
 
 Show a native recovery screen before the normal Flutter command center:
 
 Title:
 
-`The Ditch Runtime is not responding`
+`Ditch Runtime is not responding`
 
 Body:
 
-`Agent processes may still be running. The Ditch could not reconnect to its local runtime service.`
+`Agent processes may still be running. Ditch could not reconnect to its local runtime service.`
 
 Display available diagnostics:
 
@@ -129,11 +129,11 @@ This is an emergency destructive action. It requires explicit native confirmatio
 
 Title:
 
-`Force stop The Ditch Runtime?`
+`Force stop Ditch Runtime?`
 
 Body:
 
-`This will terminate The Ditch Runtime and every active agent process that it can verify it owns. Unsaved agent work may be incomplete. Git worktree changes and recorded history will be preserved where possible.`
+`This will terminate Ditch Runtime and every active agent process that it can verify it owns. Unsaved agent work may be incomplete. Git worktree changes and recorded history will be preserved where possible.`
 
 Actions:
 
@@ -162,7 +162,7 @@ Provide an `Open Activity Monitor` action that opens Activity Monitor.
 
 Show this instruction in the recovery UI:
 
-`Search for “The Ditch Runtime”. Force Quit Applications does not list macOS background services.`
+`Search for “Ditch Runtime”. Force Quit Applications does not list macOS background services.`
 
 Do not claim that `Option+Command+Escape` will display `ditchd`.
 
@@ -171,11 +171,11 @@ The packaged runtime must be named clearly enough to locate in Activity Monitor.
 Document the exact manual fallback:
 
 1. Open Activity Monitor.
-2. Search for `The Ditch Runtime`.
+2. Search for `Ditch Runtime`.
 3. Select it.
 4. Choose Stop.
 5. Use Force Quit only if normal Quit fails.
-6. Relaunch The Ditch and run recovery.
+6. Relaunch Ditch and run recovery.
 
 ### Command-line recovery tool
 
@@ -229,7 +229,7 @@ Add tests for:
 
 ### Scope restriction
 
-Do not create a second normal macOS application named `The Ditch Runtime` merely to make it appear in the Force Quit Applications window.
+Do not create a second normal macOS application named `Ditch Runtime` merely to make it appear in the Force Quit Applications window.
 
 Do not add a permanent Dock icon for the runtime helper.
 
