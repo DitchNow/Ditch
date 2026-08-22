@@ -1,4 +1,4 @@
-# The Ditch
+# Ditch
 
 **Ditch Community Edition** is a local macOS workspace for running, following, and returning to Codex sessions across multiple projects.
 
