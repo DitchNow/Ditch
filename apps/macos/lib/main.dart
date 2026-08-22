@@ -1384,20 +1384,12 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
     if (!mounted) return;
     setState(() {
       _selectedProjectKey = _projectKey(_projects[index]);
-      final sessions = _visibleSessions;
-      _expandedAgentLocalId = sessions.isEmpty ? null : sessions.first.localId;
+      _expandedAgentLocalId = null;
+      _focusedAgentLocalId = null;
       _terminalPresentation = TerminalPresentation.docked;
       _presentedTool = WorkspaceToolKind.terminal;
       _dockedTerminalExpanded = true;
     });
-    final expandedId = _expandedAgentLocalId;
-    if (expandedId != null) {
-      _chatViewports
-          .putIfAbsent(expandedId, ConversationViewportController.new)
-          .beginOpening(onInitialPositioned: _focusComposerAfterLayout);
-      final session = _agentSessionByLocalId(expandedId);
-      if (session != null) unawaited(_loadAgentMessages(session));
-    }
     unawaited(_ensureSelectedProjectTerminal());
   }
 

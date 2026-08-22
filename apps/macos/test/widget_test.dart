@@ -1665,7 +1665,7 @@ void main() {
   });
 
   testWidgets(
-    'switching projects replaces expanded agents without a blank UI',
+    'switching projects shows the new project agent list with none open',
     (tester) async {
       final projectA = AgentSession(
         localId: 'project-switch-a',
@@ -1681,6 +1681,7 @@ void main() {
       );
       var sessions = [projectA];
       String? expandedAgentId = projectA.localId;
+      String? focusedAgentId = projectA.localId;
       final composerKeys = <String, GlobalKey<AgentComposerState>>{};
 
       await tester.pumpWidget(
@@ -1694,7 +1695,8 @@ void main() {
                     onPressed: () {
                       setState(() {
                         sessions = [projectB];
-                        expandedAgentId = projectB.localId;
+                        expandedAgentId = null;
+                        focusedAgentId = null;
                       });
                     },
                     child: const Text('Switch'),
@@ -1704,7 +1706,7 @@ void main() {
               body: AgentsSurface(
                 sessions: sessions,
                 expandedAgentLocalId: expandedAgentId,
-                focusedAgentLocalId: null,
+                focusedAgentLocalId: focusedAgentId,
                 chatViewport: ConversationViewportController(),
                 agentListController: ScrollController(),
                 composerKey: GlobalKey<AgentComposerState>(),
@@ -1734,6 +1736,7 @@ void main() {
       expect(find.byKey(const ValueKey('project-switch-a')), findsNothing);
       expect(find.byKey(const ValueKey('project-switch-b')), findsOneWidget);
       expect(find.text('Agents'), findsOneWidget);
+      expect(find.byType(AgentChatPanel), findsNothing);
     },
   );
 
