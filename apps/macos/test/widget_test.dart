@@ -523,7 +523,7 @@ void main() {
     expect(find.byKey(const Key('first-project-add')), findsNothing);
     expect(find.widgetWithText(AlertDialog, 'Add Project'), findsNothing);
     expect(
-      find.text('/Users/tester/Documents/Personal/The Ditch v2'),
+      find.text('/Users/tester/Projects/example'),
       findsNothing,
     );
     expect(find.text('PROJECTS'), findsNothing);

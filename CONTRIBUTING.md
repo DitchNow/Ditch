@@ -4,10 +4,10 @@ Bug reports, reproducible test cases, documentation corrections, and focused pul
 
 ## Before You Start
 
-1. Search [existing issues](https://github.com/DitchNow/TheDitch/issues) for the same problem or proposal.
+1. Search [existing issues](https://github.com/DitchNow/TheDitch/issues) and [Discussions](https://github.com/DitchNow/TheDitch/discussions) for the same problem or proposal.
 2. Reproduce the problem where applicable and reduce it to the smallest reliable case.
 3. Read the [How It Works](README.md#how-it-works) section and inspect the relevant implementation before changing cross-component behavior.
-4. Open an issue before large features, architectural changes, schema or protocol changes, or behavior that affects several components.
+4. Start a Discussion before large features, architectural changes, schema or protocol changes, or behavior that affects several components.
 5. Keep each pull request focused on one coherent concern.
 
 Unsolicited wholesale rewrites may not be accepted when they conflict with existing runtime ownership or application boundaries. This should not delay a small bug fix, test, or documentation correction.
@@ -46,7 +46,7 @@ Comparisons can provide context, but “add X because another product has X” i
 
 ## Architecture Changes
 
-Open an issue before implementing a change that affects:
+Start a [GitHub Discussion](https://github.com/DitchNow/TheDitch/discussions) before implementing a change that affects:
 
 - `ditchd` process or runtime ownership;
 - Codex launch, resume, interruption, or execution behavior;
@@ -160,7 +160,7 @@ Account for loading, empty, error, disabled, focus, and narrow-window states whe
 
 ## Security
 
-Do not publish exploit details, credentials, tokens, private prompts, repository contents, or other sensitive data in an issue or pull request. The repository does not currently contain a `SECURITY.md` or document a private vulnerability-reporting channel. Until one is established, avoid public disclosure of a sensitive vulnerability and do not invent or guess a maintainer contact address.
+Do not publish exploit details, credentials, tokens, private prompts, repository contents, or other sensitive data in an issue, pull request, or Discussion. Follow [SECURITY.md](SECURITY.md) for vulnerability-reporting guidance.
 
 ## Contribution Licensing
 

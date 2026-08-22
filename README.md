@@ -16,7 +16,7 @@ Current limitations are:
 - Codex runs through a separate `codex exec` process for each turn. Interactive approval requests are not supported; the UI disables **Ask for approval**.
 - Closing the foreground window preserves work, but explicitly quitting the menu-bar runtime stops active agents. After an unexpected runtime restart, previously active runs are marked stale and can only be continued when Codex supplied a resumable thread ID.
 - The repository contains types and placeholder directories for other providers, hooks, MCP, tasks, and worktrees, but those are not complete user-facing features.
-- There is no GitHub release workflow, CI workflow, or private security-reporting channel in the repository yet.
+- There is no GitHub release workflow or CI workflow in the repository yet.
 
 ## Why Ditch
 
@@ -147,7 +147,7 @@ flutter analyze
 flutter test
 ```
 
-For a release-mode app bundle, run `flutter build macos` from `apps/macos`. The build script selects the host architecture, uses the app's macOS 11 deployment target, compiles release Rust artifacts, links the runtime helper, and signs the nested executables with the Xcode-selected identity (or ad hoc identity where applicable).
+For a release-mode app bundle, run `flutter build macos` from `apps/macos`. Source builds use ad hoc signing and do not require access to the maintainer's Apple Developer account. The build script selects the host architecture, uses the app's macOS 11 deployment target, compiles release Rust artifacts, links the runtime helper, and signs the nested executables with the Xcode-selected identity. Official distribution builds must supply their signing identity and team outside the committed project configuration.
 
 ## Repository Structure
 
@@ -169,7 +169,7 @@ The production path currently concentrates in `apps/macos`, `ditchd`, `ditch_pro
 
 The repository does not maintain a committed public roadmap. Current implementation notes focus on replacing the process-per-turn Codex transport with a long-lived integration capable of interactive approvals, and on making per-turn prompt/model controls more complete. These are active design directions, not shipped features or release commitments.
 
-Use [GitHub Issues](https://github.com/DitchNow/TheDitch/issues) for concrete bugs and feature proposals.
+Use [GitHub Issues](https://github.com/DitchNow/TheDitch/issues) for reproducible bugs, regressions, and concrete actionable improvements. Use [GitHub Discussions](https://github.com/DitchNow/TheDitch/discussions) for broader ideas, workflow feedback, architecture discussion, and exploratory proposals.
 
 ## Contributing
 
@@ -179,17 +179,14 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, issue guidelines, 
 
 ## Security
 
-Ditch can execute processes and read or write files inside registered projects, and **Full Access** deliberately removes Codex's sandbox restrictions. Review the selected project, execution profile, and prompt before starting a turn.
-
-There is no `SECURITY.md` and no documented private vulnerability-reporting channel. Do not put exploit details or local secrets in a public discussion; the repository needs to publish a private reporting path before it can give complete reporting instructions here.
+Ditch can execute processes and read or write files inside registered projects, and **Full Access** deliberately removes Codex's sandbox restrictions. Review the selected project, execution profile, and prompt before starting a turn. See [SECURITY.md](SECURITY.md) for vulnerability-reporting guidance.
 
 ## Community / Support
 
 - Product website and beta download: [theditch.dev](https://theditch.dev)
-- Bugs and feature proposals: [GitHub Issues](https://github.com/DitchNow/TheDitch/issues)
+- Reproducible bugs, regressions, and actionable improvements: [GitHub Issues](https://github.com/DitchNow/TheDitch/issues)
+- Questions, broader ideas, workflow feedback, and architecture discussion: [GitHub Discussions](https://github.com/DitchNow/TheDitch/discussions)
 - Codex installation and authentication: [Codex CLI documentation](https://learn.chatgpt.com/docs/codex/cli)
-
-No Discord, Slack, Discussions forum, or other maintained community channel is documented in the repository.
 
 ## License
 

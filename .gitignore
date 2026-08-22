@@ -5,6 +5,11 @@
 build/
 target/
 
+.DS_Store
+.env
+.env.*
+!.env.example
+
 *.iml
 *.log
 
@@ -15,3 +20,4 @@ apps/macos/macos/Pods/
 !.ditch/hooks/
 !.ditch/mcp/
 !.ditch/**/.gitkeep
+.ditch/project.json
