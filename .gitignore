@@ -12,6 +12,7 @@ target/
 
 *.iml
 *.log
+*.swp
 
 apps/macos/macos/Flutter/ephemeral/
 apps/macos/macos/Pods/

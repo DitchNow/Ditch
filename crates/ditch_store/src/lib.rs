@@ -53,36 +53,7 @@ impl DitchStore {
         let mut store = Self { connection };
         store.cleanup_polluted_permission_alerts()?;
         store.import_legacy_registry_if_empty(paths)?;
-        store.cleanup_missing_legacy_bootstrap_project()?;
         Ok(store)
-    }
-
-    /// Early development builds registered the source checkout as every
-    /// user's first project. Remove that one obsolete record when its root is
-    /// gone; other unavailable projects may live on disconnected volumes and
-    /// must remain registered.
-    fn cleanup_missing_legacy_bootstrap_project(&mut self) -> Result<(), StoreError> {
-        let legacy_suffix = Path::new("Documents/Personal/The Ditch v2");
-        let mut stmt = self
-            .connection
-            .prepare("SELECT id,name,root FROM projects")?;
-        let candidates = stmt
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        drop(stmt);
-        for (id, name, root) in candidates {
-            let root = Path::new(&root);
-            if name == "The Ditch" && root.ends_with(legacy_suffix) && !root.is_dir() {
-                self.delete_project(ProjectId(parse_uuid(id)?))?;
-            }
-        }
-        Ok(())
     }
 
     fn import_legacy_registry_if_empty(&mut self, paths: &AppPaths) -> Result<(), StoreError> {
@@ -900,35 +871,6 @@ mod tests {
             fs::read_to_string(project_root.join("keep-me.txt")).unwrap(),
             "user data"
         );
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn removes_only_the_missing_obsolete_bootstrap_registration() {
-        let root = std::env::temp_dir().join(format!(
-            "ditch-store-bootstrap-migration-{}",
-            uuid::Uuid::new_v4()
-        ));
-        let paths = AppPaths {
-            data_dir: root.clone(),
-            database_path: root.join("ditch.sqlite3"),
-            socket_path: root.join("ditchd.sock"),
-            logs_dir: root.join("logs"),
-            scrollback_dir: root.join("scrollback"),
-        };
-        ensure_app_dirs(&paths).unwrap();
-        let missing_root = root.join("home/Documents/Personal/The Ditch v2");
-        let legacy = Project::new("The Ditch", &missing_root);
-        let unavailable_but_valid = Project::new("External project", root.join("missing-volume"));
-        {
-            let mut store = DitchStore::open(&paths).unwrap();
-            store.upsert_project(&legacy).unwrap();
-            store.upsert_project(&unavailable_but_valid).unwrap();
-        }
-
-        let store = DitchStore::open(&paths).unwrap();
-        let restored = store.load().unwrap();
-        assert_eq!(restored.projects, vec![unavailable_but_valid]);
         fs::remove_dir_all(root).unwrap();
     }
 }
