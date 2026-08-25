@@ -27,6 +27,15 @@ class RunnerTests: XCTestCase {
     XCTAssertEqual(ComposerTextView.plainText(from: pasteboard), "plain prompt")
   }
 
+  func testComposerPlaceholderNeverInterceptsEditorClicks() {
+    let placeholder = ComposerPlaceholderLabel(labelWithString: "Send a follow-up")
+    placeholder.frame = NSRect(x: 0, y: 0, width: 300, height: 40)
+
+    XCTAssertNil(placeholder.hitTest(NSPoint(x: 1, y: 20)))
+    XCTAssertNil(placeholder.hitTest(NSPoint(x: 150, y: 20)))
+    XCTAssertNil(placeholder.hitTest(NSPoint(x: 299, y: 20)))
+  }
+
   func testComposerReportsAndCanReassertNativeFocusOwnership() {
     let window = NSWindow(
       contentRect: NSRect(x: 0, y: 0, width: 320, height: 120),

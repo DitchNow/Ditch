@@ -1825,6 +1825,57 @@ void main() {
     expect(approvalTop.dy, greaterThan(editorTop.dy));
   });
 
+  testWidgets('whole composer surface focuses the editor', (tester) async {
+    final outsideFocus = FocusNode(debugLabel: 'outside-composer-focus');
+    addTearDown(outsideFocus.dispose);
+    String? submitted;
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: Column(
+            children: [
+              Focus(
+                focusNode: outsideFocus,
+                child: const SizedBox(width: 40, height: 40),
+              ),
+              AgentComposer(
+                initialText: '',
+                hasSession: true,
+                isWorking: false,
+                onSubmit: (value) => submitted = value,
+                onStop: () {},
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+
+    outsideFocus.requestFocus();
+    await tester.pump();
+    expect(
+      tester.widget<TextField>(find.byType(TextField)).focusNode?.hasFocus,
+      isFalse,
+    );
+
+    final surface = tester.getRect(
+      find.byKey(const Key('composer-focus-surface')),
+    );
+    await tester.tapAt(surface.topLeft + const Offset(4, 4));
+    await tester.pump();
+
+    expect(
+      tester.widget<TextField>(find.byType(TextField)).focusNode?.hasFocus,
+      isTrue,
+    );
+
+    await tester.enterText(find.byType(TextField), 'still a button');
+    await tester.tap(find.widgetWithText(FilledButton, 'Send'));
+    await tester.pump();
+    expect(submitted, 'still a button');
+  });
+
   testWidgets('native composer focus evicts stale Flutter widget focus', (
     tester,
   ) async {

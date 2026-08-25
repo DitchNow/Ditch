@@ -1279,6 +1279,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
   final _agentListController = ScrollController();
   final _idleComposerKey = GlobalKey<AgentComposerState>();
   final _composerKeys = <String, GlobalKey<AgentComposerState>>{};
+  int _composerFocusGeneration = 0;
   final _runtimeClient = DitchRuntimeClient();
   final _presentation = CommandCenterController();
   int _nextAgentSessionId = 1;
@@ -2217,7 +2218,8 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
     });
     _chatViewports
         .putIfAbsent(session.localId, ConversationViewportController.new)
-        .beginOpening(onInitialPositioned: _focusComposerAfterLayout);
+        .beginOpening();
+    _focusAgentComposerAfterLayout(session.localId);
     unawaited(_loadAgentMessages(session));
     _scheduleStatusBarUpdate();
     unawaited(_ensureSelectedProjectTerminal());
@@ -2484,6 +2486,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
           }
           _expandedAgentLocalId = session.localId;
         });
+        _focusAgentComposerAfterLayout(session.localId);
         if (target.messages.isEmpty) {
           unawaited(_loadAgentMessages(target));
         }
@@ -2497,6 +2500,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
         session.currentPrompt = prompt;
         session.updatedAt = DateTime.now();
       });
+      _focusAgentComposerAfterLayout(session.localId);
       _scheduleStatusBarUpdate();
       _addChatMessage(
         session,
@@ -2809,7 +2813,8 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
     });
     _chatViewports
         .putIfAbsent(sessionLocalId, ConversationViewportController.new)
-        .beginOpening(onInitialPositioned: _focusComposerAfterLayout);
+        .beginOpening();
+    _focusAgentComposerAfterLayout(sessionLocalId);
     final session = _agentSessionByLocalId(sessionLocalId);
     if (session != null) unawaited(_loadAgentMessages(session));
     _markAttentionIdsRead({event.id});
@@ -3335,10 +3340,25 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
     }
   }
 
-  void _focusComposerAfterLayout() {
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (mounted) _activeComposerKey.currentState?.focus();
-    });
+  void _focusAgentComposerAfterLayout(String agentId) {
+    final generation = ++_composerFocusGeneration;
+    final composerKey = _composerKeyForAgent(agentId);
+
+    void focusWhenMounted(int remainingAttempts) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted || generation != _composerFocusGeneration) return;
+        final activeAgentId = _focusedAgentLocalId ?? _expandedAgentLocalId;
+        if (activeAgentId != agentId) return;
+        final composer = composerKey.currentState;
+        if (composer != null) {
+          composer.focus();
+        } else if (remainingAttempts > 0) {
+          focusWhenMounted(remainingAttempts - 1);
+        }
+      });
+    }
+
+    focusWhenMounted(2);
   }
 
   void _toggleExpandedAgent(AgentSession session) {
@@ -3350,7 +3370,8 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
     if (collapsing) return;
     _chatViewports
         .putIfAbsent(session.localId, ConversationViewportController.new)
-        .beginOpening(onInitialPositioned: _focusComposerAfterLayout);
+        .beginOpening();
+    _focusAgentComposerAfterLayout(session.localId);
     unawaited(_loadAgentMessages(session));
   }
 
@@ -3669,7 +3690,10 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
                       _expandedAgentLocalId = session.localId;
                     }
                   });
-                  _focusComposerAfterLayout();
+                  final agentId = session?.localId ?? _expandedAgentLocalId;
+                  if (agentId != null) {
+                    _focusAgentComposerAfterLayout(agentId);
+                  }
                 },
                 onToggleExpanded: _toggleExpandedAgent,
               );
@@ -5350,6 +5374,7 @@ class AgentSessionList extends StatelessWidget {
                 initialPrompt: initialPrompt,
                 hasSession: false,
                 isWorking: false,
+                autofocusAfterInitialPositioning: true,
                 onSubmitPrompt: onStartPrompt,
                 onStopCodex: () {},
               ),
@@ -5878,6 +5903,7 @@ class AgentChatPanel extends StatelessWidget {
     required this.onSubmitPrompt,
     required this.onStopCodex,
     this.onEnlarge,
+    this.autofocusAfterInitialPositioning = false,
     super.key,
   });
 
@@ -5900,6 +5926,7 @@ class AgentChatPanel extends StatelessWidget {
   final ValueChanged<String> onSubmitPrompt;
   final VoidCallback onStopCodex;
   final VoidCallback? onEnlarge;
+  final bool autofocusAfterInitialPositioning;
 
   @override
   Widget build(BuildContext context) {
@@ -5966,7 +5993,9 @@ class AgentChatPanel extends StatelessWidget {
               hasOlderMessages: hasOlderMessages,
               historyError: historyError,
               onLoadOlder: onLoadOlder,
-              onInitialPositioned: () => composerKey.currentState?.focus(),
+              onInitialPositioned: autofocusAfterInitialPositioning
+                  ? () => composerKey.currentState?.focus()
+                  : null,
             ),
           ),
           ...footer,
@@ -6443,17 +6472,21 @@ class AgentComposerState extends State<AgentComposer> {
 
     return Padding(
       padding: const EdgeInsets.all(12),
-      child: DecoratedBox(
-        decoration: BoxDecoration(
-          color: context.ditch.surfaceHover,
-          borderRadius: BorderRadius.circular(context.ditch.radiusMedium),
-          border: Border.all(
-            color: _composerHasFocus
-                ? context.ditch.accent.withValues(alpha: 0.72)
-                : context.ditch.separator.withValues(alpha: 0.72),
+      child: GestureDetector(
+        key: const Key('composer-focus-surface'),
+        behavior: HitTestBehavior.opaque,
+        excludeFromSemantics: true,
+        onTap: editable ? focus : null,
+        child: Container(
+          decoration: BoxDecoration(
+            color: context.ditch.surfaceHover,
+            borderRadius: BorderRadius.circular(context.ditch.radiusMedium),
+            border: Border.all(
+              color: _composerHasFocus
+                  ? context.ditch.accent.withValues(alpha: 0.72)
+                  : context.ditch.separator.withValues(alpha: 0.72),
+            ),
           ),
-        ),
-        child: Padding(
           padding: const EdgeInsets.all(10),
           child: ListenableBuilder(
             listenable: agentExecutionSettings,

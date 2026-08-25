@@ -66,7 +66,7 @@ class NativeComposerTextView: NSView, NSTextViewDelegate {
   private let platformViewsChannel: FlutterMethodChannel
   private let scrollView = NSScrollView()
   private let textView = ComposerTextView()
-  private let placeholderLabel = NSTextField(labelWithString: "")
+  private let placeholderLabel = ComposerPlaceholderLabel(labelWithString: "")
   private var isApplyingFlutterText = false
   private var lastReportedContentHeight: CGFloat = 0
 
@@ -272,7 +272,44 @@ class NativeComposerTextView: NSView, NSTextViewDelegate {
 
   override func layout() {
     super.layout()
+    alignTextViewToViewport()
     reportContentHeight()
+  }
+
+  override func mouseDown(with event: NSEvent) {
+    guard textView.isEditable else {
+      super.mouseDown(with: event)
+      return
+    }
+    // The scroll view normally routes clicks directly to the text view. Keep a
+    // fallback for any uncovered editor space so the complete platform-view
+    // surface behaves as one native text input and NSTextView still computes
+    // the insertion point from the original mouse location.
+    textView.mouseDown(with: event)
+  }
+
+  private func alignTextViewToViewport() {
+    let viewport = scrollView.contentView.bounds.size
+    guard viewport.width > 0, viewport.height > 0 else { return }
+    var frame = textView.frame
+    if frame.width != viewport.width {
+      frame.size.width = viewport.width
+      textView.frame = frame
+    }
+    frame.size.height = max(measuredContentHeight(), viewport.height)
+    if frame != textView.frame {
+      textView.frame = frame
+    }
+  }
+
+  private func measuredContentHeight() -> CGFloat {
+    guard let layoutManager = textView.layoutManager,
+      let textContainer = textView.textContainer
+    else { return textView.font?.boundingRectForFont.height ?? 0 }
+    layoutManager.ensureLayout(for: textContainer)
+    let usedHeight = layoutManager.usedRect(for: textContainer).height
+    return ceil(max(textView.font?.boundingRectForFont.height ?? 0, usedHeight)
+      + (textView.textContainerInset.height * 2))
   }
 
   private func applyPlainTextAppearance(font: NSFont? = nil, color: NSColor? = nil) {
@@ -291,13 +328,7 @@ class NativeComposerTextView: NSView, NSTextViewDelegate {
   }
 
   private func reportContentHeight(force: Bool = false) {
-    guard let layoutManager = textView.layoutManager,
-      let textContainer = textView.textContainer
-    else { return }
-    layoutManager.ensureLayout(for: textContainer)
-    let usedHeight = layoutManager.usedRect(for: textContainer).height
-    let height = ceil(max(textView.font?.boundingRectForFont.height ?? 0, usedHeight)
-      + (textView.textContainerInset.height * 2))
+    let height = measuredContentHeight()
     guard force || abs(height - lastReportedContentHeight) >= 1 else { return }
     lastReportedContentHeight = height
     channel.invokeMethod("contentHeightChanged", arguments: Double(height))
@@ -312,6 +343,14 @@ class NativeComposerTextView: NSView, NSTextViewDelegate {
     channel.invokeMethod("textChanged", arguments: textView.string)
   }
 
+}
+
+final class ComposerPlaceholderLabel: NSTextField {
+  override func hitTest(_ point: NSPoint) -> NSView? {
+    // This label is visual decoration. The NSTextView underneath must receive
+    // clicks so the editor focuses and places its caret at the clicked point.
+    nil
+  }
 }
 
 final class ComposerTextView: NSTextView {
