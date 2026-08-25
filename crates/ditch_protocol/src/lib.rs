@@ -1,7 +1,8 @@
 use chrono::{DateTime, Utc};
 use ditch_core::{
-    AgentExecutionProfile, AgentId, AgentRun, AppPaths, AttentionKind, CodexLaunchMode,
-    PermissionRequest, Project, ProjectGitPolicy, ProjectId, Task,
+    AgentExecutionProfile, AgentId, AgentRun, AppPaths, AttentionKind, ChangeIntent,
+    CodexLaunchMode, ManagedWorktree, PermissionRequest, Project, ProjectGitPolicy, ProjectId,
+    Task,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -51,8 +52,19 @@ pub enum ClientRequest {
         root: String,
         git_policy: ProjectGitPolicy,
     },
+    SetProjectIntegrationPolicy {
+        project_id: ProjectId,
+        policy: ditch_core::IntegrationPolicy,
+    },
     DeleteProject {
         project_id: ProjectId,
+    },
+    InspectProjectAgentReadiness {
+        project_id: ProjectId,
+    },
+    CreateInitialProjectSnapshot {
+        project_id: ProjectId,
+        expected_tree_oid: String,
     },
     StartCodexSession {
         project_name: String,
@@ -131,6 +143,41 @@ pub enum ClientRequest {
         agent_id: AgentId,
         title: Option<String>,
     },
+    RegisterChangeIntent {
+        agent_id: AgentId,
+        intent: ChangeIntent,
+        #[serde(default)]
+        continue_on_overlap: bool,
+    },
+    RefreshWorktree {
+        agent_id: AgentId,
+    },
+    OverrideWorktreeOverlap {
+        agent_id: AgentId,
+    },
+    GetWorktreeReview {
+        agent_id: AgentId,
+    },
+    PrepareIntegration {
+        agent_id: AgentId,
+    },
+    ApplyIntegration {
+        agent_id: AgentId,
+    },
+    ApplyIntegrationWithoutValidation {
+        agent_id: AgentId,
+    },
+    CreateConflictResolution {
+        agent_id: AgentId,
+    },
+    FinalizeConflictResolution {
+        agent_id: AgentId,
+    },
+    DiscardWorktree {
+        agent_id: AgentId,
+        #[serde(default)]
+        confirm_dirty: bool,
+    },
     DismissAttention {
         attention_id: Uuid,
     },
@@ -151,7 +198,7 @@ pub enum ClientRequest {
 pub enum ServerResponse {
     Health(HealthResponse),
     RuntimeStatus(RuntimeStatus),
-    Snapshot(Snapshot),
+    Snapshot(Box<Snapshot>),
     Projects(Vec<Project>),
     AgentModels(Vec<AgentModel>),
     CodexInstallations(Vec<CodexInstallation>),
@@ -161,10 +208,37 @@ pub enum ServerResponse {
     ProjectFile(ProjectFile),
     ProjectFileSaved(ProjectFileSaved),
     ProjectCreated(Project),
-    AgentStarted(AgentRun),
+    ProjectAgentReadiness(ProjectAgentReadiness),
+    InitialProjectSnapshotCreated(InitialProjectSnapshotCreated),
+    WorktreeReview(ditch_core::WorktreeReview),
+    ConflictResolutionWorkspace { path: String },
+    AgentStarted(Box<AgentRun>),
     AgentMessages(AgentMessagePage),
     Accepted,
     Error(ProtocolError),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ProjectAgentReadinessState {
+    Ready,
+    NeedsInitialSnapshot,
+    UnsafeInitialSnapshot,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProjectAgentReadiness {
+    pub state: ProjectAgentReadinessState,
+    pub repository_root: String,
+    pub target_branch: String,
+    pub included_file_count: usize,
+    pub sample_paths: Vec<String>,
+    pub warnings: Vec<String>,
+    pub snapshot_tree_oid: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct InitialProjectSnapshotCreated {
+    pub commit_oid: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -264,6 +338,8 @@ pub struct Snapshot {
     pub agents: Vec<AgentRun>,
     pub attention: Vec<RuntimeAttention>,
     pub messages: Vec<AgentChatMessage>,
+    #[serde(default)]
+    pub worktrees: Vec<ManagedWorktree>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -340,7 +416,7 @@ pub struct RuntimeAttention {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum ServerEvent {
-    SnapshotReplaced(Snapshot),
+    SnapshotReplaced(Box<Snapshot>),
     AttentionSnapshotReplaced(Vec<RuntimeAttention>),
     RuntimeStatusChanged(RuntimeStatus),
     ProjectChanged(Project),
@@ -349,6 +425,13 @@ pub enum ServerEvent {
     },
     TaskChanged(Task),
     AgentChanged(AgentRun),
+    WorktreeChanged(Box<ManagedWorktree>),
+    GitLifecycle {
+        project_id: ProjectId,
+        agent_id: Option<AgentId>,
+        kind: String,
+        detail: String,
+    },
     AgentDeleted {
         agent_id: AgentId,
     },

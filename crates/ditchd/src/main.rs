@@ -1,12 +1,13 @@
 use chrono::{DateTime, Utc};
 use ditch_core::{
     AgentApprovalPreset, AgentExecutionProfile, AgentId, AgentProvider, AgentResumeBlockReason,
-    AgentRun, AgentState, AppPaths, AttentionKind, CodexLaunchMode, Project, ProjectGitPolicy,
-    ProjectId,
+    AgentRun, AgentState, AppPaths, AttentionKind, ChangeIntent, CodexLaunchMode, IntegrationState,
+    ManagedWorktree, Project, ProjectGitPolicy, ProjectId, WorktreeStatus,
 };
 use ditch_protocol::{
     AgentChatMessage, AgentChatRole, AgentModel, ClientRequest, CodexInstallation, CodexReadiness,
-    Envelope, HealthResponse, ProjectDirectory, ProjectFile, ProjectFileEntry, ProjectFileKind,
+    Envelope, HealthResponse, InitialProjectSnapshotCreated, ProjectAgentReadiness,
+    ProjectAgentReadinessState, ProjectDirectory, ProjectFile, ProjectFileEntry, ProjectFileKind,
     ProjectFileSaved, ProjectTerminal, ProtocolError, RuntimeAttention, RuntimeStatus, ServerEvent,
     ServerResponse, Snapshot,
 };
@@ -31,6 +32,9 @@ use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
+
+mod git_orchestration;
+use git_orchestration::{GitCoordinator, apply_overlap_projection};
 
 const RUNTIME_IDENTITY: &str = "The Ditch Runtime";
 const CODEX_BINARY_SETTING: &str = "codex_binary";
@@ -76,6 +80,8 @@ struct RuntimeState {
     store: DitchStore,
     projects: HashMap<String, Project>,
     agents: HashMap<AgentId, AgentRecord>,
+    worktrees: HashMap<AgentId, ManagedWorktree>,
+    git: Arc<GitCoordinator>,
     children: HashMap<AgentId, ActiveAgentChild>,
     terminals: HashMap<uuid::Uuid, ProjectTerminalRecord>,
     terminal_by_project: HashMap<ditch_core::ProjectId, uuid::Uuid>,
@@ -123,7 +129,9 @@ impl RuntimeState {
             .into_iter()
             .map(|project| (project.root_key(), project))
             .collect::<HashMap<_, _>>();
-        let agents = durable
+        let durable_worktrees = durable.worktrees;
+        let durable_project_git_operations = durable.project_git_operations;
+        let mut agents: HashMap<AgentId, AgentRecord> = durable
             .agents
             .into_iter()
             .filter_map(|agent| {
@@ -146,6 +154,71 @@ impl RuntimeState {
                 ))
             })
             .collect();
+        for worktree in &durable_worktrees {
+            if agents.contains_key(&worktree.session_id) {
+                continue;
+            }
+            let Some(project) = projects
+                .values()
+                .find(|project| project.id == worktree.project_id)
+            else {
+                continue;
+            };
+            let prompt = worktree
+                .intent
+                .as_ref()
+                .map(|intent| intent.summary.clone())
+                .unwrap_or_else(|| "Recovered Ditch worktree".to_owned());
+            let run = AgentRun {
+                id: worktree.session_id,
+                provider: AgentProvider::Codex,
+                state: AgentState::Stale,
+                can_stop: false,
+                launch_mode: CodexLaunchMode::Exec,
+                execution_profile: AgentExecutionProfile::default(),
+                project_id: project.id,
+                task_id: None,
+                pane_id: None,
+                native_session_id: None,
+                codex_title: None,
+                user_title: Some("Recovered agent work".into()),
+                origin_codex_home: std::env::var("CODEX_HOME").ok(),
+                current_prompt: Some(prompt.clone()),
+                last_visible_action: Some(
+                    "Recovered after an interrupted worktree operation".into(),
+                ),
+                state_confidence: 1.0,
+                state_evidence: "The durable worktree journal survived without its session row."
+                    .into(),
+                started_at: worktree.created_at,
+                updated_at: Utc::now(),
+                finished_at: Some(Utc::now()),
+                exit_code: None,
+                resume_block_reason: Some(AgentResumeBlockReason::NoCodexThread),
+            };
+            let message = AgentChatMessage {
+                agent_id: run.id,
+                role: AgentChatRole::System,
+                text: "Ditch recovered this isolated workspace after an interrupted launch. Its files remain preserved.".into(),
+                created_at: Utc::now(),
+            };
+            let home = std::env::var("CODEX_HOME").ok();
+            if store
+                .persist_new_agent(&run, &message, home.as_deref())
+                .is_ok()
+            {
+                agents.insert(
+                    run.id,
+                    AgentRecord {
+                        run,
+                        project_root: project.root.clone(),
+                        allow_non_git: false,
+                        messages: vec![message],
+                        terminal_failure: None,
+                    },
+                );
+            }
+        }
         let codex_home = std::env::var_os("CODEX_HOME").map(PathBuf::from);
         let selected_codex = store.setting(CODEX_BINARY_SETTING)?;
         let codex_binary = resolve_codex_binary(selected_codex.as_deref());
@@ -154,11 +227,16 @@ impl RuntimeState {
         {
             store.set_setting(CODEX_BINARY_SETTING, binary)?;
         }
-        Ok(Self {
+        let mut runtime = Self {
             paths,
             store,
             projects,
             agents,
+            worktrees: durable_worktrees
+                .into_iter()
+                .map(|worktree| (worktree.session_id, worktree))
+                .collect(),
+            git: Arc::new(GitCoordinator::default()),
             children: HashMap::new(),
             terminals: HashMap::new(),
             terminal_by_project: HashMap::new(),
@@ -170,7 +248,10 @@ impl RuntimeState {
             started_at: Utc::now(),
             codex_home,
             codex_binary,
-        })
+        };
+        runtime.reconcile_project_git_operations(durable_project_git_operations);
+        runtime.reconcile_worktrees();
+        Ok(runtime)
     }
 
     fn runtime_status(&self) -> RuntimeStatus {
@@ -213,6 +294,8 @@ impl RuntimeState {
                 "project_files_v1".to_owned(),
                 "persistent_attention_read_v1".to_owned(),
                 "always_on_web_access_v1".to_owned(),
+                "git_worktree_orchestration_v1".to_owned(),
+                "initial_project_snapshot_v1".to_owned(),
             ],
         }
     }
@@ -228,6 +311,68 @@ impl RuntimeState {
                 .collect(),
             attention: self.attention.clone(),
             messages: Vec::new(),
+            worktrees: self.worktrees.values().cloned().collect(),
+        }
+    }
+
+    fn reconcile_worktrees(&mut self) {
+        let ids = self.worktrees.keys().copied().collect::<Vec<_>>();
+        for agent_id in ids {
+            let Some(mut worktree) = self.worktrees.get(&agent_id).cloned() else {
+                continue;
+            };
+            let Some(project) = self
+                .projects
+                .values()
+                .find(|item| item.id == worktree.project_id)
+                .cloned()
+            else {
+                continue;
+            };
+            if let Err(error) = self.git.reconcile_operation(&project, &mut worktree) {
+                worktree.status = WorktreeStatus::RecoveryNeeded;
+                worktree.last_error = Some(error.to_string());
+            }
+            if worktree.status == WorktreeStatus::Integrated
+                && worktree.path.exists()
+                && let Err(error) = self.git.archive_integrated(&project, &mut worktree)
+            {
+                worktree.status = WorktreeStatus::CleanupPending;
+                worktree.last_error = Some(error.to_string());
+            }
+            let _ = self.store.upsert_worktree(&worktree);
+            self.worktrees.insert(agent_id, worktree);
+        }
+        let mut projection = self.worktrees.values().cloned().collect::<Vec<_>>();
+        apply_overlap_projection(&mut projection);
+        for item in projection {
+            let _ = self.store.upsert_worktree(&item);
+            self.worktrees.insert(item.session_id, item);
+        }
+    }
+
+    fn reconcile_project_git_operations(
+        &mut self,
+        operations: Vec<ditch_core::ProjectGitOperation>,
+    ) {
+        for mut operation in operations {
+            let Some(project) = self
+                .projects
+                .values()
+                .find(|project| project.id == operation.project_id)
+                .cloned()
+            else {
+                continue;
+            };
+            if let Err(error) = self
+                .git
+                .reconcile_initial_snapshot(&project, &mut operation)
+            {
+                operation.state = ditch_core::ProjectGitOperationState::RecoveryNeeded;
+                operation.last_error = Some(error.to_string());
+                operation.updated_at = Utc::now();
+            }
+            let _ = self.store.upsert_project_git_operation(&operation);
         }
     }
 
@@ -372,7 +517,7 @@ fn subscribe(mut stream: UnixStream, state: Arc<Mutex<RuntimeState>>) -> io::Res
         state.subscribers.push(tx);
         let envelope = Envelope::new(SequencedEvent {
             sequence: state.next_sequence,
-            event: ServerEvent::SnapshotReplaced(state.snapshot()),
+            event: ServerEvent::SnapshotReplaced(Box::new(state.snapshot())),
         });
         state.next_sequence += 1;
         serde_json::to_string(&envelope)
@@ -533,7 +678,7 @@ fn handle_request(request: ClientRequest, state: Arc<Mutex<RuntimeState>>) -> Se
             let state = state
                 .lock()
                 .expect("runtime state lock should not be poisoned");
-            ServerResponse::Snapshot(state.snapshot())
+            ServerResponse::Snapshot(Box::new(state.snapshot()))
         }
         ClientRequest::ListAgentMessages {
             agent_id,
@@ -580,6 +725,8 @@ fn handle_request(request: ClientRequest, state: Arc<Mutex<RuntimeState>>) -> Se
             project.name = name;
             project.root = root;
             project.git_policy = git_policy;
+            let initialized_repository =
+                project.git_policy == ProjectGitPolicy::InitializeRepository;
             if project.git_policy == ProjectGitPolicy::InitializeRepository {
                 match Command::new("git")
                     .arg("init")
@@ -604,6 +751,7 @@ fn handle_request(request: ClientRequest, state: Arc<Mutex<RuntimeState>>) -> Se
             if let Err(error) = save_project_config(&project) {
                 return protocol_error("project_config_failed", error.to_string());
             }
+            let runtime = Arc::clone(&state);
             let mut state = state
                 .lock()
                 .expect("runtime state lock should not be poisoned");
@@ -612,9 +760,49 @@ fn handle_request(request: ClientRequest, state: Arc<Mutex<RuntimeState>>) -> Se
             }
             state.projects.insert(project.root_key(), project.clone());
             state.broadcast(ServerEvent::ProjectChanged(project.clone()));
+            drop(state);
+            if initialized_repository {
+                let readiness = inspect_project_agent_readiness(Arc::clone(&runtime), project.id);
+                if let ServerResponse::ProjectAgentReadiness(readiness) = readiness
+                    && readiness.state == ProjectAgentReadinessState::NeedsInitialSnapshot
+                    && readiness.included_file_count == 0
+                    && let Some(tree_oid) = readiness.snapshot_tree_oid
+                    && let ServerResponse::Error(error) =
+                        create_initial_project_snapshot(runtime, project.id, &tree_oid)
+                {
+                    return ServerResponse::Error(error);
+                }
+            }
             ServerResponse::ProjectCreated(project)
         }
+        ClientRequest::SetProjectIntegrationPolicy { project_id, policy } => {
+            let mut state = state
+                .lock()
+                .expect("runtime state lock should not be poisoned");
+            let Some(key) = state
+                .projects
+                .iter()
+                .find_map(|(key, project)| (project.id == project_id).then(|| key.clone()))
+            else {
+                return protocol_error("project_not_found", "The project was not found");
+            };
+            let mut project = state.projects[&key].clone();
+            project.integration_policy = policy;
+            if let Err(error) = state.store.upsert_project(&project) {
+                return protocol_error("project_update_failed", error.to_string());
+            }
+            state.projects.insert(key, project.clone());
+            state.broadcast(ServerEvent::ProjectChanged(project));
+            ServerResponse::Accepted
+        }
         ClientRequest::DeleteProject { project_id } => delete_project(state, project_id),
+        ClientRequest::InspectProjectAgentReadiness { project_id } => {
+            inspect_project_agent_readiness(state, project_id)
+        }
+        ClientRequest::CreateInitialProjectSnapshot {
+            project_id,
+            expected_tree_oid,
+        } => create_initial_project_snapshot(state, project_id, &expected_tree_oid),
         ClientRequest::StartCodexSession {
             project_name,
             project_root,
@@ -688,6 +876,31 @@ fn handle_request(request: ClientRequest, state: Arc<Mutex<RuntimeState>>) -> Se
         ClientRequest::StopAgent { agent_id } => stop_agent(state, agent_id),
         ClientRequest::DeleteAgent { agent_id } => delete_agent(state, agent_id),
         ClientRequest::RenameAgent { agent_id, title } => rename_agent(state, agent_id, title),
+        ClientRequest::RegisterChangeIntent {
+            agent_id,
+            intent,
+            continue_on_overlap,
+        } => register_change_intent(state, agent_id, intent, continue_on_overlap),
+        ClientRequest::RefreshWorktree { agent_id } => refresh_worktree(state, agent_id),
+        ClientRequest::OverrideWorktreeOverlap { agent_id } => {
+            override_worktree_overlap(state, agent_id)
+        }
+        ClientRequest::GetWorktreeReview { agent_id } => get_worktree_review(state, agent_id),
+        ClientRequest::PrepareIntegration { agent_id } => prepare_integration(state, agent_id),
+        ClientRequest::ApplyIntegration { agent_id } => apply_integration(state, agent_id, false),
+        ClientRequest::ApplyIntegrationWithoutValidation { agent_id } => {
+            apply_integration(state, agent_id, true)
+        }
+        ClientRequest::CreateConflictResolution { agent_id } => {
+            create_conflict_resolution(state, agent_id)
+        }
+        ClientRequest::FinalizeConflictResolution { agent_id } => {
+            finalize_conflict_resolution(state, agent_id)
+        }
+        ClientRequest::DiscardWorktree {
+            agent_id,
+            confirm_dirty,
+        } => discard_worktree(state, agent_id, confirm_dirty),
         ClientRequest::DismissAttention { attention_id } => {
             let mut state = state
                 .lock()
@@ -907,11 +1120,11 @@ fn open_project_terminal(
         .expect("runtime state lock should not be poisoned");
     // A request can race with another UI connection. Keep the first terminal
     // for the project and terminate this just-created duplicate safely.
-    if let Some(existing_id) = state.terminal_by_project.get(&project_id).copied() {
-        if let Some(existing) = state.terminals.get(&existing_id) {
-            let _ = child.kill();
-            return ServerResponse::ProjectTerminal(existing.descriptor.clone());
-        }
+    if let Some(existing_id) = state.terminal_by_project.get(&project_id).copied()
+        && let Some(existing) = state.terminals.get(&existing_id)
+    {
+        let _ = child.kill();
+        return ServerResponse::ProjectTerminal(existing.descriptor.clone());
     }
     state.terminal_by_project.insert(project_id, terminal_id);
     state.terminals.insert(
@@ -1146,6 +1359,12 @@ fn start_codex_session(
         return error;
     }
     let allow_non_git = project.git_policy == ProjectGitPolicy::AllowOutsideGit;
+    if !allow_non_git && execution_profile.approval == AgentApprovalPreset::FullAccess {
+        return protocol_error(
+            "isolated_full_access_unsupported",
+            "Full Access is unavailable for isolated parallel work because it would remove the workspace safety boundary.",
+        );
+    }
     let user_message = AgentChatMessage {
         agent_id: run.id,
         role: AgentChatRole::User,
@@ -1163,10 +1382,35 @@ fn start_codex_session(
             "No working Codex CLI installation was found. Choose an existing installation in Ditch settings.".to_owned(),
         );
     };
+    if !allow_non_git && let Err(error) = prepare_project_snapshot_for_launch(&state, &project) {
+        return protocol_error(error.code, error.message);
+    }
+    let managed = if allow_non_git {
+        None
+    } else {
+        match create_journaled_worktree(&state, &project, run.id, &prompt) {
+            Ok(created) => Some(created),
+            Err(error) => {
+                return persist_launch_failure(
+                    &state,
+                    project,
+                    run,
+                    user_message,
+                    allow_non_git,
+                    error.message,
+                );
+            }
+        }
+    };
+    let execution_root = managed
+        .as_ref()
+        .map(|created| created.agent_cwd.as_path())
+        .unwrap_or(&project.root);
+    let codex_prompt = managed_agent_prompt(&prompt, managed.is_some());
     let child = match spawn_codex_child(
         &binary,
-        &project.root,
-        &prompt,
+        execution_root,
+        &codex_prompt,
         &mode,
         None,
         allow_non_git,
@@ -1221,6 +1465,23 @@ fn start_codex_session(
             return protocol_error("agent_store_failed", error.to_string());
         }
         state.projects.insert(project.root_key(), project.clone());
+        if let Some(created) = managed.as_ref() {
+            if let Err(error) = state.store.upsert_worktree(&created.managed) {
+                let _ = child
+                    .lock()
+                    .expect("child lock should not be poisoned")
+                    .kill();
+                return protocol_error("worktree_store_failed", error.to_string());
+            }
+            state.worktrees.insert(run.id, created.managed.clone());
+            emit_git_event(
+                &mut state,
+                project.id,
+                Some(run.id),
+                "worktree_created",
+                "isolated locked workspace created",
+            );
+        }
         state.agents.insert(
             run.id,
             AgentRecord {
@@ -1245,7 +1506,10 @@ fn start_codex_session(
     }
 
     attach_codex_io(Arc::clone(&state), run.id, run_id, child);
-    ServerResponse::AgentStarted(run)
+    if managed.is_some() {
+        monitor_worktree(Arc::clone(&state), run.id, run_id);
+    }
+    ServerResponse::AgentStarted(Box::new(run))
 }
 
 fn persist_launch_failure(
@@ -1315,7 +1579,7 @@ fn persist_launch_failure(
     );
     state.attention.push(attention.clone());
     state.broadcast(ServerEvent::ProjectChanged(project));
-    state.broadcast(ServerEvent::AgentChanged(run));
+    state.broadcast(ServerEvent::AgentChanged(run.clone()));
     state.broadcast(ServerEvent::AgentMessageAppended(user_message));
     state.broadcast(ServerEvent::AgentMessageAppended(system_message));
     state.broadcast(ServerEvent::AttentionRaised(attention));
@@ -1339,6 +1603,175 @@ fn project_for_launch(
         .unwrap_or_else(|| Project::new(project_name, root))
 }
 
+fn project_by_id(state: &Arc<Mutex<RuntimeState>>, project_id: ProjectId) -> Option<Project> {
+    state
+        .lock()
+        .expect("runtime state lock should not be poisoned")
+        .projects
+        .values()
+        .find(|project| project.id == project_id)
+        .cloned()
+}
+
+fn inspect_project_agent_readiness(
+    state: Arc<Mutex<RuntimeState>>,
+    project_id: ProjectId,
+) -> ServerResponse {
+    let Some(project) = project_by_id(&state, project_id) else {
+        return protocol_error("project_not_found", "project was not found");
+    };
+    if project.git_policy == ProjectGitPolicy::AllowOutsideGit {
+        return ServerResponse::ProjectAgentReadiness(ProjectAgentReadiness {
+            state: ProjectAgentReadinessState::Ready,
+            repository_root: project.root.to_string_lossy().into_owned(),
+            target_branch: String::new(),
+            included_file_count: 0,
+            sample_paths: Vec::new(),
+            warnings: Vec::new(),
+            snapshot_tree_oid: None,
+        });
+    }
+    let git = {
+        Arc::clone(
+            &state
+                .lock()
+                .expect("runtime state lock should not be poisoned")
+                .git,
+        )
+    };
+    match git.inspect_initial_snapshot(&project) {
+        Ok(preview) => ServerResponse::ProjectAgentReadiness(ProjectAgentReadiness {
+            state: if preview.ready {
+                ProjectAgentReadinessState::Ready
+            } else if preview.unsafe_to_snapshot {
+                ProjectAgentReadinessState::UnsafeInitialSnapshot
+            } else {
+                ProjectAgentReadinessState::NeedsInitialSnapshot
+            },
+            repository_root: preview.repository_root.to_string_lossy().into_owned(),
+            target_branch: preview.target_branch,
+            included_file_count: preview.included_paths.len(),
+            sample_paths: preview.included_paths.into_iter().take(20).collect(),
+            warnings: preview.warnings,
+            snapshot_tree_oid: preview.tree_oid,
+        }),
+        Err(error) => protocol_error(error.code, error.message),
+    }
+}
+
+fn create_initial_project_snapshot(
+    state: Arc<Mutex<RuntimeState>>,
+    project_id: ProjectId,
+    expected_tree_oid: &str,
+) -> ServerResponse {
+    let Some(project) = project_by_id(&state, project_id) else {
+        return protocol_error("project_not_found", "project was not found");
+    };
+    if project.git_policy == ProjectGitPolicy::AllowOutsideGit {
+        return protocol_error(
+            "initial_snapshot_not_applicable",
+            "This project is configured to run outside Git",
+        );
+    }
+    let git = {
+        Arc::clone(
+            &state
+                .lock()
+                .expect("runtime state lock should not be poisoned")
+                .git,
+        )
+    };
+    let result = git.create_initial_snapshot(&project, expected_tree_oid, |operation| {
+        let mut state = state
+            .lock()
+            .expect("runtime state lock should not be poisoned");
+        state
+            .store
+            .upsert_project_git_operation(operation)
+            .map_err(|error| git_orchestration::GitError {
+                code: "project_git_journal_failed",
+                message: error.to_string(),
+            })?;
+        emit_git_event(
+            &mut state,
+            project_id,
+            None,
+            "initial_snapshot_state_changed",
+            &format!("initial project snapshot: {:?}", operation.state),
+        );
+        Ok(())
+    });
+    match result {
+        Ok(commit_oid) => {
+            ServerResponse::InitialProjectSnapshotCreated(InitialProjectSnapshotCreated {
+                commit_oid,
+            })
+        }
+        Err(error) => protocol_error(error.code, error.message),
+    }
+}
+
+fn prepare_project_snapshot_for_launch(
+    state: &Arc<Mutex<RuntimeState>>,
+    project: &Project,
+) -> Result<(), git_orchestration::GitError> {
+    let git = {
+        Arc::clone(
+            &state
+                .lock()
+                .expect("runtime state lock should not be poisoned")
+                .git,
+        )
+    };
+    let preview = git.inspect_initial_snapshot(project)?;
+    if preview.ready {
+        return Ok(());
+    }
+    if preview.unsafe_to_snapshot || !preview.warnings.is_empty() {
+        return Err(git_orchestration::GitError {
+            code: "project_snapshot_review_required",
+            message: if preview.warnings.is_empty() {
+                "Some project files need review before Ditch can prepare them for agents.".into()
+            } else {
+                preview.warnings.join(" ")
+            },
+        });
+    }
+    let tree_oid = preview.tree_oid.ok_or(git_orchestration::GitError {
+        code: "project_snapshot_missing",
+        message: "Ditch could not prepare the current project files.".into(),
+    })?;
+    git.create_initial_snapshot(project, &tree_oid, |operation| {
+        let mut runtime = state
+            .lock()
+            .expect("runtime state lock should not be poisoned");
+        runtime
+            .store
+            .upsert_project_git_operation(operation)
+            .map_err(|error| git_orchestration::GitError {
+                code: "project_git_journal_failed",
+                message: error.to_string(),
+            })?;
+        emit_git_event(
+            &mut runtime,
+            project.id,
+            None,
+            "project_snapshot_state_changed",
+            &format!("project preparation: {:?}", operation.state),
+        );
+        Ok(())
+    })?;
+    let verified = git.inspect_initial_snapshot(project)?;
+    if !verified.ready {
+        return Err(git_orchestration::GitError {
+            code: "project_changed_during_preparation",
+            message: "Project files changed while Ditch was preparing them. Try starting the agent again.".into(),
+        });
+    }
+    Ok(())
+}
+
+#[allow(clippy::result_large_err)]
 fn verify_project_git_policy(project: &Project) -> Result<(), ServerResponse> {
     if project.git_policy == ProjectGitPolicy::AllowOutsideGit {
         return Ok(());
@@ -1405,6 +1838,12 @@ fn resume_codex_session(
         return error;
     }
     let allow_non_git = project.git_policy == ProjectGitPolicy::AllowOutsideGit;
+    if !allow_non_git && execution_profile.approval == AgentApprovalPreset::FullAccess {
+        return protocol_error(
+            "isolated_full_access_unsupported",
+            "Full Access is unavailable for isolated parallel work because it would remove the workspace safety boundary.",
+        );
+    }
     let user_message = AgentChatMessage {
         agent_id: run.id,
         role: AgentChatRole::User,
@@ -1422,10 +1861,35 @@ fn resume_codex_session(
             "No working Codex CLI installation was found. Choose an existing installation in Ditch settings.".to_owned(),
         );
     };
+    if !allow_non_git && let Err(error) = prepare_project_snapshot_for_launch(&state, &project) {
+        return protocol_error(error.code, error.message);
+    }
+    let managed = if allow_non_git {
+        None
+    } else {
+        match create_journaled_worktree(&state, &project, run.id, &prompt) {
+            Ok(created) => Some(created),
+            Err(error) => {
+                return persist_launch_failure(
+                    &state,
+                    project,
+                    run,
+                    user_message,
+                    allow_non_git,
+                    error.message,
+                );
+            }
+        }
+    };
+    let execution_root = managed
+        .as_ref()
+        .map(|created| created.agent_cwd.as_path())
+        .unwrap_or(&project.root);
+    let codex_prompt = managed_agent_prompt(&prompt, managed.is_some());
     let child = match spawn_codex_child(
         &binary,
-        &project.root,
-        &prompt,
+        execution_root,
+        &codex_prompt,
         &CodexLaunchMode::Exec,
         Some(&thread_id),
         allow_non_git,
@@ -1480,6 +1944,23 @@ fn resume_codex_session(
             return protocol_error("agent_store_failed", error.to_string());
         }
         state.projects.insert(project.root_key(), project.clone());
+        if let Some(created) = managed.as_ref() {
+            if let Err(error) = state.store.upsert_worktree(&created.managed) {
+                let _ = child
+                    .lock()
+                    .expect("child lock should not be poisoned")
+                    .kill();
+                return protocol_error("worktree_store_failed", error.to_string());
+            }
+            state.worktrees.insert(run.id, created.managed.clone());
+            emit_git_event(
+                &mut state,
+                project.id,
+                Some(run.id),
+                "worktree_created",
+                "isolated locked workspace created",
+            );
+        }
         state.agents.insert(
             run.id,
             AgentRecord {
@@ -1504,7 +1985,10 @@ fn resume_codex_session(
     }
 
     attach_codex_io(Arc::clone(&state), run.id, run_id, child);
-    ServerResponse::AgentStarted(run)
+    if managed.is_some() {
+        monitor_worktree(Arc::clone(&state), run.id, run_id);
+    }
+    ServerResponse::AgentStarted(Box::new(run))
 }
 
 fn validate_thread_project(
@@ -1574,8 +2058,27 @@ fn prompt_agent(
                 "This session belongs to a different CODEX_HOME. Start a new agent with the current Codex account.",
             );
         }
+        let execution_root = state
+            .worktrees
+            .get(&agent_id)
+            .map(|worktree| {
+                if worktree.agent_cwd.as_os_str().is_empty() {
+                    worktree.path.clone()
+                } else {
+                    worktree.agent_cwd.clone()
+                }
+            })
+            .unwrap_or_else(|| record.project_root.clone());
+        if state.worktrees.contains_key(&agent_id)
+            && execution_profile.approval == AgentApprovalPreset::FullAccess
+        {
+            return protocol_error(
+                "isolated_full_access_unsupported",
+                "Full Access is unavailable for isolated parallel work because it would remove the workspace safety boundary.",
+            );
+        }
         (
-            record.project_root.clone(),
+            execution_root,
             record.run.native_session_id.clone(),
             record.allow_non_git,
         )
@@ -1650,10 +2153,561 @@ fn prompt_agent(
         );
         state.broadcast(ServerEvent::AgentChanged(run));
         state.broadcast(ServerEvent::AgentMessageAppended(user_message));
+        if let Some(worktree) = state.worktrees.get_mut(&agent_id) {
+            worktree.status = if worktree.dirty {
+                WorktreeStatus::Dirty
+            } else {
+                WorktreeStatus::Active
+            };
+            worktree.integration_state = IntegrationState::NotRequested;
+            worktree.validation_state = ditch_core::ValidationState::NotRun;
+            worktree.conflict_state = ditch_core::ConflictState::None;
+            worktree.last_error = None;
+            worktree.updated_at = Utc::now();
+            let changed = worktree.clone();
+            let _ = state.store.upsert_worktree(&changed);
+            state.broadcast(ServerEvent::WorktreeChanged(Box::new(changed)));
+        }
     }
 
     attach_codex_io(Arc::clone(&state), agent_id, run_id, child);
     ServerResponse::Accepted
+}
+
+fn register_change_intent(
+    state: Arc<Mutex<RuntimeState>>,
+    agent_id: AgentId,
+    intent: ChangeIntent,
+    continue_on_overlap: bool,
+) -> ServerResponse {
+    let mut state = state
+        .lock()
+        .expect("runtime state lock should not be poisoned");
+    let Some(worktree) = state.worktrees.get_mut(&agent_id) else {
+        return protocol_error(
+            "worktree_not_found",
+            "This agent does not own a managed worktree",
+        );
+    };
+    worktree.intent = Some(intent);
+    worktree.overlap_override = continue_on_overlap;
+    worktree.updated_at = Utc::now();
+    let project_id = worktree.project_id;
+    let mut projection = state.worktrees.values().cloned().collect::<Vec<_>>();
+    apply_overlap_projection(&mut projection);
+    let has_overlap = projection
+        .iter()
+        .find(|item| item.session_id == agent_id)
+        .is_some_and(|item| !item.overlapping_session_ids.is_empty());
+    for item in projection {
+        let _ = state.store.upsert_worktree(&item);
+        state.worktrees.insert(item.session_id, item.clone());
+        state.broadcast(ServerEvent::WorktreeChanged(Box::new(item)));
+    }
+    emit_git_event(
+        &mut state,
+        project_id,
+        Some(agent_id),
+        "change_intent_registered",
+        if has_overlap {
+            "overlap detected"
+        } else {
+            "no overlap detected"
+        },
+    );
+    ServerResponse::Accepted
+}
+
+fn refresh_worktree(state: Arc<Mutex<RuntimeState>>, agent_id: AgentId) -> ServerResponse {
+    match refresh_worktree_inner(&state, agent_id) {
+        Ok(()) => ServerResponse::Accepted,
+        Err((code, message)) => protocol_error(code, message),
+    }
+}
+
+fn override_worktree_overlap(state: Arc<Mutex<RuntimeState>>, agent_id: AgentId) -> ServerResponse {
+    let mut state = state
+        .lock()
+        .expect("runtime state lock should not be poisoned");
+    let Some(worktree) = state.worktrees.get_mut(&agent_id) else {
+        return protocol_error(
+            "worktree_not_found",
+            "This agent does not own a managed worktree",
+        );
+    };
+    worktree.overlap_override = true;
+    worktree.updated_at = Utc::now();
+    persist_overlap_projection(&mut state);
+    let project_id = state
+        .worktrees
+        .get(&agent_id)
+        .map(|worktree| worktree.project_id);
+    if let Some(project_id) = project_id {
+        emit_git_event(
+            &mut state,
+            project_id,
+            Some(agent_id),
+            "path_overlap_overridden",
+            "user chose to continue separately; automatic integration remains guarded",
+        );
+    }
+    ServerResponse::Accepted
+}
+
+fn get_worktree_review(state: Arc<Mutex<RuntimeState>>, agent_id: AgentId) -> ServerResponse {
+    let (git, project, worktree) = {
+        let state = state
+            .lock()
+            .expect("runtime state lock should not be poisoned");
+        let Some(worktree) = state.worktrees.get(&agent_id).cloned() else {
+            return protocol_error(
+                "worktree_not_found",
+                "This agent does not own a managed worktree",
+            );
+        };
+        let Some(project) = state
+            .projects
+            .values()
+            .find(|item| item.id == worktree.project_id)
+            .cloned()
+        else {
+            return protocol_error("project_not_found", "The worktree project was not found");
+        };
+        (Arc::clone(&state.git), project, worktree)
+    };
+    match git.review(&project, &worktree) {
+        Ok(review) => ServerResponse::WorktreeReview(review),
+        Err(error) => protocol_error(error.code, error.message),
+    }
+}
+
+fn refresh_worktree_inner(
+    state: &Arc<Mutex<RuntimeState>>,
+    agent_id: AgentId,
+) -> Result<(), (&'static str, String)> {
+    let (git, project, mut worktree) = {
+        let state = state
+            .lock()
+            .expect("runtime state lock should not be poisoned");
+        let worktree = state.worktrees.get(&agent_id).cloned().ok_or((
+            "worktree_not_found",
+            "This agent does not own a managed worktree".to_owned(),
+        ))?;
+        let project = state
+            .projects
+            .values()
+            .find(|item| item.id == worktree.project_id)
+            .cloned()
+            .ok_or((
+                "project_not_found",
+                "The worktree project was not found".to_owned(),
+            ))?;
+        (Arc::clone(&state.git), project, worktree)
+    };
+    git.refresh(&project, &mut worktree)
+        .map_err(|error| (error.code, error.message))?;
+    let mut state = state
+        .lock()
+        .expect("runtime state lock should not be poisoned");
+    state.worktrees.insert(agent_id, worktree);
+    persist_overlap_projection(&mut state);
+    Ok(())
+}
+
+fn prepare_integration(state: Arc<Mutex<RuntimeState>>, agent_id: AgentId) -> ServerResponse {
+    let (git, project, mut worktree, validation_root) = {
+        let mut state = state
+            .lock()
+            .expect("runtime state lock should not be poisoned");
+        let Some(mut worktree) = state.worktrees.get(&agent_id).cloned() else {
+            return protocol_error(
+                "worktree_not_found",
+                "This agent does not own a managed worktree",
+            );
+        };
+        if state.children.contains_key(&agent_id)
+            || state.agents.get(&agent_id).is_some_and(|record| {
+                matches!(record.run.state, AgentState::Working | AgentState::Stopping)
+            })
+        {
+            return protocol_error(
+                "agent_active",
+                "This agent is still working. Ditch will check its result when it finishes.",
+            );
+        }
+        let Some(project) = state
+            .projects
+            .values()
+            .find(|item| item.id == worktree.project_id)
+            .cloned()
+        else {
+            return protocol_error("project_not_found", "The worktree project was not found");
+        };
+        worktree.operation = Some("prepare_integration".into());
+        worktree.status = WorktreeStatus::QueuedForIntegration;
+        worktree.integration_state = IntegrationState::Queued;
+        worktree.updated_at = Utc::now();
+        let _ = state.store.upsert_worktree(&worktree);
+        state.worktrees.insert(agent_id, worktree.clone());
+        state.broadcast(ServerEvent::WorktreeChanged(Box::new(worktree.clone())));
+        emit_git_event(
+            &mut state,
+            project.id,
+            Some(agent_id),
+            "integration_queued",
+            "candidate queued",
+        );
+        (
+            Arc::clone(&state.git),
+            project,
+            worktree,
+            state.paths.data_dir.join("validation-worktrees"),
+        )
+    };
+    let result = (|| {
+        git.checkpoint(&project, &mut worktree)?;
+        git.prepare_integration(&project, &mut worktree, &validation_root)
+    })();
+    worktree.operation = None;
+    if let Err(error) = result {
+        worktree.status = WorktreeStatus::NeedsReview;
+        worktree.integration_state = IntegrationState::Blocked;
+        worktree.last_error = Some(error.message.clone());
+        persist_one_worktree(&state, worktree);
+        return protocol_error(error.code, error.message);
+    }
+    let conflict = worktree.status == WorktreeStatus::ConflictRisk;
+    let ready = worktree.status == WorktreeStatus::ReadyToApply;
+    let project_id = worktree.project_id;
+    persist_one_worktree(&state, worktree);
+    let mut locked = state
+        .lock()
+        .expect("runtime state lock should not be poisoned");
+    emit_git_event(
+        &mut locked,
+        project_id,
+        Some(agent_id),
+        if conflict {
+            "integration_conflict_detected"
+        } else if ready {
+            "validation_passed"
+        } else {
+            "validation_failed"
+        },
+        if conflict {
+            "Git merge simulation reported a conflict"
+        } else if ready {
+            "combined candidate validation passed"
+        } else {
+            "combined candidate validation failed"
+        },
+    );
+    drop(locked);
+    if ready
+        && project.integration_policy == ditch_core::IntegrationPolicy::AutoApplyAfterValidation
+    {
+        return apply_integration(state, agent_id, false);
+    }
+    ServerResponse::Accepted
+}
+
+fn apply_integration(
+    state: Arc<Mutex<RuntimeState>>,
+    agent_id: AgentId,
+    allow_without_validation: bool,
+) -> ServerResponse {
+    let (git, project, mut worktree) = {
+        let mut state = state
+            .lock()
+            .expect("runtime state lock should not be poisoned");
+        let Some(mut worktree) = state.worktrees.get(&agent_id).cloned() else {
+            return protocol_error(
+                "worktree_not_found",
+                "This agent does not own a managed worktree",
+            );
+        };
+        if state.children.contains_key(&agent_id) {
+            return protocol_error(
+                "agent_active",
+                "This agent is still working. Its current result cannot be applied yet.",
+            );
+        }
+        let applyable = worktree.status == WorktreeStatus::ReadyToApply
+            || (allow_without_validation
+                && worktree.status == WorktreeStatus::NeedsReview
+                && worktree.validation_state == ditch_core::ValidationState::NotConfigured);
+        if !applyable {
+            return protocol_error(
+                "integration_not_ready",
+                "This result must finish its safety checks before it can be applied.",
+            );
+        }
+        let Some(project) = state
+            .projects
+            .values()
+            .find(|item| item.id == worktree.project_id)
+            .cloned()
+        else {
+            return protocol_error("project_not_found", "The worktree project was not found");
+        };
+        worktree.operation = Some("apply_integration".into());
+        worktree.status = WorktreeStatus::Applying;
+        worktree.integration_state = IntegrationState::Applying;
+        let _ = state.store.upsert_worktree(&worktree);
+        state.worktrees.insert(agent_id, worktree.clone());
+        (Arc::clone(&state.git), project, worktree)
+    };
+    let result = git.apply(&project, &mut worktree, allow_without_validation);
+    worktree.operation = None;
+    if let Err(error) = result {
+        if worktree.status == WorktreeStatus::Applying {
+            worktree.status = if worktree.validation_state == ditch_core::ValidationState::Passed {
+                WorktreeStatus::ReadyToApply
+            } else {
+                WorktreeStatus::NeedsReview
+            };
+            worktree.integration_state = ditch_core::IntegrationState::Blocked;
+            worktree.last_error = Some(error.message.clone());
+        }
+        persist_one_worktree(&state, worktree);
+        return protocol_error(error.code, error.message);
+    }
+    if let Err(error) = git.archive_integrated(&project, &mut worktree) {
+        worktree.status = WorktreeStatus::CleanupPending;
+        worktree.last_error = Some(error.message);
+    }
+    let project_id = worktree.project_id;
+    persist_one_worktree(&state, worktree);
+    let remaining = {
+        let mut state = state
+            .lock()
+            .expect("runtime state lock should not be poisoned");
+        emit_git_event(
+            &mut state,
+            project_id,
+            Some(agent_id),
+            "integration_applied",
+            "canonical target advanced safely",
+        );
+        state
+            .worktrees
+            .values()
+            .filter(|item| {
+                item.project_id == project_id
+                    && item.session_id != agent_id
+                    && item.checkpoint_oid.is_some()
+                    && !state.children.contains_key(&item.session_id)
+                    && state
+                        .agents
+                        .get(&item.session_id)
+                        .is_some_and(|record| record.run.state == AgentState::Completed)
+                    && !matches!(
+                        item.status,
+                        WorktreeStatus::Integrated | WorktreeStatus::Discarded
+                    )
+            })
+            .map(|item| item.session_id)
+            .collect::<Vec<_>>()
+    };
+    for candidate in remaining {
+        let _ = prepare_integration(Arc::clone(&state), candidate);
+    }
+    ServerResponse::Accepted
+}
+
+fn create_conflict_resolution(
+    state: Arc<Mutex<RuntimeState>>,
+    agent_id: AgentId,
+) -> ServerResponse {
+    let (git, project, mut worktree, resolution_root) = {
+        let mut state = state
+            .lock()
+            .expect("runtime state lock should not be poisoned");
+        if state.children.contains_key(&agent_id) {
+            return protocol_error(
+                "agent_active",
+                "Stop this agent before opening a conflict-resolution workspace",
+            );
+        }
+        let Some(mut worktree) = state.worktrees.get(&agent_id).cloned() else {
+            return protocol_error("worktree_not_found", "The agent workspace was not found");
+        };
+        let Some(project) = state
+            .projects
+            .values()
+            .find(|project| project.id == worktree.project_id)
+            .cloned()
+        else {
+            return protocol_error("project_not_found", "The project was not found");
+        };
+        let resolution_root = state.paths.data_dir.join("resolution-worktrees");
+        worktree.resolution_path = Some(
+            resolution_root
+                .join(project.id.0.simple().to_string())
+                .join(agent_id.0.simple().to_string()),
+        );
+        worktree.resolution_branch = Some(format!("ditch/resolver/{}", agent_id.0.simple()));
+        worktree.operation = Some("create_resolution".into());
+        worktree.updated_at = Utc::now();
+        let _ = state.store.upsert_worktree(&worktree);
+        (Arc::clone(&state.git), project, worktree, resolution_root)
+    };
+    match git.create_conflict_resolution(&project, &mut worktree, &resolution_root) {
+        Ok(path) => {
+            worktree.operation = None;
+            persist_one_worktree(&state, worktree);
+            ServerResponse::ConflictResolutionWorkspace {
+                path: path.to_string_lossy().into_owned(),
+            }
+        }
+        Err(error) => {
+            worktree.operation = None;
+            if worktree
+                .resolution_path
+                .as_ref()
+                .is_some_and(|path| !path.exists())
+            {
+                worktree.resolution_path = None;
+                worktree.resolution_branch = None;
+                worktree.resolution_target_oid = None;
+            }
+            persist_one_worktree(&state, worktree);
+            protocol_error(error.code, error.message)
+        }
+    }
+}
+
+fn finalize_conflict_resolution(
+    state: Arc<Mutex<RuntimeState>>,
+    agent_id: AgentId,
+) -> ServerResponse {
+    let (git, project, mut worktree, validation_root) = {
+        let state = state
+            .lock()
+            .expect("runtime state lock should not be poisoned");
+        let Some(worktree) = state.worktrees.get(&agent_id).cloned() else {
+            return protocol_error("worktree_not_found", "The agent workspace was not found");
+        };
+        let Some(project) = state
+            .projects
+            .values()
+            .find(|project| project.id == worktree.project_id)
+            .cloned()
+        else {
+            return protocol_error("project_not_found", "The project was not found");
+        };
+        (
+            Arc::clone(&state.git),
+            project,
+            worktree,
+            state.paths.data_dir.join("validation-worktrees"),
+        )
+    };
+    if let Err(error) = git.finalize_conflict_resolution(&project, &mut worktree, &validation_root)
+    {
+        worktree.last_error = Some(error.message.clone());
+        persist_one_worktree(&state, worktree);
+        return protocol_error(error.code, error.message);
+    }
+    let ready = worktree.status == WorktreeStatus::ReadyToApply;
+    persist_one_worktree(&state, worktree);
+    if ready
+        && project.integration_policy == ditch_core::IntegrationPolicy::AutoApplyAfterValidation
+    {
+        return apply_integration(state, agent_id, false);
+    }
+    ServerResponse::Accepted
+}
+
+fn discard_worktree(
+    state: Arc<Mutex<RuntimeState>>,
+    agent_id: AgentId,
+    confirm_dirty: bool,
+) -> ServerResponse {
+    let (git, project, mut worktree) = {
+        let state = state
+            .lock()
+            .expect("runtime state lock should not be poisoned");
+        if state.children.contains_key(&agent_id) {
+            return protocol_error(
+                "agent_active",
+                "Stop this agent before discarding its workspace",
+            );
+        }
+        let Some(worktree) = state.worktrees.get(&agent_id).cloned() else {
+            return protocol_error(
+                "worktree_not_found",
+                "This agent does not own a managed worktree",
+            );
+        };
+        let Some(project) = state
+            .projects
+            .values()
+            .find(|item| item.id == worktree.project_id)
+            .cloned()
+        else {
+            return protocol_error("project_not_found", "The worktree project was not found");
+        };
+        (Arc::clone(&state.git), project, worktree)
+    };
+    if let Err(error) = git.discard(&project, &mut worktree, confirm_dirty) {
+        persist_one_worktree(&state, worktree);
+        return protocol_error(error.code, error.message);
+    }
+    let project_id = worktree.project_id;
+    persist_one_worktree(&state, worktree);
+    let mut state = state
+        .lock()
+        .expect("runtime state lock should not be poisoned");
+    emit_git_event(
+        &mut state,
+        project_id,
+        Some(agent_id),
+        "worktree_removed",
+        "managed workspace removed with Git",
+    );
+    ServerResponse::Accepted
+}
+
+fn persist_one_worktree(state: &Arc<Mutex<RuntimeState>>, worktree: ManagedWorktree) {
+    let mut state = state
+        .lock()
+        .expect("runtime state lock should not be poisoned");
+    let _ = state.store.upsert_worktree(&worktree);
+    state
+        .worktrees
+        .insert(worktree.session_id, worktree.clone());
+    state.broadcast(ServerEvent::WorktreeChanged(Box::new(worktree)));
+}
+
+fn persist_overlap_projection(state: &mut RuntimeState) {
+    let mut worktrees = state.worktrees.values().cloned().collect::<Vec<_>>();
+    apply_overlap_projection(&mut worktrees);
+    for worktree in worktrees {
+        let _ = state.store.upsert_worktree(&worktree);
+        state
+            .worktrees
+            .insert(worktree.session_id, worktree.clone());
+        state.broadcast(ServerEvent::WorktreeChanged(Box::new(worktree)));
+    }
+}
+
+fn emit_git_event(
+    state: &mut RuntimeState,
+    project_id: ProjectId,
+    agent_id: Option<AgentId>,
+    kind: &str,
+    detail: &str,
+) {
+    let _ = state
+        .store
+        .append_git_event(project_id, agent_id, kind, detail);
+    state.broadcast(ServerEvent::GitLifecycle {
+        project_id,
+        agent_id,
+        kind: kind.to_owned(),
+        detail: detail.to_owned(),
+    });
 }
 
 fn stop_agent(state: Arc<Mutex<RuntimeState>>, agent_id: AgentId) -> ServerResponse {
@@ -1819,7 +2873,7 @@ fn finalize_stopped_run(state: &Arc<Mutex<RuntimeState>>, agent_id: AgentId, run
         .then_some(AgentResumeBlockReason::NoCodexThread);
     let run = record.run.clone();
     state.persist_agent(agent_id);
-    state.broadcast(ServerEvent::AgentChanged(run));
+    state.broadcast(ServerEvent::AgentChanged(run.clone()));
 }
 
 fn delete_agent(state: Arc<Mutex<RuntimeState>>, agent_id: AgentId) -> ServerResponse {
@@ -1839,10 +2893,22 @@ fn delete_agent(state: Arc<Mutex<RuntimeState>>, agent_id: AgentId) -> ServerRes
             "Stop this agent before deleting it permanently.",
         );
     }
+    if state.worktrees.get(&agent_id).is_some_and(|worktree| {
+        !matches!(
+            worktree.status,
+            WorktreeStatus::Discarded | WorktreeStatus::Integrated
+        ) || worktree.path.exists()
+    }) {
+        return protocol_error(
+            "managed_worktree_preserved",
+            "Discard this agent's preserved workspace before deleting its history.",
+        );
+    }
     if let Err(error) = state.store.delete_agent(agent_id) {
         return protocol_error("agent_delete_failed", error.to_string());
     }
     state.agents.remove(&agent_id);
+    state.worktrees.remove(&agent_id);
     state
         .attention
         .retain(|item| item.agent_id != Some(agent_id));
@@ -1883,14 +2949,26 @@ fn delete_project(
             "Stop this project's active agents before deleting it.",
         );
     }
+    if state.worktrees.values().any(|worktree| {
+        worktree.project_id == project_id
+            && (!matches!(
+                worktree.status,
+                WorktreeStatus::Discarded | WorktreeStatus::Integrated
+            ) || worktree.path.exists())
+    }) {
+        return protocol_error(
+            "project_worktrees_preserved",
+            "Discard or apply this project's preserved agent work before removing the project from Ditch.",
+        );
+    }
     if let Err(error) = state.store.delete_project(project_id) {
         return protocol_error("project_delete_failed", error.to_string());
     }
 
-    if let Some(terminal_id) = state.terminal_by_project.remove(&project_id) {
-        if let Some(mut terminal) = state.terminals.remove(&terminal_id) {
-            let _ = terminal.child.kill();
-        }
+    if let Some(terminal_id) = state.terminal_by_project.remove(&project_id)
+        && let Some(mut terminal) = state.terminals.remove(&terminal_id)
+    {
+        let _ = terminal.child.kill();
     }
     let agent_ids = state
         .agents
@@ -1901,12 +2979,13 @@ fn delete_project(
     for agent_id in &agent_ids {
         state.agents.remove(agent_id);
         state.children.remove(agent_id);
+        state.worktrees.remove(agent_id);
     }
     state.attention.retain(|item| {
         item.project_id != Some(project_id)
             && item
                 .agent_id
-                .map_or(true, |agent_id| !agent_ids.contains(&agent_id))
+                .is_none_or(|agent_id| !agent_ids.contains(&agent_id))
     });
     state.projects.remove(&project_key);
     state.broadcast(ServerEvent::ProjectDeleted { project_id });
@@ -2030,6 +3109,96 @@ fn attach_codex_io(
         }
         finish_agent(&state, agent_id, Some(run_id), code);
     });
+}
+
+fn monitor_worktree(state: Arc<Mutex<RuntimeState>>, agent_id: AgentId, run_id: uuid::Uuid) {
+    thread::spawn(move || {
+        loop {
+            thread::sleep(Duration::from_millis(1500));
+            let active = {
+                let state = state
+                    .lock()
+                    .expect("runtime state lock should not be poisoned");
+                state
+                    .children
+                    .get(&agent_id)
+                    .is_some_and(|child| child.run_id == run_id)
+            };
+            let _ = refresh_worktree_inner(&state, agent_id);
+            if !active {
+                break;
+            }
+        }
+    });
+}
+
+fn managed_agent_prompt(prompt: &str, isolated: bool) -> String {
+    if !isolated {
+        return prompt.to_owned();
+    }
+    format!(
+        "{prompt}\n\n[Ditch workspace boundary]\nYou are operating inside a Ditch-managed isolated Git worktree. Treat the current directory as the complete project workspace. Do not switch branches, merge or rebase the target branch, create/remove worktrees, modify another Ditch worktree or the canonical project directory, delete/relocate this worktree, or force-reset shared refs. Ditch owns integration. Keep all task work inside the current working directory. Do not ask the user to manage Ditch branches or worktrees. If the prepared project appears incomplete, report that Ditch could not prepare the project instead of prescribing Git commands."
+    )
+}
+
+fn create_journaled_worktree(
+    state: &Arc<Mutex<RuntimeState>>,
+    project: &Project,
+    agent_id: AgentId,
+    prompt: &str,
+) -> Result<git_orchestration::CreatedWorktree, git_orchestration::GitError> {
+    let (git, root) = {
+        let mut state = state
+            .lock()
+            .expect("runtime state lock should not be poisoned");
+        state
+            .store
+            .upsert_project(project)
+            .map_err(|error| git_orchestration::GitError {
+                code: "project_store_failed",
+                message: error.to_string(),
+            })?;
+        (
+            Arc::clone(&state.git),
+            state.paths.data_dir.join("worktrees"),
+        )
+    };
+    let result = git.create_journaled(project, agent_id, prompt, &root, |worktree| {
+        let mut state = state
+            .lock()
+            .expect("runtime state lock should not be poisoned");
+        state
+            .store
+            .upsert_worktree(worktree)
+            .map_err(|error| git_orchestration::GitError {
+                code: "worktree_store_failed",
+                message: error.to_string(),
+            })?;
+        state.worktrees.insert(agent_id, worktree.clone());
+        emit_git_event(
+            &mut state,
+            project.id,
+            Some(agent_id),
+            "worktree_create_started",
+            "creating isolated locked workspace",
+        );
+        Ok(())
+    });
+    if let Err(error) = &result {
+        let mut state = state
+            .lock()
+            .expect("runtime state lock should not be poisoned");
+        if let Some(mut worktree) = state.worktrees.get(&agent_id).cloned() {
+            worktree.status = WorktreeStatus::Failed;
+            worktree.operation = None;
+            worktree.last_error = Some(error.message.clone());
+            worktree.updated_at = Utc::now();
+            let _ = state.store.upsert_worktree(&worktree);
+            state.worktrees.insert(agent_id, worktree.clone());
+            state.broadcast(ServerEvent::WorktreeChanged(Box::new(worktree)));
+        }
+    }
+    result
 }
 
 fn handle_codex_stdout_line(
@@ -2516,13 +3685,14 @@ fn finish_agent(
     run_id: Option<uuid::Uuid>,
     code: Option<i32>,
 ) {
+    let state_handle = Arc::clone(state);
     let mut state = state
         .lock()
         .expect("runtime state lock should not be poisoned");
-    if let Some(run_id) = run_id {
-        if !is_current_run(&state, agent_id, run_id) {
-            return;
-        }
+    if let Some(run_id) = run_id
+        && !is_current_run(&state, agent_id, run_id)
+    {
+        return;
     }
     state.children.remove(&agent_id);
     let (run, attention) = {
@@ -2623,13 +3793,79 @@ fn finish_agent(
         (record.run.clone(), attention)
     };
     state.persist_agent(agent_id);
-    state.broadcast(ServerEvent::AgentChanged(run));
+    state.broadcast(ServerEvent::AgentChanged(run.clone()));
     if let Some(attention) = attention {
         if let Err(error) = state.store.upsert_attention(&attention) {
             eprintln!("{RUNTIME_IDENTITY} failed to persist attention: {error}");
         }
         state.attention.push(attention.clone());
         state.broadcast(ServerEvent::AttentionRaised(attention));
+    }
+    let checkpoint = matches!(run.state, AgentState::Completed | AgentState::Interrupted)
+        && state.worktrees.contains_key(&agent_id);
+    drop(state);
+    if checkpoint {
+        checkpoint_finished_worktree(&state_handle, agent_id, run.state == AgentState::Completed);
+    }
+}
+
+fn checkpoint_finished_worktree(
+    state: &Arc<Mutex<RuntimeState>>,
+    agent_id: AgentId,
+    prepare_when_complete: bool,
+) {
+    let (git, project, mut worktree) = {
+        let state = state
+            .lock()
+            .expect("runtime state lock should not be poisoned");
+        let Some(worktree) = state.worktrees.get(&agent_id).cloned() else {
+            return;
+        };
+        let Some(project) = state
+            .projects
+            .values()
+            .find(|item| item.id == worktree.project_id)
+            .cloned()
+        else {
+            return;
+        };
+        (Arc::clone(&state.git), project, worktree)
+    };
+    let result = git.checkpoint(&project, &mut worktree);
+    let mut locked = state
+        .lock()
+        .expect("runtime state lock should not be poisoned");
+    match result {
+        Ok(_) => {
+            worktree.status = WorktreeStatus::NeedsReview;
+            worktree.integration_state = IntegrationState::NotRequested;
+            worktree.last_error = None;
+            emit_git_event(
+                &mut locked,
+                project.id,
+                Some(agent_id),
+                "worktree_checkpointed",
+                "agent result preserved without changing its index",
+            );
+        }
+        Err(error) => {
+            worktree.status = WorktreeStatus::RecoveryNeeded;
+            worktree.last_error = Some(error.message);
+            emit_git_event(
+                &mut locked,
+                project.id,
+                Some(agent_id),
+                "worktree_recovery_needed",
+                "agent result could not be checkpointed automatically",
+            );
+        }
+    }
+    let _ = locked.store.upsert_worktree(&worktree);
+    locked.worktrees.insert(agent_id, worktree.clone());
+    locked.broadcast(ServerEvent::WorktreeChanged(Box::new(worktree)));
+    drop(locked);
+    if prepare_when_complete {
+        let _ = prepare_integration(Arc::clone(state), agent_id);
     }
 }
 
@@ -2779,6 +4015,7 @@ fn canonical_project_root(root: &Path) -> PathBuf {
 
 const MAX_EDITABLE_FILE_BYTES: u64 = 1024 * 1024;
 
+#[allow(clippy::result_large_err)]
 fn project_for_file_request(
     state: &Arc<Mutex<RuntimeState>>,
     project_id: ProjectId,
@@ -2793,6 +4030,7 @@ fn project_for_file_request(
         .ok_or_else(|| protocol_error("project_not_found", "project was not found"))
 }
 
+#[allow(clippy::result_large_err)]
 fn resolve_project_path(project: &Project, relative_path: &str) -> Result<PathBuf, ServerResponse> {
     let relative = Path::new(relative_path);
     if relative.is_absolute()
@@ -3596,6 +4834,236 @@ esac
         };
         ensure_app_dirs(&paths).expect("test app directories should be created");
         RuntimeState::new(paths).expect("test runtime should initialize")
+    }
+
+    #[test]
+    fn validated_completed_work_applies_automatically_by_default() {
+        let mut runtime = test_runtime();
+        let cleanup = runtime.paths.data_dir.clone();
+        let repo = cleanup.join("auto-apply-project");
+        fs::create_dir_all(repo.join(".ditch")).unwrap();
+        Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        fs::write(repo.join("base.txt"), "base\n").unwrap();
+        Command::new("git")
+            .args(["add", "base.txt"])
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        let committed = Command::new("git")
+            .args([
+                "-c",
+                "user.name=Ditch Test",
+                "-c",
+                "user.email=ditch-test@localhost",
+                "commit",
+                "-m",
+                "baseline",
+            ])
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        assert!(committed.status.success());
+        fs::write(
+            repo.join(".ditch/validation.json"),
+            r#"{"commands":[["sh","-c","exit 0"]]}"#,
+        )
+        .unwrap();
+        let project = Project::new("Automatic", &repo);
+        assert_eq!(
+            project.integration_policy,
+            ditch_core::IntegrationPolicy::AutoApplyAfterValidation
+        );
+        runtime.store.upsert_project(&project).unwrap();
+        runtime.projects.insert(project.root_key(), project.clone());
+        let agent_id = AgentId::new();
+        let mut worktree = runtime
+            .git
+            .create(
+                &project,
+                agent_id,
+                "automatic",
+                &cleanup.join("managed-worktrees"),
+            )
+            .unwrap()
+            .managed;
+        fs::write(worktree.path.join("feature.txt"), "automatic\n").unwrap();
+        runtime.git.checkpoint(&project, &mut worktree).unwrap();
+        runtime.store.upsert_worktree(&worktree).unwrap();
+        runtime.worktrees.insert(agent_id, worktree);
+        let state = Arc::new(Mutex::new(runtime));
+
+        let response = prepare_integration(Arc::clone(&state), agent_id);
+
+        assert!(matches!(response, ServerResponse::Accepted));
+        assert_eq!(
+            fs::read_to_string(repo.join("feature.txt")).unwrap(),
+            "automatic\n"
+        );
+        assert_eq!(
+            state.lock().unwrap().worktrees[&agent_id].integration_state,
+            IntegrationState::Applied
+        );
+        fs::remove_dir_all(cleanup).ok();
+    }
+
+    #[test]
+    fn initialized_empty_project_is_immediately_ready_for_agents() {
+        let runtime = test_runtime();
+        let cleanup = runtime.paths.data_dir.clone();
+        let project_root = cleanup.join("empty-project");
+        fs::create_dir_all(&project_root).unwrap();
+        let state = Arc::new(Mutex::new(runtime));
+
+        let response = handle_request(
+            ClientRequest::CreateProject {
+                name: "Empty".into(),
+                root: project_root.to_string_lossy().into_owned(),
+                git_policy: ProjectGitPolicy::InitializeRepository,
+            },
+            Arc::clone(&state),
+        );
+        let ServerResponse::ProjectCreated(project) = response else {
+            panic!("project creation should succeed");
+        };
+        assert!(
+            git_orchestration::changed_paths(&project_root)
+                .unwrap()
+                .iter()
+                .all(|path| path == ".ditch" || path.starts_with(".ditch/"))
+        );
+        assert!(
+            Command::new("git")
+                .args(["rev-parse", "--verify", "HEAD"])
+                .current_dir(&project_root)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let readiness = inspect_project_agent_readiness(state, project.id);
+        assert!(matches!(
+            readiness,
+            ServerResponse::ProjectAgentReadiness(ProjectAgentReadiness {
+                state: ProjectAgentReadinessState::Ready,
+                ..
+            })
+        ));
+        fs::remove_dir_all(cleanup).ok();
+    }
+
+    #[test]
+    fn launch_preparation_saves_files_added_after_an_empty_baseline() {
+        let runtime = test_runtime();
+        let cleanup = runtime.paths.data_dir.clone();
+        let project_root = cleanup.join("later-populated-project");
+        fs::create_dir_all(&project_root).unwrap();
+        let state = Arc::new(Mutex::new(runtime));
+        let response = handle_request(
+            ClientRequest::CreateProject {
+                name: "Later populated".into(),
+                root: project_root.to_string_lossy().into_owned(),
+                git_policy: ProjectGitPolicy::InitializeRepository,
+            },
+            Arc::clone(&state),
+        );
+        let ServerResponse::ProjectCreated(project) = response else {
+            panic!("project creation should succeed");
+        };
+        let read_head = || {
+            let output = Command::new("git")
+                .args(["rev-parse", "--verify", "HEAD"])
+                .current_dir(&project_root)
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            String::from_utf8(output.stdout).unwrap().trim().to_owned()
+        };
+        let empty_head = read_head();
+        fs::create_dir_all(project_root.join("src")).unwrap();
+        fs::write(project_root.join("src/main.rs"), "fn main() {}\n").unwrap();
+        fs::write(
+            project_root.join("Cargo.toml"),
+            "[package]\nname='later-populated'\nversion='0.1.0'\n",
+        )
+        .unwrap();
+
+        prepare_project_snapshot_for_launch(&state, &project).unwrap();
+
+        let prepared_head = read_head();
+        assert_ne!(prepared_head, empty_head);
+        assert!(matches!(
+            inspect_project_agent_readiness(Arc::clone(&state), project.id),
+            ServerResponse::ProjectAgentReadiness(ProjectAgentReadiness {
+                state: ProjectAgentReadinessState::Ready,
+                ..
+            })
+        ));
+        let created = state
+            .lock()
+            .unwrap()
+            .git
+            .create(
+                &project,
+                AgentId::new(),
+                "Dockerize this app",
+                &cleanup.join("managed-worktrees"),
+            )
+            .unwrap();
+        assert!(created.agent_cwd.join("Cargo.toml").is_file());
+        assert!(created.agent_cwd.join("src/main.rs").is_file());
+
+        fs::remove_dir_all(cleanup).ok();
+    }
+
+    #[test]
+    fn populated_unborn_project_prepares_without_creating_a_failed_agent() {
+        let mut runtime = test_runtime();
+        let cleanup = runtime.paths.data_dir.clone();
+        let project_root = cleanup.join("populated-project");
+        fs::create_dir_all(&project_root).unwrap();
+        assert!(
+            Command::new("git")
+                .args(["init", "-b", "main"])
+                .current_dir(&project_root)
+                .status()
+                .unwrap()
+                .success()
+        );
+        fs::write(project_root.join("app.txt"), "hello\n").unwrap();
+        let project = Project::new("Populated", &project_root);
+        runtime.store.upsert_project(&project).unwrap();
+        runtime.projects.insert(project.root_key(), project.clone());
+        let state = Arc::new(Mutex::new(runtime));
+
+        let readiness = inspect_project_agent_readiness(Arc::clone(&state), project.id);
+        let ServerResponse::ProjectAgentReadiness(readiness) = readiness else {
+            panic!("readiness should be returned");
+        };
+        assert_eq!(
+            readiness.state,
+            ProjectAgentReadinessState::NeedsInitialSnapshot
+        );
+        assert_eq!(readiness.included_file_count, 1);
+        let response = create_initial_project_snapshot(
+            Arc::clone(&state),
+            project.id,
+            readiness.snapshot_tree_oid.as_deref().unwrap(),
+        );
+        assert!(matches!(
+            response,
+            ServerResponse::InitialProjectSnapshotCreated(_)
+        ));
+        assert!(
+            state
+                .lock()
+                .expect("runtime state lock should not be poisoned")
+                .agents
+                .is_empty()
+        );
+        fs::remove_dir_all(cleanup).ok();
     }
 
     #[test]

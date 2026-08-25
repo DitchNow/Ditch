@@ -1,5 +1,10 @@
+#![allow(clippy::items_after_test_module)]
+
 use chrono::{DateTime, Utc};
-use ditch_core::{AgentResumeBlockReason, AgentRun, AgentState, AppPaths, Project, ProjectId};
+use ditch_core::{
+    AgentId, AgentResumeBlockReason, AgentRun, AgentState, AppPaths, ManagedWorktree, Project,
+    ProjectGitOperation, ProjectGitOperationId, ProjectId, WorktreeId,
+};
 use ditch_protocol::{AgentChatMessage, AgentMessagePage, RuntimeAttention, SequencedAgentMessage};
 use rusqlite::{Connection, Transaction, params};
 use std::collections::HashSet;
@@ -29,6 +34,8 @@ pub struct DurableState {
     pub projects: Vec<Project>,
     pub agents: Vec<DurableAgent>,
     pub attention: Vec<RuntimeAttention>,
+    pub worktrees: Vec<ManagedWorktree>,
+    pub project_git_operations: Vec<ProjectGitOperation>,
 }
 
 pub struct DitchStore {
@@ -46,10 +53,16 @@ impl DitchStore {
             "git_policy",
             "TEXT NOT NULL DEFAULT '\"RequireRepository\"'",
         )?;
+        ensure_column(
+            &connection,
+            "projects",
+            "integration_policy",
+            "TEXT NOT NULL DEFAULT '\"AutoApplyAfterValidation\"'",
+        )?;
         ensure_column(&connection, "agents", "run_json", "TEXT")?;
         ensure_column(&connection, "agents", "terminal_failure", "TEXT")?;
         ensure_column(&connection, "agents", "codex_home", "TEXT")?;
-        connection.pragma_update(None, "user_version", 1)?;
+        connection.pragma_update(None, "user_version", 4)?;
         let mut store = Self { connection };
         store.cleanup_polluted_permission_alerts()?;
         store.import_legacy_registry_if_empty(paths)?;
@@ -160,7 +173,7 @@ impl DitchStore {
 
     pub fn load(&self) -> Result<DurableState, StoreError> {
         let mut projects_stmt = self.connection.prepare(
-            "SELECT id, name, root, created_at, archived_at, git_policy FROM projects ORDER BY created_at",
+            "SELECT id, name, root, created_at, archived_at, git_policy, integration_policy FROM projects ORDER BY created_at",
         )?;
         let projects = projects_stmt
             .query_map([], |row| {
@@ -174,6 +187,7 @@ impl DitchStore {
                         .map(parse_time)
                         .transpose()?,
                     git_policy: from_json(&row.get::<_, String>(5)?)?,
+                    integration_policy: from_json(&row.get::<_, String>(6)?)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -211,10 +225,24 @@ impl DitchStore {
         let attention = attention_stmt
             .query_map([], |row| from_json(&row.get::<_, String>(0)?))?
             .collect::<Result<Vec<_>, _>>()?;
+        let mut worktree_stmt = self
+            .connection
+            .prepare("SELECT worktree_json FROM managed_worktrees ORDER BY created_at")?;
+        let worktrees = worktree_stmt
+            .query_map([], |row| from_json(&row.get::<_, String>(0)?))?
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut operation_stmt = self
+            .connection
+            .prepare("SELECT operation_json FROM project_git_operations ORDER BY created_at")?;
+        let project_git_operations = operation_stmt
+            .query_map([], |row| from_json(&row.get::<_, String>(0)?))?
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(DurableState {
             projects,
             agents,
             attention,
+            worktrees,
+            project_git_operations,
         })
     }
 
@@ -241,9 +269,9 @@ impl DitchStore {
 
     pub fn upsert_project(&mut self, project: &Project) -> Result<(), StoreError> {
         self.connection.execute(
-            "INSERT INTO projects(id,name,root,created_at,archived_at,git_policy) VALUES(?1,?2,?3,?4,?5,?6)
-             ON CONFLICT(id) DO UPDATE SET name=excluded.name,root=excluded.root,archived_at=excluded.archived_at,git_policy=excluded.git_policy",
-            params![project.id.0.to_string(), project.name, project.root.to_string_lossy(), project.created_at.to_rfc3339(), project.archived_at.map(|v| v.to_rfc3339()), to_json(&project.git_policy)?],
+            "INSERT INTO projects(id,name,root,created_at,archived_at,git_policy,integration_policy) VALUES(?1,?2,?3,?4,?5,?6,?7)
+             ON CONFLICT(id) DO UPDATE SET name=excluded.name,root=excluded.root,archived_at=excluded.archived_at,git_policy=excluded.git_policy,integration_policy=excluded.integration_policy",
+            params![project.id.0.to_string(), project.name, project.root.to_string_lossy(), project.created_at.to_rfc3339(), project.archived_at.map(|v| v.to_rfc3339()), to_json(&project.git_policy)?, to_json(&project.integration_policy)?],
         )?;
         Ok(())
     }
@@ -285,6 +313,104 @@ impl DitchStore {
              VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)
              ON CONFLICT(id) DO UPDATE SET state=excluded.state,native_session_id=excluded.native_session_id,current_prompt=excluded.current_prompt,last_visible_action=excluded.last_visible_action,state_confidence=excluded.state_confidence,state_evidence=excluded.state_evidence,updated_at=excluded.updated_at,run_json=excluded.run_json,terminal_failure=excluded.terminal_failure,codex_home=COALESCE(agents.codex_home,excluded.codex_home)",
             params![run.id.0.to_string(), to_json(&run.provider)?, to_json(&run.state)?, to_json(&run.launch_mode)?, run.project_id.0.to_string(), run.native_session_id, run.current_prompt, run.last_visible_action, run.state_confidence, run.state_evidence, run.started_at.to_rfc3339(), run.updated_at.to_rfc3339(), to_json(run)?, terminal_failure, codex_home],
+        )?;
+        Ok(())
+    }
+
+    pub fn upsert_worktree(&mut self, worktree: &ManagedWorktree) -> Result<(), StoreError> {
+        self.connection.execute(
+            "INSERT INTO managed_worktrees(id,project_id,session_id,path,branch_name,status,operation,worktree_json,created_at,updated_at)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
+             ON CONFLICT(id) DO UPDATE SET path=excluded.path,branch_name=excluded.branch_name,status=excluded.status,operation=excluded.operation,worktree_json=excluded.worktree_json,updated_at=excluded.updated_at",
+            params![
+                worktree.id.0.to_string(),
+                worktree.project_id.0.to_string(),
+                worktree.session_id.0.to_string(),
+                worktree.path.to_string_lossy(),
+                worktree.branch_name,
+                to_json(&worktree.status)?,
+                worktree.operation,
+                to_json(worktree)?,
+                worktree.created_at.to_rfc3339(),
+                worktree.updated_at.to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn worktree_for_agent(
+        &self,
+        agent_id: AgentId,
+    ) -> Result<Option<ManagedWorktree>, StoreError> {
+        match self.connection.query_row(
+            "SELECT worktree_json FROM managed_worktrees WHERE session_id=?1",
+            params![agent_id.0.to_string()],
+            |row| from_json(&row.get::<_, String>(0)?),
+        ) {
+            Ok(value) => Ok(Some(value)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    pub fn delete_worktree(&mut self, id: WorktreeId) -> Result<(), StoreError> {
+        self.connection.execute(
+            "DELETE FROM managed_worktrees WHERE id=?1",
+            params![id.0.to_string()],
+        )?;
+        Ok(())
+    }
+
+    pub fn append_git_event(
+        &mut self,
+        project_id: ProjectId,
+        session_id: Option<AgentId>,
+        kind: &str,
+        detail: &str,
+    ) -> Result<(), StoreError> {
+        self.connection.execute(
+            "INSERT INTO git_lifecycle_events(id,project_id,session_id,kind,detail,created_at)
+             VALUES(?1,?2,?3,?4,?5,?6)",
+            params![
+                uuid::Uuid::new_v4().to_string(),
+                project_id.0.to_string(),
+                session_id.map(|id| id.0.to_string()),
+                kind,
+                detail,
+                Utc::now().to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn upsert_project_git_operation(
+        &mut self,
+        operation: &ProjectGitOperation,
+    ) -> Result<(), StoreError> {
+        self.connection.execute(
+            "INSERT INTO project_git_operations(id,project_id,kind,state,operation_json,created_at,updated_at)
+             VALUES(?1,?2,?3,?4,?5,?6,?7)
+             ON CONFLICT(id) DO UPDATE SET state=excluded.state,operation_json=excluded.operation_json,updated_at=excluded.updated_at",
+            params![
+                operation.id.0.to_string(),
+                operation.project_id.0.to_string(),
+                operation.kind,
+                to_json(&operation.state)?,
+                to_json(operation)?,
+                operation.created_at.to_rfc3339(),
+                operation.updated_at.to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_project_git_operation(
+        &mut self,
+        id: ProjectGitOperationId,
+    ) -> Result<(), StoreError> {
+        self.connection.execute(
+            "DELETE FROM project_git_operations WHERE id=?1",
+            params![id.0.to_string()],
         )?;
         Ok(())
     }
@@ -417,6 +543,10 @@ impl DitchStore {
     pub fn delete_agent(&mut self, agent_id: ditch_core::AgentId) -> Result<(), StoreError> {
         let tx = self.connection.transaction()?;
         let id = agent_id.0.to_string();
+        tx.execute(
+            "DELETE FROM managed_worktrees WHERE session_id=?1",
+            params![id],
+        )?;
         tx.execute(
             "DELETE FROM permission_requests WHERE agent_id=?1",
             params![id],
@@ -873,6 +1003,107 @@ mod tests {
         );
         fs::remove_dir_all(root).unwrap();
     }
+
+    #[test]
+    fn persists_in_progress_worktree_journal_for_restart_reconciliation() {
+        let root =
+            std::env::temp_dir().join(format!("ditch-store-worktree-{}", uuid::Uuid::new_v4()));
+        let paths = AppPaths {
+            data_dir: root.clone(),
+            database_path: root.join("ditch.sqlite3"),
+            socket_path: root.join("ditchd.sock"),
+            logs_dir: root.join("logs"),
+            scrollback_dir: root.join("scrollback"),
+        };
+        ensure_app_dirs(&paths).unwrap();
+        let project = Project::new("Journal", root.join("project"));
+        let now = Utc::now();
+        let worktree = ManagedWorktree {
+            id: WorktreeId::new(),
+            project_id: project.id,
+            session_id: AgentId::new(),
+            path: root.join("managed"),
+            agent_cwd: root.join("managed"),
+            branch_name: format!("ditch/agent/{}/task", uuid::Uuid::new_v4().simple()),
+            base_branch: "main".into(),
+            base_commit_oid: "a".repeat(40),
+            target_branch: "main".into(),
+            target_oid_at_start: "a".repeat(40),
+            head_oid: "a".repeat(40),
+            checkpoint_oid: None,
+            candidate_oid: None,
+            candidate_target_oid: None,
+            candidate_checkpoint_oid: None,
+            resolution_path: None,
+            resolution_branch: None,
+            resolution_target_oid: None,
+            status: ditch_core::WorktreeStatus::Creating,
+            lock_state: ditch_core::WorktreeLockState::Unknown,
+            dirty: false,
+            changed_paths: vec![],
+            intent: None,
+            overlap_override: false,
+            overlapping_session_ids: vec![],
+            overlapping_paths: vec![],
+            overlap_risk: ditch_core::OverlapRisk::None,
+            conflict_state: ditch_core::ConflictState::None,
+            integration_state: ditch_core::IntegrationState::NotRequested,
+            validation_state: ditch_core::ValidationState::NotRun,
+            validation_checks: vec![],
+            operation: Some("create".into()),
+            last_error: None,
+            created_at: now,
+            updated_at: now,
+            last_reconciled_at: None,
+        };
+        {
+            let mut store = DitchStore::open(&paths).unwrap();
+            store.upsert_project(&project).unwrap();
+            store.upsert_worktree(&worktree).unwrap();
+        }
+        let restored = DitchStore::open(&paths).unwrap().load().unwrap();
+        assert_eq!(restored.worktrees, vec![worktree]);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn persists_initial_snapshot_operation_for_restart_reconciliation() {
+        let root = std::env::temp_dir().join(format!(
+            "ditch-store-initial-snapshot-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let paths = AppPaths {
+            data_dir: root.clone(),
+            database_path: root.join("ditch.sqlite3"),
+            socket_path: root.join("ditchd.sock"),
+            logs_dir: root.join("logs"),
+            scrollback_dir: root.join("scrollback"),
+        };
+        ensure_app_dirs(&paths).unwrap();
+        let project = Project::new("Journal", root.join("project"));
+        let now = Utc::now();
+        let operation = ProjectGitOperation {
+            id: ProjectGitOperationId::new(),
+            project_id: project.id,
+            kind: "initial_snapshot".into(),
+            target_branch: "main".into(),
+            expected_tree_oid: "a".repeat(40),
+            expected_old_oid: None,
+            created_commit_oid: Some("b".repeat(40)),
+            state: ditch_core::ProjectGitOperationState::CommitCreated,
+            last_error: None,
+            created_at: now,
+            updated_at: now,
+        };
+        {
+            let mut store = DitchStore::open(&paths).unwrap();
+            store.upsert_project(&project).unwrap();
+            store.upsert_project_git_operation(&operation).unwrap();
+        }
+        let restored = DitchStore::open(&paths).unwrap().load().unwrap();
+        assert_eq!(restored.project_git_operations, vec![operation]);
+        fs::remove_dir_all(root).unwrap();
+    }
 }
 
 pub const SCHEMA: &str = r#"
@@ -883,6 +1114,7 @@ CREATE TABLE IF NOT EXISTS projects (
   created_at TEXT NOT NULL,
   archived_at TEXT,
   git_policy TEXT NOT NULL
+  ,integration_policy TEXT NOT NULL DEFAULT '"AutoApplyAfterValidation"'
 );
 
 CREATE TABLE IF NOT EXISTS tasks (
@@ -947,5 +1179,37 @@ CREATE TABLE IF NOT EXISTS permission_requests (
 CREATE TABLE IF NOT EXISTS app_settings (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS managed_worktrees (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  session_id TEXT NOT NULL UNIQUE,
+  path TEXT NOT NULL UNIQUE,
+  branch_name TEXT NOT NULL UNIQUE,
+  status TEXT NOT NULL,
+  operation TEXT,
+  worktree_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS git_lifecycle_events (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  session_id TEXT REFERENCES agents(id) ON DELETE SET NULL,
+  kind TEXT NOT NULL,
+  detail TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS project_git_operations (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  kind TEXT NOT NULL,
+  state TEXT NOT NULL,
+  operation_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
 );
 "#;

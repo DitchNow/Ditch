@@ -15,7 +15,7 @@ Current limitations are:
 - macOS and Codex are the only working platform/provider combination.
 - Codex runs through a separate `codex exec` process for each turn. Interactive approval requests are not supported; the UI disables **Ask for approval**.
 - Closing the foreground window preserves work, but explicitly quitting the menu-bar runtime stops active agents. After an unexpected runtime restart, previously active runs are marked stale and can only be continued when Codex supplied a resumable thread ID.
-- The repository contains types and placeholder directories for other providers, hooks, MCP, tasks, and worktrees, but those are not complete user-facing features.
+- The repository contains early types and placeholder directories for other providers, hooks, MCP, and tasks. Git-backed Codex sessions now use daemon-managed linked worktrees; non-Git projects remain explicitly opt-in and do not receive isolation or integration support.
 - There is no GitHub release workflow or CI workflow in the repository yet.
 
 ## Why Ditch
@@ -57,6 +57,14 @@ Adding a project creates `.ditch/project.json` plus `.ditch/agents`, `.ditch/hoo
 
 Register local repositories and run more than one Codex agent at a time. Each session is tied to its project root, has its own lifecycle state, and can be stopped without targeting unrelated Codex processes.
 
+For Git-backed projects, each new agent receives a Ditch-owned branch and locked linked worktree. The runtime tracks actual changed paths, flags overlapping work, checkpoints completed work without changing the agent's index, simulates the merge against the current target, validates the combined candidate, and applies it only after a final target-OID and canonical-workspace safety check. Worktrees isolate files; they do not make semantic conflicts impossible, so clean Git merges still require combined validation.
+
+Ditch discovers validation from explicit `.ditch/validation.json` commands and declared repository tooling across JavaScript package managers, Cargo, Flutter/Dart, Go, Python, Gradle/Maven, Swift, .NET, Ruby, PHP, Elixir, Make, and Just. Validated candidates apply automatically by default; projects can opt into review-before-apply. When no trustworthy check can be discovered, Ditch keeps the result separate and requires an explicit “Apply without checks” confirmation.
+
+Git conflicts remain quarantined. An advanced manual-resolution action creates a separate locked resolver worktree containing Git's real conflicted merge; the canonical workspace stays untouched. Ditch accepts the resolved tree only after the user asks it to check the resolution and the combined validation succeeds.
+
+Linked worktrees require a committed starting tree, but this stays behind the product surface. Before every launch, Ditch compares the visible project with its current Git tree. Empty repositories receive an automatic baseline; safe non-ignored project files receive a journaled local save point using a repository-local Ditch identity; and the resulting checkout is verified before Codex starts. Ditch-owned metadata and ignored files are excluded. Only genuine hazards—such as credentials, nested repositories, staged manual Git work, or an in-progress merge/rebase—pause for review. Branches, worktree paths, and Git repair remain advanced details.
+
 ### Return to prior work
 
 Ditch stores prompts, assistant output, tool activity, run state, and Codex thread IDs. Conversations survive foreground-app restarts, earlier messages can be paged into the chat, and a follow-up resumes the original Codex thread when its identity and `CODEX_HOME` still match.
@@ -87,8 +95,9 @@ flowchart TD
     CLI[ditch_cli] -->|same local protocol| D
     H[AppKit menu-bar helper] --- D
     D -->|process group; stdin and JSON events| C[User's Codex CLI]
-    D -->|projects, runs, transcripts, attention| DB[(SQLite)]
+    D -->|projects, runs, worktrees, transcripts, attention| DB[(SQLite)]
     D -->|PTY I/O| SH[Per-project login shells]
+    D -->|locked linked worktrees and serialized integration| G[Git]
     H --> N[macOS local notifications]
 ```
 
@@ -97,6 +106,8 @@ The runtime is compiled as a Rust static library into the menu-bar login-item he
 For Codex work, `ditchd` starts `codex exec --json` in a dedicated process group for each turn and sends the prompt over stdin. Follow-ups use `codex exec resume` with the persisted native thread ID. Dedicated process groups allow Stop to interrupt and, if necessary, terminate the full child tree instead of leaving helper processes behind.
 
 Projects, session metadata, transcripts, attention state, and selected runtime settings are durable. Project terminals are PTYs owned by the running daemon, not by Flutter. File reads and writes also pass through the daemon, which enforces project-root and revision checks.
+
+Git control-plane mutations are owned exclusively by `ditchd` and serialized per repository. Managed worktrees live under the Ditch application-data directory, while project terminals and the file editor remain rooted in the user's canonical project. On restart the runtime reconciles persisted ownership against `git worktree list --porcelain -z`; missing or mismatched managed worktrees are retained as recovery states, and foreign worktrees are left alone.
 
 ## Local-First & Privacy
 

@@ -8,6 +8,7 @@
 include!("main.rs");
 
 #[unsafe(no_mangle)]
+#[allow(clippy::items_after_test_module)]
 pub extern "C" fn ditch_runtime_run() -> i32 {
     match run_runtime() {
         Ok(()) => 0,

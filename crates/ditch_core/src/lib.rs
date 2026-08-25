@@ -18,6 +18,12 @@ pub struct AgentId(pub Uuid);
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 pub struct RuntimePaneId(pub Uuid);
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+pub struct WorktreeId(pub Uuid);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+pub struct ProjectGitOperationId(pub Uuid);
+
 macro_rules! id_newtype {
     ($name:ident) => {
         impl $name {
@@ -39,6 +45,8 @@ id_newtype!(TaskId);
 id_newtype!(AttemptId);
 id_newtype!(AgentId);
 id_newtype!(RuntimePaneId);
+id_newtype!(WorktreeId);
+id_newtype!(ProjectGitOperationId);
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum TaskState {
@@ -109,17 +117,12 @@ pub enum CodexLaunchMode {
     Exec,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub enum AgentApprovalPreset {
     Ask,
+    #[default]
     ApproveForMe,
     FullAccess,
-}
-
-impl Default for AgentApprovalPreset {
-    fn default() -> Self {
-        Self::ApproveForMe
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Default)]
@@ -130,17 +133,204 @@ pub struct AgentExecutionProfile {
     pub approval: AgentApprovalPreset,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ProjectGitPolicy {
+    #[default]
     RequireRepository,
     InitializeRepository,
     AllowOutsideGit,
 }
 
-impl Default for ProjectGitPolicy {
-    fn default() -> Self {
-        Self::RequireRepository
-    }
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ProjectGitOperationState {
+    Preparing,
+    CommitCreated,
+    RefUpdated,
+    Completed,
+    RecoveryNeeded,
+    Failed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProjectGitOperation {
+    pub id: ProjectGitOperationId,
+    pub project_id: ProjectId,
+    pub kind: String,
+    pub target_branch: String,
+    pub expected_tree_oid: String,
+    /// The target value protected by compare-and-swap when this operation began.
+    /// `None` denotes an unborn branch created from the all-zero OID.
+    #[serde(default)]
+    pub expected_old_oid: Option<String>,
+    pub created_commit_oid: Option<String>,
+    pub state: ProjectGitOperationState,
+    pub last_error: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum WorktreeStatus {
+    Creating,
+    Ready,
+    Active,
+    Dirty,
+    Waiting,
+    Finished,
+    NeedsReview,
+    QueuedForIntegration,
+    CheckingMerge,
+    ConflictRisk,
+    Validating,
+    ReadyToApply,
+    Applying,
+    Integrated,
+    Discarded,
+    CleanupPending,
+    Orphaned,
+    RecoveryNeeded,
+    Failed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum WorktreeLockState {
+    Locked,
+    Unlocked,
+    Missing,
+    Unknown,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ConflictState {
+    None,
+    IntentOverlap,
+    PathOverlap,
+    GitConflict,
+    ValidationFailed,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub enum OverlapRisk {
+    #[default]
+    None,
+    Intent,
+    Path,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum IntegrationState {
+    NotRequested,
+    Queued,
+    Checking,
+    Conflict,
+    Validating,
+    Ready,
+    Applying,
+    Applied,
+    Blocked,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ValidationState {
+    NotRun,
+    Running,
+    Passed,
+    Failed,
+    NotConfigured,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub enum IntegrationPolicy {
+    ReviewBeforeApply,
+    #[default]
+    AutoApplyAfterValidation,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ChangeIntent {
+    pub summary: String,
+    #[serde(default)]
+    pub expected_paths: Vec<String>,
+    #[serde(default)]
+    pub shared_paths: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ValidationCheck {
+    pub name: String,
+    pub passed: bool,
+    pub exit_code: Option<i32>,
+    pub output: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct WorktreeFileChange {
+    pub status: String,
+    pub path: String,
+    pub previous_path: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct WorktreeReview {
+    pub session_id: AgentId,
+    pub base_commit_oid: String,
+    pub checkpoint_oid: String,
+    pub candidate_target_oid: Option<String>,
+    pub candidate_oid: Option<String>,
+    pub candidate_is_stale: bool,
+    pub agent_changes: Vec<WorktreeFileChange>,
+    pub combined_changes: Vec<WorktreeFileChange>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ManagedWorktree {
+    pub id: WorktreeId,
+    pub project_id: ProjectId,
+    pub session_id: AgentId,
+    pub path: PathBuf,
+    #[serde(default)]
+    pub agent_cwd: PathBuf,
+    pub branch_name: String,
+    pub base_branch: String,
+    pub base_commit_oid: String,
+    pub target_branch: String,
+    pub target_oid_at_start: String,
+    pub head_oid: String,
+    pub checkpoint_oid: Option<String>,
+    pub candidate_oid: Option<String>,
+    pub candidate_target_oid: Option<String>,
+    #[serde(default)]
+    pub candidate_checkpoint_oid: Option<String>,
+    #[serde(default)]
+    pub resolution_path: Option<PathBuf>,
+    #[serde(default)]
+    pub resolution_branch: Option<String>,
+    #[serde(default)]
+    pub resolution_target_oid: Option<String>,
+    pub status: WorktreeStatus,
+    pub lock_state: WorktreeLockState,
+    pub dirty: bool,
+    #[serde(default)]
+    pub changed_paths: Vec<String>,
+    pub intent: Option<ChangeIntent>,
+    #[serde(default)]
+    pub overlap_override: bool,
+    #[serde(default)]
+    pub overlapping_session_ids: Vec<AgentId>,
+    #[serde(default)]
+    pub overlapping_paths: Vec<String>,
+    #[serde(default)]
+    pub overlap_risk: OverlapRisk,
+    pub conflict_state: ConflictState,
+    pub integration_state: IntegrationState,
+    pub validation_state: ValidationState,
+    #[serde(default)]
+    pub validation_checks: Vec<ValidationCheck>,
+    pub operation: Option<String>,
+    pub last_error: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub last_reconciled_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -152,6 +342,8 @@ pub struct Project {
     pub archived_at: Option<DateTime<Utc>>,
     #[serde(default)]
     pub git_policy: ProjectGitPolicy,
+    #[serde(default)]
+    pub integration_policy: IntegrationPolicy,
 }
 
 impl Project {
@@ -163,6 +355,7 @@ impl Project {
             created_at: Utc::now(),
             archived_at: None,
             git_policy: ProjectGitPolicy::RequireRepository,
+            integration_policy: IntegrationPolicy::default(),
         }
     }
 

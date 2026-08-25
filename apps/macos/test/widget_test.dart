@@ -24,6 +24,137 @@ Widget _testApp() => const TheDitchApp(
 );
 
 void main() {
+  testWidgets('managed worktree status uses founder-facing language', (
+    tester,
+  ) async {
+    final session = AgentSession(
+      localId: 'agent-worktree',
+      provider: AgentProvider.codex,
+      status: AgentStatus.completed,
+      messages: const [],
+      worktreePath: '/tmp/managed',
+      worktreeStatus: 'ReadyToApply',
+      changedPaths: const ['lib/auth.dart', 'test/auth_test.dart'],
+    );
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(body: WorktreeStatusChip(session: session)),
+      ),
+    );
+    expect(find.text('Ready to apply'), findsOneWidget);
+  });
+
+  testWidgets('overlap risk does not present a running agent as waiting', (
+    tester,
+  ) async {
+    final session = AgentSession(
+      localId: 'agent-overlap',
+      provider: AgentProvider.codex,
+      status: AgentStatus.working,
+      messages: const [],
+      worktreePath: '/tmp/managed-overlap',
+      worktreeStatus: 'Dirty',
+      overlapRisk: 'Path',
+      overlappingPaths: const ['lib/auth/login.dart'],
+    );
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(body: WorktreeStatusChip(session: session)),
+      ),
+    );
+
+    expect(find.text('Working separately · overlap detected'), findsOneWidget);
+    expect(find.text('Waiting for another task'), findsNothing);
+    expect(find.text('Run separately anyway'), findsNothing);
+  });
+
+  testWidgets('worktree review shows agent and combined file sets', (
+    tester,
+  ) async {
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: WorktreeReviewDialog(
+            review: {
+              'agent_changes': [
+                {
+                  'status': 'R100',
+                  'previous_path': 'lib/old.dart',
+                  'path': 'lib/new.dart',
+                },
+              ],
+              'combined_changes': [
+                {'status': 'M', 'path': 'lib/new.dart'},
+              ],
+              'candidate_is_stale': false,
+            },
+            validationState: 'Passed',
+            validationChecks: const [
+              {'name': 'Project tests', 'passed': true},
+            ],
+            canApply: true,
+          ),
+        ),
+      ),
+    );
+
+    expect(find.text('What the agent changed'), findsOneWidget);
+    expect(find.text('What will be applied'), findsOneWidget);
+    expect(find.text('lib/old.dart → lib/new.dart'), findsOneWidget);
+    expect(find.text('Project tests'), findsOneWidget);
+    expect(find.text('Apply'), findsOneWidget);
+    expect(find.text('Keep separate'), findsOneWidget);
+  });
+
+  testWidgets(
+    'review offers explicit continuation when checks are unavailable',
+    (tester) async {
+      await tester.pumpWidget(
+        const MaterialApp(
+          home: Scaffold(
+            body: WorktreeReviewDialog(
+              review: {
+                'agent_changes': [],
+                'combined_changes': [],
+                'candidate_is_stale': false,
+              },
+              validationState: 'NotConfigured',
+              canApplyWithoutValidation: true,
+            ),
+          ),
+        ),
+      );
+
+      expect(
+        find.text('No project validation commands were discovered.'),
+        findsOneWidget,
+      );
+      expect(find.text('Apply without checks'), findsOneWidget);
+    },
+  );
+
+  testWidgets('conflicted review offers an isolated manual resolution path', (
+    tester,
+  ) async {
+    await tester.pumpWidget(
+      const MaterialApp(
+        home: Scaffold(
+          body: WorktreeReviewDialog(
+            review: {
+              'agent_changes': [],
+              'combined_changes': [],
+              'candidate_is_stale': false,
+            },
+            canResolve: true,
+          ),
+        ),
+      ),
+    );
+
+    expect(find.text('Resolve manually'), findsOneWidget);
+    expect(find.text('Keep separate'), findsOneWidget);
+  });
+
   test('agent execution settings expose model and approval controls', () {
     final settings = AgentExecutionSettings();
 
@@ -82,10 +213,7 @@ void main() {
         'codex_home': '/tmp/codex',
         'codex_binary': '/opt/homebrew/bin/codex',
         'build_version': '1.0.0',
-        'capabilities': [
-          'persistent_sessions_v1',
-          'always_on_web_access_v1',
-        ],
+        'capabilities': ['persistent_sessions_v1', 'always_on_web_access_v1'],
       },
     });
 
@@ -121,12 +249,17 @@ void main() {
       'name': 'Recovered',
       'root': '/tmp/recovered',
       'git_policy': 'AllowOutsideGit',
+      'integration_policy': 'ReviewBeforeApply',
     });
 
     expect(project, isNotNull);
     expect(project!.name, 'Recovered');
     expect(project.path, '/tmp/recovered');
     expect(project.gitPolicy, ProjectGitPolicy.allowOutsideGit);
+    expect(
+      project.integrationPolicy,
+      ProjectIntegrationPolicy.reviewBeforeApply,
+    );
   });
 
   test('project reconciliation replaces duplicate ids and paths', () {
@@ -522,10 +655,7 @@ void main() {
     expect(find.byKey(const Key('onboarding-continue')), findsOneWidget);
     expect(find.byKey(const Key('first-project-add')), findsNothing);
     expect(find.widgetWithText(AlertDialog, 'Add Project'), findsNothing);
-    expect(
-      find.text('/Users/tester/Projects/example'),
-      findsNothing,
-    );
+    expect(find.text('/Users/tester/Projects/example'), findsNothing);
     expect(find.text('PROJECTS'), findsNothing);
   });
 
@@ -1228,6 +1358,69 @@ void main() {
       find.descendant(of: dialog, matching: find.text('new initial prompt')),
       findsOneWidget,
     );
+  });
+
+  testWidgets('initial snapshot confirmation uses founder-facing language', (
+    tester,
+  ) async {
+    const readiness = ProjectAgentReadinessReport(
+      state: ProjectAgentReadinessState.needsInitialSnapshot,
+      repositoryRoot: '/tmp/project',
+      targetBranch: 'main',
+      includedFileCount: 2,
+      samplePaths: ['Cargo.toml', 'src/main.rs'],
+      warnings: [],
+      snapshotTreeOid: 'tree',
+    );
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Builder(
+          builder: (context) => Scaffold(
+            body: TextButton(
+              onPressed: () => showDialog<bool>(
+                context: context,
+                builder: (_) =>
+                    const InitialProjectSnapshotDialog(readiness: readiness),
+              ),
+              child: const Text('Open'),
+            ),
+          ),
+        ),
+      ),
+    );
+
+    await tester.tap(find.text('Open'));
+    await tester.pumpAndSettle();
+
+    expect(find.text('Review project files'), findsOneWidget);
+    expect(find.textContaining('2 project files'), findsOneWidget);
+    expect(find.text('Continue and run agent'), findsOneWidget);
+    expect(find.text('Cancel'), findsOneWidget);
+    expect(find.textContaining('root commit'), findsNothing);
+  });
+
+  test('safe project preparation is automatic and hazards require review', () {
+    const safe = ProjectAgentReadinessReport(
+      state: ProjectAgentReadinessState.needsInitialSnapshot,
+      repositoryRoot: '/tmp/project',
+      targetBranch: 'main',
+      includedFileCount: 2,
+      samplePaths: ['Cargo.toml', 'src/main.rs'],
+      warnings: [],
+      snapshotTreeOid: 'tree',
+    );
+    const hazardous = ProjectAgentReadinessReport(
+      state: ProjectAgentReadinessState.needsInitialSnapshot,
+      repositoryRoot: '/tmp/project',
+      targetBranch: 'main',
+      includedFileCount: 1,
+      samplePaths: ['.env'],
+      warnings: ['.env may contain credentials.'],
+      snapshotTreeOid: 'tree',
+    );
+
+    expect(initialProjectPreparationNeedsReview(safe), isFalse);
+    expect(initialProjectPreparationNeedsReview(hazardous), isTrue);
   });
 
   testWidgets('new agent action lives in the Agents header', (tester) async {

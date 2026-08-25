@@ -101,13 +101,17 @@ class DitchProject {
     required this.name,
     required this.path,
     this.gitPolicy = ProjectGitPolicy.requireRepository,
+    this.integrationPolicy = ProjectIntegrationPolicy.autoApply,
   });
 
   final String? id;
   final String name;
   final String path;
   final ProjectGitPolicy gitPolicy;
+  final ProjectIntegrationPolicy integrationPolicy;
 }
+
+enum ProjectIntegrationPolicy { autoApply, reviewBeforeApply }
 
 enum ProjectGitPolicy {
   requireRepository,
@@ -280,6 +284,69 @@ class CodexReadinessReport {
   bool get ready => path != null && compatible && authenticated;
 }
 
+enum ProjectAgentReadinessState {
+  ready,
+  needsInitialSnapshot,
+  unsafeInitialSnapshot,
+}
+
+class ProjectAgentReadinessReport {
+  const ProjectAgentReadinessReport({
+    required this.state,
+    required this.repositoryRoot,
+    required this.targetBranch,
+    required this.includedFileCount,
+    required this.samplePaths,
+    required this.warnings,
+    required this.snapshotTreeOid,
+  });
+
+  factory ProjectAgentReadinessReport.fromResponse(
+    Map<String, dynamic> response,
+  ) {
+    final value = response['ProjectAgentReadiness'];
+    if (value is! Map) {
+      throw const FormatException(
+        'Runtime returned invalid project agent readiness.',
+      );
+    }
+    final state = switch (value['state']?.toString()) {
+      'Ready' => ProjectAgentReadinessState.ready,
+      'NeedsInitialSnapshot' => ProjectAgentReadinessState.needsInitialSnapshot,
+      'UnsafeInitialSnapshot' =>
+        ProjectAgentReadinessState.unsafeInitialSnapshot,
+      _ => throw const FormatException(
+        'Runtime returned an unknown project readiness state.',
+      ),
+    };
+    return ProjectAgentReadinessReport(
+      state: state,
+      repositoryRoot: value['repository_root']?.toString() ?? '',
+      targetBranch: value['target_branch']?.toString() ?? '',
+      includedFileCount: (value['included_file_count'] as num?)?.toInt() ?? 0,
+      samplePaths:
+          (value['sample_paths'] as List?)
+              ?.map((path) => path.toString())
+              .toList() ??
+          const [],
+      warnings:
+          (value['warnings'] as List?)
+              ?.map((warning) => warning.toString())
+              .toList() ??
+          const [],
+      snapshotTreeOid: value['snapshot_tree_oid']?.toString(),
+    );
+  }
+
+  final ProjectAgentReadinessState state;
+  final String repositoryRoot;
+  final String targetBranch;
+  final int includedFileCount;
+  final List<String> samplePaths;
+  final List<String> warnings;
+  final String? snapshotTreeOid;
+}
+
 enum NotificationAuthorizationState {
   notDetermined,
   denied,
@@ -411,6 +478,21 @@ class AgentSession {
     this.hasOlderMessages = false,
     this.nextBeforeSequence,
     this.historyError,
+    this.worktreeStatus,
+    this.worktreePath,
+    this.worktreeBranch,
+    this.baseCommit,
+    this.targetBranch,
+    this.headCommit,
+    this.checkpointCommit,
+    this.resolutionPath,
+    this.integrationState,
+    this.validationState,
+    this.conflictState,
+    this.overlapRisk,
+    this.changedPaths = const [],
+    this.overlappingPaths = const [],
+    this.validationChecks = const [],
     DateTime? createdAt,
     DateTime? updatedAt,
   }) : createdAt = createdAt ?? DateTime.now(),
@@ -438,6 +520,82 @@ class AgentSession {
   bool hasOlderMessages;
   int? nextBeforeSequence;
   String? historyError;
+  String? worktreeStatus;
+  String? worktreePath;
+  String? worktreeBranch;
+  String? baseCommit;
+  String? targetBranch;
+  String? headCommit;
+  String? checkpointCommit;
+  String? resolutionPath;
+  String? integrationState;
+  String? validationState;
+  String? conflictState;
+  String? overlapRisk;
+  List<String> changedPaths;
+  List<String> overlappingPaths;
+  List<Map<String, dynamic>> validationChecks;
+
+  bool get hasManagedWorktree => worktreePath != null;
+  bool get hasPreservedChanges => checkpointCommit != null;
+  bool get hasOverlapRisk => overlapRisk == 'Path' || overlapRisk == 'Intent';
+  bool get canReviewChanges =>
+      hasManagedWorktree && hasPreservedChanges && !isActive;
+  bool get canPrepareIntegration =>
+      hasManagedWorktree &&
+      hasPreservedChanges &&
+      !isActive &&
+      worktreeStatus != 'ReadyToApply' &&
+      worktreeStatus != 'Integrated' &&
+      worktreeStatus != 'Applying' &&
+      worktreeStatus != 'CheckingMerge' &&
+      worktreeStatus != 'Validating' &&
+      worktreeStatus != 'QueuedForIntegration';
+  bool get canApplyIntegration => worktreeStatus == 'ReadyToApply' && !isActive;
+  bool get canApplyWithoutValidation =>
+      worktreeStatus == 'NeedsReview' &&
+      validationState == 'NotConfigured' &&
+      !isActive;
+  bool get canResolveConflict =>
+      conflictState == 'GitConflict' && resolutionPath == null && !isActive;
+  bool get canFinalizeResolution => resolutionPath != null && !isActive;
+  bool get canDiscardWorktree =>
+      hasManagedWorktree &&
+      !isActive &&
+      worktreeStatus != 'Discarded' &&
+      worktreeStatus != 'Integrated' &&
+      integrationState != 'Applied';
+
+  void applyWorktree(Object? value) {
+    if (value is! Map) return;
+    worktreeStatus = value['status']?.toString();
+    worktreePath = value['path']?.toString();
+    worktreeBranch = value['branch_name']?.toString();
+    baseCommit = value['base_commit_oid']?.toString();
+    targetBranch = value['target_branch']?.toString();
+    headCommit = value['head_oid']?.toString();
+    checkpointCommit = value['checkpoint_oid']?.toString();
+    resolutionPath = value['resolution_path']?.toString();
+    integrationState = value['integration_state']?.toString();
+    validationState = value['validation_state']?.toString();
+    conflictState = value['conflict_state']?.toString();
+    overlapRisk = value['overlap_risk']?.toString();
+    final paths = value['changed_paths'];
+    changedPaths = paths is List
+        ? paths.map((item) => item.toString()).toList(growable: false)
+        : const [];
+    final overlaps = value['overlapping_paths'];
+    overlappingPaths = overlaps is List
+        ? overlaps.map((item) => item.toString()).toList(growable: false)
+        : const [];
+    final checks = value['validation_checks'];
+    validationChecks = checks is List
+        ? checks
+              .whereType<Map>()
+              .map((item) => Map<String, dynamic>.from(item))
+              .toList(growable: false)
+        : const [];
+  }
 
   String get displayName {
     final override = userTitle?.trim();
@@ -478,6 +636,23 @@ void reconcileAgentSession(List<AgentSession> sessions, AgentSession incoming) {
   existing.currentPrompt = incoming.currentPrompt;
   existing.lastVisibleAction = incoming.lastVisibleAction;
   existing.canStop = incoming.canStop;
+  if (incoming.hasManagedWorktree) {
+    existing.worktreeStatus = incoming.worktreeStatus;
+    existing.worktreePath = incoming.worktreePath;
+    existing.worktreeBranch = incoming.worktreeBranch;
+    existing.baseCommit = incoming.baseCommit;
+    existing.targetBranch = incoming.targetBranch;
+    existing.headCommit = incoming.headCommit;
+    existing.checkpointCommit = incoming.checkpointCommit;
+    existing.resolutionPath = incoming.resolutionPath;
+    existing.integrationState = incoming.integrationState;
+    existing.validationState = incoming.validationState;
+    existing.conflictState = incoming.conflictState;
+    existing.overlapRisk = incoming.overlapRisk;
+    existing.changedPaths = incoming.changedPaths;
+    existing.overlappingPaths = incoming.overlappingPaths;
+    existing.validationChecks = incoming.validationChecks;
+  }
   existing.updatedAt = incoming.updatedAt;
   sessions.removeWhere(
     (session) =>
@@ -1012,9 +1187,45 @@ class DitchRuntimeClient {
     });
   }
 
+  Future<Map<String, dynamic>> setProjectIntegrationPolicy({
+    required String projectId,
+    required ProjectIntegrationPolicy policy,
+  }) {
+    return request({
+      'SetProjectIntegrationPolicy': {
+        'project_id': projectId,
+        'policy': policy == ProjectIntegrationPolicy.autoApply
+            ? 'AutoApplyAfterValidation'
+            : 'ReviewBeforeApply',
+      },
+    });
+  }
+
   Future<Map<String, dynamic>> deleteProject(String projectId) {
     return request({
       'DeleteProject': {'project_id': projectId},
+    });
+  }
+
+  Future<ProjectAgentReadinessReport> inspectProjectAgentReadiness(
+    String projectId,
+  ) async {
+    return ProjectAgentReadinessReport.fromResponse(
+      await request({
+        'InspectProjectAgentReadiness': {'project_id': projectId},
+      }),
+    );
+  }
+
+  Future<Map<String, dynamic>> createInitialProjectSnapshot({
+    required String projectId,
+    required String expectedTreeOid,
+  }) {
+    return request({
+      'CreateInitialProjectSnapshot': {
+        'project_id': projectId,
+        'expected_tree_oid': expectedTreeOid,
+      },
     });
   }
 
@@ -1066,6 +1277,82 @@ class DitchRuntimeClient {
         'agent_id': agentId,
         'prompt': prompt,
         'execution_profile': agentExecutionSettings.protocolValue,
+      },
+    });
+  }
+
+  Future<Map<String, dynamic>> prepareIntegration(String agentId) {
+    return request({
+      'PrepareIntegration': {'agent_id': agentId},
+    });
+  }
+
+  Future<Map<String, dynamic>> getWorktreeReview(String agentId) {
+    return request({
+      'GetWorktreeReview': {'agent_id': agentId},
+    });
+  }
+
+  Future<Map<String, dynamic>> applyIntegration(String agentId) {
+    return request({
+      'ApplyIntegration': {'agent_id': agentId},
+    });
+  }
+
+  Future<Map<String, dynamic>> applyIntegrationWithoutValidation(
+    String agentId,
+  ) {
+    return request({
+      'ApplyIntegrationWithoutValidation': {'agent_id': agentId},
+    });
+  }
+
+  Future<Map<String, dynamic>> createConflictResolution(String agentId) {
+    return request({
+      'CreateConflictResolution': {'agent_id': agentId},
+    });
+  }
+
+  Future<Map<String, dynamic>> finalizeConflictResolution(String agentId) {
+    return request({
+      'FinalizeConflictResolution': {'agent_id': agentId},
+    });
+  }
+
+  Future<Map<String, dynamic>> refreshWorktree(String agentId) {
+    return request({
+      'RefreshWorktree': {'agent_id': agentId},
+    });
+  }
+
+  Future<Map<String, dynamic>> overrideWorktreeOverlap(String agentId) {
+    return request({
+      'OverrideWorktreeOverlap': {'agent_id': agentId},
+    });
+  }
+
+  Future<Map<String, dynamic>> discardWorktree(String agentId) {
+    return request({
+      'DiscardWorktree': {'agent_id': agentId, 'confirm_dirty': true},
+    });
+  }
+
+  Future<Map<String, dynamic>> registerChangeIntent({
+    required String agentId,
+    required String summary,
+    required List<String> expectedPaths,
+    List<String> sharedPaths = const [],
+    bool continueOnOverlap = false,
+  }) {
+    return request({
+      'RegisterChangeIntent': {
+        'agent_id': agentId,
+        'intent': {
+          'summary': summary,
+          'expected_paths': expectedPaths,
+          'shared_paths': sharedPaths,
+        },
+        'continue_on_overlap': continueOnOverlap,
       },
     });
   }
@@ -1242,11 +1529,16 @@ DitchProject? parseRuntimeProject(Object? value) {
     'InitializeRepository' => ProjectGitPolicy.initializeRepository,
     _ => ProjectGitPolicy.requireRepository,
   };
+  final integrationPolicy =
+      value['integration_policy']?.toString() == 'ReviewBeforeApply'
+      ? ProjectIntegrationPolicy.reviewBeforeApply
+      : ProjectIntegrationPolicy.autoApply;
   return DitchProject(
     id: value['id']?.toString(),
     name: name,
     path: root,
     gitPolicy: gitPolicy,
+    integrationPolicy: integrationPolicy,
   );
 }
 
@@ -1978,6 +2270,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
     }
     final agentsJson = snapshot['agents'];
     final messagesJson = snapshot['messages'];
+    final worktreesJson = snapshot['worktrees'];
     if (agentsJson is! List) {
       return;
     }
@@ -2002,6 +2295,15 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
     final existingSessions = {
       for (final session in _agentSessions) session.localId: session,
     };
+    final worktreesByAgent = <String, Object?>{};
+    if (worktreesJson is List) {
+      for (final item in worktreesJson) {
+        if (item is Map) {
+          final agentId = _agentIdToString(item['session_id']);
+          if (agentId != null) worktreesByAgent[agentId] = item;
+        }
+      }
+    }
     final sessionsById = <String, AgentSession>{};
     for (final agentJson in agentsJson) {
       final session = _agentSessionFromRuntime(
@@ -2009,6 +2311,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
         messagesByAgent[_agentIdFromRuntimeAgent(agentJson)] ?? const [],
       );
       if (session != null) {
+        session.applyWorktree(worktreesByAgent[session.localId]);
         final existing = existingSessions[session.localId];
         if (existing != null) {
           session.messages
@@ -2310,6 +2613,35 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
     ).showSnackBar(const SnackBar(content: Text('Project path copied.')));
   }
 
+  Future<void> _toggleProjectIntegrationPolicy(DitchProject project) async {
+    final id = project.id;
+    if (id == null) return;
+    final next = project.integrationPolicy == ProjectIntegrationPolicy.autoApply
+        ? ProjectIntegrationPolicy.reviewBeforeApply
+        : ProjectIntegrationPolicy.autoApply;
+    try {
+      await _runtimeClient.setProjectIntegrationPolicy(
+        projectId: id,
+        policy: next,
+      );
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            next == ProjectIntegrationPolicy.autoApply
+                ? 'Safe validated results will apply automatically.'
+                : 'Ditch will wait for review before applying results.',
+          ),
+        ),
+      );
+    } on DitchRuntimeException catch (error) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(error.message)));
+    }
+  }
+
   Future<void> _deleteProject(DitchProject project) async {
     final projectId = project.id;
     if (projectId == null || !mounted) return;
@@ -2547,53 +2879,123 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
       );
       return false;
     }
-    final project = _selectedProject;
-    if (project.gitPolicy != ProjectGitPolicy.requireRepository ||
-        isInsideGitWorkTree(project.path)) {
+    var project = _selectedProject;
+    if (project.gitPolicy == ProjectGitPolicy.requireRepository &&
+        !isInsideGitWorkTree(project.path)) {
+      final policy = await showDialog<ProjectGitPolicy>(
+        context: context,
+        builder: (context) => AlertDialog(
+          title: const Text('Choose how Codex should run'),
+          content: Text(
+            '${project.name} is not inside a Git repository. You can initialize Git or explicitly allow Codex to run outside Git for this project.',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(),
+              child: const Text('Cancel'),
+            ),
+            OutlinedButton(
+              onPressed: () => Navigator.of(
+                context,
+              ).pop(ProjectGitPolicy.initializeRepository),
+              child: const Text('Initialize Git Repository'),
+            ),
+            FilledButton(
+              onPressed: () =>
+                  Navigator.of(context).pop(ProjectGitPolicy.allowOutsideGit),
+              child: const Text('Allow Codex Outside Git'),
+            ),
+          ],
+        ),
+      );
+      if (policy == null) {
+        return false;
+      }
+      final response = await _runtimeClient.createProject(
+        name: project.name,
+        root: project.path,
+        gitPolicy: policy,
+      );
+      final created = _projectFromRuntime(response['ProjectCreated']);
+      if (created != null && mounted) {
+        setState(() {
+          _projects[_selectedProjectIndex] = created;
+          _selectedProjectKey = _projectKey(created);
+        });
+        project = created;
+      }
+    }
+    if (project.gitPolicy != ProjectGitPolicy.requireRepository) {
       return true;
     }
-    final policy = await showDialog<ProjectGitPolicy>(
-      context: context,
-      builder: (context) => AlertDialog(
-        title: const Text('Choose how Codex should run'),
-        content: Text(
-          '${project.name} is not inside a Git repository. You can initialize Git or explicitly allow Codex to run outside Git for this project.',
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.of(context).pop(),
-            child: const Text('Cancel'),
-          ),
-          OutlinedButton(
-            onPressed: () => Navigator.of(
-              context,
-            ).pop(ProjectGitPolicy.initializeRepository),
-            child: const Text('Initialize Git Repository'),
-          ),
-          FilledButton(
-            onPressed: () =>
-                Navigator.of(context).pop(ProjectGitPolicy.allowOutsideGit),
-            child: const Text('Allow Codex Outside Git'),
-          ),
-        ],
-      ),
-    );
-    if (policy == null) {
+    return _prepareInitialProjectSnapshot(project);
+  }
+
+  Future<bool> _prepareInitialProjectSnapshot(DitchProject project) async {
+    final projectId = project.id;
+    if (projectId == null) {
+      _showProjectSetupResult(
+        title: 'Project setup required',
+        message: 'Reload this project before starting an agent.',
+        isError: true,
+      );
       return false;
     }
-    final response = await _runtimeClient.createProject(
-      name: project.name,
-      root: project.path,
-      gitPolicy: policy,
-    );
-    final created = _projectFromRuntime(response['ProjectCreated']);
-    if (created != null && mounted) {
-      setState(() {
-        _projects[_selectedProjectIndex] = created;
-        _selectedProjectKey = _projectKey(created);
-      });
+    try {
+      final readiness = await _runtimeClient.inspectProjectAgentReadiness(
+        projectId,
+      );
+      if (!mounted || readiness.state == ProjectAgentReadinessState.ready) {
+        return mounted;
+      }
+      if (readiness.state == ProjectAgentReadinessState.unsafeInitialSnapshot) {
+        _showProjectSetupResult(
+          title: 'Project needs review',
+          message: readiness.warnings.isEmpty
+              ? 'Ditch cannot safely prepare the current project files.'
+              : readiness.warnings.join('\n'),
+          isError: true,
+        );
+        return false;
+      }
+      final treeOid = readiness.snapshotTreeOid;
+      if (treeOid == null) {
+        throw const FormatException(
+          'Runtime did not provide a starting snapshot token.',
+        );
+      }
+      final approved = !initialProjectPreparationNeedsReview(readiness)
+          ? true
+          : await showDialog<bool>(
+              context: context,
+              builder: (context) =>
+                  InitialProjectSnapshotDialog(readiness: readiness),
+            );
+      if (approved != true || !mounted) {
+        return false;
+      }
+      await _runtimeClient.createInitialProjectSnapshot(
+        projectId: projectId,
+        expectedTreeOid: treeOid,
+      );
+      return mounted;
+    } on DitchRuntimeException catch (error) {
+      _showProjectSetupResult(
+        title: error.code == 'initial_snapshot_changed'
+            ? 'Project changed during setup'
+            : 'Project setup failed',
+        message: error.message,
+        isError: true,
+      );
+      return false;
+    } on Object catch (error) {
+      _showProjectSetupResult(
+        title: 'Project setup failed',
+        message: '$error',
+        isError: true,
+      );
+      return false;
     }
-    return true;
   }
 
   Future<void> _submitComposer(AgentSession session, String prompt) async {
@@ -2998,6 +3400,16 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
         }
       });
       _scheduleStatusBarUpdate();
+      return;
+    }
+
+    final worktreeChanged = eventBody['WorktreeChanged'];
+    if (worktreeChanged is Map) {
+      final agentId = _agentIdToString(worktreeChanged['session_id']);
+      final session = agentId == null ? null : _agentSessionByLocalId(agentId);
+      if (session != null) {
+        setState(() => session.applyWorktree(worktreeChanged));
+      }
       return;
     }
 
@@ -3886,6 +4298,8 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
                             unawaited(_revealProjectInFinder(project)),
                         onCopyProjectPath: (project) =>
                             unawaited(_copyProjectPath(project)),
+                        onToggleIntegrationPolicy: (project) =>
+                            unawaited(_toggleProjectIntegrationPolicy(project)),
                         onDeleteProject: (project) =>
                             unawaited(_deleteProject(project)),
                         summaryForProject: (project) => summarizeProjectAgents(
@@ -4941,6 +5355,7 @@ class ProjectSidebar extends StatelessWidget {
     required this.onSelectProject,
     required this.onRevealProject,
     required this.onCopyProjectPath,
+    required this.onToggleIntegrationPolicy,
     required this.onDeleteProject,
     required this.summaryForProject,
     super.key,
@@ -4953,6 +5368,7 @@ class ProjectSidebar extends StatelessWidget {
   final ValueChanged<int> onSelectProject;
   final ValueChanged<DitchProject> onRevealProject;
   final ValueChanged<DitchProject> onCopyProjectPath;
+  final ValueChanged<DitchProject> onToggleIntegrationPolicy;
   final ValueChanged<DitchProject> onDeleteProject;
   final ProjectAgentSummary Function(DitchProject) summaryForProject;
 
@@ -4993,6 +5409,9 @@ class ProjectSidebar extends StatelessWidget {
                         onTap: () => onSelectProject(index),
                         onReveal: () => onRevealProject(project),
                         onCopyPath: () => onCopyProjectPath(project),
+                        integrationPolicy: project.integrationPolicy,
+                        onToggleIntegrationPolicy: () =>
+                            onToggleIntegrationPolicy(project),
                         onDelete: () => onDeleteProject(project),
                         runningCount: summary.runningCount,
                         stoppedCount: summary.stoppedCount,
@@ -5024,6 +5443,8 @@ class ProjectTile extends StatelessWidget {
     required this.onTap,
     required this.onReveal,
     required this.onCopyPath,
+    this.integrationPolicy = ProjectIntegrationPolicy.autoApply,
+    this.onToggleIntegrationPolicy = _ignoreCallback,
     required this.onDelete,
     this.runningCount = 0,
     this.stoppedCount = 0,
@@ -5037,6 +5458,8 @@ class ProjectTile extends StatelessWidget {
   final VoidCallback onTap;
   final VoidCallback onReveal;
   final VoidCallback onCopyPath;
+  final ProjectIntegrationPolicy integrationPolicy;
+  final VoidCallback onToggleIntegrationPolicy;
   final VoidCallback onDelete;
   final int runningCount;
   final int stoppedCount;
@@ -5058,18 +5481,31 @@ class ProjectTile extends StatelessWidget {
         ),
         Offset.zero & overlay.size,
       ),
-      items: const [
-        PopupMenuItem(
+      items: [
+        const PopupMenuItem(
           value: _ProjectMenuAction.copyPath,
           child: Text('Copy Project Path'),
         ),
-        PopupMenuDivider(),
-        PopupMenuItem(value: _ProjectMenuAction.delete, child: Text('Delete')),
+        PopupMenuItem(
+          value: _ProjectMenuAction.toggleIntegration,
+          child: Text(
+            integrationPolicy == ProjectIntegrationPolicy.autoApply
+                ? 'Review Before Applying'
+                : 'Apply Validated Work Automatically',
+          ),
+        ),
+        const PopupMenuDivider(),
+        const PopupMenuItem(
+          value: _ProjectMenuAction.delete,
+          child: Text('Delete'),
+        ),
       ],
     );
     switch (action) {
       case _ProjectMenuAction.copyPath:
         onCopyPath();
+      case _ProjectMenuAction.toggleIntegration:
+        onToggleIntegrationPolicy();
       case _ProjectMenuAction.delete:
         onDelete();
       case null:
@@ -5163,7 +5599,7 @@ class ProjectTile extends StatelessWidget {
   }
 }
 
-enum _ProjectMenuAction { copyPath, delete }
+enum _ProjectMenuAction { copyPath, toggleIntegration, delete }
 
 class AgentsSurface extends StatelessWidget {
   const AgentsSurface({
@@ -5659,6 +6095,15 @@ class ExpandableAgentPanel extends StatelessWidget {
                   ),
                   const SizedBox(height: 2),
                   AgentStatusChip(status: session.status),
+                  if (session.hasManagedWorktree) ...[
+                    const SizedBox(height: 4),
+                    WorktreeStatusChip(session: session),
+                    const SizedBox(height: 2),
+                    Text(
+                      '${session.changedPaths.length} ${session.changedPaths.length == 1 ? 'file' : 'files'} changed',
+                      style: Theme.of(context).textTheme.bodySmall,
+                    ),
+                  ],
                   if (session.lastVisibleAction != null) ...[
                     const SizedBox(height: 2),
                     Text(
@@ -5686,6 +6131,39 @@ class ExpandableAgentPanel extends StatelessWidget {
           spacing: 8,
           runSpacing: 8,
           children: [
+            if (session.canReviewChanges)
+              OutlinedButton.icon(
+                onPressed: () => _reviewChanges(context),
+                icon: const Icon(Icons.difference_outlined),
+                label: const Text('Review changes'),
+              ),
+            if (session.canPrepareIntegration)
+              OutlinedButton.icon(
+                onPressed: () => _runIntegrationAction(
+                  context,
+                  () =>
+                      DitchRuntimeClient().prepareIntegration(session.localId),
+                  'Checking against the latest project…',
+                ),
+                icon: const Icon(Icons.refresh_outlined),
+                label: const Text('Check again'),
+              ),
+            if (session.canApplyIntegration)
+              FilledButton.icon(
+                onPressed: () => _runIntegrationAction(
+                  context,
+                  () => DitchRuntimeClient().applyIntegration(session.localId),
+                  'Applying safely…',
+                ),
+                icon: const Icon(Icons.merge_outlined),
+                label: const Text('Apply'),
+              ),
+            if (session.canDiscardWorktree)
+              IconButton(
+                onPressed: () => _confirmDiscardWorktree(context),
+                tooltip: 'Discard preserved workspace',
+                icon: const Icon(Icons.delete_sweep_outlined),
+              ),
             IconButton(
               onPressed: onEnlarge,
               tooltip: enlarged
@@ -5708,7 +6186,9 @@ class ExpandableAgentPanel extends StatelessWidget {
               label: const Text('Stop'),
             ),
             IconButton(
-              onPressed: session.isActive ? null : onDelete,
+              onPressed: session.isActive || session.canDiscardWorktree
+                  ? null
+                  : onDelete,
               tooltip: 'Delete agent permanently',
               icon: const Icon(Icons.delete_outline),
             ),
@@ -5798,6 +6278,412 @@ class ExpandableAgentPanel extends StatelessWidget {
     return switch (provider) {
       AgentProvider.codex => Icons.memory,
     };
+  }
+
+  Future<void> _runIntegrationAction(
+    BuildContext context,
+    Future<Map<String, dynamic>> Function() action,
+    String progress,
+  ) async {
+    final messenger = ScaffoldMessenger.of(context);
+    messenger.showSnackBar(SnackBar(content: Text(progress)));
+    try {
+      await action();
+    } on DitchRuntimeException catch (error) {
+      if (!context.mounted) return;
+      messenger.showSnackBar(SnackBar(content: Text(error.message)));
+    } on Object catch (_) {
+      if (!context.mounted) return;
+      messenger.showSnackBar(
+        const SnackBar(content: Text('That action could not be completed.')),
+      );
+    }
+  }
+
+  Future<void> _reviewChanges(BuildContext context) async {
+    final messenger = ScaffoldMessenger.of(context);
+    try {
+      final response = await DitchRuntimeClient().getWorktreeReview(
+        session.localId,
+      );
+      final raw = response['WorktreeReview'];
+      if (!context.mounted || raw is! Map) return;
+      final selected = await showDialog<WorktreeReviewAction>(
+        context: context,
+        builder: (dialogContext) => WorktreeReviewDialog(
+          review: Map<String, dynamic>.from(raw),
+          validationState: session.validationState,
+          validationChecks: session.validationChecks,
+          canApply: session.canApplyIntegration,
+          canApplyWithoutValidation: session.canApplyWithoutValidation,
+          canRetry: session.canPrepareIntegration,
+          canResolve: session.canResolveConflict,
+          canFinalizeResolution: session.canFinalizeResolution,
+        ),
+      );
+      if (!context.mounted) return;
+      switch (selected) {
+        case WorktreeReviewAction.apply:
+          await _runIntegrationAction(
+            context,
+            () => DitchRuntimeClient().applyIntegration(session.localId),
+            'Applying safely…',
+          );
+        case WorktreeReviewAction.applyWithoutValidation:
+          await _confirmApplyWithoutValidation(context);
+        case WorktreeReviewAction.retry:
+          await _runIntegrationAction(
+            context,
+            () => DitchRuntimeClient().prepareIntegration(session.localId),
+            'Checking against the latest project…',
+          );
+        case WorktreeReviewAction.resolve:
+          await _openConflictResolution(context);
+        case WorktreeReviewAction.finalizeResolution:
+          await _runIntegrationAction(
+            context,
+            () => DitchRuntimeClient().finalizeConflictResolution(
+              session.localId,
+            ),
+            'Checking the manual resolution…',
+          );
+        case null:
+          break;
+      }
+    } on DitchRuntimeException catch (error) {
+      messenger.showSnackBar(SnackBar(content: Text(error.message)));
+    } on Object catch (_) {
+      messenger.showSnackBar(
+        const SnackBar(content: Text('The change review could not be opened.')),
+      );
+    }
+  }
+
+  Future<void> _openConflictResolution(BuildContext context) async {
+    final messenger = ScaffoldMessenger.of(context);
+    try {
+      final response = await DitchRuntimeClient().createConflictResolution(
+        session.localId,
+      );
+      final raw = response['ConflictResolutionWorkspace'];
+      final path = raw is Map ? raw['path']?.toString() : null;
+      if (path == null) return;
+      try {
+        await _TheDitchAppState._applicationChannel.invokeMethod<bool>(
+          'revealInFinder',
+          path,
+        );
+      } on Object {
+        // The path remains available in advanced worktree details.
+      }
+      messenger.showSnackBar(
+        const SnackBar(
+          content: Text(
+            'Resolve the marked files in the isolated workspace, then choose “Check resolution.”',
+          ),
+        ),
+      );
+    } on DitchRuntimeException catch (error) {
+      messenger.showSnackBar(SnackBar(content: Text(error.message)));
+    }
+  }
+
+  Future<void> _confirmApplyWithoutValidation(BuildContext context) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('Apply without validation?'),
+        content: const Text(
+          'Git found no merge conflict, but Ditch could not discover project checks. The combined software has not been tested.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, false),
+            child: const Text('Keep separate'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(dialogContext, true),
+            child: const Text('Apply without checks'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !context.mounted) return;
+    await _runIntegrationAction(
+      context,
+      () => DitchRuntimeClient().applyIntegrationWithoutValidation(
+        session.localId,
+      ),
+      'Applying without validation…',
+    );
+  }
+
+  Future<void> _confirmDiscardWorktree(BuildContext context) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('Discard this task workspace?'),
+        content: const Text(
+          'The agent conversation stays in Ditch. Its preserved code changes will be removed and cannot be applied afterward.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(dialogContext, true),
+            child: const Text('Discard'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !context.mounted) return;
+    await _runIntegrationAction(
+      context,
+      () => DitchRuntimeClient().discardWorktree(session.localId),
+      'Discarding the preserved workspace…',
+    );
+  }
+}
+
+class WorktreeStatusChip extends StatelessWidget {
+  const WorktreeStatusChip({required this.session, super.key});
+
+  final AgentSession session;
+
+  @override
+  Widget build(BuildContext context) {
+    final status = session.worktreeStatus;
+    final (label, color) = switch (status) {
+      'ReadyToApply' => ('Ready to apply', Colors.green),
+      'Applying' => ('Applying', Colors.blue),
+      'Integrated' => ('Applied', Colors.green),
+      'CleanupPending' when session.integrationState == 'Applied' => (
+        'Applied · cleanup pending',
+        Colors.orange,
+      ),
+      'Waiting' => ('Queued', Colors.orange),
+      'ConflictRisk' => ('Conflict risk', Colors.red),
+      'NeedsReview' => ('Needs review', Colors.orange),
+      'Validating' ||
+      'CheckingMerge' ||
+      'QueuedForIntegration' => ('Checking combined result', Colors.blue),
+      'RecoveryNeeded' ||
+      'Orphaned' ||
+      'Failed' => ('Recovery needed', Colors.red),
+      _ when session.hasOverlapRisk => (
+        'Working separately · overlap detected',
+        Colors.orange,
+      ),
+      _ => ('Working separately', Colors.teal),
+    };
+    final details = <String>[
+      if (session.worktreeBranch != null) 'Branch: ${session.worktreeBranch}',
+      if (session.worktreePath != null) 'Workspace: ${session.worktreePath}',
+      if (session.resolutionPath != null)
+        'Resolution workspace: ${session.resolutionPath}',
+      if (session.baseCommit != null) 'Base: ${session.baseCommit}',
+      if (session.headCommit != null) 'Head: ${session.headCommit}',
+      if (session.targetBranch != null) 'Target: ${session.targetBranch}',
+      if (session.validationState != null)
+        'Validation: ${session.validationState}',
+      if (session.hasOverlapRisk && session.overlappingPaths.isEmpty)
+        'Overlap: another task expects to work in the same area',
+      if (session.overlappingPaths.isNotEmpty)
+        'Overlap: ${session.overlappingPaths.join(', ')}',
+    ].join('\n');
+    return Tooltip(
+      message: details,
+      child: Container(
+        key: ValueKey('worktree-status-${session.localId}'),
+        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+        decoration: BoxDecoration(
+          color: color.withValues(alpha: 0.12),
+          borderRadius: BorderRadius.circular(6),
+          border: Border.all(color: color.withValues(alpha: 0.28)),
+        ),
+        child: Text(label, style: Theme.of(context).textTheme.labelSmall),
+      ),
+    );
+  }
+}
+
+enum WorktreeReviewAction {
+  apply,
+  applyWithoutValidation,
+  retry,
+  resolve,
+  finalizeResolution,
+}
+
+class WorktreeReviewDialog extends StatelessWidget {
+  const WorktreeReviewDialog({
+    required this.review,
+    this.validationState,
+    this.validationChecks = const [],
+    this.canApply = false,
+    this.canApplyWithoutValidation = false,
+    this.canRetry = false,
+    this.canResolve = false,
+    this.canFinalizeResolution = false,
+    super.key,
+  });
+
+  final Map<String, dynamic> review;
+  final String? validationState;
+  final List<Map<String, dynamic>> validationChecks;
+  final bool canApply;
+  final bool canApplyWithoutValidation;
+  final bool canRetry;
+  final bool canResolve;
+  final bool canFinalizeResolution;
+
+  List<Map<String, dynamic>> _changes(String key) {
+    final raw = review[key];
+    if (raw is! List) return const [];
+    return raw
+        .whereType<Map>()
+        .map((item) => Map<String, dynamic>.from(item))
+        .toList();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final agentChanges = _changes('agent_changes');
+    final combinedChanges = _changes('combined_changes');
+    final stale = review['candidate_is_stale'] == true;
+    return AlertDialog(
+      title: const Text('Review changes'),
+      content: SizedBox(
+        width: 620,
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxHeight: 560),
+          child: ListView(
+            shrinkWrap: true,
+            children: [
+              Text(
+                'What the agent changed',
+                style: Theme.of(context).textTheme.titleSmall,
+              ),
+              const SizedBox(height: 6),
+              Text(
+                '${agentChanges.length} ${agentChanges.length == 1 ? 'file' : 'files'} compared with the agent’s starting point.',
+              ),
+              const SizedBox(height: 8),
+              ...agentChanges.map(_changeRow),
+              if (stale) ...[
+                const SizedBox(height: 16),
+                const Text(
+                  'The project changed after this result was checked. Ditch will rebuild and validate the combined result before it can be applied.',
+                ),
+              ] else if (combinedChanges.isNotEmpty) ...[
+                const SizedBox(height: 20),
+                Text(
+                  'What will be applied',
+                  style: Theme.of(context).textTheme.titleSmall,
+                ),
+                const SizedBox(height: 6),
+                Text(
+                  '${combinedChanges.length} ${combinedChanges.length == 1 ? 'file' : 'files'} compared with the project version used for validation.',
+                ),
+                const SizedBox(height: 8),
+                ...combinedChanges.map(_changeRow),
+              ],
+              const SizedBox(height: 20),
+              Text('Checks', style: Theme.of(context).textTheme.titleSmall),
+              const SizedBox(height: 6),
+              if (validationChecks.isEmpty)
+                Text(
+                  validationState == 'NotConfigured'
+                      ? 'No project validation commands were discovered.'
+                      : 'Checks have not completed yet.',
+                )
+              else
+                ...validationChecks.map(
+                  (check) => ListTile(
+                    dense: true,
+                    contentPadding: EdgeInsets.zero,
+                    leading: Icon(
+                      check['passed'] == true
+                          ? Icons.check_circle_outline
+                          : Icons.error_outline,
+                      color: check['passed'] == true
+                          ? Colors.green
+                          : Colors.red,
+                    ),
+                    title: Text(check['name']?.toString() ?? 'Project check'),
+                  ),
+                ),
+            ],
+          ),
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(context),
+          child: const Text('Keep separate'),
+        ),
+        if (canRetry)
+          OutlinedButton(
+            onPressed: () => Navigator.pop(context, WorktreeReviewAction.retry),
+            child: const Text('Retry checks'),
+          ),
+        if (canResolve)
+          OutlinedButton(
+            onPressed: () =>
+                Navigator.pop(context, WorktreeReviewAction.resolve),
+            child: const Text('Resolve manually'),
+          ),
+        if (canFinalizeResolution)
+          FilledButton(
+            onPressed: () =>
+                Navigator.pop(context, WorktreeReviewAction.finalizeResolution),
+            child: const Text('Check resolution'),
+          ),
+        if (canApplyWithoutValidation)
+          OutlinedButton(
+            onPressed: () => Navigator.pop(
+              context,
+              WorktreeReviewAction.applyWithoutValidation,
+            ),
+            child: const Text('Apply without checks'),
+          ),
+        if (canApply)
+          FilledButton(
+            onPressed: () => Navigator.pop(context, WorktreeReviewAction.apply),
+            child: const Text('Apply'),
+          ),
+      ],
+    );
+  }
+
+  Widget _changeRow(Map<String, dynamic> change) {
+    final status = change['status']?.toString() ?? 'M';
+    final path = change['path']?.toString() ?? '';
+    final previous = change['previous_path']?.toString();
+    final label = previous == null ? path : '$previous → $path';
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 3),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          SizedBox(
+            width: 42,
+            child: Text(
+              status,
+              style: const TextStyle(fontFamily: 'monospace'),
+            ),
+          ),
+          Expanded(
+            child: SelectableText(
+              label,
+              style: const TextStyle(fontFamily: 'monospace'),
+            ),
+          ),
+        ],
+      ),
+    );
   }
 }
 
@@ -8127,6 +9013,75 @@ class _AddProjectDialogState extends State<AddProjectDialog> {
     );
   }
 }
+
+class InitialProjectSnapshotDialog extends StatelessWidget {
+  const InitialProjectSnapshotDialog({required this.readiness, super.key});
+
+  final ProjectAgentReadinessReport readiness;
+
+  @override
+  Widget build(BuildContext context) {
+    final count = readiness.includedFileCount;
+    return AlertDialog(
+      key: const Key('initial-project-snapshot-dialog'),
+      icon: const Icon(Icons.shield_outlined),
+      title: const Text('Review project files'),
+      content: SizedBox(
+        width: 500,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              'Before starting, Ditch found $count ${count == 1 ? "project file" : "project files"} that need to be saved. Ignored files won’t be included.',
+            ),
+            if (readiness.warnings.isNotEmpty) ...[
+              const SizedBox(height: 12),
+              Text(
+                readiness.warnings.join('\n'),
+                style: TextStyle(color: context.ditch.error),
+              ),
+            ],
+            if (readiness.samplePaths.isNotEmpty) ...[
+              const SizedBox(height: 8),
+              ExpansionTile(
+                tilePadding: EdgeInsets.zero,
+                childrenPadding: EdgeInsets.zero,
+                title: const Text('Review included files'),
+                children: readiness.samplePaths
+                    .map(
+                      (path) => Align(
+                        alignment: Alignment.centerLeft,
+                        child: Padding(
+                          padding: const EdgeInsets.only(bottom: 4),
+                          child: SelectableText(path),
+                        ),
+                      ),
+                    )
+                    .toList(),
+              ),
+            ],
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(false),
+          child: const Text('Cancel'),
+        ),
+        FilledButton(
+          key: const Key('prepare-project-and-run'),
+          onPressed: () => Navigator.of(context).pop(true),
+          child: const Text('Continue and run agent'),
+        ),
+      ],
+    );
+  }
+}
+
+bool initialProjectPreparationNeedsReview(
+  ProjectAgentReadinessReport readiness,
+) => readiness.warnings.isNotEmpty;
 
 class StartCodexSessionDialog extends StatefulWidget {
   const StartCodexSessionDialog({required this.initialPrompt, super.key});
