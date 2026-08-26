@@ -7,6 +7,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart' show ScrollDirection;
 import 'package:flutter/services.dart';
 import 'package:xterm/xterm.dart';
+import 'package:qr_flutter/qr_flutter.dart';
 
 import 'application/command_center_controller.dart';
 import 'data/runtime_models.dart';
@@ -1226,6 +1227,33 @@ class DitchRuntimeClient {
       'MarkAttentionRead': {'attention_ids': attentionIds},
     });
   }
+
+  Future<Map<String, dynamic>> remoteControlStatus() =>
+      request('RemoteControlStatus');
+
+  Future<Map<String, dynamic>> createRemotePairing() =>
+      request('CreateRemotePairing');
+
+  Future<Map<String, dynamic>> getRemotePairing(String pairingId) => request({
+    'GetRemotePairing': {'pairing_id': pairingId},
+  });
+
+  Future<Map<String, dynamic>> confirmRemotePairing(String pairingId) =>
+      request({
+        'ConfirmRemotePairing': {'pairing_id': pairingId},
+      });
+
+  Future<Map<String, dynamic>> cancelRemotePairing(String pairingId) =>
+      request({
+        'CancelRemotePairing': {'pairing_id': pairingId},
+      });
+
+  Future<Map<String, dynamic>> revokeRemoteDevice(String deviceId) => request({
+    'RevokeRemoteDevice': {'device_id': deviceId},
+  });
+
+  Future<Map<String, dynamic>> disableRemoteControl() =>
+      request('DisableRemoteControl');
 }
 
 DitchProject? parseRuntimeProject(Object? value) {
@@ -1915,6 +1943,43 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text('Could not load Codex installations: $error')),
+      );
+    }
+  }
+
+  Future<void> _openAppSettings() async {
+    final section = await showDialog<String>(
+      context: context,
+      builder: (context) => SimpleDialog(
+        title: const Text('Settings'),
+        children: [
+          SimpleDialogOption(
+            onPressed: () => Navigator.pop(context, 'codex'),
+            child: const ListTile(
+              leading: Icon(Icons.terminal),
+              title: Text('Codex'),
+              subtitle: Text('Installation and runtime setup'),
+            ),
+          ),
+          SimpleDialogOption(
+            key: const Key('settings-remote-mobile'),
+            onPressed: () => Navigator.pop(context, 'remote'),
+            child: const ListTile(
+              leading: Icon(Icons.phone_iphone),
+              title: Text('Remote / Mobile'),
+              subtitle: Text('Pair and manage iPhones'),
+            ),
+          ),
+        ],
+      ),
+    );
+    if (!mounted) return;
+    if (section == 'codex') {
+      await _openCodexSettings();
+    } else if (section == 'remote') {
+      await showDialog<void>(
+        context: context,
+        builder: (context) => RemoteSettingsDialog(client: _runtimeClient),
       );
     }
   }
@@ -3963,7 +4028,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
                       onOpenNotification: _openAttentionSession,
                       onDismissNotification: _dismissAttention,
                       onDismissAllNotifications: _dismissAllNotifications,
-                      onOpenCodexSettings: _openCodexSettings,
+                      onOpenCodexSettings: _openAppSettings,
                       codexAvailable: _codexBinary != null,
                       onToggleSidebar: _presentation.toggleSidebar,
                       onToggleInspector: _presentation.toggleInspector,
@@ -4431,6 +4496,395 @@ class NotificationSetupBanner extends StatelessWidget {
           ],
         ),
       ),
+    );
+  }
+}
+
+class RemoteSettingsDialog extends StatefulWidget {
+  const RemoteSettingsDialog({required this.client, super.key});
+
+  final DitchRuntimeClient client;
+
+  @override
+  State<RemoteSettingsDialog> createState() => _RemoteSettingsDialogState();
+}
+
+class _RemoteSettingsDialogState extends State<RemoteSettingsDialog> {
+  Map<String, dynamic>? _status;
+  Map<String, dynamic>? _pairing;
+  Timer? _timer;
+  bool _busy = false;
+  String? _error;
+
+  @override
+  void initState() {
+    super.initState();
+    unawaited(_refresh());
+    _timer = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (!mounted) return;
+      setState(() {});
+      if (_pairing?['state'] == 'pending' || _pairing?['state'] == 'claimed') {
+        unawaited(_pollPairing());
+      }
+    });
+  }
+
+  @override
+  void dispose() {
+    _timer?.cancel();
+    super.dispose();
+  }
+
+  Future<void> _refresh() async {
+    if (mounted) {
+      setState(() {
+        _status = null;
+        _error = null;
+      });
+    }
+    try {
+      final response = await widget.client.remoteControlStatus();
+      if (!mounted) return;
+      setState(() {
+        _status = (response['RemoteControlStatus'] as Map?)
+            ?.cast<String, dynamic>();
+        _error = null;
+      });
+    } on Object catch (error) {
+      if (mounted) setState(() => _error = '$error');
+    }
+  }
+
+  Future<void> _connect() async {
+    setState(() {
+      _busy = true;
+      _error = null;
+    });
+    try {
+      final response = await widget.client.createRemotePairing();
+      if (!mounted) return;
+      setState(() {
+        _pairing = (response['RemotePairing'] as Map?)?.cast<String, dynamic>();
+        _busy = false;
+      });
+    } on Object catch (error) {
+      if (mounted) {
+        setState(() {
+          _busy = false;
+          _error = '$error';
+        });
+      }
+    }
+  }
+
+  Future<void> _pollPairing() async {
+    final pairingId = _pairing?['pairing_id']?.toString();
+    if (pairingId == null || _busy) return;
+    try {
+      final response = await widget.client.getRemotePairing(pairingId);
+      if (!mounted) return;
+      final next = (response['RemotePairing'] as Map?)?.cast<String, dynamic>();
+      if (next != null) {
+        // The one-time QR payload exists only in memory on initial creation.
+        next['qr_payload'] ??= _pairing?['qr_payload'];
+        setState(() => _pairing = next);
+      }
+    } on Object catch (error) {
+      if (mounted) setState(() => _error = '$error');
+    }
+  }
+
+  Future<void> _confirm() async {
+    final pairingId = _pairing?['pairing_id']?.toString();
+    if (pairingId == null) return;
+    setState(() => _busy = true);
+    try {
+      final response = await widget.client.confirmRemotePairing(pairingId);
+      if (!mounted) return;
+      setState(() {
+        _pairing = (response['RemotePairing'] as Map?)?.cast<String, dynamic>();
+        _busy = false;
+      });
+      await _refresh();
+    } on Object catch (error) {
+      if (mounted) {
+        setState(() {
+          _busy = false;
+          _error = '$error';
+        });
+      }
+    }
+  }
+
+  Future<void> _cancelPairing() async {
+    final pairingId = _pairing?['pairing_id']?.toString();
+    if (pairingId != null) await widget.client.cancelRemotePairing(pairingId);
+    if (mounted) setState(() => _pairing = null);
+  }
+
+  Future<void> _revoke(String id, String name) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Revoke this iPhone?'),
+        content: Text('$name will immediately lose remote access.'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('Revoke'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+    await widget.client.revokeRemoteDevice(id);
+    await _refresh();
+  }
+
+  Future<void> _disable() async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Disable Remote Control?'),
+        content: const Text(
+          'Connected phones will lose access. Local projects and sessions will keep working.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('Disable'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+    await widget.client.disableRemoteControl();
+    await _refresh();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final status = _status;
+    final devices =
+        (status?['devices'] as List?)?.whereType<Map>().toList() ?? const [];
+    return AlertDialog(
+      icon: const Icon(Icons.phone_iphone),
+      title: const Text('Remote Control'),
+      content: SizedBox(
+        width: 580,
+        child: status == null
+            ? _error == null
+                  ? const Center(child: CircularProgressIndicator())
+                  : Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Text(
+                          'Connected devices could not be refreshed.',
+                          style: Theme.of(context).textTheme.titleSmall,
+                        ),
+                        const SizedBox(height: 8),
+                        SelectableText(
+                          _error!,
+                          style: TextStyle(
+                            color: Theme.of(context).colorScheme.error,
+                          ),
+                        ),
+                        const SizedBox(height: 12),
+                        OutlinedButton(
+                          onPressed: _refresh,
+                          child: const Text('Try again'),
+                        ),
+                      ],
+                    )
+            : SingleChildScrollView(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    SwitchListTile(
+                      contentPadding: EdgeInsets.zero,
+                      title: const Text('Mobile Control'),
+                      subtitle: Text(
+                        status?['enabled'] == true
+                            ? 'This Mac accepts encrypted Ditch commands.'
+                            : 'Local Ditch works without Remote Control.',
+                      ),
+                      value: status?['enabled'] == true,
+                      onChanged: null,
+                    ),
+                    ListTile(
+                      contentPadding: EdgeInsets.zero,
+                      leading: Icon(
+                        status?['online'] == true
+                            ? Icons.cloud_done_outlined
+                            : Icons.cloud_off_outlined,
+                      ),
+                      title: Text(
+                        status?['machine_name']?.toString() ?? 'This Mac',
+                      ),
+                      subtitle: Text(
+                        status?['online'] == true ? 'Online' : 'Offline',
+                      ),
+                    ),
+                    const Divider(),
+                    Text(
+                      'Connected devices',
+                      style: Theme.of(context).textTheme.titleSmall,
+                    ),
+                    if (devices.isEmpty)
+                      const Padding(
+                        padding: EdgeInsets.symmetric(vertical: 12),
+                        child: Text('No iPhones are connected.'),
+                      ),
+                    ...devices.map((raw) {
+                      final device = raw.cast<Object?, Object?>();
+                      final name = device['name']?.toString() ?? 'iPhone';
+                      final state = device['state']?.toString() ?? 'unknown';
+                      final lastSeen = device['last_seen_at']?.toString();
+                      return ListTile(
+                        contentPadding: EdgeInsets.zero,
+                        leading: const Icon(Icons.phone_iphone),
+                        title: Text(name),
+                        subtitle: Text(
+                          state == 'active'
+                              ? lastSeen == null
+                                    ? 'Paired'
+                                    : 'Paired · Last seen $lastSeen'
+                              : 'Device revoked',
+                        ),
+                        trailing: state == 'active'
+                            ? TextButton(
+                                onPressed: _busy
+                                    ? null
+                                    : () => _revoke(
+                                        device['device_id'].toString(),
+                                        name,
+                                      ),
+                                child: const Text('Revoke'),
+                              )
+                            : null,
+                      );
+                    }),
+                    if (_pairing != null) ...[
+                      const Divider(),
+                      _buildPairing(context),
+                    ],
+                    if (_error != null) ...[
+                      const SizedBox(height: 10),
+                      SelectableText(
+                        _error!,
+                        style: TextStyle(
+                          color: Theme.of(context).colorScheme.error,
+                        ),
+                      ),
+                    ],
+                    const SizedBox(height: 12),
+                    const Text(
+                      'Source code, terminal output, Git worktrees, secrets, and full transcripts stay on this Mac. Anonymous identity and sanitized status metadata are stored by the remote relay; sensitive command and transcript payloads are relayed encrypted.',
+                    ),
+                  ],
+                ),
+              ),
+      ),
+      actions: [
+        if (status?['enabled'] == true)
+          TextButton(
+            onPressed: _busy ? null : _disable,
+            child: const Text('Disable Remote Control'),
+          ),
+        if (_pairing == null)
+          FilledButton.icon(
+            key: const Key('connect-iphone'),
+            onPressed: _busy || status?['configured'] != true ? null : _connect,
+            icon: const Icon(Icons.qr_code),
+            label: const Text('Connect iPhone'),
+          ),
+        TextButton(
+          onPressed: () => Navigator.pop(context),
+          child: const Text('Close'),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildPairing(BuildContext context) {
+    final state = _pairing?['state']?.toString() ?? 'pending';
+    final expiry = DateTime.tryParse(_pairing?['expires_at']?.toString() ?? '');
+    final remaining =
+        expiry?.difference(DateTime.now().toUtc()) ?? Duration.zero;
+    if (state == 'consumed') {
+      return const ListTile(
+        leading: Icon(Icons.check_circle_outline),
+        title: Text('iPhone connected'),
+      );
+    }
+    if (state == 'claimed') {
+      return Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Text(
+            '${_pairing?['pending_device_name'] ?? 'An iPhone'} wants to connect',
+            style: Theme.of(context).textTheme.titleMedium,
+          ),
+          const SizedBox(height: 8),
+          const Text(
+            'Confirm only if this is the iPhone you just scanned with.',
+          ),
+          const SizedBox(height: 12),
+          Row(
+            mainAxisAlignment: MainAxisAlignment.end,
+            children: [
+              TextButton(
+                onPressed: _busy ? null : _cancelPairing,
+                child: const Text('Cancel'),
+              ),
+              const SizedBox(width: 8),
+              FilledButton(
+                onPressed: _busy ? null : _confirm,
+                child: const Text('Connect'),
+              ),
+            ],
+          ),
+        ],
+      );
+    }
+    final qr = _pairing?['qr_payload']?.toString();
+    return Column(
+      children: [
+        Text(
+          'Scan this with The Ditch on iPhone',
+          style: Theme.of(context).textTheme.titleMedium,
+        ),
+        const SizedBox(height: 12),
+        if (qr != null)
+          ColoredBox(
+            color: Colors.white,
+            child: Padding(
+              padding: const EdgeInsets.all(12),
+              child: QrImageView(
+                data: qr,
+                size: 220,
+                semanticsLabel: 'One-time Ditch iPhone pairing code',
+              ),
+            ),
+          ),
+        const SizedBox(height: 10),
+        Text(
+          'Expires in ${remaining.isNegative ? '0:00' : '${remaining.inMinutes}:${(remaining.inSeconds % 60).toString().padLeft(2, '0')}'}',
+        ),
+        TextButton(
+          onPressed: _busy ? null : _cancelPairing,
+          child: const Text('Cancel'),
+        ),
+      ],
     );
   }
 }

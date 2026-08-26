@@ -1,0 +1,115 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://theditch.dev/remote/v1/projection.schema.json",
+  "title": "ProjectionUpdate",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "protocol_version",
+    "machine_id",
+    "epoch",
+    "sequence",
+    "kind",
+    "record"
+  ],
+  "properties": {
+    "protocol_version": { "const": 1 },
+    "machine_id": { "type": "string", "format": "uuid" },
+    "epoch": { "type": "string", "format": "uuid" },
+    "sequence": { "type": "integer", "minimum": 1 },
+    "kind": {
+      "enum": ["full_snapshot", "project", "session", "attention", "delete"]
+    },
+    "record": { "type": "object" }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": { "kind": { "const": "project" } },
+        "required": ["kind"]
+      },
+      "then": {
+        "properties": { "record": { "$ref": "#/$defs/projectRecord" } }
+      }
+    },
+    {
+      "if": {
+        "properties": { "kind": { "const": "session" } },
+        "required": ["kind"]
+      },
+      "then": {
+        "properties": { "record": { "$ref": "#/$defs/sessionRecord" } }
+      }
+    }
+  ],
+  "$defs": {
+    "epochMilliseconds": {
+      "type": "integer",
+      "description": "Signed 64-bit Unix epoch milliseconds. RFC3339 strings are invalid.",
+      "minimum": -9223372036854775808,
+      "maximum": 9223372036854775807
+    },
+    "projectRecord": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "project_id",
+        "name",
+        "status",
+        "running_count",
+        "waiting_count",
+        "ready_count",
+        "failed_count",
+        "attention_count",
+        "last_activity_at",
+        "projection_version"
+      ],
+      "properties": {
+        "project_id": { "type": "string", "format": "uuid" },
+        "name": { "type": "string", "maxLength": 200 },
+        "status": { "type": "string", "maxLength": 40 },
+        "running_count": { "type": "integer", "minimum": 0 },
+        "waiting_count": { "type": "integer", "minimum": 0 },
+        "ready_count": { "type": "integer", "minimum": 0 },
+        "failed_count": { "type": "integer", "minimum": 0 },
+        "attention_count": { "type": "integer", "minimum": 0 },
+        "last_activity_at": { "$ref": "#/$defs/epochMilliseconds" },
+        "projection_version": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "sessionRecord": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "session_id",
+        "project_id",
+        "title",
+        "provider_name",
+        "status",
+        "semantic_phase",
+        "needs_user",
+        "attention_count",
+        "changed_file_count",
+        "validation_summary",
+        "integration_readiness",
+        "last_activity_at",
+        "projection_version"
+      ],
+      "properties": {
+        "session_id": { "type": "string", "format": "uuid" },
+        "project_id": { "type": "string", "format": "uuid" },
+        "title": { "type": "string", "maxLength": 240 },
+        "provider_name": { "type": "string", "maxLength": 80 },
+        "status": { "type": "string", "maxLength": 40 },
+        "semantic_phase": { "type": ["string", "null"], "maxLength": 240 },
+        "needs_user": { "type": "boolean" },
+        "attention_count": { "type": "integer", "minimum": 0 },
+        "changed_file_count": { "type": ["integer", "null"], "minimum": 0 },
+        "validation_summary": { "type": ["string", "null"], "maxLength": 240 },
+        "integration_readiness": { "type": ["string", "null"], "maxLength": 240 },
+        "last_activity_at": { "$ref": "#/$defs/epochMilliseconds" },
+        "projection_version": { "type": "integer", "minimum": 1 }
+      }
+    }
+  }
+}

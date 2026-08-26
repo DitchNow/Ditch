@@ -138,6 +138,21 @@ pub enum ClientRequest {
         attention_ids: Vec<Uuid>,
     },
     MarkAllAttentionRead,
+    RemoteControlStatus,
+    CreateRemotePairing,
+    GetRemotePairing {
+        pairing_id: Uuid,
+    },
+    ConfirmRemotePairing {
+        pairing_id: Uuid,
+    },
+    CancelRemotePairing {
+        pairing_id: Uuid,
+    },
+    RevokeRemoteDevice {
+        device_id: Uuid,
+    },
+    DisableRemoteControl,
     ApprovePermission {
         request_id: Uuid,
     },
@@ -163,6 +178,8 @@ pub enum ServerResponse {
     ProjectCreated(Project),
     AgentStarted(AgentRun),
     AgentMessages(AgentMessagePage),
+    RemoteControlStatus(RemoteControlStatus),
+    RemotePairing(RemotePairing),
     Accepted,
     Error(ProtocolError),
 }
@@ -384,4 +401,40 @@ pub enum ServerEvent {
 pub struct ProtocolError {
     pub code: String,
     pub message: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RemoteDeviceSummary {
+    pub device_id: Uuid,
+    pub name: String,
+    pub state: String,
+    pub last_seen_at: Option<DateTime<Utc>>,
+    pub currently_connected: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RemoteControlStatus {
+    pub configured: bool,
+    pub enabled: bool,
+    pub machine_id: Option<Uuid>,
+    pub owner_id: Option<Uuid>,
+    pub machine_name: String,
+    /// Online means the daemon has a currently authenticated relay socket, not
+    /// merely that D1 contains an old last-seen timestamp.
+    pub online: bool,
+    pub relay_origin: Option<String>,
+    pub devices: Vec<RemoteDeviceSummary>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RemotePairing {
+    pub pairing_id: Uuid,
+    pub machine_id: Uuid,
+    pub state: String,
+    pub expires_at: DateTime<Utc>,
+    /// Present only on initial creation so Flutter can render it as a QR. It is
+    /// never persisted locally and is omitted after a claim or restart.
+    pub qr_payload: Option<String>,
+    pub pending_device_name: Option<String>,
+    pub pending_device_id: Option<Uuid>,
 }

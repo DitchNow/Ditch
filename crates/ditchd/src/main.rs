@@ -32,6 +32,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
+mod remote_control;
+use remote_control::RemoteController;
+
 const RUNTIME_IDENTITY: &str = "The Ditch Runtime";
 const CODEX_BINARY_SETTING: &str = "codex_binary";
 const STOP_INTERRUPT_GRACE: Duration = Duration::from_millis(1500);
@@ -87,6 +90,7 @@ struct RuntimeState {
     started_at: DateTime<Utc>,
     codex_home: Option<PathBuf>,
     codex_binary: Option<String>,
+    remote: RemoteController,
 }
 
 struct ProjectTerminalRecord {
@@ -170,6 +174,7 @@ impl RuntimeState {
             started_at: Utc::now(),
             codex_home,
             codex_binary,
+            remote: RemoteController::new(),
         })
     }
 
@@ -213,6 +218,7 @@ impl RuntimeState {
                 "project_files_v1".to_owned(),
                 "persistent_attention_read_v1".to_owned(),
                 "always_on_web_access_v1".to_owned(),
+                "remote_control_v1".to_owned(),
             ],
         }
     }
@@ -263,6 +269,7 @@ impl RuntimeState {
             }
             self.attention_subscribers = live;
         }
+        remote_control::publish_projection(self);
     }
 
     fn persist_agent(&mut self, agent_id: AgentId) {
@@ -302,6 +309,7 @@ fn serve(paths: AppPaths) -> io::Result<()> {
     let state = Arc::new(Mutex::new(
         RuntimeState::new(paths).map_err(io::Error::other)?,
     ));
+    remote_control::start_connection(Arc::clone(&state));
 
     for stream in listener.incoming() {
         let stream = stream?;
@@ -703,6 +711,21 @@ fn handle_request(request: ClientRequest, state: Arc<Mutex<RuntimeState>>) -> Se
             mark_attention_read(state, Some(&attention_ids))
         }
         ClientRequest::MarkAllAttentionRead => mark_attention_read(state, None),
+        ClientRequest::RemoteControlStatus => remote_control::status(state),
+        ClientRequest::CreateRemotePairing => remote_control::create_pairing(state),
+        ClientRequest::GetRemotePairing { pairing_id } => {
+            remote_control::get_pairing(state, pairing_id)
+        }
+        ClientRequest::ConfirmRemotePairing { pairing_id } => {
+            remote_control::confirm_pairing(state, pairing_id)
+        }
+        ClientRequest::CancelRemotePairing { pairing_id } => {
+            remote_control::cancel_pairing(state, pairing_id)
+        }
+        ClientRequest::RevokeRemoteDevice { device_id } => {
+            remote_control::revoke_device(state, device_id)
+        }
+        ClientRequest::DisableRemoteControl => remote_control::disable(state),
         ClientRequest::StartCodex { .. }
         | ClientRequest::ApprovePermission { .. }
         | ClientRequest::DenyPermission { .. }
@@ -1720,6 +1743,39 @@ fn stop_agent(state: Arc<Mutex<RuntimeState>>, agent_id: AgentId) -> ServerRespo
 
     // The exit watcher drains stdout before finalizing, which preserves a
     // thread.started event that was already in flight when Stop was clicked.
+    if !wait_for_run_finalization(&state, agent_id, active.run_id, Duration::from_secs(1)) {
+        finalize_stopped_run(&state, agent_id, active.run_id);
+    }
+    ServerResponse::Accepted
+}
+
+fn force_kill_agent(state: Arc<Mutex<RuntimeState>>, agent_id: AgentId) -> ServerResponse {
+    let active = {
+        let state = state
+            .lock()
+            .expect("runtime state lock should not be poisoned");
+        if !state.agents.contains_key(&agent_id) {
+            return protocol_error("agent_not_found", "agent session was not found");
+        }
+        state.children.get(&agent_id).cloned()
+    };
+    let Some(active) = active else {
+        return protocol_error("agent_not_running", "agent session is not running");
+    };
+    // The PID is never supplied remotely. It comes only from the Child owned by
+    // this exact agent/run token and targets its dedicated process group.
+    signal_process_group(active.process_group_id, libc::SIGKILL);
+    let _ = active
+        .child
+        .lock()
+        .expect("child lock should not be poisoned")
+        .kill();
+    if !wait_for_process_group_exit(&active, STOP_KILL_GRACE) {
+        return protocol_error(
+            "agent_stop_failed",
+            "The owned Codex process group did not exit.",
+        );
+    }
     if !wait_for_run_finalization(&state, agent_id, active.run_id, Duration::from_secs(1)) {
         finalize_stopped_run(&state, agent_id, active.run_id);
     }
