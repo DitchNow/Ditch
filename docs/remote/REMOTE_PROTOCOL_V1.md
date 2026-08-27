@@ -57,19 +57,26 @@ Client-supplied `owner_id` is never an authorization source.
 
 ## Device roster and revocation
 
-The relay is authoritative for the currently authorized device roster. A
-signed machine `GET /v1/devices` returns the complete owner-scoped set of active
-devices, including the public keys needed for pairwise command validation.
-Before desktop Remote settings are displayed, `ditchd` transactionally replaces
-its local `remote_devices` cache with this snapshot. An empty array is a valid
-complete snapshot.
+The relay is authoritative for machine-device authorization. Owner identity is
+the tenancy boundary but does not automatically grant every owner device access
+to every owner machine. Pairing creates an explicit many-to-many authorization
+between one machine and one device.
 
-Revocation from either a machine or the device itself removes authorization at
-the relay. Machine-initiated revocation also deletes the corresponding local
-row immediately. A device-initiated revocation is removed locally by the next
-settings reconciliation. Revoked-device tombstones are not displayed as
-connected devices, and a failed roster request must not be represented as a
-successful cached device list.
+A signed machine `GET /v1/machines/{machine_id}/devices` returns the complete
+set of active devices authorized for that machine, including the public keys
+needed for pairwise command validation. A machine may request only its own
+roster. Before desktop Remote settings are displayed, `ditchd` transactionally
+replaces its local `remote_devices` cache with this snapshot. An empty array is
+a valid complete snapshot.
+
+`DELETE /v1/machines/{machine_id}/devices/{device_id}` revokes only that
+machine-device authorization. Machine-initiated revocation also deletes the
+corresponding local row immediately. Device-initiated disconnection is removed
+locally by the next settings reconciliation. Global device-identity revocation
+is a separate operation that removes all of the device's machine
+authorizations. Revoked authorization tombstones are not displayed, and a
+failed roster request must not be represented as a successful cached device
+list.
 
 ## Pairing
 
@@ -158,10 +165,52 @@ return the persisted prior outcome and never repeat an effect.
 
 ## Projection sequencing
 
-Each machine publishes `{epoch, sequence}`. The relay applies the next sequence,
-ignores an exact duplicate, rejects stale epochs and out-of-order updates, and
-requests a full sanitized snapshot on a gap. Reconnect creates a fresh epoch and
-starts with a full snapshot. Local SQLite is authoritative.
+Each machine publishes `{epoch, sequence}`. Only one projection frame is in
+flight per machine in v1. The relay commits the exact next sequence and then
+returns `projection_ack`; an exact duplicate returns a duplicate ACK without
+repeating its mutation. The Mac does not advance its durable acknowledged
+sequence until that ACK arrives.
+
+A full reconciliation is staged using:
+
+```text
+projection_snapshot_begin
+projection_snapshot_record (zero or more)
+projection_snapshot_commit
+```
+
+Begin and commit include exact `projects`, `sessions`, and `attention` record
+counts. Snapshot records use the same allowlisted records as incremental
+updates. The relay writes the new epoch as staging data. It keeps the previous
+committed epoch visible until it validates and commits the complete new
+snapshot. A disconnect, timeout, or invalid record before commit cannot clear
+the last committed projection.
+
+After snapshot commit, `projection_update` carries one changed record or an
+explicit delete record. `ditchd` coalesces repeated changes by stable domain ID,
+sends no more than 32 records in an incremental batch, and never queues an
+unbounded stream of projection payloads.
+
+Every projection data frame contains exact `owner_id`, `machine_id`, `epoch`,
+and positive `sequence` fields. The owner and machine must match the
+authenticated WebSocket attachment. Acknowledgements contain:
+
+```json
+{"epoch":"uuid","accepted_sequence":42,"status":"applied"}
+```
+
+The only ACK statuses are `applied` and `duplicate`. On an out-of-order frame,
+the relay does not mutate projection data and returns:
+
+```json
+{"epoch":"uuid","expected_sequence":42,"received_sequence":44,"full_snapshot_required":true}
+```
+
+On `projection_gap`, `ditchd` abandons all queued and in-flight work for that
+epoch, creates a fresh random epoch at sequence one, and sends a new staged
+snapshot. Stale ACKs and gaps from an abandoned epoch are ignored. Reconnect
+also creates a fresh epoch and staged snapshot. Local SQLite remains
+authoritative.
 
 Project, session, and attention projections are explicit allowlists. In
 particular, project root paths, prompts, transcript bodies, terminal output,
@@ -170,6 +219,11 @@ source, Git objects, and environment data are excluded.
 All Remote Protocol v1 timestamp fields, including project and session
 `last_activity_at`, are signed 64-bit Unix epoch milliseconds encoded as JSON
 integers. RFC3339 strings are not a valid wire representation.
+
+Heartbeat, inbound command, gap, acknowledgement, and revocation processing
+take priority over projection transmission. Projection backpressure cannot make
+an authenticated but unresponsive socket appear healthy, and cannot block
+local execution.
 
 ## Transcripts
 

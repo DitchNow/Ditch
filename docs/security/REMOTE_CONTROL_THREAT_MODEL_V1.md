@@ -15,6 +15,7 @@ with sensitive payload plaintext.
 | Threat | Control |
 |---|---|
 | Known UUID accesses another owner | Every lookup derives owner from verified principal and includes owner/machine predicates; isolation tests cover all resources. |
+| Same-owner device accesses an unpaired machine | Socket tickets, commands, roster reads, and revocation require an active authorization for the exact machine-device pair; owner membership alone is insufficient. |
 | Leaked QR | 256-bit one-use secret, hash-only storage, three-minute expiry, rate limit, explicit Mac confirmation. |
 | REST replay | Signed canonical request, five-minute window, nonce consumption before side effects. |
 | Socket-ticket theft | Random one-use 30-second ticket bound to principal, owner, machine, role, protocol, and epoch. |
@@ -28,7 +29,9 @@ with sensitive payload plaintext.
 | Revoked socket remains useful | D1 state changes immediately; hub receives close request; future REST/tickets fail; daemon revalidates device on command. |
 | APNs leaks content | Minimal IDs and generic copy by default; no prompt, transcript, terminal, source, or secret data. |
 | Projection leaks local data | Explicit outbound DTO allowlist; never serialize domain objects wholesale; tests reject root/current prompt/evidence fields. |
-| Projection becomes authority | Epoch/sequence reconciliation converges D1 to SQLite; no cloud projection mutates runtime. |
+| Projection becomes authority | ACK-driven epoch/sequence reconciliation converges D1 to SQLite; no cloud projection mutates runtime. |
+| Partial snapshot erases visible state | Relay stages a fresh epoch and switches visibility only after validated commit; the Mac abandons gaps and reconciles with a new epoch. |
+| Projection flood starves heartbeat or commands | `ditchd` coalesces dirty signals, bounds each incremental batch, permits one projection frame in flight, and prioritizes inbound frames and heartbeat. |
 | Notification queue executes command | Queue binding accepts only `PushJob`; command gateway checks live machine socket and has no persistence path. |
 | Key extraction from SQLite/files | Private key material is stored only in Keychain; SQLite holds Keychain labels and public keys. |
 
@@ -55,6 +58,6 @@ external credentials and must not be called verified by local tests.
 - Unknown protocol/command fails closed.
 - Offline commands are rejected and never persisted for delivery.
 - Owner predicates cover lists, detail reads, commands, sockets, push tokens, and revocation.
+- Exact machine-device authorization predicates cover sockets, commands, roster reads, and machine-specific revocation.
 - Revocation closes live sockets and invalidates push state.
 - Approval/integration return unavailable until canonical local services exist.
-

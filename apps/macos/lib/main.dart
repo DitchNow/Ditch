@@ -4687,7 +4687,7 @@ class _RemoteSettingsDialogState extends State<RemoteSettingsDialog> {
                       mainAxisSize: MainAxisSize.min,
                       children: [
                         Text(
-                          'Connected devices could not be refreshed.',
+                          'iPhones with access could not be refreshed.',
                           style: Theme.of(context).textTheme.titleSmall,
                         ),
                         const SizedBox(height: 8),
@@ -4736,13 +4736,13 @@ class _RemoteSettingsDialogState extends State<RemoteSettingsDialog> {
                     ),
                     const Divider(),
                     Text(
-                      'Connected devices',
+                      'iPhones with access to this Mac',
                       style: Theme.of(context).textTheme.titleSmall,
                     ),
                     if (devices.isEmpty)
                       const Padding(
                         padding: EdgeInsets.symmetric(vertical: 12),
-                        child: Text('No iPhones are connected.'),
+                        child: Text('No iPhones have access to this Mac.'),
                       ),
                     ...devices.map((raw) {
                       final device = raw.cast<Object?, Object?>();

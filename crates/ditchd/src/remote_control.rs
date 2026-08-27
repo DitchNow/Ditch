@@ -3,18 +3,19 @@ use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{TimeZone, Utc};
 use ditch_protocol::{RemoteControlStatus, RemoteDeviceSummary, RemotePairing, ServerResponse};
 use ditch_remote::{
-    Aad, ConfirmationClass, PairwiseContext, RemoteCommand, RemoteCommandType, RemoteProjector,
-    SessionPromptPayload, SessionStartPayload, SessionTargetPayload, TranscriptQueryPayload,
-    decrypt, encrypt,
+    Aad, AttentionProjection, ConfirmationClass, PairwiseContext, ProjectProjection, RemoteCommand,
+    RemoteCommandType, RemoteProjector, SessionProjection, SessionPromptPayload,
+    SessionStartPayload, SessionTargetPayload, TranscriptQueryPayload, decrypt, encrypt,
+    validate_p256_public_key,
 };
 use ditch_remote::{IdentityStore, KeychainIdentityStore, MachineIdentity, canonical_request};
 use ditch_store::{RemoteDeviceRecord, RemoteMachineRecord};
 use rand_core::{OsRng, RngCore};
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{
     Arc, Mutex,
-    mpsc::{self, Receiver, Sender, TryRecvError},
+    mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError},
 };
 use std::thread;
 use std::time::{Duration as StdDuration, Instant};
@@ -23,13 +24,16 @@ use url::Url;
 use uuid::Uuid;
 
 const PRODUCTION_RELAY_ORIGIN: &str = "https://relay.ditchnow.nl";
+const HEARTBEAT_INTERVAL: StdDuration = StdDuration::from_secs(20);
+const PROJECTION_ACK_TIMEOUT: StdDuration = StdDuration::from_secs(30);
+const MAX_INCREMENTAL_RECORDS: usize = 32;
 
 pub(super) struct RemoteController {
     relay_origin: Option<String>,
     pairings: HashMap<Uuid, RemotePairing>,
     authenticated_socket_live: bool,
     connection_started: bool,
-    outbound: Option<Sender<String>>,
+    projection_wakeup: Option<SyncSender<()>>,
 }
 
 impl RemoteController {
@@ -44,7 +48,7 @@ impl RemoteController {
             pairings: HashMap::new(),
             authenticated_socket_live: false,
             connection_started: false,
-            outbound: None,
+            projection_wakeup: None,
         }
     }
 }
@@ -87,6 +91,13 @@ pub(super) fn status(state: Arc<Mutex<RuntimeState>>) -> ServerResponse {
         if let Err(error) = reconcile_remote_devices(&state) {
             return protocol_error("remote_device_sync_failed", error);
         }
+    } else if let Err(error) = state
+        .lock()
+        .expect("runtime state lock should not be poisoned")
+        .store
+        .replace_remote_devices(&[])
+    {
+        return protocol_error("remote_store_failed", error.to_string());
     }
     status_from_local_store(state)
 }
@@ -130,7 +141,8 @@ fn status_from_local_store(state: Arc<Mutex<RuntimeState>>) -> ServerResponse {
 fn reconcile_remote_devices(state: &Arc<Mutex<RuntimeState>>) -> Result<(), String> {
     let (origin, identity) =
         remote_identity(state).map_err(|_| "remote identity unavailable".to_owned())?;
-    let response = signed_request(&origin, &identity, "GET", "/v1/devices", b"")?;
+    let path = machine_devices_path(identity.machine_id);
+    let response = signed_request(&origin, &identity, "GET", &path, b"")?;
     let devices = active_devices_from_response(&response)?;
     state
         .lock()
@@ -138,6 +150,23 @@ fn reconcile_remote_devices(state: &Arc<Mutex<RuntimeState>>) -> Result<(), Stri
         .store
         .replace_remote_devices(&devices)
         .map_err(|error| error.to_string())
+}
+
+fn machine_devices_path(machine_id: Uuid) -> String {
+    format!("/v1/machines/{machine_id}/devices")
+}
+
+fn machine_device_path(machine_id: Uuid, device_id: Uuid) -> String {
+    format!("{}/{device_id}", machine_devices_path(machine_id))
+}
+
+fn validated_public_key(device: &Value, field: &str) -> Result<String, String> {
+    let encoded = device
+        .get(field)
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("relay device omitted {field}"))?;
+    validate_p256_public_key(encoded).map_err(|_| format!("relay returned invalid {field}"))?;
+    Ok(encoded.to_owned())
 }
 
 fn active_devices_from_response(value: &Value) -> Result<Vec<RemoteDeviceRecord>, String> {
@@ -151,6 +180,14 @@ fn active_devices_from_response(value: &Value) -> Result<Vec<RemoteDeviceRecord>
     devices
         .iter()
         .map(|device| {
+            let platform = device
+                .get("platform")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty() && value.len() <= 32)
+                .ok_or("relay device omitted platform")?;
+            if platform != "ios" {
+                return Err("relay returned an unsupported device platform".to_owned());
+            }
             let state = device
                 .get("state")
                 .and_then(Value::as_str)
@@ -158,6 +195,10 @@ fn active_devices_from_response(value: &Value) -> Result<Vec<RemoteDeviceRecord>
             if state != "active" {
                 return Err("relay returned a non-active device".to_owned());
             }
+            device
+                .get("authorized_at")
+                .and_then(Value::as_i64)
+                .ok_or("relay device omitted authorized_at")?;
             let last_seen_at = match device.get("last_seen_at") {
                 None | Some(Value::Null) => None,
                 Some(value) => Some(
@@ -181,20 +222,13 @@ fn active_devices_from_response(value: &Value) -> Result<Vec<RemoteDeviceRecord>
                     .and_then(Value::as_str)
                     .ok_or("relay device omitted name")?
                     .to_owned(),
-                signing_public_key: device
-                    .get("signing_public_key")
-                    .and_then(Value::as_str)
-                    .ok_or("relay device omitted signing_public_key")?
-                    .to_owned(),
-                agreement_public_key: device
-                    .get("agreement_public_key")
-                    .and_then(Value::as_str)
-                    .ok_or("relay device omitted agreement_public_key")?
-                    .to_owned(),
+                signing_public_key: validated_public_key(device, "signing_public_key")?,
+                agreement_public_key: validated_public_key(device, "agreement_public_key")?,
                 key_version: device
                     .get("key_version")
                     .and_then(Value::as_u64)
                     .and_then(|value| u32::try_from(value).ok())
+                    .filter(|value| *value > 0)
                     .ok_or("relay device omitted key_version")?,
                 state: state.to_owned(),
                 last_seen_at,
@@ -368,7 +402,7 @@ pub(super) fn revoke_device(state: Arc<Mutex<RuntimeState>>, device_id: Uuid) ->
         Ok(value) => value,
         Err(response) => return response,
     };
-    let path = format!("/v1/devices/{device_id}");
+    let path = machine_device_path(identity.machine_id, device_id);
     if let Err(error) = signed_request(&origin, &identity, "DELETE", &path, b"") {
         return protocol_error("remote_revoke_failed", error);
     }
@@ -394,6 +428,9 @@ pub(super) fn disable(state: Arc<Mutex<RuntimeState>>) -> ServerResponse {
         .expect("runtime state lock should not be poisoned");
     state.remote.authenticated_socket_live = false;
     if let Err(error) = state.store.set_remote_enabled(false) {
+        return protocol_error("remote_store_failed", error.to_string());
+    }
+    if let Err(error) = state.store.replace_remote_devices(&[]) {
         return protocol_error("remote_store_failed", error.to_string());
     }
     ServerResponse::Accepted
@@ -600,8 +637,12 @@ pub(super) fn start_connection(state: Arc<Mutex<RuntimeState>>) {
         if !enabled || guard.remote.connection_started || guard.remote.relay_origin.is_none() {
             return;
         }
-        let (sender, receiver) = mpsc::channel();
-        guard.remote.outbound = Some(sender);
+        // Capacity one coalesces any number of local domain events into one
+        // wake-up. The connection thread rebuilds sanitized state from the
+        // authoritative runtime, so projection payloads cannot accumulate in
+        // an unbounded channel.
+        let (sender, receiver) = mpsc::sync_channel(1);
+        guard.remote.projection_wakeup = Some(sender);
         guard.remote.connection_started = true;
         receiver
     };
@@ -612,122 +653,336 @@ pub(super) fn publish_projection(state: &mut RuntimeState) {
     if !state.remote.authenticated_socket_live {
         return;
     }
-    let Some(sender) = state.remote.outbound.clone() else {
+    let Some(sender) = state.remote.projection_wakeup.clone() else {
         return;
     };
-    for frame in projection_frames(state, false) {
-        let _ = sender.send(frame);
+    match sender.try_send(()) {
+        Ok(()) | Err(TrySendError::Full(())) => {}
+        Err(TrySendError::Disconnected(())) => {
+            state.remote.authenticated_socket_live = false;
+        }
     }
 }
 
-fn projection_frames(state: &mut RuntimeState, new_epoch: bool) -> Vec<String> {
-    let Some(mut machine) = state.store.remote_machine().ok().flatten() else {
-        return Vec::new();
-    };
-    let Some(owner_id) = machine.owner_id else {
-        return Vec::new();
-    };
-    if !machine.enabled {
-        return Vec::new();
+#[derive(Clone, Debug, Default, PartialEq)]
+struct ProjectionSnapshot {
+    records: BTreeMap<(String, String), Value>,
+}
+
+impl ProjectionSnapshot {
+    fn from_state(state: &RuntimeState) -> Self {
+        let agents = state
+            .agents
+            .values()
+            .map(|record| record.run.clone())
+            .collect::<Vec<_>>();
+        let mut records = BTreeMap::new();
+        for project in state.projects.values() {
+            let value = RemoteProjector::project(project, &agents, &state.attention, 1);
+            if let Ok(record) = serde_json::to_value(value) {
+                records.insert(("project".to_owned(), project.id.0.to_string()), record);
+            }
+        }
+        for run in &agents {
+            let value = RemoteProjector::session(run, &state.attention, 1);
+            if let Ok(record) = serde_json::to_value(value) {
+                records.insert(("session".to_owned(), run.id.0.to_string()), record);
+            }
+        }
+        for item in &state.attention {
+            let value = RemoteProjector::attention(item, 1);
+            if let Ok(record) = serde_json::to_value(value) {
+                records.insert(("attention".to_owned(), item.id.to_string()), record);
+            }
+        }
+        Self { records }
     }
-    if new_epoch {
-        machine.projection_epoch = Uuid::new_v4();
-        machine.projection_sequence = 0;
-    }
-    let agents = state
-        .agents
-        .values()
-        .map(|record| record.run.clone())
-        .collect::<Vec<_>>();
-    let projects = state
-        .projects
-        .values()
-        .map(|project| {
-            RemoteProjector::project(
-                project,
-                &agents,
-                &state.attention,
-                machine.projection_sequence + 1,
-            )
+
+    fn counts(&self) -> Value {
+        let count = |kind: &str| {
+            self.records
+                .keys()
+                .filter(|(record_kind, _)| record_kind == kind)
+                .count()
+        };
+        json!({
+            "projects": count("project"),
+            "sessions": count("session"),
+            "attention": count("attention"),
         })
-        .collect::<Vec<_>>();
-    let sessions = agents
-        .iter()
-        .map(|run| RemoteProjector::session(run, &state.attention, machine.projection_sequence + 1))
-        .collect::<Vec<_>>();
-    let attention = state
-        .attention
-        .iter()
-        .map(|item| RemoteProjector::attention(item, machine.projection_sequence + 1))
-        .collect::<Vec<_>>();
-    let mut records: Vec<(&str, Value)> = Vec::new();
-    records.push(("full_snapshot", json!({})));
-    records.extend(projects.iter().filter_map(|value| {
-        serde_json::to_value(value)
-            .ok()
-            .map(|value| ("project", value))
-    }));
-    records.extend(sessions.iter().filter_map(|value| {
-        serde_json::to_value(value)
-            .ok()
-            .map(|value| ("session", value))
-    }));
-    records.extend(attention.iter().filter_map(|value| {
-        serde_json::to_value(value)
-            .ok()
-            .map(|value| ("attention", value))
-    }));
-    let mut frames = Vec::with_capacity(records.len());
-    for (kind, record) in records {
-        machine.projection_sequence += 1;
-        frames.push(projection_frame(
-            owner_id,
-            machine.machine_id,
-            machine.projection_epoch,
-            machine.projection_sequence,
-            kind,
-            record,
-            Utc::now().timestamp_millis(),
-        ));
     }
-    let _ = state.store.upsert_remote_machine(&machine);
-    let _ = state.store.replace_remote_projection_cache(
-        machine.projection_epoch,
-        machine.projection_sequence,
-        &projects,
-        &sessions,
-        &attention,
-    );
-    frames
+
+    fn persist(&self, state: &mut RuntimeState, epoch: Uuid, sequence: u64) -> Result<(), String> {
+        let projects = self
+            .records
+            .iter()
+            .filter(|((kind, _), _)| kind == "project")
+            .map(|(_, value)| serde_json::from_value::<ProjectProjection>(value.clone()))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        let sessions = self
+            .records
+            .iter()
+            .filter(|((kind, _), _)| kind == "session")
+            .map(|(_, value)| serde_json::from_value::<SessionProjection>(value.clone()))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        let attention = self
+            .records
+            .iter()
+            .filter(|((kind, _), _)| kind == "attention")
+            .map(|(_, value)| serde_json::from_value::<AttentionProjection>(value.clone()))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        state
+            .store
+            .replace_remote_projection_cache(epoch, sequence, &projects, &sessions, &attention)
+            .map_err(|error| error.to_string())
+    }
 }
 
-fn projection_frame(
+#[derive(Debug)]
+struct ProjectionWork {
+    epoch: Uuid,
+    sequence: u64,
+    frame: String,
+    resulting_snapshot: Option<ProjectionSnapshot>,
+    sent_at: Option<Instant>,
+}
+
+#[derive(Debug)]
+struct ProjectionTransport {
     owner_id: Uuid,
     machine_id: Uuid,
     epoch: Uuid,
-    sequence: u64,
-    kind: &str,
-    record: Value,
-    created_at: i64,
-) -> String {
+    next_sequence: u64,
+    acknowledged_sequence: u64,
+    queue: VecDeque<ProjectionWork>,
+    inflight: Option<ProjectionWork>,
+    baseline: ProjectionSnapshot,
+    dirty: bool,
+}
+
+#[derive(Debug)]
+enum ProjectionAckOutcome {
+    Ignored,
+    Advanced,
+    Committed(ProjectionSnapshot),
+}
+
+impl ProjectionTransport {
+    fn new(owner_id: Uuid, machine_id: Uuid, snapshot: ProjectionSnapshot) -> Self {
+        let mut transport = Self {
+            owner_id,
+            machine_id,
+            epoch: Uuid::new_v4(),
+            next_sequence: 0,
+            acknowledged_sequence: 0,
+            queue: VecDeque::new(),
+            inflight: None,
+            baseline: ProjectionSnapshot::default(),
+            dirty: false,
+        };
+        transport.queue_snapshot(snapshot);
+        transport
+    }
+
+    fn queue_snapshot(&mut self, mut snapshot: ProjectionSnapshot) {
+        self.epoch = Uuid::new_v4();
+        self.next_sequence = 0;
+        self.acknowledged_sequence = 0;
+        self.queue.clear();
+        self.inflight = None;
+        self.dirty = false;
+        let counts = snapshot.counts();
+        self.enqueue(
+            "projection_snapshot_begin",
+            json!({ "counts": counts }),
+            None,
+        );
+        let keys = snapshot.records.keys().cloned().collect::<Vec<_>>();
+        for key in keys {
+            let sequence = self.next_sequence + 1;
+            let Some(record) = snapshot.records.get_mut(&key) else {
+                continue;
+            };
+            set_projection_version(record, sequence);
+            let record = record.clone();
+            self.enqueue(
+                "projection_snapshot_record",
+                json!({ "kind": key.0, "record": record }),
+                None,
+            );
+        }
+        self.enqueue(
+            "projection_snapshot_commit",
+            json!({ "counts": snapshot.counts() }),
+            Some(snapshot),
+        );
+    }
+
+    fn queue_incremental(&mut self, current: ProjectionSnapshot) {
+        if !self.queue.is_empty() || self.inflight.is_some() {
+            self.dirty = true;
+            return;
+        }
+        let mut changes = Vec::new();
+        for (key, record) in &current.records {
+            let changed = self
+                .baseline
+                .records
+                .get(key)
+                .is_none_or(|baseline| !same_projection_content(baseline, record));
+            if changed {
+                changes.push((key.clone(), Some(record.clone())));
+            }
+        }
+        for key in self.baseline.records.keys() {
+            if !current.records.contains_key(key) {
+                changes.push((key.clone(), None));
+            }
+        }
+        changes.sort_by(|left, right| left.0.cmp(&right.0));
+        self.dirty = changes.len() > MAX_INCREMENTAL_RECORDS;
+        let mut next_baseline = self.baseline.clone();
+        let selected = changes
+            .into_iter()
+            .take(MAX_INCREMENTAL_RECORDS)
+            .collect::<Vec<_>>();
+        for (index, (key, record)) in selected.iter().enumerate() {
+            let is_last = index + 1 == selected.len();
+            match record {
+                Some(value) => {
+                    let mut value = value.clone();
+                    set_projection_version(&mut value, self.next_sequence + 1);
+                    next_baseline.records.insert(key.clone(), value.clone());
+                    self.enqueue(
+                        "projection_update",
+                        json!({ "kind": key.0, "record": value }),
+                        is_last.then(|| next_baseline.clone()),
+                    );
+                }
+                None => {
+                    next_baseline.records.remove(key);
+                    self.enqueue(
+                        "projection_update",
+                        json!({ "kind": "delete", "record": { "entity": key.0, "id": key.1 } }),
+                        is_last.then(|| next_baseline.clone()),
+                    );
+                }
+            }
+        }
+        if selected.is_empty() {
+            self.dirty = false;
+        }
+    }
+
+    fn enqueue(
+        &mut self,
+        frame_type: &str,
+        details: Value,
+        resulting_snapshot: Option<ProjectionSnapshot>,
+    ) {
+        self.next_sequence += 1;
+        let mut payload = details.as_object().cloned().unwrap_or_default();
+        payload.insert("owner_id".to_owned(), json!(self.owner_id));
+        payload.insert("machine_id".to_owned(), json!(self.machine_id));
+        payload.insert("epoch".to_owned(), json!(self.epoch));
+        payload.insert("sequence".to_owned(), json!(self.next_sequence));
+        self.queue.push_back(ProjectionWork {
+            epoch: self.epoch,
+            sequence: self.next_sequence,
+            frame: websocket_frame(frame_type, Value::Object(payload)),
+            resulting_snapshot,
+            sent_at: None,
+        });
+    }
+
+    fn acknowledge(
+        &mut self,
+        epoch: Uuid,
+        sequence: u64,
+        status: &str,
+    ) -> Result<ProjectionAckOutcome, String> {
+        if !matches!(status, "applied" | "duplicate") {
+            return Err("relay returned invalid projection acknowledgement".to_owned());
+        }
+        if epoch != self.epoch || sequence <= self.acknowledged_sequence {
+            return Ok(ProjectionAckOutcome::Ignored);
+        }
+        let Some(work) = self.inflight.take() else {
+            return Err("relay acknowledged a projection that was not in flight".to_owned());
+        };
+        if work.epoch != epoch || work.sequence != sequence {
+            self.inflight = Some(work);
+            return Err("relay acknowledged an unexpected projection sequence".to_owned());
+        }
+        self.acknowledged_sequence = sequence;
+        if let Some(snapshot) = work.resulting_snapshot {
+            self.baseline = snapshot.clone();
+            return Ok(ProjectionAckOutcome::Committed(snapshot));
+        }
+        Ok(ProjectionAckOutcome::Advanced)
+    }
+
+    fn next_frame(&mut self) -> Option<&mut ProjectionWork> {
+        if self.inflight.is_none() {
+            self.inflight = self.queue.pop_front();
+        }
+        self.inflight.as_mut()
+    }
+}
+
+fn set_projection_version(record: &mut Value, version: u64) {
+    if let Some(record) = record.as_object_mut() {
+        record.insert("projection_version".to_owned(), json!(version));
+    }
+}
+
+fn same_projection_content(left: &Value, right: &Value) -> bool {
+    let mut left = left.clone();
+    let mut right = right.clone();
+    if let Some(value) = left.as_object_mut() {
+        value.remove("projection_version");
+    }
+    if let Some(value) = right.as_object_mut() {
+        value.remove("projection_version");
+    }
+    left == right
+}
+
+fn websocket_frame(frame_type: &str, payload: Value) -> String {
     json!({
         "protocol_version": 1,
         "message_id": Uuid::new_v4(),
-        "type": "projection_update",
-        "created_at": created_at,
-        "payload": {
-            "owner_id": owner_id,
-            "machine_id": machine_id,
-            "epoch": epoch,
-            "sequence": sequence,
-            "kind": kind,
-            "record": record,
-        }
+        "type": frame_type,
+        "created_at": Utc::now().timestamp_millis(),
+        "payload": payload,
     })
     .to_string()
 }
 
-fn connection_loop(state: Arc<Mutex<RuntimeState>>, receiver: Receiver<String>) {
+fn persist_projection_progress(
+    state: &mut RuntimeState,
+    epoch: Uuid,
+    sequence: u64,
+) -> Result<(), String> {
+    let Some(mut machine) = state
+        .store
+        .remote_machine()
+        .map_err(|error| error.to_string())?
+    else {
+        return Err("remote identity unavailable".to_owned());
+    };
+    machine.projection_epoch = epoch;
+    machine.projection_sequence = sequence;
+    state
+        .store
+        .upsert_remote_machine(&machine)
+        .map_err(|error| error.to_string())
+}
+
+fn connection_loop(state: Arc<Mutex<RuntimeState>>, receiver: Receiver<()>) {
     let mut backoff = 1_u64;
     loop {
         let enabled = state
@@ -760,14 +1015,11 @@ fn connection_loop(state: Arc<Mutex<RuntimeState>>, receiver: Receiver<String>) 
     if let Ok(mut guard) = state.lock() {
         guard.remote.authenticated_socket_live = false;
         guard.remote.connection_started = false;
-        guard.remote.outbound = None;
+        guard.remote.projection_wakeup = None;
     }
 }
 
-fn connect_once(
-    state: &Arc<Mutex<RuntimeState>>,
-    receiver: &Receiver<String>,
-) -> Result<(), String> {
+fn connect_once(state: &Arc<Mutex<RuntimeState>>, receiver: &Receiver<()>) -> Result<(), String> {
     let (origin, identity) =
         remote_identity(state).map_err(|_| "remote identity unavailable".to_owned())?;
     let epoch = Uuid::new_v4();
@@ -789,45 +1041,70 @@ fn connect_once(
             .map_err(|error| error.to_string())?;
     match socket.get_mut() {
         MaybeTlsStream::Plain(stream) => {
-            let _ = stream.set_read_timeout(Some(StdDuration::from_secs(1)));
+            let _ = stream.set_read_timeout(Some(StdDuration::from_millis(200)));
         }
         MaybeTlsStream::Rustls(stream) => {
             let _ = stream
                 .get_mut()
-                .set_read_timeout(Some(StdDuration::from_secs(1)));
+                .set_read_timeout(Some(StdDuration::from_millis(200)));
         }
         _ => {}
     }
-    let initial = {
+    let mut transport = {
         let mut guard = state
             .lock()
             .map_err(|_| "runtime lock poisoned".to_owned())?;
+        let machine = guard
+            .store
+            .remote_machine()
+            .map_err(|error| error.to_string())?
+            .ok_or("remote identity unavailable")?;
+        let owner_id = machine.owner_id.ok_or("remote owner unavailable")?;
         guard.remote.authenticated_socket_live = true;
-        projection_frames(&mut guard, true)
+        ProjectionTransport::new(
+            owner_id,
+            machine.machine_id,
+            ProjectionSnapshot::from_state(&guard),
+        )
     };
-    for frame in initial {
-        socket
-            .send(Message::Text(frame.into()))
-            .map_err(|error| error.to_string())?;
-    }
     let mut last_heartbeat = Instant::now();
     loop {
-        loop {
-            match receiver.try_recv() {
-                Ok(frame) => socket
-                    .send(Message::Text(frame.into()))
-                    .map_err(|error| error.to_string())?,
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => return Ok(()),
-            }
-        }
-        if last_heartbeat.elapsed() >= StdDuration::from_secs(20) {
-            socket.send(Message::Text(json!({ "protocol_version": 1, "message_id": Uuid::new_v4(), "type": "heartbeat", "created_at": Utc::now().timestamp_millis(), "payload": {} }).to_string().into())).map_err(|error| error.to_string())?;
-            last_heartbeat = Instant::now();
-        }
         match socket.read() {
             Ok(Message::Text(text)) => {
-                handle_socket_frame(state, &identity, &mut socket, text.as_str())?
+                match handle_socket_frame(state, &identity, &mut socket, text.as_str())? {
+                    RelayFrameAction::None => {}
+                    RelayFrameAction::ProjectionAck {
+                        epoch,
+                        sequence,
+                        status,
+                    } => match transport.acknowledge(epoch, sequence, &status)? {
+                        ProjectionAckOutcome::Ignored => {}
+                        ProjectionAckOutcome::Advanced => {
+                            let mut guard = state
+                                .lock()
+                                .map_err(|_| "runtime lock poisoned".to_owned())?;
+                            persist_projection_progress(&mut guard, epoch, sequence)?;
+                        }
+                        ProjectionAckOutcome::Committed(snapshot) => {
+                            let mut guard = state
+                                .lock()
+                                .map_err(|_| "runtime lock poisoned".to_owned())?;
+                            snapshot.persist(&mut guard, epoch, sequence)?;
+                        }
+                    },
+                    RelayFrameAction::ProjectionGap { epoch } => {
+                        if epoch != transport.epoch {
+                            continue;
+                        }
+                        let snapshot = {
+                            let guard = state
+                                .lock()
+                                .map_err(|_| "runtime lock poisoned".to_owned())?;
+                            ProjectionSnapshot::from_state(&guard)
+                        };
+                        transport.queue_snapshot(snapshot);
+                    }
+                }
             }
             Ok(Message::Close(_)) => return Err("relay closed connection".to_owned()),
             Ok(Message::Ping(value)) => socket
@@ -841,7 +1118,60 @@ fn connect_once(
                 ) => {}
             Err(error) => return Err(error.to_string()),
         }
+
+        if last_heartbeat.elapsed() >= HEARTBEAT_INTERVAL {
+            socket
+                .send(Message::Text(
+                    websocket_frame("heartbeat", json!({})).into(),
+                ))
+                .map_err(|error| error.to_string())?;
+            last_heartbeat = Instant::now();
+        }
+
+        match receiver.try_recv() {
+            Ok(()) => transport.dirty = true,
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => return Ok(()),
+        }
+
+        if transport.queue.is_empty() && transport.inflight.is_none() && transport.dirty {
+            let snapshot = {
+                let guard = state
+                    .lock()
+                    .map_err(|_| "runtime lock poisoned".to_owned())?;
+                ProjectionSnapshot::from_state(&guard)
+            };
+            transport.queue_incremental(snapshot);
+        }
+
+        if let Some(work) = transport.next_frame() {
+            if work
+                .sent_at
+                .is_some_and(|sent_at| sent_at.elapsed() >= PROJECTION_ACK_TIMEOUT)
+            {
+                return Err("projection acknowledgement timed out".to_owned());
+            }
+            if work.sent_at.is_none() {
+                socket
+                    .send(Message::Text(work.frame.clone().into()))
+                    .map_err(|error| error.to_string())?;
+                work.sent_at = Some(Instant::now());
+            }
+        }
     }
+}
+
+#[derive(Debug, PartialEq)]
+enum RelayFrameAction {
+    None,
+    ProjectionAck {
+        epoch: Uuid,
+        sequence: u64,
+        status: String,
+    },
+    ProjectionGap {
+        epoch: Uuid,
+    },
 }
 
 fn handle_socket_frame<S: std::io::Read + std::io::Write>(
@@ -849,13 +1179,112 @@ fn handle_socket_frame<S: std::io::Read + std::io::Write>(
     identity: &MachineIdentity,
     socket: &mut tungstenite::WebSocket<S>,
     text: &str,
-) -> Result<(), String> {
+) -> Result<RelayFrameAction, String> {
     let frame: Value = serde_json::from_str(text).map_err(|_| "invalid relay frame".to_owned())?;
     if frame.get("protocol_version").and_then(Value::as_u64) != Some(1) {
         return Err("unsupported relay protocol".to_owned());
     }
-    if frame.get("type").and_then(Value::as_str) != Some("command") {
-        return Ok(());
+    let frame_type = frame
+        .get("type")
+        .and_then(Value::as_str)
+        .ok_or("relay frame omitted type")?;
+    if frame_type == "projection_ack" {
+        let payload = frame
+            .get("payload")
+            .and_then(Value::as_object)
+            .ok_or("projection acknowledgement omitted payload")?;
+        let epoch = payload
+            .get("epoch")
+            .and_then(Value::as_str)
+            .and_then(|value| Uuid::parse_str(value).ok())
+            .ok_or("projection acknowledgement omitted epoch")?;
+        let sequence = payload
+            .get("accepted_sequence")
+            .and_then(Value::as_u64)
+            .ok_or("projection acknowledgement omitted sequence")?;
+        let status = payload
+            .get("status")
+            .and_then(Value::as_str)
+            .ok_or("projection acknowledgement omitted status")?
+            .to_owned();
+        return Ok(RelayFrameAction::ProjectionAck {
+            epoch,
+            sequence,
+            status,
+        });
+    }
+    if frame_type == "projection_gap" {
+        let payload = frame
+            .get("payload")
+            .and_then(Value::as_object)
+            .ok_or("projection gap omitted payload")?;
+        let epoch = payload
+            .get("epoch")
+            .and_then(Value::as_str)
+            .and_then(|value| Uuid::parse_str(value).ok())
+            .ok_or("projection gap omitted epoch")?;
+        payload
+            .get("expected_sequence")
+            .and_then(Value::as_u64)
+            .ok_or("projection gap omitted expected sequence")?;
+        payload
+            .get("received_sequence")
+            .and_then(Value::as_u64)
+            .ok_or("projection gap omitted received sequence")?;
+        if payload
+            .get("full_snapshot_required")
+            .and_then(Value::as_bool)
+            != Some(true)
+        {
+            return Err("projection gap did not require reconciliation".to_owned());
+        }
+        return Ok(RelayFrameAction::ProjectionGap { epoch });
+    }
+    if matches!(frame_type, "hello" | "presence") {
+        return Ok(RelayFrameAction::None);
+    }
+    if frame_type == "machine_access_revoked" {
+        if let Some(device_id) = frame
+            .get("payload")
+            .and_then(|payload| payload.get("device_id"))
+            .and_then(Value::as_str)
+            .and_then(|value| Uuid::parse_str(value).ok())
+        {
+            let mut guard = state
+                .lock()
+                .map_err(|_| "runtime lock poisoned".to_owned())?;
+            guard
+                .store
+                .delete_remote_device(device_id)
+                .map_err(|error| error.to_string())?;
+        }
+        return Ok(RelayFrameAction::None);
+    }
+    if frame_type == "revoked" {
+        let mut guard = state
+            .lock()
+            .map_err(|_| "runtime lock poisoned".to_owned())?;
+        guard.remote.authenticated_socket_live = false;
+        guard
+            .store
+            .set_remote_enabled(false)
+            .map_err(|error| error.to_string())?;
+        guard
+            .store
+            .replace_remote_devices(&[])
+            .map_err(|error| error.to_string())?;
+        return Err("machine revoked".to_owned());
+    }
+    if frame_type == "error" {
+        let code = frame
+            .get("payload")
+            .and_then(|payload| payload.get("code"))
+            .and_then(Value::as_str)
+            .unwrap_or("relay_error");
+        return Err(format!("relay error: {code}"));
+    }
+    if frame_type != "command" {
+        return Err("relay frame type denied".to_owned());
     }
     let message_id = frame
         .get("message_id")
@@ -941,7 +1370,8 @@ fn handle_socket_frame<S: std::io::Read + std::io::Write>(
         &serde_json::to_vec(&result).map_err(|error| error.to_string())?,
     )
     .map_err(|_| "result encryption failed".to_owned())?;
-    socket.send(Message::Text(json!({ "protocol_version": 1, "message_id": result_message_id, "type": "command_result", "created_at": created_at, "payload": { "command_id": command.command_id, "device_id": command.device_id, "expires_at": expires_at, "encrypted": encrypted } }).to_string().into())).map_err(|error| error.to_string())
+    socket.send(Message::Text(json!({ "protocol_version": 1, "message_id": result_message_id, "type": "command_result", "created_at": created_at, "payload": { "command_id": command.command_id, "device_id": command.device_id, "expires_at": expires_at, "encrypted": encrypted } }).to_string().into())).map_err(|error| error.to_string())?;
+    Ok(RelayFrameAction::None)
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -1186,12 +1616,86 @@ fn remote_error_code(error: &ditch_remote::RemoteError) -> &'static str {
 #[cfg(test)]
 mod relay_origin_tests {
     use super::{
-        PRODUCTION_RELAY_ORIGIN, active_devices_from_response, configured_relay_origin,
-        projection_frame,
+        PRODUCTION_RELAY_ORIGIN, ProjectionAckOutcome, ProjectionSnapshot, ProjectionTransport,
+        active_devices_from_response, configured_relay_origin, machine_device_path,
+        machine_devices_path,
     };
     use ditch_remote::ProjectProjection;
     use serde_json::{Value, json};
     use uuid::Uuid;
+
+    #[derive(Default)]
+    struct FakeProjectionRelay {
+        active: ProjectionSnapshot,
+        staging: Option<(Uuid, u64, ProjectionSnapshot)>,
+    }
+
+    impl FakeProjectionRelay {
+        fn receive(&mut self, frame: &str) -> Value {
+            let frame: Value = serde_json::from_str(frame).unwrap();
+            let payload = frame["payload"].as_object().unwrap();
+            let epoch = Uuid::parse_str(payload["epoch"].as_str().unwrap()).unwrap();
+            let sequence = payload["sequence"].as_u64().unwrap();
+            let expected = self
+                .staging
+                .as_ref()
+                .filter(|(staging_epoch, _, _)| *staging_epoch == epoch)
+                .map_or(1, |(_, accepted, _)| accepted + 1);
+            if sequence != expected {
+                return json!({
+                    "protocol_version": 1,
+                    "message_id": Uuid::new_v4(),
+                    "type": "projection_gap",
+                    "created_at": 1_787_596_800_000_i64,
+                    "payload": {
+                        "epoch": epoch,
+                        "expected_sequence": expected,
+                        "received_sequence": sequence,
+                        "full_snapshot_required": true
+                    }
+                });
+            }
+            match frame["type"].as_str().unwrap() {
+                "projection_snapshot_begin" => {
+                    self.staging = Some((epoch, sequence, ProjectionSnapshot::default()));
+                }
+                "projection_snapshot_record" => {
+                    let (_, accepted, snapshot) = self.staging.as_mut().unwrap();
+                    *accepted = sequence;
+                    let kind = payload["kind"].as_str().unwrap().to_owned();
+                    let record = payload["record"].clone();
+                    let id_key = match kind.as_str() {
+                        "project" => "project_id",
+                        "session" => "session_id",
+                        "attention" => "attention_id",
+                        _ => panic!("unexpected snapshot kind"),
+                    };
+                    let id = record[id_key].as_str().unwrap().to_owned();
+                    snapshot.records.insert((kind, id), record);
+                }
+                "projection_snapshot_commit" => {
+                    let (_, accepted, _) = self.staging.as_mut().unwrap();
+                    *accepted = sequence;
+                    self.active = self.staging.take().unwrap().2;
+                }
+                _ => panic!("unexpected fake-relay frame"),
+            }
+            if let Some((_, accepted, _)) = self.staging.as_mut() {
+                *accepted = sequence;
+            }
+            json!({
+                "protocol_version": 1,
+                "message_id": Uuid::new_v4(),
+                "type": "projection_ack",
+                "created_at": 1_787_596_800_000_i64,
+                "payload": {
+                    "epoch": epoch,
+                    "accepted_sequence": sequence,
+                    "status": "applied"
+                }
+            })
+        }
+    }
 
     #[test]
     fn production_relay_is_the_default() {
@@ -1232,6 +1736,20 @@ mod relay_origin_tests {
     }
 
     #[test]
+    fn device_roster_and_revoke_paths_are_machine_scoped() {
+        let machine_id = Uuid::parse_str("22222222-2222-4222-8222-222222222222").unwrap();
+        let device_id = Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap();
+        assert_eq!(
+            machine_devices_path(machine_id),
+            "/v1/machines/22222222-2222-4222-8222-222222222222/devices"
+        );
+        assert_eq!(
+            machine_device_path(machine_id, device_id),
+            "/v1/machines/22222222-2222-4222-8222-222222222222/devices/11111111-1111-4111-8111-111111111111"
+        );
+    }
+
+    #[test]
     fn transmitted_projection_frame_keeps_timestamp_as_json_integer() {
         let project = ProjectProjection {
             project_id: Uuid::new_v4(),
@@ -1245,16 +1763,15 @@ mod relay_origin_tests {
             last_activity_at: 1_787_596_800_123,
             projection_version: 1,
         };
-        let frame = projection_frame(
-            Uuid::new_v4(),
-            Uuid::new_v4(),
-            Uuid::new_v4(),
-            2,
-            "project",
-            serde_json::to_value(project).unwrap(),
-            1_787_596_800_456,
-        );
-        let json: Value = serde_json::from_str(&frame).unwrap();
+        let key = ("project".to_owned(), project.project_id.to_string());
+        let snapshot = ProjectionSnapshot {
+            records: [(key, serde_json::to_value(project).unwrap())]
+                .into_iter()
+                .collect(),
+        };
+        let transport = ProjectionTransport::new(Uuid::new_v4(), Uuid::new_v4(), snapshot);
+        let json: Value = serde_json::from_str(&transport.queue[1].frame).unwrap();
+        assert_eq!(json["type"], "projection_snapshot_record");
         assert_eq!(
             json.pointer("/payload/record/last_activity_at")
                 .and_then(Value::as_i64),
@@ -1265,15 +1782,19 @@ mod relay_origin_tests {
     #[test]
     fn active_device_roster_uses_integer_timestamps_and_rejects_tombstones() {
         let device_id = Uuid::new_v4();
+        let signing_public_key = "BEpzUDasQTezvS3DbSVeuAqDbQ7lL27drGz6T2wFxigZ7q0Cq5KV0ZgV3gGsCWAQq6d1GgTTArxB7r-tF3UsNeY";
+        let agreement_public_key = "BKLLvBAvoHGRc8aMEJgGlYX6M_FcwKQqu8B5czZ-XzsEoEvQgqAK7cDxfc1NpOQVmXFm6pfcyXSoSm5bfEoo05E";
         let response = json!({
             "protocol_version": 1,
             "devices": [{
                 "id": device_id,
                 "name": "iPhone",
+                "platform": "ios",
                 "state": "active",
-                "signing_public_key": "signing",
-                "agreement_public_key": "agreement",
+                "signing_public_key": signing_public_key,
+                "agreement_public_key": agreement_public_key,
                 "key_version": 3,
+                "authorized_at": 1_787_596_700_000_i64,
                 "last_seen_at": 1_787_596_800_123_i64
             }]
         });
@@ -1290,5 +1811,157 @@ mod relay_origin_tests {
         let mut revoked = response;
         revoked["devices"][0]["state"] = json!("revoked");
         assert!(active_devices_from_response(&revoked).is_err());
+    }
+
+    fn snapshot_with_projects(count: usize) -> ProjectionSnapshot {
+        let records = (0..count)
+            .map(|index| {
+                let id = Uuid::new_v4();
+                (
+                    ("project".to_owned(), id.to_string()),
+                    json!({
+                        "project_id": id,
+                        "name": format!("Project {index}"),
+                        "status": "idle",
+                        "running_count": 0,
+                        "waiting_count": 0,
+                        "ready_count": 0,
+                        "failed_count": 0,
+                        "attention_count": 0,
+                        "last_activity_at": 1_787_596_800_123_i64,
+                        "projection_version": 1
+                    }),
+                )
+            })
+            .collect();
+        ProjectionSnapshot { records }
+    }
+
+    #[test]
+    fn staged_snapshot_waits_for_each_ack_and_commits_at_the_end() {
+        let snapshot = snapshot_with_projects(2);
+        let mut transport = ProjectionTransport::new(Uuid::new_v4(), Uuid::new_v4(), snapshot);
+        assert_eq!(transport.queue.len(), 4);
+
+        let mut frame_types = Vec::new();
+        let mut committed = false;
+        while let Some(work) = transport.next_frame() {
+            let frame: Value = serde_json::from_str(&work.frame).unwrap();
+            frame_types.push(frame["type"].as_str().unwrap().to_owned());
+            let epoch = work.epoch;
+            let sequence = work.sequence;
+            match transport.acknowledge(epoch, sequence, "applied").unwrap() {
+                ProjectionAckOutcome::Committed(snapshot) => {
+                    committed = true;
+                    assert_eq!(snapshot.records.len(), 2);
+                }
+                ProjectionAckOutcome::Advanced => {}
+                ProjectionAckOutcome::Ignored => panic!("current ACK must advance"),
+            }
+        }
+        assert!(committed);
+        assert_eq!(
+            frame_types,
+            [
+                "projection_snapshot_begin",
+                "projection_snapshot_record",
+                "projection_snapshot_record",
+                "projection_snapshot_commit"
+            ]
+        );
+    }
+
+    #[test]
+    fn ordinary_change_emits_only_the_changed_projection() {
+        let original = snapshot_with_projects(2);
+        let mut transport =
+            ProjectionTransport::new(Uuid::new_v4(), Uuid::new_v4(), original.clone());
+        while let Some(work) = transport.next_frame() {
+            let epoch = work.epoch;
+            let sequence = work.sequence;
+            transport.acknowledge(epoch, sequence, "applied").unwrap();
+        }
+        let mut changed = original;
+        changed.records.values_mut().next().unwrap()["status"] = json!("running");
+        transport.queue_incremental(changed);
+        assert_eq!(transport.queue.len(), 1);
+        let frame: Value = serde_json::from_str(&transport.queue[0].frame).unwrap();
+        assert_eq!(frame["type"], "projection_update");
+        assert_eq!(frame["payload"]["kind"], "project");
+    }
+
+    #[test]
+    fn stale_ack_is_ignored_without_changing_current_epoch() {
+        let mut transport =
+            ProjectionTransport::new(Uuid::new_v4(), Uuid::new_v4(), snapshot_with_projects(1));
+        let current_epoch = transport.epoch;
+        assert!(matches!(
+            transport.acknowledge(Uuid::new_v4(), 1, "applied").unwrap(),
+            ProjectionAckOutcome::Ignored
+        ));
+        assert_eq!(transport.epoch, current_epoch);
+        assert_eq!(transport.acknowledged_sequence, 0);
+    }
+
+    #[test]
+    fn deterministic_relay_keeps_old_projection_until_snapshot_commit() {
+        let old = snapshot_with_projects(1);
+        let replacement = snapshot_with_projects(2);
+        let mut relay = FakeProjectionRelay {
+            active: old.clone(),
+            staging: None,
+        };
+        let mut transport =
+            ProjectionTransport::new(Uuid::new_v4(), Uuid::new_v4(), replacement.clone());
+
+        for _ in 0..3 {
+            let work = transport.next_frame().unwrap();
+            let epoch = work.epoch;
+            let sequence = work.sequence;
+            let response = relay.receive(&work.frame);
+            assert_eq!(response["type"], "projection_ack");
+            transport.acknowledge(epoch, sequence, "applied").unwrap();
+        }
+        assert_eq!(relay.active, old);
+
+        let work = transport.next_frame().unwrap();
+        let epoch = work.epoch;
+        let sequence = work.sequence;
+        relay.receive(&work.frame);
+        assert!(matches!(
+            transport.acknowledge(epoch, sequence, "applied").unwrap(),
+            ProjectionAckOutcome::Committed(_)
+        ));
+        assert_eq!(relay.active.records.len(), replacement.records.len());
+    }
+
+    #[test]
+    fn deterministic_relay_requests_reconciliation_for_a_gap() {
+        let mut relay = FakeProjectionRelay::default();
+        let transport =
+            ProjectionTransport::new(Uuid::new_v4(), Uuid::new_v4(), snapshot_with_projects(1));
+        let mut skipped: Value = serde_json::from_str(&transport.queue[1].frame).unwrap();
+        skipped["payload"]["sequence"] = json!(2);
+        let response = relay.receive(&skipped.to_string());
+        assert_eq!(response["type"], "projection_gap");
+        assert_eq!(response["payload"]["expected_sequence"], 1);
+        assert_eq!(response["payload"]["full_snapshot_required"], true);
+    }
+
+    #[test]
+    fn incremental_projection_work_is_bounded_to_thirty_two_records() {
+        let mut transport = ProjectionTransport::new(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            ProjectionSnapshot::default(),
+        );
+        while let Some(work) = transport.next_frame() {
+            let epoch = work.epoch;
+            let sequence = work.sequence;
+            transport.acknowledge(epoch, sequence, "applied").unwrap();
+        }
+        transport.queue_incremental(snapshot_with_projects(40));
+        assert_eq!(transport.queue.len(), 32);
+        assert!(transport.dirty);
     }
 }

@@ -535,7 +535,7 @@ impl DitchStore {
         Ok(())
     }
 
-    /// Replaces the local cache with the relay's complete owner-scoped active
+    /// Replaces the local cache with the relay's complete machine-scoped active
     /// device roster. The transaction prevents command authorization from
     /// observing a partially reconciled list.
     pub fn replace_remote_devices(

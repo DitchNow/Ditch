@@ -23,11 +23,23 @@ Worker authorizes requests using D1 metadata and routes sockets into one
 Durable Object per machine. Phones also connect outbound. No Cloudflare Tunnel,
 inbound Mac listener, generic RPC, shell, PTY, or filesystem operation exists.
 
+Owners are anonymous tenancy boundaries, not accounts and not authorization
+grants. Control authority is an explicit many-to-many machine-device
+association created by confirmed pairing. Consequently, one phone can control
+multiple Macs and one Mac can be controlled by multiple phones without granting
+every owner device access to every owner machine.
+
 Machine private keys live in macOS Keychain and are owned by `ditchd`; only
 public keys and opaque identifiers enter SQLite. Sensitive phone↔machine payloads
 are pairwise encrypted above TLS. D1 stores only anonymous relationships,
 sanitized projections, attention metadata, push tokens, and privacy-safe audit
 metadata. Transcript pages are live ciphertext relay only.
+
+Projection synchronization permits one acknowledged frame in flight. Full
+snapshots are staged under a fresh epoch and become visible only after an
+explicit commit, so a dropped connection cannot replace the last complete
+cloud projection with an empty or partial snapshot. Ordinary local events emit
+coalesced incremental records rather than complete snapshots.
 
 Remote command adapters invoke the same daemon functions used by the local IPC
 dispatcher. The command allowlist is exhaustive. Idempotency and expiry are
@@ -45,4 +57,3 @@ device and machine is lost.
 The Cloudflare service is separately deployable TypeScript and adds no Workers
 dependencies to Rust or Flutter. Protocol schemas and fixtures are exported as
 a versioned bundle for the separate iPhone repository.
-

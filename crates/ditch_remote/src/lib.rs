@@ -290,6 +290,16 @@ impl MachineIdentity {
     }
 }
 
+/// Validates the canonical uncompressed SEC1 encoding used for both Remote
+/// Protocol v1 P-256 identity and agreement public keys.
+pub fn validate_p256_public_key(value: &str) -> Result<(), RemoteError> {
+    let bytes = URL_SAFE_NO_PAD
+        .decode(value)
+        .map_err(|_| RemoteError::InvalidKey)?;
+    PublicKey::from_sec1_bytes(&bytes).map_err(|_| RemoteError::InvalidKey)?;
+    Ok(())
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PairwiseContext {
     pub owner_id: Uuid,
@@ -730,5 +740,17 @@ mod tests {
         let json = serde_json::to_value(session).unwrap();
         assert_eq!(json["last_activity_at"], serde_json::json!(-1));
         assert!(!json["last_activity_at"].is_string());
+    }
+
+    #[test]
+    fn public_key_validation_rejects_invalid_curve_points() {
+        let identity = MachineIdentity::generate(Uuid::new_v4());
+        assert!(validate_p256_public_key(&identity.signing_public_key()).is_ok());
+        assert!(validate_p256_public_key(&identity.agreement_public_key()).is_ok());
+        assert!(validate_p256_public_key("not-base64url").is_err());
+        assert!(validate_p256_public_key(
+            "BAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        )
+        .is_err());
     }
 }

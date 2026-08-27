@@ -87,13 +87,14 @@ paths:
       operationId: putPushToken
       parameters: [{$ref: '#/components/parameters/DeviceId'}]
       responses: {'204': {description: Updated}, '401': {$ref: '#/components/responses/Error'}}
-  /v1/devices:
+  /v1/machines/{machine_id}/devices:
     get:
-      operationId: listDevices
-      description: Returns the authenticated owner's complete active-device roster. Machine clients use this authoritative snapshot to reconcile their local authorization cache before displaying Remote settings.
+      operationId: listMachineDevices
+      description: Returns the complete active-device roster authorized for this machine. A machine may request only its own roster. Machine clients use this authoritative snapshot to reconcile their local authorization cache before displaying Remote settings.
+      parameters: [{$ref: '#/components/parameters/MachineId'}]
       responses:
         '200':
-          description: Owner-scoped active devices
+          description: Active devices authorized for this machine
           content:
             application/json:
               schema:
@@ -106,9 +107,18 @@ paths:
                     type: array
                     items: {$ref: '#/components/schemas/ActiveDevice'}
         '401': {$ref: '#/components/responses/Error'}
+  /v1/machines/{machine_id}/devices/{device_id}:
+    delete:
+      operationId: revokeMachineDevice
+      description: Revokes this device's authorization for this machine only. It does not revoke the device identity or its authorization for another machine.
+      parameters:
+        - {$ref: '#/components/parameters/MachineId'}
+        - {$ref: '#/components/parameters/DeviceId'}
+      responses: {'204': {description: Machine-specific authorization revoked}, '401': {$ref: '#/components/responses/Error'}}
   /v1/devices/{device_id}:
     delete:
       operationId: revokeDevice
+      description: Globally revokes the device identity and all of its machine authorizations. The ordinary Mac settings Revoke action does not use this operation.
       parameters: [{$ref: '#/components/parameters/DeviceId'}]
       responses: {'204': {description: Revoked}, '401': {$ref: '#/components/responses/Error'}}
   /v1/machines/{machine_id}/commands:
@@ -138,14 +148,16 @@ components:
     ActiveDevice:
       type: object
       additionalProperties: false
-      required: [id, name, state, signing_public_key, agreement_public_key, key_version, last_seen_at]
+      required: [id, name, platform, state, signing_public_key, agreement_public_key, key_version, authorized_at, last_seen_at]
       properties:
         id: {type: string, format: uuid}
         name: {type: string, maxLength: 120}
+        platform: {const: ios}
         state: {const: active}
         signing_public_key: {type: string}
         agreement_public_key: {type: string}
         key_version: {type: integer, minimum: 1}
+        authorized_at: {type: integer}
         last_seen_at: {type: [integer, 'null']}
     MachineRegistration:
       type: object
