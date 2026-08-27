@@ -3,10 +3,12 @@ use ditch_core::{
     AgentExecutionProfile, AgentId, AgentRun, AppPaths, AttentionKind, CodexLaunchMode,
     PermissionRequest, Project, ProjectGitPolicy, ProjectId, Task,
 };
+use ditch_ssh::{NewSshHost, ResolvedSshHost, SshHostSummary};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 pub const PROTOCOL_VERSION: u16 = 1;
+pub const REMOTE_RUNTIME_PROTOCOL_VERSION: u16 = 1;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Envelope<T> {
@@ -51,10 +53,84 @@ pub enum ClientRequest {
         root: String,
         git_policy: ProjectGitPolicy,
     },
+    DiscoverSshHosts,
+    ResolveSshHost {
+        alias: String,
+    },
+    PreviewSshHost {
+        host: NewSshHost,
+    },
+    AddSshHost {
+        host: NewSshHost,
+    },
+    CheckRemoteSetup {
+        alias: String,
+        #[serde(default)]
+        password: Option<String>,
+        #[serde(default)]
+        remember_password: bool,
+        #[serde(default)]
+        trust_unknown_host: bool,
+    },
+    InstallRemoteRuntime {
+        alias: String,
+    },
+    InstallRemoteCodex {
+        alias: String,
+    },
+    InstallRemoteGit {
+        alias: String,
+    },
+    OpenRemoteCodexAuthentication {
+        alias: String,
+        columns: u16,
+        rows: u16,
+    },
+    /// Internal remote-daemon command. It can only launch the fixed Codex
+    /// login flow and is not a generic PTY/shell launcher.
+    OpenCodexAuthentication {
+        columns: u16,
+        rows: u16,
+    },
+    WriteSetupTerminal {
+        terminal_id: Uuid,
+        data: Vec<u8>,
+    },
+    ResizeSetupTerminal {
+        terminal_id: Uuid,
+        columns: u16,
+        rows: u16,
+    },
+    TakeSetupTerminalOutput {
+        terminal_id: Uuid,
+    },
+    CloseSetupTerminal {
+        terminal_id: Uuid,
+    },
+    ListRemoteDirectory {
+        alias: String,
+        absolute_path: String,
+    },
+    /// Bootstrap-only typed query handled by a remote daemon. This is not a
+    /// generic shell or file mutation API.
+    ListFilesystemDirectory {
+        absolute_path: String,
+    },
+    CreateRemoteProject {
+        ssh_host_alias: String,
+        name: String,
+        remote_root: String,
+        git_policy: ProjectGitPolicy,
+    },
+    CheckRemoteProject {
+        project_id: ProjectId,
+    },
     DeleteProject {
         project_id: ProjectId,
     },
     StartCodexSession {
+        #[serde(default)]
+        project_id: Option<ProjectId>,
         project_name: String,
         project_root: String,
         prompt: String,
@@ -63,6 +139,8 @@ pub enum ClientRequest {
         execution_profile: AgentExecutionProfile,
     },
     ResumeCodexSession {
+        #[serde(default)]
+        project_id: Option<ProjectId>,
         project_name: String,
         project_root: String,
         thread_id: String,
@@ -83,6 +161,8 @@ pub enum ClientRequest {
     },
     ListAgentModels {
         provider: ditch_core::AgentProvider,
+        #[serde(default)]
+        project_id: Option<ProjectId>,
     },
     DiscoverCodexInstallations,
     CheckCodexReadiness,
@@ -124,6 +204,9 @@ pub enum ClientRequest {
     StopAgent {
         agent_id: AgentId,
     },
+    ForceKillAgent {
+        agent_id: AgentId,
+    },
     DeleteAgent {
         agent_id: AgentId,
     },
@@ -139,6 +222,25 @@ pub enum ClientRequest {
     },
     MarkAllAttentionRead,
     RemoteControlStatus,
+    EnsureRemoteMachineIdentity,
+    RemoteMachineControlStatus {
+        alias: String,
+    },
+    CreateRemoteMachinePairing {
+        alias: String,
+    },
+    GetRemoteMachinePairing {
+        alias: String,
+        pairing_id: Uuid,
+    },
+    ConfirmRemoteMachinePairing {
+        alias: String,
+        pairing_id: Uuid,
+    },
+    CancelRemoteMachinePairing {
+        alias: String,
+        pairing_id: Uuid,
+    },
     CreateRemotePairing,
     GetRemotePairing {
         pairing_id: Uuid,
@@ -168,10 +270,17 @@ pub enum ServerResponse {
     RuntimeStatus(RuntimeStatus),
     Snapshot(Snapshot),
     Projects(Vec<Project>),
+    SshHosts(Vec<SshHostSummary>),
+    ResolvedSshHost(ResolvedSshHost),
+    SshConfigPreview(String),
+    RemoteSetup(RemoteSetupStatus),
+    RemoteDirectory(RemoteDirectory),
     AgentModels(Vec<AgentModel>),
     CodexInstallations(Vec<CodexInstallation>),
     CodexReadiness(CodexReadiness),
     ProjectTerminal(ProjectTerminal),
+    SetupTerminal(SetupTerminal),
+    SetupTerminalOutput(SetupTerminalOutput),
     ProjectDirectory(ProjectDirectory),
     ProjectFile(ProjectFile),
     ProjectFileSaved(ProjectFileSaved),
@@ -228,6 +337,19 @@ pub struct ProjectTerminal {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SetupTerminal {
+    pub id: Uuid,
+    pub purpose: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SetupTerminalOutput {
+    pub terminal_id: Uuid,
+    pub data: Vec<u8>,
+    pub exited: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ProjectFileKind {
     Directory,
     File,
@@ -274,6 +396,70 @@ pub struct HealthResponse {
     pub claude_binary: Option<String>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteCheckState {
+    Checking,
+    Ready,
+    Missing,
+    AuthenticationRequired,
+    InstallAvailable,
+    ManualActionRequired,
+    Failed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RemoteSetupCheck {
+    pub key: String,
+    pub label: String,
+    pub state: RemoteCheckState,
+    pub detail: String,
+    #[serde(default)]
+    pub technical_detail: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RemoteRuntimeHandshake {
+    pub client_version: String,
+    pub server_version: Option<String>,
+    pub protocol_version: u16,
+    pub build_identifier: Option<String>,
+    pub daemon_epoch: Option<Uuid>,
+    pub os: Option<String>,
+    pub architecture: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RemoteSetupStatus {
+    pub ssh_host_alias: String,
+    pub remote_machine_id: Option<Uuid>,
+    pub ready: bool,
+    pub connection_state: String,
+    pub home_directory: Option<String>,
+    pub checks: Vec<RemoteSetupCheck>,
+    pub handshake: RemoteRuntimeHandshake,
+    #[serde(default)]
+    pub host_key_fingerprint: Option<String>,
+    #[serde(default)]
+    pub last_error: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RemoteDirectoryEntry {
+    pub name: String,
+    pub absolute_path: String,
+    pub is_directory: bool,
+    pub is_symlink: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RemoteDirectory {
+    pub ssh_host_alias: String,
+    pub absolute_path: String,
+    pub parent_path: Option<String>,
+    pub entries: Vec<RemoteDirectoryEntry>,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Snapshot {
     pub projects: Vec<Project>,
@@ -305,6 +491,12 @@ pub struct RuntimeStatus {
     pub build_version: String,
     #[serde(default)]
     pub capabilities: Vec<String>,
+    #[serde(default)]
+    pub protocol_version: u16,
+    #[serde(default)]
+    pub platform: String,
+    #[serde(default)]
+    pub architecture: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -360,6 +552,7 @@ pub enum ServerEvent {
     SnapshotReplaced(Snapshot),
     AttentionSnapshotReplaced(Vec<RuntimeAttention>),
     RuntimeStatusChanged(RuntimeStatus),
+    RemoteHostStatusChanged(RemoteHostPresence),
     ProjectChanged(Project),
     ProjectDeleted {
         project_id: ProjectId,
@@ -395,6 +588,15 @@ pub enum ServerEvent {
     ProjectTerminalExited {
         terminal_id: Uuid,
     },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RemoteHostPresence {
+    pub ssh_host_alias: String,
+    pub state: String,
+    pub updated_at: DateTime<Utc>,
+    #[serde(default)]
+    pub detail: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

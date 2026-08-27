@@ -102,12 +102,18 @@ class DitchProject {
     required this.name,
     required this.path,
     this.gitPolicy = ProjectGitPolicy.requireRepository,
+    this.remoteMachineId,
+    this.sshHostAlias,
   });
 
   final String? id;
   final String name;
   final String path;
   final ProjectGitPolicy gitPolicy;
+  final String? remoteMachineId;
+  final String? sshHostAlias;
+
+  bool get isRemote => sshHostAlias != null;
 }
 
 enum ProjectGitPolicy {
@@ -115,6 +121,10 @@ enum ProjectGitPolicy {
   initializeRepository,
   allowOutsideGit,
 }
+
+String _titleCase(String value) => value.isEmpty
+    ? value
+    : '${value.substring(0, 1).toUpperCase()}${value.substring(1)}';
 
 bool isInsideGitWorkTree(String path) {
   var directory = Directory(path).absolute;
@@ -141,11 +151,18 @@ String canonicalProjectPath(String path) {
 }
 
 void upsertProject(List<DitchProject> projects, DitchProject incoming) {
-  final incomingPath = canonicalProjectPath(incoming.path);
+  final incomingPath = incoming.isRemote
+      ? incoming.path
+      : canonicalProjectPath(incoming.path);
   final index = projects.indexWhere(
     (existing) =>
         (incoming.id != null && existing.id == incoming.id) ||
-        canonicalProjectPath(existing.path) == incomingPath,
+        (existing.isRemote == incoming.isRemote &&
+            existing.sshHostAlias == incoming.sshHostAlias &&
+            (existing.isRemote
+                    ? existing.path
+                    : canonicalProjectPath(existing.path)) ==
+                incomingPath),
   );
   if (index >= 0) {
     projects[index] = incoming;
@@ -184,6 +201,7 @@ class ProjectEditorDocument {
     required this.relativePath,
     required String content,
     required this.revision,
+    this.readOnly = false,
   }) : originalContent = content,
        controller = TextEditingController(text: content);
 
@@ -191,6 +209,7 @@ class ProjectEditorDocument {
   final TextEditingController controller;
   String originalContent;
   String revision;
+  final bool readOnly;
   bool saving = false;
   bool conflict = false;
   String? error;
@@ -1013,6 +1032,142 @@ class DitchRuntimeClient {
     });
   }
 
+  Future<List<Map<String, dynamic>>> discoverSshHosts() async {
+    final response = await request('DiscoverSshHosts');
+    final values = response['SshHosts'];
+    return values is List
+        ? values
+              .whereType<Map>()
+              .map((item) => Map<String, dynamic>.from(item))
+              .toList()
+        : const [];
+  }
+
+  Future<String> previewSshHost(Map<String, dynamic> host) async {
+    final response = await request({
+      'PreviewSshHost': {'host': host},
+    });
+    return response['SshConfigPreview']?.toString() ?? '';
+  }
+
+  Future<void> addSshHost(Map<String, dynamic> host) async {
+    await request({
+      'AddSshHost': {'host': host},
+    });
+  }
+
+  Future<Map<String, dynamic>> checkRemoteSetup({
+    required String alias,
+    String? password,
+    bool rememberPassword = false,
+    bool trustUnknownHost = false,
+  }) async {
+    final response = await request({
+      'CheckRemoteSetup': {
+        'alias': alias,
+        'password': password,
+        'remember_password': rememberPassword,
+        'trust_unknown_host': trustUnknownHost,
+      },
+    });
+    return Map<String, dynamic>.from(response['RemoteSetup'] as Map);
+  }
+
+  Future<Map<String, dynamic>> installRemoteRuntime(String alias) async {
+    final response = await request({
+      'InstallRemoteRuntime': {'alias': alias},
+    });
+    return Map<String, dynamic>.from(response['RemoteSetup'] as Map);
+  }
+
+  Future<Map<String, dynamic>> installRemoteCodex(String alias) async {
+    final response = await request({
+      'InstallRemoteCodex': {'alias': alias},
+    });
+    return Map<String, dynamic>.from(response['RemoteSetup'] as Map);
+  }
+
+  Future<Map<String, dynamic>> installRemoteGit(String alias) async {
+    final response = await request({
+      'InstallRemoteGit': {'alias': alias},
+    });
+    return Map<String, dynamic>.from(response['RemoteSetup'] as Map);
+  }
+
+  Future<String> openRemoteCodexAuthentication(String alias) async {
+    final response = await request({
+      'OpenRemoteCodexAuthentication': {
+        'alias': alias,
+        'columns': 90,
+        'rows': 24,
+      },
+    });
+    return (response['SetupTerminal'] as Map)['id'].toString();
+  }
+
+  Future<void> writeSetupTerminal(String terminalId, List<int> data) async {
+    await request({
+      'WriteSetupTerminal': {'terminal_id': terminalId, 'data': data},
+    });
+  }
+
+  Future<Map<String, dynamic>> takeSetupTerminalOutput(
+    String terminalId,
+  ) async {
+    final response = await request({
+      'TakeSetupTerminalOutput': {'terminal_id': terminalId},
+    });
+    return Map<String, dynamic>.from(response['SetupTerminalOutput'] as Map);
+  }
+
+  Future<void> resizeSetupTerminal(
+    String terminalId,
+    int columns,
+    int rows,
+  ) async {
+    await request({
+      'ResizeSetupTerminal': {
+        'terminal_id': terminalId,
+        'columns': columns,
+        'rows': rows,
+      },
+    });
+  }
+
+  Future<void> closeSetupTerminal(String terminalId) async {
+    await request({
+      'CloseSetupTerminal': {'terminal_id': terminalId},
+    });
+  }
+
+  Future<Map<String, dynamic>> listRemoteDirectory(
+    String alias,
+    String absolutePath,
+  ) async {
+    final response = await request({
+      'ListRemoteDirectory': {'alias': alias, 'absolute_path': absolutePath},
+    });
+    return Map<String, dynamic>.from(response['RemoteDirectory'] as Map);
+  }
+
+  Future<Map<String, dynamic>> createRemoteProject({
+    required String alias,
+    required String name,
+    required String root,
+    required ProjectGitPolicy gitPolicy,
+  }) => request({
+    'CreateRemoteProject': {
+      'ssh_host_alias': alias,
+      'name': name,
+      'remote_root': root,
+      'git_policy': switch (gitPolicy) {
+        ProjectGitPolicy.requireRepository => 'RequireRepository',
+        ProjectGitPolicy.initializeRepository => 'InitializeRepository',
+        ProjectGitPolicy.allowOutsideGit => 'AllowOutsideGit',
+      },
+    },
+  });
+
   Future<Map<String, dynamic>> deleteProject(String projectId) {
     return request({
       'DeleteProject': {'project_id': projectId},
@@ -1026,12 +1181,14 @@ class DitchRuntimeClient {
   }
 
   Future<Map<String, dynamic>> startCodexSession({
+    String? projectId,
     required String projectName,
     required String projectRoot,
     required String prompt,
   }) {
     return request({
       'StartCodexSession': {
+        'project_id': projectId,
         'project_name': projectName,
         'project_root': projectRoot,
         'prompt': prompt,
@@ -1071,9 +1228,9 @@ class DitchRuntimeClient {
     });
   }
 
-  Future<List<AgentModelOption>> listCodexModels() async {
+  Future<List<AgentModelOption>> listCodexModels({String? projectId}) async {
     final response = await request({
-      'ListAgentModels': {'provider': 'Codex'},
+      'ListAgentModels': {'provider': 'Codex', 'project_id': projectId},
     });
     final values = response['AgentModels'];
     if (values is! List) return const [];
@@ -1228,25 +1385,61 @@ class DitchRuntimeClient {
     });
   }
 
-  Future<Map<String, dynamic>> remoteControlStatus() =>
-      request('RemoteControlStatus');
+  Future<Map<String, dynamic>> remoteControlStatus({String? sshAlias}) =>
+      sshAlias == null
+      ? request('RemoteControlStatus')
+      : request({
+          'RemoteMachineControlStatus': {'alias': sshAlias},
+        });
 
-  Future<Map<String, dynamic>> createRemotePairing() =>
-      request('CreateRemotePairing');
+  Future<Map<String, dynamic>> createRemotePairing({String? sshAlias}) =>
+      sshAlias == null
+      ? request('CreateRemotePairing')
+      : request({
+          'CreateRemoteMachinePairing': {'alias': sshAlias},
+        });
 
-  Future<Map<String, dynamic>> getRemotePairing(String pairingId) => request({
-    'GetRemotePairing': {'pairing_id': pairingId},
-  });
+  Future<Map<String, dynamic>> getRemotePairing(
+    String pairingId, {
+    String? sshAlias,
+  }) => sshAlias == null
+      ? request({
+          'GetRemotePairing': {'pairing_id': pairingId},
+        })
+      : request({
+          'GetRemoteMachinePairing': {
+            'alias': sshAlias,
+            'pairing_id': pairingId,
+          },
+        });
 
-  Future<Map<String, dynamic>> confirmRemotePairing(String pairingId) =>
-      request({
-        'ConfirmRemotePairing': {'pairing_id': pairingId},
-      });
+  Future<Map<String, dynamic>> confirmRemotePairing(
+    String pairingId, {
+    String? sshAlias,
+  }) => sshAlias == null
+      ? request({
+          'ConfirmRemotePairing': {'pairing_id': pairingId},
+        })
+      : request({
+          'ConfirmRemoteMachinePairing': {
+            'alias': sshAlias,
+            'pairing_id': pairingId,
+          },
+        });
 
-  Future<Map<String, dynamic>> cancelRemotePairing(String pairingId) =>
-      request({
-        'CancelRemotePairing': {'pairing_id': pairingId},
-      });
+  Future<Map<String, dynamic>> cancelRemotePairing(
+    String pairingId, {
+    String? sshAlias,
+  }) => sshAlias == null
+      ? request({
+          'CancelRemotePairing': {'pairing_id': pairingId},
+        })
+      : request({
+          'CancelRemoteMachinePairing': {
+            'alias': sshAlias,
+            'pairing_id': pairingId,
+          },
+        });
 
   Future<Map<String, dynamic>> revokeRemoteDevice(String deviceId) => request({
     'RevokeRemoteDevice': {'device_id': deviceId},
@@ -1270,11 +1463,15 @@ DitchProject? parseRuntimeProject(Object? value) {
     'InitializeRepository' => ProjectGitPolicy.initializeRepository,
     _ => ProjectGitPolicy.requireRepository,
   };
+  final target = value['execution_target'];
+  final remote = target is Map && target['kind']?.toString() == 'remote';
   return DitchProject(
     id: value['id']?.toString(),
     name: name,
     path: root,
     gitPolicy: gitPolicy,
+    remoteMachineId: remote ? target['remote_machine_id']?.toString() : null,
+    sshHostAlias: remote ? target['ssh_host_alias']?.toString() : null,
   );
 }
 
@@ -1317,6 +1514,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
   final _readAttentionIds = <String>{};
   final Map<String, ProjectTerminalSession> _projectTerminals = {};
   final Map<String, ProjectFilesState> _projectFiles = {};
+  final Map<String, String> _remoteHostStatus = {};
 
   StreamSubscription<Map<String, dynamic>>? _runtimeEvents;
   String? _runtimeInstanceId;
@@ -1348,6 +1546,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
   String? _expandedAgentLocalId;
   String? _focusedAgentLocalId;
   AgentNotificationTarget? _pendingNotificationTarget;
+  BuildContext? _projectSetupProgressContext;
   bool _runtimeSnapshotHydrated = false;
   final List<AgentSession> _agentSessions = [];
 
@@ -1361,7 +1560,10 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
   }
 
   String _projectKey(DitchProject project) =>
-      project.id ?? canonicalProjectPath(project.path);
+      project.id ??
+      (project.isRemote
+          ? 'remote:${project.sshHostAlias}:${project.path}'
+          : canonicalProjectPath(project.path));
 
   int get _selectedProjectIndex {
     if (_projects.isEmpty) return -1;
@@ -1423,6 +1625,18 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
   }
 
   Future<void> _revealProjectInFinder(DitchProject project) async {
+    if (project.isRemote) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              '${project.path} lives on ${project.sshHostAlias}. Source files remain remote.',
+            ),
+          ),
+        );
+      }
+      return;
+    }
     try {
       final revealed =
           await _applicationChannel.invokeMethod<bool>(
@@ -2069,6 +2283,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
       for (final session in _agentSessions) session.localId: session,
     };
     final sessionsById = <String, AgentSession>{};
+    final refreshLatestAgentIds = <String>{};
     for (final agentJson in agentsJson) {
       final session = _agentSessionFromRuntime(
         agentJson,
@@ -2077,6 +2292,13 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
       if (session != null) {
         final existing = existingSessions[session.localId];
         if (existing != null) {
+          if (session.updatedAt.isAfter(existing.updatedAt) &&
+              _projects.any(
+                (project) =>
+                    project.id == session.projectId && project.isRemote,
+              )) {
+            refreshLatestAgentIds.add(session.localId);
+          }
           session.messages
             ..clear()
             ..addAll(existing.messages);
@@ -2175,6 +2397,12 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
         ? null
         : sessionsById[_expandedAgentLocalId];
     if (expanded != null) unawaited(_loadAgentMessages(expanded));
+    for (final agentId in refreshLatestAgentIds) {
+      final session = sessionsById[agentId];
+      if (session != null) {
+        unawaited(_loadAgentMessages(session, refreshLatest: true));
+      }
+    }
     _scheduleStatusBarUpdate();
     final pendingTarget = _pendingNotificationTarget;
     if (pendingTarget != null) {
@@ -2298,6 +2526,16 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
     if (!mounted) {
       return;
     }
+    final kind = await showDialog<_AddProjectKind>(
+      context: context,
+      builder: (context) => const AddProjectKindDialog(),
+    );
+    if (kind == null) return;
+    if (kind == _AddProjectKind.remote) {
+      await _addRemoteProject();
+      return;
+    }
+    if (!mounted) return;
     final project = await showDialog<DitchProject>(
       context: context,
       builder: (context) => const AddProjectDialog(),
@@ -2329,7 +2567,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
       if (!mounted) {
         return;
       }
-      Navigator.of(context, rootNavigator: true).pop();
+      _dismissProjectSetupProgress();
       final configuredProject =
           _projectFromRuntime(response['ProjectCreated']) ??
           DitchProject(
@@ -2360,7 +2598,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
       if (!mounted) {
         return;
       }
-      Navigator.of(context, rootNavigator: true).pop();
+      _dismissProjectSetupProgress();
       _showProjectSetupResult(
         title: 'Setup incomplete',
         message: '$error',
@@ -2369,12 +2607,103 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
     }
   }
 
+  Future<void> _addRemoteProject() async {
+    await _ensureRuntimeStarted();
+    if (!mounted) return;
+    final created = await showDialog<DitchProject>(
+      context: context,
+      barrierDismissible: true,
+      builder: (context) => AddRemoteProjectDialog(client: _runtimeClient),
+    );
+    if (created == null || !mounted) return;
+    setState(() {
+      upsertProject(_projects, created);
+      _selectedProjectKey = _projectKey(created);
+      _createAgentSession(expand: true);
+    });
+    unawaited(_ensureSelectedProjectTerminal());
+  }
+
   Future<void> _copyProjectPath(DitchProject project) async {
     await Clipboard.setData(ClipboardData(text: project.path));
     if (!mounted) return;
     ScaffoldMessenger.of(
       context,
     ).showSnackBar(const SnackBar(content: Text('Project path copied.')));
+  }
+
+  Future<void> _checkRemoteSetupForProject(DitchProject project) async {
+    final alias = project.sshHostAlias;
+    if (alias == null) return;
+    try {
+      final resolvedResponse = await _runtimeClient.request({
+        'ResolveSshHost': {'alias': alias},
+      });
+      final resolved = resolvedResponse['ResolvedSshHost'];
+      final setup = await _runtimeClient.checkRemoteSetup(alias: alias);
+      if (!mounted) return;
+      final checks = setup['checks'];
+      await showDialog<void>(
+        context: context,
+        builder: (context) => AlertDialog(
+          title: Text('Remote setup · $alias'),
+          content: SizedBox(
+            width: 560,
+            child: ListView(
+              shrinkWrap: true,
+              children: [
+                if (resolved is Map)
+                  ListTile(
+                    dense: true,
+                    leading: const Icon(Icons.dns_outlined),
+                    title: Text(
+                      '${resolved['user']}@${resolved['hostname']}:${resolved['port']}',
+                    ),
+                    subtitle: Text(
+                      'SSH alias $alias · Remote path ${project.path}',
+                    ),
+                  ),
+                if (checks is List)
+                  ...checks.whereType<Map>().map(
+                    (item) => ListTile(
+                      dense: true,
+                      leading: Icon(
+                        item['state'] == 'ready'
+                            ? Icons.check_circle_outline
+                            : Icons.info_outline,
+                      ),
+                      title: Text(item['label']?.toString() ?? ''),
+                      subtitle: SelectableText(
+                        [
+                              item['detail']?.toString(),
+                              item['technical_detail']?.toString(),
+                            ]
+                            .whereType<String>()
+                            .where((value) => value.isNotEmpty)
+                            .join('\n'),
+                      ),
+                    ),
+                  ),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('Close'),
+            ),
+          ],
+        ),
+      );
+    } on Object catch (error) {
+      if (mounted) {
+        _showProjectSetupResult(
+          title: 'Remote setup unavailable',
+          message: '$error',
+          isError: true,
+        );
+      }
+    }
   }
 
   Future<void> _deleteProject(DitchProject project) async {
@@ -2472,19 +2801,32 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
   }
 
   void _showProjectSetupProgress() {
-    showDialog<void>(
-      context: context,
-      barrierDismissible: false,
-      builder: (context) => const AlertDialog(
-        content: Row(
-          children: [
-            CircularProgressIndicator(),
-            SizedBox(width: 20),
-            Text('Configuring project…'),
-          ],
-        ),
-      ),
+    unawaited(
+      showDialog<void>(
+        context: context,
+        barrierDismissible: true,
+        builder: (dialogContext) {
+          _projectSetupProgressContext = dialogContext;
+          return const AlertDialog(
+            content: Row(
+              children: [
+                CircularProgressIndicator(),
+                SizedBox(width: 20),
+                Text('Configuring project…'),
+              ],
+            ),
+          );
+        },
+      ).whenComplete(() => _projectSetupProgressContext = null),
     );
+  }
+
+  void _dismissProjectSetupProgress() {
+    final dialogContext = _projectSetupProgressContext;
+    _projectSetupProgressContext = null;
+    if (dialogContext != null && dialogContext.mounted) {
+      Navigator.of(dialogContext).pop();
+    }
   }
 
   void _showProjectSetupResult({
@@ -2536,6 +2878,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
     }
     try {
       final response = await _runtimeClient.startCodexSession(
+        projectId: _selectedProject.id,
         projectName: _selectedProject.name,
         projectRoot: _selectedProject.path,
         prompt: prompt,
@@ -2583,6 +2926,21 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
   }
 
   Future<bool> _prepareSelectedProjectForCodex() async {
+    if (_selectedProject.isRemote) {
+      try {
+        await _runtimeClient.request({
+          'CheckRemoteProject': {'project_id': _selectedProject.id},
+        });
+        return true;
+      } on Object catch (error) {
+        _showProjectSetupResult(
+          title: 'Remote project unavailable',
+          message: '$error',
+          isError: true,
+        );
+        return false;
+      }
+    }
     if (_codexReadiness?.ready != true) {
       await _refreshCodexReadiness();
       if (_codexReadiness?.ready != true) {
@@ -3036,6 +3394,15 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
     }
 
     final projectChanged = eventBody['ProjectChanged'];
+    final remotePresence = eventBody['RemoteHostStatusChanged'];
+    if (remotePresence is Map) {
+      final alias = remotePresence['ssh_host_alias']?.toString();
+      final status = remotePresence['state']?.toString();
+      if (alias != null && status != null) {
+        setState(() => _remoteHostStatus[alias] = status);
+      }
+      return;
+    }
     if (projectChanged != null) {
       final project = _projectFromRuntime(projectChanged);
       if (project == null) {
@@ -3067,6 +3434,14 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
           _expandedAgentLocalId ??= incoming.localId;
         }
       });
+      final updated = _agentSessionByLocalId(incoming.localId);
+      if (updated != null &&
+          _projects.any(
+            (project) =>
+                project.id == updated.projectId && project.isRemote,
+          )) {
+        unawaited(_loadAgentMessages(updated, refreshLatest: true));
+      }
       _scheduleStatusBarUpdate();
       return;
     }
@@ -3345,12 +3720,17 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
     _scheduleStatusBarUpdate();
   }
 
-  Future<void> _loadAgentMessages(AgentSession session) async {
+  Future<void> _loadAgentMessages(
+    AgentSession session, {
+    bool refreshLatest = false,
+  }) async {
     if (session.messagesLoading ||
-        (session.messagesLoaded && !session.hasOlderMessages)) {
+        (!refreshLatest &&
+            session.messagesLoaded &&
+            !session.hasOlderMessages)) {
       return;
     }
-    final initial = !session.messagesLoaded;
+    final initial = refreshLatest || !session.messagesLoaded;
     setState(() {
       session.messagesLoading = true;
       session.historyError = null;
@@ -3386,13 +3766,19 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
       if (target == null) return;
       setState(() {
         final additions = uniqueRuntimeMessages(target.messages, pageItems);
-        target.messages.insertAll(0, additions);
+        if (refreshLatest && target.messagesLoaded) {
+          target.messages.addAll(additions);
+        } else {
+          target.messages.insertAll(0, additions);
+        }
         target.messagesLoaded = true;
         target.messagesLoading = false;
-        target.hasOlderMessages = page['has_more'] == true;
-        target.nextBeforeSequence = page['next_before_sequence'] is int
-            ? page['next_before_sequence'] as int
-            : null;
+        if (!refreshLatest || target.nextBeforeSequence == null) {
+          target.hasOlderMessages = page['has_more'] == true;
+          target.nextBeforeSequence = page['next_before_sequence'] is int
+              ? page['next_before_sequence'] as int
+              : null;
+        }
       });
     } on Object catch (error) {
       if (!mounted) return;
@@ -3554,6 +3940,9 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
         relativePath: entry.relativePath,
         content: value['content']?.toString() ?? '',
         revision: value['revision']?.toString() ?? '',
+        readOnly: _projects.any(
+          (project) => project.id == projectId && project.isRemote,
+        ),
       );
       document.controller.addListener(() {
         if (mounted && identical(files.document, document)) setState(() {});
@@ -3580,6 +3969,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
     final projectId = _selectedProject.id;
     final document = files.document;
     if (projectId == null || document == null || document.saving) return false;
+    if (document.readOnly) return false;
     setState(() {
       document.saving = true;
       document.conflict = false;
@@ -3968,6 +4358,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
                       ProjectSidebar(
                         width: projectSidebarWidth,
                         projects: _projects,
+                        remoteHostStatus: _remoteHostStatus,
                         selectedIndex: _selectedProjectIndex,
                         onAddProject: _addProject,
                         onSelectProject: _selectProject,
@@ -3975,6 +4366,8 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
                             unawaited(_revealProjectInFinder(project)),
                         onCopyProjectPath: (project) =>
                             unawaited(_copyProjectPath(project)),
+                        onCheckRemoteSetup: (project) =>
+                            unawaited(_checkRemoteSetupForProject(project)),
                         onDeleteProject: (project) =>
                             unawaited(_deleteProject(project)),
                         summaryForProject: (project) => summarizeProjectAgents(
@@ -4501,9 +4894,10 @@ class NotificationSetupBanner extends StatelessWidget {
 }
 
 class RemoteSettingsDialog extends StatefulWidget {
-  const RemoteSettingsDialog({required this.client, super.key});
+  const RemoteSettingsDialog({required this.client, this.sshAlias, super.key});
 
   final DitchRuntimeClient client;
+  final String? sshAlias;
 
   @override
   State<RemoteSettingsDialog> createState() => _RemoteSettingsDialogState();
@@ -4543,7 +4937,9 @@ class _RemoteSettingsDialogState extends State<RemoteSettingsDialog> {
       });
     }
     try {
-      final response = await widget.client.remoteControlStatus();
+      final response = await widget.client.remoteControlStatus(
+        sshAlias: widget.sshAlias,
+      );
       if (!mounted) return;
       setState(() {
         _status = (response['RemoteControlStatus'] as Map?)
@@ -4561,7 +4957,9 @@ class _RemoteSettingsDialogState extends State<RemoteSettingsDialog> {
       _error = null;
     });
     try {
-      final response = await widget.client.createRemotePairing();
+      final response = await widget.client.createRemotePairing(
+        sshAlias: widget.sshAlias,
+      );
       if (!mounted) return;
       setState(() {
         _pairing = (response['RemotePairing'] as Map?)?.cast<String, dynamic>();
@@ -4581,7 +4979,10 @@ class _RemoteSettingsDialogState extends State<RemoteSettingsDialog> {
     final pairingId = _pairing?['pairing_id']?.toString();
     if (pairingId == null || _busy) return;
     try {
-      final response = await widget.client.getRemotePairing(pairingId);
+      final response = await widget.client.getRemotePairing(
+        pairingId,
+        sshAlias: widget.sshAlias,
+      );
       if (!mounted) return;
       final next = (response['RemotePairing'] as Map?)?.cast<String, dynamic>();
       if (next != null) {
@@ -4599,7 +5000,10 @@ class _RemoteSettingsDialogState extends State<RemoteSettingsDialog> {
     if (pairingId == null) return;
     setState(() => _busy = true);
     try {
-      final response = await widget.client.confirmRemotePairing(pairingId);
+      final response = await widget.client.confirmRemotePairing(
+        pairingId,
+        sshAlias: widget.sshAlias,
+      );
       if (!mounted) return;
       setState(() {
         _pairing = (response['RemotePairing'] as Map?)?.cast<String, dynamic>();
@@ -4618,7 +5022,12 @@ class _RemoteSettingsDialogState extends State<RemoteSettingsDialog> {
 
   Future<void> _cancelPairing() async {
     final pairingId = _pairing?['pairing_id']?.toString();
-    if (pairingId != null) await widget.client.cancelRemotePairing(pairingId);
+    if (pairingId != null) {
+      await widget.client.cancelRemotePairing(
+        pairingId,
+        sshAlias: widget.sshAlias,
+      );
+    }
     if (mounted) setState(() => _pairing = null);
   }
 
@@ -4677,7 +5086,11 @@ class _RemoteSettingsDialogState extends State<RemoteSettingsDialog> {
         (status?['devices'] as List?)?.whereType<Map>().toList() ?? const [];
     return AlertDialog(
       icon: const Icon(Icons.phone_iphone),
-      title: const Text('Remote Control'),
+      title: Text(
+        widget.sshAlias == null
+            ? 'Remote Control'
+            : 'Enroll ${widget.sshAlias}',
+      ),
       content: SizedBox(
         width: 580,
         child: status == null
@@ -4713,25 +5126,27 @@ class _RemoteSettingsDialogState extends State<RemoteSettingsDialog> {
                       contentPadding: EdgeInsets.zero,
                       title: const Text('Mobile Control'),
                       subtitle: Text(
-                        status?['enabled'] == true
-                            ? 'This Mac accepts encrypted Ditch commands.'
-                            : 'Local Ditch works without Remote Control.',
+                        status['enabled'] == true
+                            ? '${widget.sshAlias ?? "This Mac"} accepts encrypted Ditch commands.'
+                            : 'Remote Control is not enrolled.',
                       ),
-                      value: status?['enabled'] == true,
+                      value: status['enabled'] == true,
                       onChanged: null,
                     ),
                     ListTile(
                       contentPadding: EdgeInsets.zero,
                       leading: Icon(
-                        status?['online'] == true
+                        status['online'] == true
                             ? Icons.cloud_done_outlined
                             : Icons.cloud_off_outlined,
                       ),
                       title: Text(
-                        status?['machine_name']?.toString() ?? 'This Mac',
+                        status['machine_name']?.toString() ??
+                            widget.sshAlias ??
+                            'This Mac',
                       ),
                       subtitle: Text(
-                        status?['online'] == true ? 'Online' : 'Offline',
+                        status['online'] == true ? 'Online' : 'Offline',
                       ),
                     ),
                     const Divider(),
@@ -4760,7 +5175,7 @@ class _RemoteSettingsDialogState extends State<RemoteSettingsDialog> {
                                     : 'Paired · Last seen $lastSeen'
                               : 'Device revoked',
                         ),
-                        trailing: state == 'active'
+                        trailing: state == 'active' && widget.sshAlias == null
                             ? TextButton(
                                 onPressed: _busy
                                     ? null
@@ -4787,15 +5202,15 @@ class _RemoteSettingsDialogState extends State<RemoteSettingsDialog> {
                       ),
                     ],
                     const SizedBox(height: 12),
-                    const Text(
-                      'Source code, terminal output, Git worktrees, secrets, and full transcripts stay on this Mac. Anonymous identity and sanitized status metadata are stored by the remote relay; sensitive command and transcript payloads are relayed encrypted.',
+                    Text(
+                      'Source code, terminal output, Git worktrees, secrets, and full transcripts stay on ${widget.sshAlias ?? "this Mac"}. The relay stores sanitized status metadata; sensitive command and transcript payloads are relayed encrypted.',
                     ),
                   ],
                 ),
               ),
       ),
       actions: [
-        if (status?['enabled'] == true)
+        if (status?['enabled'] == true && widget.sshAlias == null)
           TextButton(
             onPressed: _busy ? null : _disable,
             child: const Text('Disable Remote Control'),
@@ -5414,11 +5829,13 @@ class ProjectSidebar extends StatelessWidget {
   const ProjectSidebar({
     required this.width,
     required this.projects,
+    required this.remoteHostStatus,
     required this.selectedIndex,
     required this.onAddProject,
     required this.onSelectProject,
     required this.onRevealProject,
     required this.onCopyProjectPath,
+    required this.onCheckRemoteSetup,
     required this.onDeleteProject,
     required this.summaryForProject,
     super.key,
@@ -5426,11 +5843,13 @@ class ProjectSidebar extends StatelessWidget {
 
   final double width;
   final List<DitchProject> projects;
+  final Map<String, String> remoteHostStatus;
   final int selectedIndex;
   final VoidCallback onAddProject;
   final ValueChanged<int> onSelectProject;
   final ValueChanged<DitchProject> onRevealProject;
   final ValueChanged<DitchProject> onCopyProjectPath;
+  final ValueChanged<DitchProject> onCheckRemoteSetup;
   final ValueChanged<DitchProject> onDeleteProject;
   final ProjectAgentSummary Function(DitchProject) summaryForProject;
 
@@ -5467,10 +5886,19 @@ class ProjectSidebar extends StatelessWidget {
                       return ProjectTile(
                         name: project.name,
                         path: project.path,
+                        isRemote: project.isRemote,
+                        sshHostAlias: project.sshHostAlias,
+                        remoteStatus: project.isRemote
+                            ? remoteHostStatus[project.sshHostAlias] ??
+                                  'connecting'
+                            : null,
                         selected: index == selectedIndex,
                         onTap: () => onSelectProject(index),
                         onReveal: () => onRevealProject(project),
                         onCopyPath: () => onCopyProjectPath(project),
+                        onCheckRemoteSetup: project.isRemote
+                            ? () => onCheckRemoteSetup(project)
+                            : null,
                         onDelete: () => onDeleteProject(project),
                         runningCount: summary.runningCount,
                         stoppedCount: summary.stoppedCount,
@@ -5502,10 +5930,14 @@ class ProjectTile extends StatelessWidget {
     required this.onTap,
     required this.onReveal,
     required this.onCopyPath,
+    this.onCheckRemoteSetup,
     required this.onDelete,
     this.runningCount = 0,
     this.stoppedCount = 0,
     this.hasUnreadResult = false,
+    this.isRemote = false,
+    this.sshHostAlias,
+    this.remoteStatus,
     super.key,
   });
 
@@ -5515,10 +5947,14 @@ class ProjectTile extends StatelessWidget {
   final VoidCallback onTap;
   final VoidCallback onReveal;
   final VoidCallback onCopyPath;
+  final VoidCallback? onCheckRemoteSetup;
   final VoidCallback onDelete;
   final int runningCount;
   final int stoppedCount;
   final bool hasUnreadResult;
+  final bool isRemote;
+  final String? sshHostAlias;
+  final String? remoteStatus;
 
   Future<void> _showContextMenu(
     BuildContext context,
@@ -5536,18 +5972,28 @@ class ProjectTile extends StatelessWidget {
         ),
         Offset.zero & overlay.size,
       ),
-      items: const [
-        PopupMenuItem(
+      items: [
+        const PopupMenuItem(
           value: _ProjectMenuAction.copyPath,
           child: Text('Copy Project Path'),
         ),
-        PopupMenuDivider(),
-        PopupMenuItem(value: _ProjectMenuAction.delete, child: Text('Delete')),
+        if (onCheckRemoteSetup != null)
+          const PopupMenuItem(
+            value: _ProjectMenuAction.checkRemoteSetup,
+            child: Text('Check Remote Setup'),
+          ),
+        const PopupMenuDivider(),
+        const PopupMenuItem(
+          value: _ProjectMenuAction.delete,
+          child: Text('Delete'),
+        ),
       ],
     );
     switch (action) {
       case _ProjectMenuAction.copyPath:
         onCopyPath();
+      case _ProjectMenuAction.checkRemoteSetup:
+        onCheckRemoteSetup?.call();
       case _ProjectMenuAction.delete:
         onDelete();
       case null:
@@ -5604,7 +6050,9 @@ class ProjectTile extends StatelessWidget {
                       ],
                     ),
                     Text(
-                      path,
+                      isRemote
+                          ? 'Remote · $sshHostAlias · ${_titleCase(remoteStatus ?? "connecting")}'
+                          : path,
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,
                       style: Theme.of(context).textTheme.bodySmall,
@@ -5623,8 +6071,10 @@ class ProjectTile extends StatelessWidget {
               const SizedBox(width: 4),
               IconButton(
                 key: ValueKey('reveal-project-$path'),
-                onPressed: onReveal,
-                tooltip: 'Show in Finder',
+                onPressed: isRemote ? null : onReveal,
+                tooltip: isRemote
+                    ? 'Source remains on the remote machine'
+                    : 'Show in Finder',
                 visualDensity: VisualDensity.compact,
                 constraints: const BoxConstraints.tightFor(
                   width: 28,
@@ -5641,7 +6091,7 @@ class ProjectTile extends StatelessWidget {
   }
 }
 
-enum _ProjectMenuAction { copyPath, delete }
+enum _ProjectMenuAction { copyPath, checkRemoteSetup, delete }
 
 class AgentsSurface extends StatelessWidget {
   const AgentsSurface({
@@ -8114,7 +8564,8 @@ class ProjectFileEditorBody extends StatelessWidget {
   Widget build(BuildContext context) {
     return CallbackShortcuts(
       bindings: {
-        const SingleActivator(LogicalKeyboardKey.keyS, meta: true): onSave,
+        if (!document.readOnly)
+          const SingleActivator(LogicalKeyboardKey.keyS, meta: true): onSave,
       },
       child: Column(
         children: [
@@ -8140,8 +8591,12 @@ class ProjectFileEditorBody extends StatelessWidget {
                   ),
                   IconButton(
                     key: const Key('editor-save'),
-                    tooltip: 'Save file (⌘S)',
-                    onPressed: document.dirty && !document.saving
+                    tooltip: document.readOnly
+                        ? 'Remote files are read-only'
+                        : 'Save file (⌘S)',
+                    onPressed: !document.readOnly &&
+                            document.dirty &&
+                            !document.saving
                         ? onSave
                         : null,
                     icon: document.saving
@@ -8210,6 +8665,7 @@ class ProjectFileEditorBody extends StatelessWidget {
               child: TextField(
                 key: const Key('project-file-editor'),
                 controller: document.controller,
+                readOnly: document.readOnly,
                 expands: true,
                 maxLines: null,
                 minLines: null,
@@ -8451,6 +8907,855 @@ class ProjectTerminalHeader extends StatelessWidget {
       ),
     );
   }
+}
+
+enum _AddProjectKind { local, remote }
+
+class AddProjectKindDialog extends StatelessWidget {
+  const AddProjectKindDialog({super.key});
+
+  @override
+  Widget build(BuildContext context) => AlertDialog(
+    title: const Text('Add Project'),
+    content: SizedBox(
+      width: 480,
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          ListTile(
+            leading: const Icon(Icons.laptop_mac_outlined),
+            title: const Text('Local Project'),
+            subtitle: const Text('Runs on this Mac'),
+            onTap: () => Navigator.pop(context, _AddProjectKind.local),
+          ),
+          const SizedBox(height: 8),
+          ListTile(
+            leading: const Icon(Icons.dns_outlined),
+            title: const Text('Remote Project'),
+            subtitle: const Text('Runs on a machine over SSH'),
+            onTap: () => Navigator.pop(context, _AddProjectKind.remote),
+          ),
+        ],
+      ),
+    ),
+    actions: [
+      TextButton(
+        onPressed: () => Navigator.pop(context),
+        child: const Text('Cancel'),
+      ),
+    ],
+  );
+}
+
+class AddRemoteProjectDialog extends StatefulWidget {
+  const AddRemoteProjectDialog({required this.client, super.key});
+  final DitchRuntimeClient client;
+
+  @override
+  State<AddRemoteProjectDialog> createState() => _AddRemoteProjectDialogState();
+}
+
+class _AddRemoteProjectDialogState extends State<AddRemoteProjectDialog> {
+  final _password = TextEditingController();
+  final _path = TextEditingController();
+  final _name = TextEditingController();
+  List<Map<String, dynamic>> _hosts = const [];
+  List<Map<String, dynamic>> _entries = const [];
+  Map<String, dynamic>? _setup;
+  String? _alias;
+  String? _error;
+  bool _busy = true;
+  bool _selectingDirectory = false;
+  bool _remember = false;
+  ProjectGitPolicy _gitPolicy = ProjectGitPolicy.requireRepository;
+
+  @override
+  void initState() {
+    super.initState();
+    unawaited(_loadHosts());
+  }
+
+  @override
+  void dispose() {
+    _password.dispose();
+    _path.dispose();
+    _name.dispose();
+    super.dispose();
+  }
+
+  Future<void> _loadHosts() async {
+    try {
+      final hosts = await widget.client.discoverSshHosts();
+      if (mounted) {
+        setState(() {
+          _hosts = hosts;
+          _busy = false;
+        });
+      }
+    } on Object catch (error) {
+      if (mounted) {
+        setState(() {
+          _busy = false;
+          _error = '$error';
+        });
+      }
+    }
+  }
+
+  Future<void> _check({bool trust = false}) async {
+    final alias = _alias;
+    if (alias == null) return;
+    setState(() {
+      _busy = true;
+      _error = null;
+    });
+    try {
+      final setup = await widget.client.checkRemoteSetup(
+        alias: alias,
+        password: _password.text.isEmpty ? null : _password.text,
+        rememberPassword: _remember,
+        trustUnknownHost: trust,
+      );
+      if (!mounted) return;
+      await _acceptSetup(setup);
+      if (!mounted) return;
+      if (setup['connection_state'] == 'host_key_confirmation_required') {
+        final fingerprint =
+            setup['host_key_fingerprint']?.toString() ?? 'Unknown fingerprint';
+        final approved = await showDialog<bool>(
+          context: context,
+          builder: (context) => AlertDialog(
+            icon: const Icon(Icons.security),
+            title: const Text('Trust this SSH host?'),
+            content: Text(
+              'The authenticity of $alias has not been established.\n\nFingerprint:\n$fingerprint',
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(context, false),
+                child: const Text('Cancel'),
+              ),
+              FilledButton(
+                onPressed: () => Navigator.pop(context, true),
+                child: const Text('Trust & Connect'),
+              ),
+            ],
+          ),
+        );
+        if (approved == true) await _check(trust: true);
+      }
+    } on Object catch (error) {
+      if (mounted) {
+        setState(() {
+          _busy = false;
+          _error = '$error';
+        });
+      }
+    }
+  }
+
+  Future<void> _acceptSetup(Map<String, dynamic> setup) async {
+    if (!mounted) return;
+    final ready = setup['ready'] == true;
+    final home = setup['home_directory']?.toString().trim();
+    setState(() {
+      _setup = setup;
+      _busy = false;
+      if (ready && home != null && home.isNotEmpty) {
+        _selectingDirectory = true;
+        _path.text = home;
+      }
+    });
+    if (ready) {
+      if (home == null || home.isEmpty) {
+        setState(() {
+          _error = 'The remote runtime did not report its home directory.';
+        });
+        return;
+      }
+      await _browse(home);
+    }
+  }
+
+  Future<void> _installRuntime() async {
+    final alias = _alias;
+    if (alias == null) return;
+    setState(() {
+      _busy = true;
+      _error = null;
+    });
+    try {
+      final setup = await widget.client.installRemoteRuntime(alias);
+      if (!mounted) return;
+      await _acceptSetup(setup);
+    } on Object catch (error) {
+      if (mounted) {
+        setState(() {
+          _busy = false;
+          _error = '$error';
+        });
+      }
+    }
+  }
+
+  Future<void> _installCodex() async {
+    final alias = _alias;
+    if (alias == null) return;
+    setState(() {
+      _busy = true;
+      _error = null;
+    });
+    try {
+      final setup = await widget.client.installRemoteCodex(alias);
+      if (!mounted) return;
+      await _acceptSetup(setup);
+    } on Object catch (error) {
+      if (mounted) {
+        setState(() {
+          _busy = false;
+          _error = '$error';
+        });
+      }
+    }
+  }
+
+  Future<void> _installGit() async {
+    final alias = _alias;
+    if (alias == null) return;
+    setState(() {
+      _busy = true;
+      _error = null;
+    });
+    try {
+      final setup = await widget.client.installRemoteGit(alias);
+      if (!mounted) return;
+      await _acceptSetup(setup);
+    } on Object catch (error) {
+      if (mounted) {
+        setState(() {
+          _busy = false;
+          _error = '$error';
+        });
+      }
+    }
+  }
+
+  Future<void> _authenticateCodex() async {
+    final alias = _alias;
+    if (alias == null) return;
+    final authenticated = await showDialog<bool>(
+      context: context,
+      barrierDismissible: true,
+      builder: (context) =>
+          CodexAuthenticationDialog(client: widget.client, alias: alias),
+    );
+    if (authenticated == true) await _check();
+  }
+
+  Future<void> _browse(String path) async {
+    final alias = _alias;
+    if (alias == null) return;
+    setState(() {
+      _busy = true;
+      _error = null;
+    });
+    try {
+      final directory = await widget.client.listRemoteDirectory(alias, path);
+      final entries = directory['entries'];
+      if (!mounted) return;
+      setState(() {
+        _path.text = directory['absolute_path']?.toString() ?? path;
+        _entries = entries is List
+            ? entries
+                  .whereType<Map>()
+                  .map((item) => Map<String, dynamic>.from(item))
+                  .toList()
+            : const [];
+        if (_name.text.isEmpty) {
+          _name.text =
+              _path.text.split('/').where((v) => v.isNotEmpty).lastOrNull ??
+              alias;
+        }
+        _busy = false;
+      });
+    } on Object catch (error) {
+      if (mounted) {
+        setState(() {
+          _busy = false;
+          _error = '$error';
+        });
+      }
+    }
+  }
+
+  Future<void> _addHost() async {
+    final host = await showDialog<Map<String, dynamic>>(
+      context: context,
+      builder: (context) => const AddSshHostDialog(),
+    );
+    if (host == null) return;
+    try {
+      final preview = await widget.client.previewSshHost(host);
+      if (!mounted) return;
+      final approved = await showDialog<bool>(
+        context: context,
+        builder: (context) => AlertDialog(
+          title: const Text('Add to ~/.ssh/config?'),
+          content: SelectableText(preview),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context, false),
+              child: const Text('Cancel'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(context, true),
+              child: const Text('Add SSH Host'),
+            ),
+          ],
+        ),
+      );
+      if (approved != true) return;
+      await widget.client.addSshHost(host);
+      await _loadHosts();
+      if (mounted) setState(() => _alias = host['alias']?.toString());
+    } on Object catch (error) {
+      if (mounted) setState(() => _error = '$error');
+    }
+  }
+
+  Future<void> _create() async {
+    final alias = _alias;
+    if (alias == null || _path.text.isEmpty || _name.text.trim().isEmpty) {
+      return;
+    }
+    setState(() {
+      _busy = true;
+      _error = null;
+    });
+    try {
+      final response = await widget.client.createRemoteProject(
+        alias: alias,
+        name: _name.text.trim(),
+        root: _path.text,
+        gitPolicy: _gitPolicy,
+      );
+      final project = parseRuntimeProject(response['ProjectCreated']);
+      if (project == null) {
+        throw const FormatException(
+          'Remote runtime returned an invalid project.',
+        );
+      }
+      if (mounted) Navigator.pop(context, project);
+    } on Object catch (error) {
+      if (mounted) {
+        setState(() {
+          _busy = false;
+          _error = '$error';
+        });
+      }
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final checks = _setup?['checks'];
+    final ready = _setup?['ready'] == true;
+    final selectingDirectory = ready && _selectingDirectory;
+    final runtimeNeedsInstall =
+        checks is List &&
+        checks.whereType<Map>().any(
+          (item) => item['key'] == 'runtime' && item['state'] != 'ready',
+        );
+    final codexNeedsInstall =
+        checks is List &&
+        checks.whereType<Map>().any(
+          (item) => item['key'] == 'codex' && item['state'] != 'ready',
+        );
+    final gitInstallAvailable =
+        checks is List &&
+        checks.whereType<Map>().any(
+          (item) =>
+              item['key'] == 'git' && item['state'] == 'install_available',
+        );
+    final codexNeedsAuthentication =
+        checks is List &&
+        checks.whereType<Map>().any(
+          (item) =>
+              item['key'] == 'codex_auth' &&
+              item['state'] == 'authentication_required',
+        );
+    return AlertDialog(
+      title: Text(
+        _setup == null
+            ? 'Choose a machine'
+            : selectingDirectory
+            ? 'Choose project folder · ${_alias ?? ''}'
+            : 'Remote setup · ${_alias ?? ''}',
+      ),
+      content: SizedBox(
+        width: 600,
+        height: 520,
+        child: _busy && _hosts.isEmpty
+            ? const Center(child: CircularProgressIndicator())
+            : ListView(
+                children: [
+                  if (_setup == null) ...[
+                    ..._hosts.map(
+                      (host) => ListTile(
+                        leading: const Icon(Icons.dns_outlined),
+                        title: Text(host['alias']?.toString() ?? ''),
+                        selected: _alias == host['alias'],
+                        onTap: () =>
+                            setState(() => _alias = host['alias']?.toString()),
+                      ),
+                    ),
+                    TextButton.icon(
+                      onPressed: _addHost,
+                      icon: const Icon(Icons.add),
+                      label: const Text('Add SSH Host'),
+                    ),
+                    const Divider(),
+                    TextField(
+                      controller: _password,
+                      obscureText: true,
+                      decoration: const InputDecoration(
+                        labelText: 'Password (only if required)',
+                      ),
+                    ),
+                    CheckboxListTile(
+                      value: _remember,
+                      onChanged: (value) =>
+                          setState(() => _remember = value ?? false),
+                      title: const Text('Remember in Keychain'),
+                      controlAffinity: ListTileControlAffinity.leading,
+                    ),
+                  ] else if (!selectingDirectory) ...[
+                    if (checks is List)
+                      ...checks.whereType<Map>().map(
+                        (item) => ListTile(
+                          dense: true,
+                          leading: Icon(
+                            item['state'] == 'ready'
+                                ? Icons.check_circle_outline
+                                : Icons.info_outline,
+                          ),
+                          title: Text(item['label']?.toString() ?? ''),
+                          subtitle: Text(
+                            [
+                                  item['detail']?.toString(),
+                                  item['technical_detail']?.toString(),
+                                ]
+                                .whereType<String>()
+                                .where((value) => value.isNotEmpty)
+                                .join('\n'),
+                          ),
+                        ),
+                      ),
+                    if (runtimeNeedsInstall)
+                      FilledButton.tonalIcon(
+                        onPressed: _busy ? null : _installRuntime,
+                        icon: const Icon(Icons.system_update_alt),
+                        label: const Text('Install / Repair Ditch Runtime'),
+                      ),
+                    if (codexNeedsInstall)
+                      FilledButton.tonalIcon(
+                        onPressed: _busy ? null : _installCodex,
+                        icon: const Icon(Icons.download_outlined),
+                        label: const Text('Install Codex'),
+                      ),
+                    if (gitInstallAvailable)
+                      FilledButton.tonalIcon(
+                        onPressed: _busy ? null : _installGit,
+                        icon: const Icon(Icons.download_outlined),
+                        label: const Text('Install Git'),
+                      ),
+                    if (codexNeedsAuthentication)
+                      FilledButton.tonalIcon(
+                        onPressed: _busy ? null : _authenticateCodex,
+                        icon: const Icon(Icons.login),
+                        label: const Text('Authenticate Codex'),
+                      ),
+                    if (!ready)
+                      Padding(
+                        padding: const EdgeInsets.only(top: 12),
+                        child: Text(
+                          'Complete the indicated Git or Codex setup on this machine, then retry. Credentials are never copied from this Mac.',
+                        ),
+                      ),
+                  ] else ...[
+                    Row(
+                      children: [
+                        IconButton(
+                          tooltip: 'Go up',
+                          onPressed: _busy || _path.text == '/'
+                              ? null
+                              : () {
+                                  final parts = _path.text
+                                      .split('/')
+                                      .where((part) => part.isNotEmpty)
+                                      .toList();
+                                  final parent = parts.length <= 1
+                                      ? '/'
+                                      : '/${parts.take(parts.length - 1).join('/')}';
+                                  _browse(parent);
+                                },
+                          icon: const Icon(Icons.arrow_upward),
+                        ),
+                        Expanded(
+                          child: TextField(
+                            controller: _path,
+                            decoration: const InputDecoration(
+                              labelText: 'Remote directory',
+                            ),
+                            onSubmitted: _busy ? null : _browse,
+                          ),
+                        ),
+                        IconButton(
+                          tooltip: 'Refresh',
+                          onPressed: _busy ? null : () => _browse(_path.text),
+                          icon: const Icon(Icons.refresh),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 8),
+                    ..._entries.map(
+                      (entry) => ListTile(
+                        dense: true,
+                        leading: const Icon(Icons.folder_outlined),
+                        title: Text(entry['name']?.toString() ?? ''),
+                        onTap: entry['is_directory'] == true
+                            ? () => _browse(
+                                entry['absolute_path']?.toString() ?? '',
+                              )
+                            : null,
+                      ),
+                    ),
+                    const Divider(),
+                    TextField(
+                      controller: _name,
+                      decoration: const InputDecoration(
+                        labelText: 'Project name',
+                      ),
+                    ),
+                    DropdownButtonFormField<ProjectGitPolicy>(
+                      initialValue: _gitPolicy,
+                      decoration: const InputDecoration(
+                        labelText: 'Git policy',
+                      ),
+                      items: const [
+                        DropdownMenuItem(
+                          value: ProjectGitPolicy.requireRepository,
+                          child: Text('Require existing Git repository'),
+                        ),
+                        DropdownMenuItem(
+                          value: ProjectGitPolicy.initializeRepository,
+                          child: Text('Initialize Git repository'),
+                        ),
+                        DropdownMenuItem(
+                          value: ProjectGitPolicy.allowOutsideGit,
+                          child: Text('Allow outside Git'),
+                        ),
+                      ],
+                      onChanged: (value) =>
+                          setState(() => _gitPolicy = value ?? _gitPolicy),
+                    ),
+                    const SizedBox(height: 8),
+                    const Text(
+                      'Ditch will validate this directory remotely and create its .ditch project metadata on the remote machine.',
+                    ),
+                  ],
+                  if (_busy) const LinearProgressIndicator(),
+                  if (_error != null)
+                    Padding(
+                      padding: const EdgeInsets.only(top: 12),
+                      child: Text(
+                        _error!,
+                        style: TextStyle(
+                          color: Theme.of(context).colorScheme.error,
+                        ),
+                      ),
+                    ),
+                ],
+              ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: _busy ? null : () => Navigator.pop(context),
+          child: const Text('Cancel'),
+        ),
+        if (_setup == null)
+          FilledButton(
+            onPressed: _alias == null || _busy ? null : _check,
+            child: const Text('Connect'),
+          )
+        else if (!selectingDirectory)
+          OutlinedButton(
+            onPressed: _busy ? null : _check,
+            child: const Text('Check Again'),
+          )
+        else
+          FilledButton(
+            onPressed: _busy ? null : _create,
+            child: const Text('Add Project'),
+          ),
+      ],
+    );
+  }
+}
+
+class CodexAuthenticationDialog extends StatefulWidget {
+  const CodexAuthenticationDialog({
+    required this.client,
+    required this.alias,
+    super.key,
+  });
+  final DitchRuntimeClient client;
+  final String alias;
+
+  @override
+  State<CodexAuthenticationDialog> createState() =>
+      _CodexAuthenticationDialogState();
+}
+
+class _CodexAuthenticationDialogState extends State<CodexAuthenticationDialog> {
+  final terminal = Terminal(
+    maxLines: 5000,
+    platform: TerminalTargetPlatform.macos,
+  );
+  String? terminalId;
+  Timer? timer;
+  bool polling = false;
+  bool closing = false;
+  String? error;
+
+  @override
+  void initState() {
+    super.initState();
+    unawaited(_open());
+  }
+
+  Future<void> _open() async {
+    try {
+      final id = await widget.client.openRemoteCodexAuthentication(
+        widget.alias,
+      );
+      if (!mounted) {
+        await widget.client.closeSetupTerminal(id);
+        return;
+      }
+      terminalId = id;
+      terminal.onOutput = (data) {
+        unawaited(widget.client.writeSetupTerminal(id, utf8.encode(data)));
+      };
+      terminal.onResize = (columns, rows, _, _) {
+        unawaited(widget.client.resizeSetupTerminal(id, columns, rows));
+      };
+      timer = Timer.periodic(
+        const Duration(milliseconds: 150),
+        (_) => unawaited(_poll()),
+      );
+      await _poll();
+    } on Object catch (caught) {
+      if (mounted) setState(() => error = '$caught');
+    }
+  }
+
+  Future<void> _poll() async {
+    final id = terminalId;
+    if (id == null || polling) return;
+    polling = true;
+    try {
+      final chunk = await widget.client.takeSetupTerminalOutput(id);
+      final raw = chunk['data'];
+      if (raw is List && raw.isNotEmpty) {
+        terminal.write(
+          utf8.decode(
+            raw.whereType<num>().map((byte) => byte.toInt()).toList(),
+            allowMalformed: true,
+          ),
+        );
+      }
+      if (chunk['exited'] == true) {
+        timer?.cancel();
+        final status = await widget.client.checkRemoteSetup(
+          alias: widget.alias,
+        );
+        final checks = status['checks'];
+        final authenticated =
+            checks is List &&
+            checks.whereType<Map>().any(
+              (item) => item['key'] == 'codex_auth' && item['state'] == 'ready',
+            );
+        if (authenticated) {
+          await _closeTerminal();
+          if (mounted) Navigator.pop(context, true);
+        }
+        if (!authenticated && mounted) {
+          setState(() => error = 'Codex authentication did not complete.');
+        }
+      }
+    } on Object catch (caught) {
+      if (mounted) setState(() => error = '$caught');
+    } finally {
+      polling = false;
+    }
+  }
+
+  Future<void> _cancel() async {
+    await _closeTerminal();
+    if (mounted) Navigator.pop(context, false);
+  }
+
+  Future<void> _closeTerminal() async {
+    if (closing) return;
+    closing = true;
+    timer?.cancel();
+    final id = terminalId;
+    terminalId = null;
+    if (id != null) {
+      try {
+        await widget.client.closeSetupTerminal(id);
+      } on Object catch (_) {}
+    }
+  }
+
+  @override
+  void dispose() {
+    timer?.cancel();
+    unawaited(_closeTerminal());
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) => AlertDialog(
+    title: Text('Authenticate Codex · ${widget.alias}'),
+    content: SizedBox(
+      width: 720,
+      height: 430,
+      child: Column(
+        children: [
+          const Align(
+            alignment: Alignment.centerLeft,
+            child: Text(
+              'This terminal is owned by the remote Ditch runtime and can only run the Codex sign-in flow.',
+            ),
+          ),
+          const SizedBox(height: 10),
+          Expanded(
+            child: DecoratedBox(
+              decoration: BoxDecoration(
+                color: Colors.black,
+                borderRadius: BorderRadius.circular(6),
+              ),
+              child: TerminalView(
+                terminal,
+                autofocus: true,
+                theme: ditchTerminalTheme(context),
+                padding: const EdgeInsets.all(8),
+              ),
+            ),
+          ),
+          if (terminalId == null && error == null)
+            const LinearProgressIndicator(),
+          if (error != null)
+            Align(
+              alignment: Alignment.centerLeft,
+              child: Text(
+                error!,
+                style: TextStyle(color: Theme.of(context).colorScheme.error),
+              ),
+            ),
+        ],
+      ),
+    ),
+    actions: [TextButton(onPressed: _cancel, child: const Text('Cancel'))],
+  );
+}
+
+class AddSshHostDialog extends StatefulWidget {
+  const AddSshHostDialog({super.key});
+  @override
+  State<AddSshHostDialog> createState() => _AddSshHostDialogState();
+}
+
+class _AddSshHostDialogState extends State<AddSshHostDialog> {
+  final alias = TextEditingController();
+  final hostname = TextEditingController();
+  final user = TextEditingController();
+  final port = TextEditingController(text: '22');
+  final identity = TextEditingController();
+  @override
+  void dispose() {
+    alias.dispose();
+    hostname.dispose();
+    user.dispose();
+    port.dispose();
+    identity.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) => AlertDialog(
+    title: const Text('Add SSH Host'),
+    content: SizedBox(
+      width: 460,
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          TextField(
+            controller: alias,
+            decoration: const InputDecoration(labelText: 'Name / SSH alias'),
+          ),
+          TextField(
+            controller: hostname,
+            decoration: const InputDecoration(labelText: 'Hostname / IP'),
+          ),
+          TextField(
+            controller: user,
+            decoration: const InputDecoration(labelText: 'User'),
+          ),
+          TextField(
+            controller: port,
+            keyboardType: TextInputType.number,
+            decoration: const InputDecoration(labelText: 'Port'),
+          ),
+          TextField(
+            controller: identity,
+            decoration: const InputDecoration(
+              labelText: 'Identity file (optional)',
+            ),
+          ),
+        ],
+      ),
+    ),
+    actions: [
+      TextButton(
+        onPressed: () => Navigator.pop(context),
+        child: const Text('Cancel'),
+      ),
+      FilledButton(
+        onPressed: () {
+          final parsedPort = int.tryParse(port.text);
+          if (alias.text.trim().isEmpty ||
+              hostname.text.trim().isEmpty ||
+              user.text.trim().isEmpty ||
+              parsedPort == null) {
+            return;
+          }
+          Navigator.pop(context, <String, dynamic>{
+            'alias': alias.text.trim(),
+            'hostname': hostname.text.trim(),
+            'user': user.text.trim(),
+            'port': parsedPort,
+            'identity_file': identity.text.trim().isEmpty
+                ? null
+                : identity.text.trim(),
+          });
+        },
+        child: const Text('Preview'),
+      ),
+    ],
+  );
 }
 
 class AddProjectDialog extends StatefulWidget {

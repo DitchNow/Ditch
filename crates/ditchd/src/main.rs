@@ -1,14 +1,14 @@
 use chrono::{DateTime, Utc};
 use ditch_core::{
     AgentApprovalPreset, AgentExecutionProfile, AgentId, AgentProvider, AgentResumeBlockReason,
-    AgentRun, AgentState, AppPaths, AttentionKind, CodexLaunchMode, Project, ProjectGitPolicy,
-    ProjectId,
+    AgentRun, AgentState, AppPaths, AttentionKind, CodexLaunchMode, Project,
+    ProjectExecutionTarget, ProjectGitPolicy, ProjectId,
 };
 use ditch_protocol::{
     AgentChatMessage, AgentChatRole, AgentModel, ClientRequest, CodexInstallation, CodexReadiness,
     Envelope, HealthResponse, ProjectDirectory, ProjectFile, ProjectFileEntry, ProjectFileKind,
-    ProjectFileSaved, ProjectTerminal, ProtocolError, RuntimeAttention, RuntimeStatus, ServerEvent,
-    ServerResponse, Snapshot,
+    ProjectFileSaved, ProjectTerminal, ProtocolError, RemoteHostPresence, RuntimeAttention,
+    RuntimeStatus, ServerEvent, ServerResponse, SetupTerminal, SetupTerminalOutput, Snapshot,
 };
 use ditch_store::{
     DitchStore, discover_legacy_projects, ensure_app_dirs, ensure_project_metadata,
@@ -17,7 +17,7 @@ use ditch_store::{
 use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 use serde_json::Value;
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs;
 use std::hash::{Hash, Hasher};
@@ -27,12 +27,15 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
+use uuid::Uuid;
 
 mod remote_control;
+mod ssh_remote;
 use remote_control::RemoteController;
 
 const RUNTIME_IDENTITY: &str = "The Ditch Runtime";
@@ -44,7 +47,35 @@ static LOGIN_SHELL_PATH: OnceLock<Option<OsString>> = OnceLock::new();
 
 #[allow(dead_code)]
 fn main() {
-    if let Err(error) = run_runtime() {
+    let result = match std::env::args().skip(1).collect::<Vec<_>>().as_slice() {
+        [command] if command == "daemon" => run_runtime_with_paths(AppPaths::for_remote_user()),
+        [command, flag] if command == "daemon" && flag == "--remote" => {
+            run_runtime_with_paths(AppPaths::for_remote_user())
+        }
+        [command, flag] if command == "bridge" && flag == "--stdio" => {
+            bridge_stdio(AppPaths::for_remote_user())
+        }
+        [command] if command == "version-json" => {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "version": env!("CARGO_PKG_VERSION"),
+                    "protocol_version": ditch_protocol::PROTOCOL_VERSION,
+                    "remote_runtime_protocol_version": ditch_protocol::REMOTE_RUNTIME_PROTOCOL_VERSION,
+                    "build_identifier": option_env!("DITCH_BUILD_IDENTIFIER").unwrap_or(env!("CARGO_PKG_VERSION")),
+                    "os": std::env::consts::OS,
+                    "architecture": std::env::consts::ARCH,
+                })
+            );
+            Ok(())
+        }
+        [] => run_runtime(),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "unsupported ditchd command",
+        )),
+    };
+    if let Err(error) = result {
         eprintln!("{RUNTIME_IDENTITY} failed: {error}");
         std::process::exit(1);
     }
@@ -52,9 +83,53 @@ fn main() {
 
 fn run_runtime() -> io::Result<()> {
     let paths = AppPaths::for_current_user();
+    run_runtime_with_paths(paths)
+}
+
+fn run_runtime_with_paths(paths: AppPaths) -> io::Result<()> {
     validate_codex_home()
         .and_then(|_| ensure_app_dirs(&paths).map_err(io::Error::other))
         .and_then(|_| serve(paths))
+}
+
+/// Stdio transport used by OpenSSH. It is intentionally only a byte bridge to
+/// the daemon's versioned typed protocol; it does not parse or execute shell
+/// commands and exiting it never affects the remote daemon.
+fn bridge_stdio(paths: AppPaths) -> io::Result<()> {
+    let stdin = io::stdin();
+    let mut stdout = io::stdout().lock();
+    for line in stdin.lock().lines() {
+        let line = line?;
+        if line.len() > 4 * 1024 * 1024 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "bridge request is too large",
+            ));
+        }
+        let mut stream = UnixStream::connect(&paths.socket_path)?;
+        stream.write_all(line.as_bytes())?;
+        stream.write_all(b"\n")?;
+        stream.flush()?;
+
+        let subscription = serde_json::from_str::<Envelope<ClientRequest>>(&line)
+            .ok()
+            .is_some_and(|envelope| {
+                matches!(
+                    envelope.body,
+                    ClientRequest::SubscribeEvents { .. } | ClientRequest::SubscribeAttention
+                )
+            });
+        if subscription {
+            io::copy(&mut stream, &mut stdout)?;
+            stdout.flush()?;
+            return Ok(());
+        }
+        let mut response = String::new();
+        BufReader::new(stream).read_line(&mut response)?;
+        stdout.write_all(response.as_bytes())?;
+        stdout.flush()?;
+    }
+    Ok(())
 }
 
 fn validate_codex_home() -> io::Result<()> {
@@ -91,6 +166,14 @@ struct RuntimeState {
     codex_home: Option<PathBuf>,
     codex_binary: Option<String>,
     remote: RemoteController,
+    remote_connections: ssh_remote::RemoteConnectionManager,
+    remote_agent_hosts: HashMap<AgentId, String>,
+    remote_terminal_hosts: HashMap<uuid::Uuid, String>,
+    setup_terminals: HashMap<uuid::Uuid, SetupTerminalRecord>,
+    remote_attention_hosts: HashMap<uuid::Uuid, String>,
+    remote_event_subscriptions: HashSet<String>,
+    remote_epochs: HashMap<String, uuid::Uuid>,
+    remote_connection_states: HashMap<String, String>,
 }
 
 struct ProjectTerminalRecord {
@@ -98,6 +181,14 @@ struct ProjectTerminalRecord {
     master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     child: Box<dyn portable_pty::Child + Send>,
+}
+
+struct SetupTerminalRecord {
+    master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
+    child: Box<dyn portable_pty::Child + Send>,
+    output: Arc<Mutex<Vec<u8>>>,
+    exited: Arc<AtomicBool>,
 }
 
 struct AgentRecord {
@@ -175,6 +266,14 @@ impl RuntimeState {
             codex_home,
             codex_binary,
             remote: RemoteController::new(),
+            remote_connections: ssh_remote::RemoteConnectionManager::default(),
+            remote_agent_hosts: HashMap::new(),
+            remote_terminal_hosts: HashMap::new(),
+            setup_terminals: HashMap::new(),
+            remote_attention_hosts: HashMap::new(),
+            remote_event_subscriptions: HashSet::new(),
+            remote_epochs: HashMap::new(),
+            remote_connection_states: HashMap::new(),
         })
     }
 
@@ -219,7 +318,13 @@ impl RuntimeState {
                 "persistent_attention_read_v1".to_owned(),
                 "always_on_web_access_v1".to_owned(),
                 "remote_control_v1".to_owned(),
+                "ssh_remote_runtime_v1".to_owned(),
+                "remote_directory_picker_v1".to_owned(),
+                "remote_runtime_protocol_v1".to_owned(),
             ],
+            protocol_version: ditch_protocol::PROTOCOL_VERSION,
+            platform: std::env::consts::OS.to_owned(),
+            architecture: std::env::consts::ARCH.to_owned(),
         }
     }
 
@@ -306,10 +411,13 @@ struct SequencedEvent {
 fn serve(paths: AppPaths) -> io::Result<()> {
     remove_stale_socket(&paths.socket_path)?;
     let listener = UnixListener::bind(&paths.socket_path)?;
+    fs::set_permissions(&paths.socket_path, fs::Permissions::from_mode(0o600))?;
     let state = Arc::new(Mutex::new(
         RuntimeState::new(paths).map_err(io::Error::other)?,
     ));
+    write_runtime_metadata(&state)?;
     remote_control::start_connection(Arc::clone(&state));
+    start_remote_reconciler(Arc::clone(&state));
 
     for stream in listener.incoming() {
         let stream = stream?;
@@ -322,6 +430,296 @@ fn serve(paths: AppPaths) -> io::Result<()> {
     }
 
     Ok(())
+}
+
+/// Reconciles sanitized projections from remote authorities. A failed poll is
+/// deliberately a no-op: losing SSH never changes an agent to stopped and no
+/// command is queued for replay. Every successful poll replaces the cache for
+/// that host, so remote truth wins after reconnect or a daemon epoch change.
+fn start_remote_reconciler(state: Arc<Mutex<RuntimeState>>) {
+    thread::spawn(move || {
+        loop {
+            thread::sleep(Duration::from_secs(3));
+            let (hosts, connections) = {
+                let state = state
+                    .lock()
+                    .expect("runtime state lock should not be poisoned");
+                let mut hosts: HashMap<String, Vec<Project>> = HashMap::new();
+                for project in state
+                    .projects
+                    .values()
+                    .filter(|project| project.is_remote())
+                {
+                    if let Some(alias) = ssh_remote::remote_alias(project) {
+                        hosts
+                            .entry(alias.to_owned())
+                            .or_default()
+                            .push(project.clone());
+                    }
+                }
+                (hosts, state.remote_connections.clone())
+            };
+            for (alias, projects) in hosts {
+                ensure_remote_event_subscription(&state, &alias);
+                let status = match connections.request(&alias, ClientRequest::RuntimeStatus) {
+                    Ok(ServerResponse::RuntimeStatus(status)) => status,
+                    _ => {
+                        update_remote_presence(
+                            &state,
+                            &alias,
+                            "offline",
+                            Some("SSH bridge unavailable"),
+                        );
+                        continue;
+                    }
+                };
+                let snapshot = match connections.request(&alias, ClientRequest::Snapshot) {
+                    Ok(ServerResponse::Snapshot(snapshot)) => snapshot,
+                    _ => {
+                        update_remote_presence(
+                            &state,
+                            &alias,
+                            "offline",
+                            Some("Remote daemon unavailable"),
+                        );
+                        continue;
+                    }
+                };
+                update_remote_presence(&state, &alias, "online", None);
+                reconcile_remote_snapshot(&state, &alias, &projects, status.instance_id, snapshot);
+            }
+        }
+    });
+}
+
+fn ensure_remote_event_subscription(state: &Arc<Mutex<RuntimeState>>, alias: &str) {
+    let connections = {
+        let mut state = state
+            .lock()
+            .expect("runtime state lock should not be poisoned");
+        if !state.remote_event_subscriptions.insert(alias.to_owned()) {
+            return;
+        }
+        state.remote_connections.clone()
+    };
+    let state_for_events = Arc::clone(state);
+    let alias_for_thread = alias.to_owned();
+    thread::spawn(move || {
+        let alias_for_event = alias_for_thread.clone();
+        let result = connections.stream_events(&alias_for_thread, |event| {
+            forward_remote_event(&state_for_events, &alias_for_event, event);
+        });
+        let mut state = state_for_events
+            .lock()
+            .expect("runtime state lock should not be poisoned");
+        state.remote_event_subscriptions.remove(&alias_for_thread);
+        if let Err(error) = result {
+            ssh_remote::observe(
+                "remote_daemon_disconnected",
+                &alias_for_thread,
+                Some(&error.to_string()),
+            );
+        }
+    });
+}
+
+fn forward_remote_event(state: &Arc<Mutex<RuntimeState>>, alias: &str, event: ServerEvent) {
+    let mut state = state
+        .lock()
+        .expect("runtime state lock should not be poisoned");
+    match event {
+        ServerEvent::AgentChanged(run) => {
+            let owns_project = state.projects.values().any(|project| {
+                project.id == run.project_id
+                    && ssh_remote::remote_alias(project).is_some_and(|host| host == alias)
+            });
+            if !owns_project {
+                return;
+            }
+            state.remote_agent_hosts.insert(run.id, alias.to_owned());
+            if let Some(record) = state.agents.get_mut(&run.id) {
+                record.run = run.clone();
+            }
+            state.broadcast(ServerEvent::AgentChanged(run));
+        }
+        ServerEvent::AgentMessageAppended(message) => {
+            if !state
+                .remote_agent_hosts
+                .get(&message.agent_id)
+                .is_some_and(|host| host == alias)
+            {
+                return;
+            }
+            if let Some(record) = state.agents.get_mut(&message.agent_id)
+                && !record.messages.iter().any(|existing| existing == &message)
+            {
+                record.messages.push(message.clone());
+            }
+            state.broadcast(ServerEvent::AgentMessageAppended(message));
+        }
+        ServerEvent::ProjectTerminalOutput { terminal_id, data } => {
+            if state
+                .remote_terminal_hosts
+                .get(&terminal_id)
+                .is_some_and(|host| host == alias)
+            {
+                state.broadcast(ServerEvent::ProjectTerminalOutput { terminal_id, data });
+            }
+        }
+        ServerEvent::ProjectTerminalExited { terminal_id } => {
+            if state
+                .remote_terminal_hosts
+                .get(&terminal_id)
+                .is_some_and(|host| host == alias)
+            {
+                state.remote_terminal_hosts.remove(&terminal_id);
+                state.broadcast(ServerEvent::ProjectTerminalExited { terminal_id });
+            }
+        }
+        // Snapshots and attention are reconciled authoritatively by the
+        // bounded poller. Project/agent terminal events need low latency and
+        // are the only event classes forwarded here.
+        _ => {}
+    }
+}
+
+fn update_remote_presence(
+    state: &Arc<Mutex<RuntimeState>>,
+    alias: &str,
+    status: &str,
+    detail: Option<&str>,
+) {
+    let mut state = state
+        .lock()
+        .expect("runtime state lock should not be poisoned");
+    if state
+        .remote_connection_states
+        .get(alias)
+        .is_some_and(|value| value == status)
+    {
+        return;
+    }
+    state
+        .remote_connection_states
+        .insert(alias.to_owned(), status.to_owned());
+    state.broadcast(ServerEvent::RemoteHostStatusChanged(RemoteHostPresence {
+        ssh_host_alias: alias.to_owned(),
+        state: status.to_owned(),
+        updated_at: Utc::now(),
+        detail: detail.map(str::to_owned),
+    }));
+}
+
+fn reconcile_remote_snapshot(
+    state: &Arc<Mutex<RuntimeState>>,
+    alias: &str,
+    projects: &[Project],
+    epoch: uuid::Uuid,
+    snapshot: Snapshot,
+) {
+    let project_ids = projects
+        .iter()
+        .map(|project| project.id)
+        .collect::<HashSet<_>>();
+    let projects_by_id = projects
+        .iter()
+        .map(|project| (project.id, project))
+        .collect::<HashMap<_, _>>();
+    let mut state = state
+        .lock()
+        .expect("runtime state lock should not be poisoned");
+    let previous_epoch = state.remote_epochs.insert(alias.to_owned(), epoch);
+    if previous_epoch != Some(epoch) {
+        ssh_remote::observe(
+            "remote_daemon_reconciled",
+            alias,
+            previous_epoch.map(|_| "daemon_restarted"),
+        );
+    }
+
+    let authoritative_ids = snapshot
+        .agents
+        .iter()
+        .filter(|run| project_ids.contains(&run.project_id))
+        .map(|run| run.id)
+        .collect::<HashSet<_>>();
+    let stale = state
+        .remote_agent_hosts
+        .iter()
+        .filter(|(_, host)| host.as_str() == alias)
+        .filter_map(|(id, _)| (!authoritative_ids.contains(id)).then_some(*id))
+        .collect::<Vec<_>>();
+    for id in stale {
+        state.remote_agent_hosts.remove(&id);
+        state.agents.remove(&id);
+    }
+    for run in snapshot
+        .agents
+        .into_iter()
+        .filter(|run| project_ids.contains(&run.project_id))
+    {
+        let Some(project) = projects_by_id.get(&run.project_id) else {
+            continue;
+        };
+        state.remote_agent_hosts.insert(run.id, alias.to_owned());
+        state.agents.insert(
+            run.id,
+            AgentRecord {
+                run,
+                project_root: project.root.clone(),
+                allow_non_git: project.git_policy == ProjectGitPolicy::AllowOutsideGit,
+                messages: Vec::new(),
+                terminal_failure: None,
+            },
+        );
+    }
+
+    let replaced_attention_ids = state
+        .remote_attention_hosts
+        .iter()
+        .filter_map(|(id, host)| (host == alias).then_some(*id))
+        .collect::<HashSet<_>>();
+    state
+        .attention
+        .retain(|attention| !replaced_attention_ids.contains(&attention.id));
+    state.remote_attention_hosts.retain(|_, host| host != alias);
+    for attention in snapshot.attention.into_iter().filter(|item| {
+        item.project_id.is_some_and(|id| project_ids.contains(&id))
+            || item
+                .agent_id
+                .is_some_and(|id| authoritative_ids.contains(&id))
+    }) {
+        state
+            .remote_attention_hosts
+            .insert(attention.id, alias.to_owned());
+        state.attention.push(attention);
+    }
+    let snapshot = state.snapshot();
+    state.broadcast(ServerEvent::SnapshotReplaced(snapshot));
+    let attention = state.attention.clone();
+    state.broadcast(ServerEvent::AttentionSnapshotReplaced(attention));
+}
+
+fn write_runtime_metadata(state: &Arc<Mutex<RuntimeState>>) -> io::Result<()> {
+    let state = state
+        .lock()
+        .expect("runtime state lock should not be poisoned");
+    let run_dir = state
+        .paths
+        .socket_path
+        .parent()
+        .unwrap_or(&state.paths.data_dir);
+    let path = run_dir.join("daemon.json");
+    let temporary = run_dir.join(format!(".daemon-{}.tmp", uuid::Uuid::new_v4()));
+    let bytes = serde_json::to_vec(&serde_json::json!({
+        "pid": std::process::id(),
+        "epoch": state.instance_id,
+        "started_at": state.started_at,
+        "version": env!("CARGO_PKG_VERSION"),
+    }))?;
+    fs::write(&temporary, bytes)?;
+    fs::set_permissions(&temporary, fs::Permissions::from_mode(0o600))?;
+    fs::rename(temporary, path)
 }
 
 fn remove_stale_socket(path: &Path) -> io::Result<()> {
@@ -548,6 +946,29 @@ fn handle_request(request: ClientRequest, state: Arc<Mutex<RuntimeState>>) -> Se
             before_sequence,
             limit,
         } => {
+            let remote = {
+                let state = state
+                    .lock()
+                    .expect("runtime state lock should not be poisoned");
+                state
+                    .remote_agent_hosts
+                    .get(&agent_id)
+                    .cloned()
+                    .map(|alias| (alias, state.remote_connections.clone()))
+            };
+            if let Some((alias, connections)) = remote {
+                return match connections.request(
+                    &alias,
+                    ClientRequest::ListAgentMessages {
+                        agent_id,
+                        before_sequence,
+                        limit,
+                    },
+                ) {
+                    Ok(response) => response,
+                    Err(error) => protocol_error("remote_unavailable", error.to_string()),
+                };
+            }
             let state = state
                 .lock()
                 .expect("runtime state lock should not be poisoned");
@@ -572,6 +993,161 @@ fn handle_request(request: ClientRequest, state: Arc<Mutex<RuntimeState>>) -> Se
                 Err(error) => protocol_error("project_discovery_failed", error.to_string()),
             }
         }
+        ClientRequest::DiscoverSshHosts => match ssh_remote::ssh_hosts() {
+            Ok(hosts) => ServerResponse::SshHosts(hosts),
+            Err(error) => protocol_error("ssh_config_failed", error.to_string()),
+        },
+        ClientRequest::ResolveSshHost { alias } => match ssh_remote::ssh_host(&alias) {
+            Ok(host) => ServerResponse::ResolvedSshHost(host),
+            Err(error) => protocol_error("ssh_config_failed", error.to_string()),
+        },
+        ClientRequest::PreviewSshHost { host } => match ssh_remote::preview_host(&host) {
+            Ok(preview) => ServerResponse::SshConfigPreview(preview),
+            Err(error) => protocol_error("ssh_config_failed", error.to_string()),
+        },
+        ClientRequest::AddSshHost { host } => match ssh_remote::add_host(&host) {
+            Ok(()) => ServerResponse::Accepted,
+            Err(error) => protocol_error("ssh_config_failed", error.to_string()),
+        },
+        ClientRequest::CheckRemoteSetup {
+            alias,
+            password,
+            remember_password,
+            trust_unknown_host,
+        } => {
+            let connections = state
+                .lock()
+                .expect("runtime state lock should not be poisoned")
+                .remote_connections
+                .clone();
+            match ssh_remote::check_setup(
+                &connections,
+                &alias,
+                password,
+                remember_password,
+                trust_unknown_host,
+            ) {
+                Ok(status) => ServerResponse::RemoteSetup(status),
+                Err(error) => protocol_error("remote_setup_failed", error.to_string()),
+            }
+        }
+        ClientRequest::InstallRemoteRuntime { alias } => {
+            let connections = state
+                .lock()
+                .expect("runtime state lock should not be poisoned")
+                .remote_connections
+                .clone();
+            match ssh_remote::install_remote_runtime(&connections, &alias) {
+                Ok(status) => ServerResponse::RemoteSetup(status),
+                Err(error) => protocol_error("remote_runtime_install_failed", error.to_string()),
+            }
+        }
+        ClientRequest::InstallRemoteCodex { alias } => {
+            let connections = state
+                .lock()
+                .expect("runtime state lock should not be poisoned")
+                .remote_connections
+                .clone();
+            match ssh_remote::install_remote_codex(&connections, &alias) {
+                Ok(status) => ServerResponse::RemoteSetup(status),
+                Err(error) => protocol_error("remote_codex_install_failed", error.to_string()),
+            }
+        }
+        ClientRequest::InstallRemoteGit { alias } => {
+            let connections = state
+                .lock()
+                .expect("runtime state lock should not be poisoned")
+                .remote_connections
+                .clone();
+            match ssh_remote::install_remote_git(&connections, &alias) {
+                Ok(status) => ServerResponse::RemoteSetup(status),
+                Err(error) => protocol_error("remote_git_install_failed", error.to_string()),
+            }
+        }
+        ClientRequest::OpenRemoteCodexAuthentication {
+            alias,
+            columns,
+            rows,
+        } => {
+            let connections = state
+                .lock()
+                .expect("runtime state lock should not be poisoned")
+                .remote_connections
+                .clone();
+            match connections.request(
+                &alias,
+                ClientRequest::OpenCodexAuthentication { columns, rows },
+            ) {
+                Ok(ServerResponse::SetupTerminal(terminal)) => {
+                    state
+                        .lock()
+                        .expect("runtime state lock should not be poisoned")
+                        .remote_terminal_hosts
+                        .insert(terminal.id, alias);
+                    ServerResponse::SetupTerminal(terminal)
+                }
+                Ok(response) => response,
+                Err(error) => protocol_error("remote_unavailable", error.to_string()),
+            }
+        }
+        ClientRequest::OpenCodexAuthentication { columns, rows } => {
+            open_codex_authentication(state, columns, rows)
+        }
+        ClientRequest::WriteSetupTerminal { terminal_id, data } => {
+            setup_terminal_request_for_target(
+                state,
+                terminal_id,
+                ClientRequest::WriteSetupTerminal { terminal_id, data },
+            )
+        }
+        ClientRequest::ResizeSetupTerminal {
+            terminal_id,
+            columns,
+            rows,
+        } => setup_terminal_request_for_target(
+            state,
+            terminal_id,
+            ClientRequest::ResizeSetupTerminal {
+                terminal_id,
+                columns,
+                rows,
+            },
+        ),
+        ClientRequest::TakeSetupTerminalOutput { terminal_id } => {
+            setup_terminal_request_for_target(
+                state,
+                terminal_id,
+                ClientRequest::TakeSetupTerminalOutput { terminal_id },
+            )
+        }
+        ClientRequest::CloseSetupTerminal { terminal_id } => setup_terminal_request_for_target(
+            state,
+            terminal_id,
+            ClientRequest::CloseSetupTerminal { terminal_id },
+        ),
+        ClientRequest::ListRemoteDirectory {
+            alias,
+            absolute_path,
+        } => {
+            let connections = state
+                .lock()
+                .expect("runtime state lock should not be poisoned")
+                .remote_connections
+                .clone();
+            match ssh_remote::list_remote_directory(&connections, &alias, &absolute_path) {
+                Ok(directory) => ServerResponse::RemoteDirectory(directory),
+                Err(error) => protocol_error("remote_directory_failed", error.to_string()),
+            }
+        }
+        ClientRequest::ListFilesystemDirectory { absolute_path } => {
+            list_filesystem_directory(&absolute_path)
+        }
+        ClientRequest::CreateRemoteProject {
+            ssh_host_alias,
+            name,
+            remote_root,
+            git_policy,
+        } => create_remote_project(state, ssh_host_alias, name, remote_root, git_policy),
         ClientRequest::CreateProject {
             name,
             root,
@@ -622,81 +1198,177 @@ fn handle_request(request: ClientRequest, state: Arc<Mutex<RuntimeState>>) -> Se
             state.broadcast(ServerEvent::ProjectChanged(project.clone()));
             ServerResponse::ProjectCreated(project)
         }
-        ClientRequest::DeleteProject { project_id } => delete_project(state, project_id),
+        ClientRequest::DeleteProject { project_id } => delete_project_for_target(state, project_id),
         ClientRequest::StartCodexSession {
+            project_id,
             project_name,
             project_root,
             prompt,
             mode,
             execution_profile,
-        } => start_codex_session(
-            state,
-            project_name,
-            project_root,
-            prompt,
-            mode,
-            execution_profile,
-        ),
+        } => {
+            if let Some(project) = project_id
+                .and_then(|id| project_by_id(&state, id))
+                .filter(Project::is_remote)
+            {
+                forward_remote_start(
+                    state,
+                    project,
+                    project_name,
+                    project_root,
+                    prompt,
+                    mode,
+                    execution_profile,
+                )
+            } else {
+                start_codex_session(
+                    state,
+                    project_name,
+                    project_root,
+                    prompt,
+                    mode,
+                    execution_profile,
+                )
+            }
+        }
         ClientRequest::ResumeCodexSession {
+            project_id,
             project_name,
             project_root,
             thread_id,
             prompt,
             execution_profile,
-        } => resume_codex_session(
-            state,
-            project_name,
-            project_root,
-            thread_id,
-            prompt,
-            execution_profile,
-        ),
+        } => {
+            if let Some(project) = project_id
+                .and_then(|id| project_by_id(&state, id))
+                .filter(Project::is_remote)
+            {
+                forward_remote_resume(
+                    state,
+                    project,
+                    project_name,
+                    project_root,
+                    thread_id,
+                    prompt,
+                    execution_profile,
+                )
+            } else {
+                resume_codex_session(
+                    state,
+                    project_name,
+                    project_root,
+                    thread_id,
+                    prompt,
+                    execution_profile,
+                )
+            }
+        }
         ClientRequest::PromptAgent {
             agent_id,
             prompt,
             execution_profile,
-        } => prompt_agent(state, agent_id, prompt, execution_profile),
-        ClientRequest::ListAgentModels { provider } => list_agent_models(state, provider),
+        } => forward_or_prompt_agent(state, agent_id, prompt, execution_profile),
+        ClientRequest::ListAgentModels {
+            provider,
+            project_id,
+        } => {
+            if let Some(project) = project_id
+                .and_then(|id| project_by_id(&state, id))
+                .filter(Project::is_remote)
+            {
+                forward_project_command(
+                    &state,
+                    &project,
+                    ClientRequest::ListAgentModels {
+                        provider,
+                        project_id: Some(project.id),
+                    },
+                )
+            } else {
+                list_agent_models(state, provider)
+            }
+        }
         ClientRequest::OpenProjectTerminal {
             project_id,
             columns,
             rows,
-        } => open_project_terminal(state, project_id, columns, rows),
+        } => open_project_terminal_for_target(state, project_id, columns, rows),
         ClientRequest::WriteProjectTerminal { terminal_id, data } => {
-            write_project_terminal(state, terminal_id, data)
+            write_project_terminal_for_target(state, terminal_id, data)
         }
         ClientRequest::ResizeProjectTerminal {
             terminal_id,
             columns,
             rows,
-        } => resize_project_terminal(state, terminal_id, columns, rows),
+        } => resize_project_terminal_for_target(state, terminal_id, columns, rows),
         ClientRequest::CloseProjectTerminal { terminal_id } => {
-            close_project_terminal(state, terminal_id)
+            close_project_terminal_for_target(state, terminal_id)
         }
         ClientRequest::ListProjectDirectory {
             project_id,
             relative_path,
-        } => list_project_directory(state, project_id, &relative_path),
+        } => project_file_request_for_target(
+            state,
+            project_id,
+            ClientRequest::ListProjectDirectory {
+                project_id,
+                relative_path,
+            },
+        ),
         ClientRequest::ReadProjectFile {
             project_id,
             relative_path,
-        } => read_project_file(state, project_id, &relative_path),
+        } => project_file_request_for_target(
+            state,
+            project_id,
+            ClientRequest::ReadProjectFile {
+                project_id,
+                relative_path,
+            },
+        ),
         ClientRequest::WriteProjectFile {
             project_id,
             relative_path,
             expected_revision,
             content,
-        } => write_project_file(
+        } => project_file_request_for_target(
             state,
             project_id,
-            &relative_path,
-            expected_revision.as_deref(),
-            &content,
+            ClientRequest::WriteProjectFile {
+                project_id,
+                relative_path,
+                expected_revision,
+                content,
+            },
         ),
-        ClientRequest::StopAgent { agent_id } => stop_agent(state, agent_id),
-        ClientRequest::DeleteAgent { agent_id } => delete_agent(state, agent_id),
-        ClientRequest::RenameAgent { agent_id, title } => rename_agent(state, agent_id, title),
+        ClientRequest::StopAgent { agent_id } => forward_or_stop_agent(state, agent_id, false),
+        ClientRequest::ForceKillAgent { agent_id } => forward_or_stop_agent(state, agent_id, true),
+        ClientRequest::DeleteAgent { agent_id } => {
+            forward_or_agent_action(state, agent_id, ClientRequest::DeleteAgent { agent_id })
+        }
+        ClientRequest::RenameAgent { agent_id, title } => forward_or_agent_action(
+            state,
+            agent_id,
+            ClientRequest::RenameAgent { agent_id, title },
+        ),
         ClientRequest::DismissAttention { attention_id } => {
+            let remote = {
+                let state = state
+                    .lock()
+                    .expect("runtime state lock should not be poisoned");
+                state
+                    .remote_attention_hosts
+                    .get(&attention_id)
+                    .cloned()
+                    .map(|alias| (alias, state.remote_connections.clone()))
+            };
+            if let Some((alias, connections)) = remote {
+                return connections
+                    .request(&alias, ClientRequest::DismissAttention { attention_id })
+                    .unwrap_or_else(|error| {
+                        protocol_error("remote_unavailable", error.to_string())
+                    });
+            }
             let mut state = state
                 .lock()
                 .expect("runtime state lock should not be poisoned");
@@ -708,10 +1380,40 @@ fn handle_request(request: ClientRequest, state: Arc<Mutex<RuntimeState>>) -> Se
             ServerResponse::Accepted
         }
         ClientRequest::MarkAttentionRead { attention_ids } => {
-            mark_attention_read(state, Some(&attention_ids))
+            mark_attention_read_for_targets(state, Some(attention_ids))
         }
-        ClientRequest::MarkAllAttentionRead => mark_attention_read(state, None),
+        ClientRequest::MarkAllAttentionRead => mark_attention_read_for_targets(state, None),
         ClientRequest::RemoteControlStatus => remote_control::status(state),
+        ClientRequest::EnsureRemoteMachineIdentity => {
+            remote_control::ensure_machine_identity(state)
+        }
+        ClientRequest::RemoteMachineControlStatus { alias } => {
+            forward_remote_machine_request(&state, &alias, ClientRequest::RemoteControlStatus)
+        }
+        ClientRequest::CreateRemoteMachinePairing { alias } => {
+            forward_remote_machine_request(&state, &alias, ClientRequest::CreateRemotePairing)
+        }
+        ClientRequest::GetRemoteMachinePairing { alias, pairing_id } => {
+            forward_remote_machine_request(
+                &state,
+                &alias,
+                ClientRequest::GetRemotePairing { pairing_id },
+            )
+        }
+        ClientRequest::ConfirmRemoteMachinePairing { alias, pairing_id } => {
+            forward_remote_machine_request(
+                &state,
+                &alias,
+                ClientRequest::ConfirmRemotePairing { pairing_id },
+            )
+        }
+        ClientRequest::CancelRemoteMachinePairing { alias, pairing_id } => {
+            forward_remote_machine_request(
+                &state,
+                &alias,
+                ClientRequest::CancelRemotePairing { pairing_id },
+            )
+        }
         ClientRequest::CreateRemotePairing => remote_control::create_pairing(state),
         ClientRequest::GetRemotePairing { pairing_id } => {
             remote_control::get_pairing(state, pairing_id)
@@ -726,6 +1428,7 @@ fn handle_request(request: ClientRequest, state: Arc<Mutex<RuntimeState>>) -> Se
             remote_control::revoke_device(state, device_id)
         }
         ClientRequest::DisableRemoteControl => remote_control::disable(state),
+        ClientRequest::CheckRemoteProject { project_id } => check_remote_project(state, project_id),
         ClientRequest::StartCodex { .. }
         | ClientRequest::ApprovePermission { .. }
         | ClientRequest::DenyPermission { .. }
@@ -770,6 +1473,829 @@ fn mark_attention_read(
         attention_ids: changed.iter().map(|attention| attention.id).collect(),
     });
     ServerResponse::Accepted
+}
+
+fn project_by_id(state: &Arc<Mutex<RuntimeState>>, project_id: ProjectId) -> Option<Project> {
+    state
+        .lock()
+        .expect("runtime state lock should not be poisoned")
+        .projects
+        .values()
+        .find(|project| project.id == project_id)
+        .cloned()
+}
+
+fn forward_remote_machine_request(
+    state: &Arc<Mutex<RuntimeState>>,
+    alias: &str,
+    request: ClientRequest,
+) -> ServerResponse {
+    let connections = state
+        .lock()
+        .expect("runtime state lock should not be poisoned")
+        .remote_connections
+        .clone();
+    connections
+        .request(alias, request)
+        .unwrap_or_else(|error| protocol_error("remote_unavailable", error.to_string()))
+}
+
+fn forward_project_command(
+    state: &Arc<Mutex<RuntimeState>>,
+    project: &Project,
+    request: ClientRequest,
+) -> ServerResponse {
+    let Some(alias) = ssh_remote::remote_alias(project) else {
+        return protocol_error("wrong_execution_target", "project is local");
+    };
+    let connections = state
+        .lock()
+        .expect("runtime state lock should not be poisoned")
+        .remote_connections
+        .clone();
+    match connections.request(alias, request) {
+        Ok(response) => response,
+        Err(error) => protocol_error("remote_unavailable", error.to_string()),
+    }
+}
+
+fn project_file_request_for_target(
+    state: Arc<Mutex<RuntimeState>>,
+    project_id: ProjectId,
+    request: ClientRequest,
+) -> ServerResponse {
+    let Some(project) = project_by_id(&state, project_id) else {
+        return protocol_error("project_not_found", "project was not found");
+    };
+    if project.is_remote() {
+        return match request {
+            ClientRequest::ListProjectDirectory { .. } | ClientRequest::ReadProjectFile { .. } => {
+                forward_project_command(&state, &project, request)
+            }
+            ClientRequest::WriteProjectFile { .. } => protocol_error(
+                "remote_source_editing_not_supported",
+                "remote project files are read-only in the desktop file browser",
+            ),
+            _ => protocol_error("unsupported_request", "not a project file request"),
+        };
+    }
+    match request {
+        ClientRequest::ListProjectDirectory { relative_path, .. } => {
+            list_project_directory(state, project_id, &relative_path)
+        }
+        ClientRequest::ReadProjectFile { relative_path, .. } => {
+            read_project_file(state, project_id, &relative_path)
+        }
+        ClientRequest::WriteProjectFile {
+            relative_path,
+            expected_revision,
+            content,
+            ..
+        } => write_project_file(
+            state,
+            project_id,
+            &relative_path,
+            expected_revision.as_deref(),
+            &content,
+        ),
+        _ => protocol_error("unsupported_request", "not a project file request"),
+    }
+}
+
+fn open_project_terminal_for_target(
+    state: Arc<Mutex<RuntimeState>>,
+    project_id: ProjectId,
+    columns: u16,
+    rows: u16,
+) -> ServerResponse {
+    let Some(project) = project_by_id(&state, project_id) else {
+        return protocol_error("project_not_found", "project was not found");
+    };
+    if !project.is_remote() {
+        return open_project_terminal(state, project_id, columns, rows);
+    }
+    let Some(alias) = ssh_remote::remote_alias(&project).map(str::to_owned) else {
+        return protocol_error(
+            "wrong_execution_target",
+            "remote project has no SSH host alias",
+        );
+    };
+    ensure_remote_event_subscription(&state, &alias);
+    let connections = state
+        .lock()
+        .expect("runtime state lock should not be poisoned")
+        .remote_connections
+        .clone();
+    match connections.request(
+        &alias,
+        ClientRequest::OpenProjectTerminal {
+            project_id,
+            columns,
+            rows,
+        },
+    ) {
+        Ok(ServerResponse::ProjectTerminal(terminal)) => {
+            state
+                .lock()
+                .expect("runtime state lock should not be poisoned")
+                .remote_terminal_hosts
+                .insert(terminal.id, alias);
+            ServerResponse::ProjectTerminal(terminal)
+        }
+        Ok(response) => response,
+        Err(error) => protocol_error("remote_unavailable", error.to_string()),
+    }
+}
+
+fn write_project_terminal_for_target(
+    state: Arc<Mutex<RuntimeState>>,
+    terminal_id: Uuid,
+    data: Vec<u8>,
+) -> ServerResponse {
+    let remote = {
+        let state = state
+            .lock()
+            .expect("runtime state lock should not be poisoned");
+        state
+            .remote_terminal_hosts
+            .get(&terminal_id)
+            .cloned()
+            .map(|alias| (alias, state.remote_connections.clone()))
+    };
+    if let Some((alias, connections)) = remote {
+        return connections
+            .request(
+                &alias,
+                ClientRequest::WriteProjectTerminal { terminal_id, data },
+            )
+            .unwrap_or_else(|error| protocol_error("remote_unavailable", error.to_string()));
+    }
+    write_project_terminal(state, terminal_id, data)
+}
+
+fn resize_project_terminal_for_target(
+    state: Arc<Mutex<RuntimeState>>,
+    terminal_id: Uuid,
+    columns: u16,
+    rows: u16,
+) -> ServerResponse {
+    let remote = {
+        let state = state
+            .lock()
+            .expect("runtime state lock should not be poisoned");
+        state
+            .remote_terminal_hosts
+            .get(&terminal_id)
+            .cloned()
+            .map(|alias| (alias, state.remote_connections.clone()))
+    };
+    if let Some((alias, connections)) = remote {
+        return connections
+            .request(
+                &alias,
+                ClientRequest::ResizeProjectTerminal {
+                    terminal_id,
+                    columns,
+                    rows,
+                },
+            )
+            .unwrap_or_else(|error| protocol_error("remote_unavailable", error.to_string()));
+    }
+    resize_project_terminal(state, terminal_id, columns, rows)
+}
+
+fn close_project_terminal_for_target(
+    state: Arc<Mutex<RuntimeState>>,
+    terminal_id: Uuid,
+) -> ServerResponse {
+    let remote = {
+        let mut state = state
+            .lock()
+            .expect("runtime state lock should not be poisoned");
+        state
+            .remote_terminal_hosts
+            .remove(&terminal_id)
+            .map(|alias| (alias, state.remote_connections.clone()))
+    };
+    if let Some((alias, connections)) = remote {
+        return connections
+            .request(&alias, ClientRequest::CloseProjectTerminal { terminal_id })
+            .unwrap_or_else(|error| protocol_error("remote_unavailable", error.to_string()));
+    }
+    close_project_terminal(state, terminal_id)
+}
+
+fn setup_terminal_request_for_target(
+    state: Arc<Mutex<RuntimeState>>,
+    terminal_id: Uuid,
+    request: ClientRequest,
+) -> ServerResponse {
+    let remote = {
+        let state = state
+            .lock()
+            .expect("runtime state lock should not be poisoned");
+        state
+            .remote_terminal_hosts
+            .get(&terminal_id)
+            .cloned()
+            .map(|alias| (alias, state.remote_connections.clone()))
+    };
+    if let Some((alias, connections)) = remote {
+        let closing = matches!(request, ClientRequest::CloseSetupTerminal { .. });
+        let response = connections
+            .request(&alias, request)
+            .unwrap_or_else(|error| protocol_error("remote_unavailable", error.to_string()));
+        if closing && matches!(response, ServerResponse::Accepted) {
+            state
+                .lock()
+                .expect("runtime state lock should not be poisoned")
+                .remote_terminal_hosts
+                .remove(&terminal_id);
+        }
+        return response;
+    }
+    match request {
+        ClientRequest::WriteSetupTerminal { data, .. } => {
+            write_setup_terminal(state, terminal_id, data)
+        }
+        ClientRequest::ResizeSetupTerminal { columns, rows, .. } => {
+            resize_setup_terminal(state, terminal_id, columns, rows)
+        }
+        ClientRequest::TakeSetupTerminalOutput { .. } => {
+            take_setup_terminal_output(state, terminal_id)
+        }
+        ClientRequest::CloseSetupTerminal { .. } => close_setup_terminal(state, terminal_id),
+        _ => protocol_error("unsupported_request", "not a setup terminal request"),
+    }
+}
+
+fn open_codex_authentication(
+    state: Arc<Mutex<RuntimeState>>,
+    columns: u16,
+    rows: u16,
+) -> ServerResponse {
+    let binary = active_codex_binary(&state).or_else(|| {
+        std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .map(|home| home.join(".local/bin/codex"))
+            .filter(|path| path.is_file())
+            .map(|path| path.to_string_lossy().into_owned())
+    });
+    let Some(binary) = binary else {
+        return protocol_error("codex_missing", "Codex is not installed on this machine");
+    };
+    let pair = match native_pty_system().openpty(terminal_size(columns, rows)) {
+        Ok(pair) => pair,
+        Err(error) => return protocol_error("terminal_open_failed", error.to_string()),
+    };
+    let mut command = CommandBuilder::new(binary);
+    command.arg("login");
+    command.env("TERM", "xterm-256color");
+    let child = match pair.slave.spawn_command(command) {
+        Ok(child) => child,
+        Err(error) => return protocol_error("codex_auth_failed", error.to_string()),
+    };
+    drop(pair.slave);
+    let writer = match pair.master.take_writer() {
+        Ok(writer) => writer,
+        Err(error) => return protocol_error("terminal_writer_failed", error.to_string()),
+    };
+    let reader = match pair.master.try_clone_reader() {
+        Ok(reader) => reader,
+        Err(error) => return protocol_error("terminal_reader_failed", error.to_string()),
+    };
+    let descriptor = SetupTerminal {
+        id: Uuid::new_v4(),
+        purpose: "codex_authentication".into(),
+    };
+    let output = Arc::new(Mutex::new(Vec::new()));
+    let exited = Arc::new(AtomicBool::new(false));
+    let reader_output = Arc::clone(&output);
+    let reader_exited = Arc::clone(&exited);
+    thread::spawn(move || {
+        let mut reader = reader;
+        let mut bytes = [0_u8; 8192];
+        loop {
+            match reader.read(&mut bytes) {
+                Ok(0) | Err(_) => break,
+                Ok(count) => {
+                    let mut output = reader_output
+                        .lock()
+                        .expect("setup terminal output lock poisoned");
+                    output.extend_from_slice(&bytes[..count]);
+                    if output.len() > 1024 * 1024 {
+                        let excess = output.len() - 1024 * 1024;
+                        output.drain(..excess);
+                    }
+                }
+            }
+        }
+        reader_exited.store(true, Ordering::Release);
+    });
+    state
+        .lock()
+        .expect("runtime state lock should not be poisoned")
+        .setup_terminals
+        .insert(
+            descriptor.id,
+            SetupTerminalRecord {
+                master: Arc::new(Mutex::new(pair.master)),
+                writer: Arc::new(Mutex::new(writer)),
+                child,
+                output,
+                exited,
+            },
+        );
+    ServerResponse::SetupTerminal(descriptor)
+}
+
+fn write_setup_terminal(
+    state: Arc<Mutex<RuntimeState>>,
+    terminal_id: Uuid,
+    data: Vec<u8>,
+) -> ServerResponse {
+    let writer = state
+        .lock()
+        .expect("runtime state lock should not be poisoned")
+        .setup_terminals
+        .get(&terminal_id)
+        .map(|record| Arc::clone(&record.writer));
+    let Some(writer) = writer else {
+        return protocol_error("terminal_not_found", "setup terminal was not found");
+    };
+    match writer
+        .lock()
+        .expect("setup terminal writer lock poisoned")
+        .write_all(&data)
+    {
+        Ok(()) => ServerResponse::Accepted,
+        Err(error) => protocol_error("terminal_write_failed", error.to_string()),
+    }
+}
+
+fn resize_setup_terminal(
+    state: Arc<Mutex<RuntimeState>>,
+    terminal_id: Uuid,
+    columns: u16,
+    rows: u16,
+) -> ServerResponse {
+    let master = state
+        .lock()
+        .expect("runtime state lock should not be poisoned")
+        .setup_terminals
+        .get(&terminal_id)
+        .map(|record| Arc::clone(&record.master));
+    let Some(master) = master else {
+        return protocol_error("terminal_not_found", "setup terminal was not found");
+    };
+    match master
+        .lock()
+        .expect("setup terminal master lock poisoned")
+        .resize(terminal_size(columns, rows))
+    {
+        Ok(()) => ServerResponse::Accepted,
+        Err(error) => protocol_error("terminal_resize_failed", error.to_string()),
+    }
+}
+
+fn take_setup_terminal_output(
+    state: Arc<Mutex<RuntimeState>>,
+    terminal_id: Uuid,
+) -> ServerResponse {
+    let values = state
+        .lock()
+        .expect("runtime state lock should not be poisoned")
+        .setup_terminals
+        .get(&terminal_id)
+        .map(|record| (Arc::clone(&record.output), Arc::clone(&record.exited)));
+    let Some((output, exited)) = values else {
+        return protocol_error("terminal_not_found", "setup terminal was not found");
+    };
+    let data = std::mem::take(&mut *output.lock().expect("setup terminal output lock poisoned"));
+    ServerResponse::SetupTerminalOutput(SetupTerminalOutput {
+        terminal_id,
+        data,
+        exited: exited.load(Ordering::Acquire),
+    })
+}
+
+fn close_setup_terminal(state: Arc<Mutex<RuntimeState>>, terminal_id: Uuid) -> ServerResponse {
+    let terminal = state
+        .lock()
+        .expect("runtime state lock should not be poisoned")
+        .setup_terminals
+        .remove(&terminal_id);
+    if let Some(mut terminal) = terminal {
+        let _ = terminal.child.kill();
+    }
+    ServerResponse::Accepted
+}
+
+fn delete_project_for_target(
+    state: Arc<Mutex<RuntimeState>>,
+    project_id: ProjectId,
+) -> ServerResponse {
+    let Some(project) = project_by_id(&state, project_id) else {
+        return protocol_error("project_not_found", "project was not found");
+    };
+    if project.is_remote() {
+        let response = forward_project_command(
+            &state,
+            &project,
+            ClientRequest::DeleteProject { project_id },
+        );
+        if !matches!(response, ServerResponse::Accepted) {
+            return response;
+        }
+        let mut state = state
+            .lock()
+            .expect("runtime state lock should not be poisoned");
+        if let Err(error) = state.store.delete_project(project_id) {
+            return protocol_error("project_delete_failed", error.to_string());
+        }
+        let agent_ids = state
+            .agents
+            .values()
+            .filter_map(|record| (record.run.project_id == project_id).then_some(record.run.id))
+            .collect::<HashSet<_>>();
+        state.agents.retain(|id, _| !agent_ids.contains(id));
+        state
+            .remote_agent_hosts
+            .retain(|id, _| !agent_ids.contains(id));
+        state.attention.retain(|item| {
+            item.project_id != Some(project_id)
+                && item.agent_id.is_none_or(|id| !agent_ids.contains(&id))
+        });
+        state
+            .projects
+            .retain(|_, candidate| candidate.id != project_id);
+        state.broadcast(ServerEvent::ProjectDeleted { project_id });
+        return ServerResponse::Accepted;
+    }
+    delete_project(state, project_id)
+}
+
+fn create_remote_project(
+    state: Arc<Mutex<RuntimeState>>,
+    alias: String,
+    name: String,
+    remote_root: String,
+    git_policy: ProjectGitPolicy,
+) -> ServerResponse {
+    let connections = state
+        .lock()
+        .expect("runtime state lock should not be poisoned")
+        .remote_connections
+        .clone();
+    let machine_id = match connections.request(&alias, ClientRequest::EnsureRemoteMachineIdentity) {
+        Ok(ServerResponse::RemoteControlStatus(status)) => status.machine_id,
+        _ => match connections.request(&alias, ClientRequest::RemoteControlStatus) {
+            Ok(ServerResponse::RemoteControlStatus(status)) => status.machine_id,
+            Ok(ServerResponse::Error(error)) => return ServerResponse::Error(error),
+            Ok(_) => None,
+            Err(error) => return protocol_error("remote_unavailable", error.to_string()),
+        },
+    };
+    let Some(machine_id) = machine_id else {
+        return protocol_error(
+            "remote_identity_failed",
+            "The remote daemon did not provide a stable machine identity.",
+        );
+    };
+    let project = match ssh_remote::create_remote_project(
+        &connections,
+        &alias,
+        machine_id,
+        name,
+        remote_root,
+        git_policy,
+    ) {
+        Ok(project) => project,
+        Err(error) => return protocol_error("remote_project_failed", error.to_string()),
+    };
+    let mut state = state
+        .lock()
+        .expect("runtime state lock should not be poisoned");
+    if let Err(error) = state.store.upsert_project(&project) {
+        return protocol_error("project_store_failed", error.to_string());
+    }
+    state.projects.insert(project.root_key(), project.clone());
+    state.broadcast(ServerEvent::ProjectChanged(project.clone()));
+    ssh_remote::observe("remote_project_added", &alias, None);
+    ServerResponse::ProjectCreated(project)
+}
+
+fn cache_remote_agent(
+    state: &Arc<Mutex<RuntimeState>>,
+    alias: &str,
+    project: &Project,
+    run: &AgentRun,
+) {
+    let mut state = state
+        .lock()
+        .expect("runtime state lock should not be poisoned");
+    state.remote_agent_hosts.insert(run.id, alias.to_owned());
+    state.agents.insert(
+        run.id,
+        AgentRecord {
+            run: run.clone(),
+            project_root: project.root.clone(),
+            allow_non_git: project.git_policy == ProjectGitPolicy::AllowOutsideGit,
+            messages: Vec::new(),
+            terminal_failure: None,
+        },
+    );
+    state.broadcast(ServerEvent::AgentChanged(run.clone()));
+}
+
+fn forward_remote_start(
+    state: Arc<Mutex<RuntimeState>>,
+    project: Project,
+    _project_name: String,
+    _project_root: String,
+    prompt: String,
+    mode: CodexLaunchMode,
+    execution_profile: AgentExecutionProfile,
+) -> ServerResponse {
+    let Some(alias) = ssh_remote::remote_alias(&project).map(str::to_owned) else {
+        return protocol_error("wrong_execution_target", "project is not remote");
+    };
+    let connections = state
+        .lock()
+        .expect("runtime state lock should not be poisoned")
+        .remote_connections
+        .clone();
+    let request = ClientRequest::StartCodexSession {
+        project_id: Some(project.id),
+        project_name: project.name.clone(),
+        project_root: project.root.to_string_lossy().into_owned(),
+        prompt,
+        mode,
+        execution_profile,
+    };
+    match connections.request(&alias, request) {
+        Ok(ServerResponse::AgentStarted(run)) => {
+            cache_remote_agent(&state, &alias, &project, &run);
+            ServerResponse::AgentStarted(run)
+        }
+        Ok(response) => response,
+        Err(error) => protocol_error("remote_unavailable", error.to_string()),
+    }
+}
+
+fn forward_remote_resume(
+    state: Arc<Mutex<RuntimeState>>,
+    project: Project,
+    _project_name: String,
+    _project_root: String,
+    thread_id: String,
+    prompt: String,
+    execution_profile: AgentExecutionProfile,
+) -> ServerResponse {
+    let Some(alias) = ssh_remote::remote_alias(&project).map(str::to_owned) else {
+        return protocol_error("wrong_execution_target", "project is not remote");
+    };
+    let connections = state
+        .lock()
+        .expect("runtime state lock should not be poisoned")
+        .remote_connections
+        .clone();
+    let request = ClientRequest::ResumeCodexSession {
+        project_id: Some(project.id),
+        project_name: project.name.clone(),
+        project_root: project.root.to_string_lossy().into_owned(),
+        thread_id,
+        prompt,
+        execution_profile,
+    };
+    match connections.request(&alias, request) {
+        Ok(ServerResponse::AgentStarted(run)) => {
+            cache_remote_agent(&state, &alias, &project, &run);
+            ServerResponse::AgentStarted(run)
+        }
+        Ok(response) => response,
+        Err(error) => protocol_error("remote_unavailable", error.to_string()),
+    }
+}
+
+fn forward_or_prompt_agent(
+    state: Arc<Mutex<RuntimeState>>,
+    agent_id: AgentId,
+    prompt: String,
+    execution_profile: AgentExecutionProfile,
+) -> ServerResponse {
+    let remote = {
+        let state = state
+            .lock()
+            .expect("runtime state lock should not be poisoned");
+        state
+            .remote_agent_hosts
+            .get(&agent_id)
+            .cloned()
+            .map(|alias| (alias, state.remote_connections.clone()))
+    };
+    let Some((alias, connections)) = remote else {
+        return prompt_agent(state, agent_id, prompt, execution_profile);
+    };
+    match connections.request(
+        &alias,
+        ClientRequest::PromptAgent {
+            agent_id,
+            prompt,
+            execution_profile,
+        },
+    ) {
+        Ok(response) => response,
+        Err(error) => protocol_error("remote_unavailable", error.to_string()),
+    }
+}
+
+fn forward_or_stop_agent(
+    state: Arc<Mutex<RuntimeState>>,
+    agent_id: AgentId,
+    force: bool,
+) -> ServerResponse {
+    let remote = {
+        let state = state
+            .lock()
+            .expect("runtime state lock should not be poisoned");
+        state
+            .remote_agent_hosts
+            .get(&agent_id)
+            .cloned()
+            .map(|alias| (alias, state.remote_connections.clone()))
+    };
+    let Some((alias, connections)) = remote else {
+        return if force {
+            force_kill_agent(state, agent_id)
+        } else {
+            stop_agent(state, agent_id)
+        };
+    };
+    let request = if force {
+        ClientRequest::ForceKillAgent { agent_id }
+    } else {
+        ClientRequest::StopAgent { agent_id }
+    };
+    match connections.request(&alias, request) {
+        Ok(response) => response,
+        Err(error) => protocol_error("remote_unavailable", error.to_string()),
+    }
+}
+
+fn forward_or_agent_action(
+    state: Arc<Mutex<RuntimeState>>,
+    agent_id: AgentId,
+    request: ClientRequest,
+) -> ServerResponse {
+    let remote = {
+        let state = state
+            .lock()
+            .expect("runtime state lock should not be poisoned");
+        state
+            .remote_agent_hosts
+            .get(&agent_id)
+            .cloned()
+            .map(|alias| (alias, state.remote_connections.clone()))
+    };
+    if let Some((alias, connections)) = remote {
+        return connections
+            .request(&alias, request)
+            .unwrap_or_else(|error| protocol_error("remote_unavailable", error.to_string()));
+    }
+    match request {
+        ClientRequest::DeleteAgent { .. } => delete_agent(state, agent_id),
+        ClientRequest::RenameAgent { title, .. } => rename_agent(state, agent_id, title),
+        _ => protocol_error("unsupported_request", "not an agent action"),
+    }
+}
+
+fn mark_attention_read_for_targets(
+    state: Arc<Mutex<RuntimeState>>,
+    requested: Option<Vec<Uuid>>,
+) -> ServerResponse {
+    let (by_host, local_ids, connections) = {
+        let state = state
+            .lock()
+            .expect("runtime state lock should not be poisoned");
+        let selected = requested
+            .clone()
+            .unwrap_or_else(|| state.attention.iter().map(|item| item.id).collect());
+        let mut by_host: HashMap<String, Vec<Uuid>> = HashMap::new();
+        let mut local = Vec::new();
+        for id in selected {
+            if let Some(host) = state.remote_attention_hosts.get(&id) {
+                by_host.entry(host.clone()).or_default().push(id);
+            } else {
+                local.push(id);
+            }
+        }
+        (by_host, local, state.remote_connections.clone())
+    };
+    for (alias, ids) in by_host {
+        let request = if requested.is_none() {
+            ClientRequest::MarkAllAttentionRead
+        } else {
+            ClientRequest::MarkAttentionRead { attention_ids: ids }
+        };
+        match connections.request(&alias, request) {
+            Ok(ServerResponse::Accepted) => {}
+            Ok(ServerResponse::Error(error)) => return ServerResponse::Error(error),
+            Ok(_) => {
+                return protocol_error("remote_protocol_error", "unexpected attention response");
+            }
+            Err(error) => return protocol_error("remote_unavailable", error.to_string()),
+        }
+    }
+    if local_ids.is_empty() {
+        ServerResponse::Accepted
+    } else {
+        mark_attention_read(state, Some(&local_ids))
+    }
+}
+
+fn check_remote_project(state: Arc<Mutex<RuntimeState>>, project_id: ProjectId) -> ServerResponse {
+    let Some(project) = project_by_id(&state, project_id) else {
+        return protocol_error("project_not_found", "project was not found");
+    };
+    let Some(alias) = ssh_remote::remote_alias(&project) else {
+        return protocol_error("wrong_execution_target", "project is local");
+    };
+    let connections = state
+        .lock()
+        .expect("runtime state lock should not be poisoned")
+        .remote_connections
+        .clone();
+    match connections.request(alias, ClientRequest::Snapshot) {
+        Ok(ServerResponse::Snapshot(snapshot))
+            if snapshot
+                .projects
+                .iter()
+                .any(|remote| remote.id == project_id) =>
+        {
+            ServerResponse::Accepted
+        }
+        Ok(ServerResponse::Snapshot(_)) => protocol_error(
+            "remote_project_missing",
+            "The remote daemon no longer has this project registration.",
+        ),
+        Ok(ServerResponse::Error(error)) => ServerResponse::Error(error),
+        Ok(_) => protocol_error(
+            "remote_protocol_error",
+            "remote daemon returned an unexpected response",
+        ),
+        Err(error) => protocol_error("remote_unavailable", error.to_string()),
+    }
+}
+
+fn list_filesystem_directory(absolute_path: &str) -> ServerResponse {
+    let path = Path::new(absolute_path);
+    if !path.is_absolute() || absolute_path.len() > 4096 || absolute_path.contains('\0') {
+        return protocol_error(
+            "invalid_remote_path",
+            "path must be an absolute directory path",
+        );
+    }
+    let path = match path.canonicalize() {
+        Ok(path) if path.is_dir() => path,
+        Ok(_) => return protocol_error("not_a_directory", "path is not a directory"),
+        Err(error) => return protocol_error("directory_read_failed", error.to_string()),
+    };
+    let mut entries = match fs::read_dir(&path) {
+        Ok(entries) => entries
+            .flatten()
+            .take(20_000)
+            .filter_map(|entry| {
+                let path = entry.path();
+                let link_metadata = fs::symlink_metadata(&path).ok()?;
+                let metadata = fs::metadata(&path).ok()?;
+                if !metadata.is_dir() {
+                    return None;
+                }
+                Some(ditch_protocol::RemoteDirectoryEntry {
+                    name: entry
+                        .file_name()
+                        .to_string_lossy()
+                        .chars()
+                        .take(1024)
+                        .collect(),
+                    absolute_path: path.to_string_lossy().chars().take(4096).collect(),
+                    is_directory: true,
+                    is_symlink: link_metadata.file_type().is_symlink(),
+                })
+            })
+            .collect::<Vec<_>>(),
+        Err(error) => return protocol_error("directory_read_failed", error.to_string()),
+    };
+    entries.sort_by_key(|entry| entry.name.to_lowercase());
+    ServerResponse::RemoteDirectory(ditch_protocol::RemoteDirectory {
+        ssh_host_alias: String::new(),
+        absolute_path: path.to_string_lossy().into_owned(),
+        parent_path: path
+            .parent()
+            .map(|parent| parent.to_string_lossy().into_owned()),
+        entries,
+    })
 }
 
 fn shutdown_runtime(state: Arc<Mutex<RuntimeState>>) -> ServerResponse {
@@ -3556,13 +5082,45 @@ trait ProjectRootKey {
 
 impl ProjectRootKey for Project {
     fn root_key(&self) -> String {
-        self.root.to_string_lossy().into_owned()
+        match &self.execution_target {
+            ProjectExecutionTarget::Local => self.root.to_string_lossy().into_owned(),
+            ProjectExecutionTarget::Remote {
+                remote_machine_id, ..
+            } => {
+                format!(
+                    "remote://{remote_machine_id}{}",
+                    self.root.to_string_lossy()
+                )
+            }
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_folder_browser_lists_directories_and_not_files() {
+        let root = std::env::temp_dir().join(format!("ditch-browser-{}", Uuid::new_v4()));
+        fs::create_dir_all(root.join("project")).unwrap();
+        fs::write(root.join("notes.txt"), "not a project folder").unwrap();
+
+        let response = list_filesystem_directory(&root.to_string_lossy());
+        let ServerResponse::RemoteDirectory(directory) = response else {
+            panic!("expected a directory response");
+        };
+        assert_eq!(
+            directory
+                .entries
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            ["project"]
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn codex_readiness_checks_capabilities_and_authentication() {

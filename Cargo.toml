@@ -7,6 +7,7 @@ members = [
   "crates/ditch_protocol",
   "crates/ditch_remote",
   "crates/ditch_runtime",
+  "crates/ditch_ssh",
   "crates/ditch_store",
   "crates/ditchd",
 ]
@@ -24,6 +25,7 @@ ditch_orchestrator = { path = "crates/ditch_orchestrator" }
 ditch_protocol = { path = "crates/ditch_protocol" }
 ditch_remote = { path = "crates/ditch_remote" }
 ditch_runtime = { path = "crates/ditch_runtime" }
+ditch_ssh = { path = "crates/ditch_ssh" }
 ditch_store = { path = "crates/ditch_store" }
 
 chrono = { version = "0.4.42", features = ["serde"] }

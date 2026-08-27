@@ -66,8 +66,14 @@ DITCH_CLI_SOURCE="$WORKSPACE_ROOT/target/$CARGO_PROFILE/ditch_cli"
 test -x "$DITCHD_SOURCE"
 test -f "$DITCHD_LIBRARY"
 test -x "$DITCH_CLI_SOURCE"
+case "$BUILD_ARCH" in
+  arm64|aarch64) HOST_REMOTE_TARGET="aarch64-apple-darwin" ;;
+  x86_64) HOST_REMOTE_TARGET="x86_64-apple-darwin" ;;
+  *) echo "error: unsupported remote runtime architecture $BUILD_ARCH" >&2; exit 1 ;;
+esac
 
 mkdir -p "$HELPER_MACOS"
+HELPER_RESOURCES="$HELPER_CONTENTS/Resources/RemoteRuntimes"
 
 # Xcode's user-script sandbox cannot write Swift's default module cache under
 # ~/.cache. Keep all compiler intermediates inside this build.
@@ -121,6 +127,25 @@ PLIST
 cp "$DITCH_CLI_SOURCE" "$HELPER_MACOS/ditch_cli"
 cp "$DITCH_CLI_SOURCE" "$MAIN_MACOS/ditch_cli"
 cp "$HELPER_MACOS/ditchd" "$MAIN_MACOS/ditchd"
+# The remote artifact must be the portable Rust daemon, not the macOS status
+# host wrapper. Its target-qualified name prevents accidental cross-arch use.
+cp "$DITCHD_SOURCE" "$MAIN_MACOS/ditchd-remote-$HOST_REMOTE_TARGET"
+cp "$DITCHD_SOURCE" "$HELPER_MACOS/ditchd-remote-$HOST_REMOTE_TARGET"
+
+# Release automation may stage the cross-built Linux/macOS matrix produced by
+# scripts/build-remote-artifacts. Keep these as checksum-verified resources;
+# the host-native sibling above remains available for ordinary development.
+WORKSPACE_VERSION=$(sed -n 's/^version = "\([^"]*\)"/\1/p' "$WORKSPACE_ROOT/Cargo.toml" | head -n 1)
+REMOTE_ARTIFACT_SOURCE="${DITCH_REMOTE_ARTIFACT_DIR:-$WORKSPACE_ROOT/dist/remote/$WORKSPACE_VERSION}"
+if [ -f "$REMOTE_ARTIFACT_SOURCE/remote-artifacts.json" ]; then
+  mkdir -p "$HELPER_RESOURCES"
+  cp "$REMOTE_ARTIFACT_SOURCE/remote-artifacts.json" "$HELPER_RESOURCES/remote-artifacts.json"
+  for ARTIFACT in "$REMOTE_ARTIFACT_SOURCE"/ditchd-*; do
+    [ -f "$ARTIFACT" ] || continue
+    cp "$ARTIFACT" "$HELPER_RESOURCES/$(basename "$ARTIFACT")"
+    chmod 600 "$HELPER_RESOURCES/$(basename "$ARTIFACT")"
+  done
+fi
 
 # Verify the copies before signing (codesign changes Mach-O bytes). `cmp` is
 # killed by Xcode's script sandbox for Mach-O inputs, so verify executability
@@ -139,6 +164,8 @@ if [ -z "$SIGNING_IDENTITY" ]; then
 fi
 /usr/bin/codesign --force --sign "$SIGNING_IDENTITY" --options runtime "$MAIN_MACOS/ditchd"
 /usr/bin/codesign --force --sign "$SIGNING_IDENTITY" --options runtime "$MAIN_MACOS/ditch_cli"
+/usr/bin/codesign --force --sign "$SIGNING_IDENTITY" --options runtime "$MAIN_MACOS/ditchd-remote-$HOST_REMOTE_TARGET"
+/usr/bin/codesign --force --sign "$SIGNING_IDENTITY" --options runtime "$HELPER_MACOS/ditchd-remote-$HOST_REMOTE_TARGET"
 /usr/bin/codesign --force --sign "$SIGNING_IDENTITY" --options runtime "$HELPER_MACOS/ditch_cli"
 /usr/bin/codesign --force --sign "$SIGNING_IDENTITY" --options runtime "$HELPER_APP"
 

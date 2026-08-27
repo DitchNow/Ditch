@@ -2,13 +2,17 @@ use super::{RuntimeState, protocol_error};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{TimeZone, Utc};
 use ditch_protocol::{RemoteControlStatus, RemoteDeviceSummary, RemotePairing, ServerResponse};
+#[cfg(not(target_os = "macos"))]
+use ditch_remote::FileIdentityStore;
+#[cfg(target_os = "macos")]
+use ditch_remote::KeychainIdentityStore;
 use ditch_remote::{
     Aad, AttentionProjection, ConfirmationClass, PairwiseContext, ProjectProjection, RemoteCommand,
     RemoteCommandType, RemoteProjector, SessionProjection, SessionPromptPayload,
     SessionStartPayload, SessionTargetPayload, TranscriptQueryPayload, decrypt, encrypt,
     validate_p256_public_key,
 };
-use ditch_remote::{IdentityStore, KeychainIdentityStore, MachineIdentity, canonical_request};
+use ditch_remote::{IdentityStore, MachineIdentity, canonical_request};
 use ditch_store::{RemoteDeviceRecord, RemoteMachineRecord};
 use rand_core::{OsRng, RngCore};
 use serde_json::{Value, json};
@@ -98,6 +102,38 @@ pub(super) fn status(state: Arc<Mutex<RuntimeState>>) -> ServerResponse {
         .replace_remote_devices(&[])
     {
         return protocol_error("remote_store_failed", error.to_string());
+    }
+    status_from_local_store(state)
+}
+
+pub(super) fn ensure_machine_identity(state: Arc<Mutex<RuntimeState>>) -> ServerResponse {
+    let (origin, identity, name) = {
+        let mut guard = state
+            .lock()
+            .expect("runtime state lock should not be poisoned");
+        let Some(origin) = guard.remote.relay_origin.clone() else {
+            return protocol_error(
+                "remote_relay_unavailable",
+                "The remote relay configuration is invalid.",
+            );
+        };
+        let identity = match ensure_identity(&mut guard) {
+            Ok(identity) => identity,
+            Err(error) => return protocol_error("remote_identity_failed", error),
+        };
+        let name = guard
+            .store
+            .remote_machine()
+            .ok()
+            .flatten()
+            .map(|machine| machine.name)
+            .unwrap_or_else(machine_name);
+        (origin, identity, name)
+    };
+    // Registration publishes public keys only. Owner enrollment remains a
+    // separate, short-lived authorization operation.
+    if let Err(error) = register_machine(&origin, &identity, &name) {
+        return protocol_error("remote_registration_failed", error);
     }
     status_from_local_store(state)
 }
@@ -445,15 +481,20 @@ fn ensure_identity(state: &mut RuntimeState) -> Result<MachineIdentity, String> 
         .as_ref()
         .map(|value| value.machine_id)
         .unwrap_or_else(Uuid::new_v4);
-    let keychain = KeychainIdentityStore;
-    let identity = match keychain
+    #[cfg(target_os = "macos")]
+    let identity_store = KeychainIdentityStore;
+    #[cfg(not(target_os = "macos"))]
+    let identity_store = FileIdentityStore::new(state.paths.data_dir.join("identity"));
+    let identity = match identity_store
         .load(machine_id)
         .map_err(|error| error.to_string())?
     {
         Some(value) => value,
         None => {
             let value = MachineIdentity::generate(machine_id);
-            keychain.save(&value).map_err(|error| error.to_string())?;
+            identity_store
+                .save(&value)
+                .map_err(|error| error.to_string())?;
             value
         }
     };

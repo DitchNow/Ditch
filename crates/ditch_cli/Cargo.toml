@@ -9,5 +9,6 @@ chrono.workspace = true
 ditch_core.workspace = true
 ditch_protocol.workspace = true
 ditch_store.workspace = true
+ditch_ssh.workspace = true
 serde_json.workspace = true
 uuid.workspace = true

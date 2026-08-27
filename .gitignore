@@ -4,6 +4,7 @@
 .packages
 build/
 target/
+dist/
 
 .DS_Store
 .env

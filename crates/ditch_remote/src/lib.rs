@@ -27,6 +27,9 @@ use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -394,6 +397,68 @@ pub trait IdentityStore {
     fn delete(&self, machine_id: Uuid) -> Result<(), RemoteError>;
 }
 
+/// Identity storage for headless hosts without a reliable OS keyring. The
+/// caller supplies `~/.ditch/identity`; private material never leaves it.
+pub struct FileIdentityStore {
+    directory: PathBuf,
+}
+
+impl FileIdentityStore {
+    pub fn new(directory: impl Into<PathBuf>) -> Self {
+        Self {
+            directory: directory.into(),
+        }
+    }
+
+    fn path(&self, machine_id: Uuid) -> PathBuf {
+        self.directory.join(format!("{machine_id}.identity"))
+    }
+}
+
+impl IdentityStore for FileIdentityStore {
+    fn load(&self, machine_id: Uuid) -> Result<Option<MachineIdentity>, RemoteError> {
+        match fs::read(self.path(machine_id)) {
+            Ok(bytes) => MachineIdentity::from_private_blob(machine_id, &bytes).map(Some),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(RemoteError::Keychain(error.to_string())),
+        }
+    }
+
+    fn save(&self, identity: &MachineIdentity) -> Result<(), RemoteError> {
+        fs::create_dir_all(&self.directory)
+            .map_err(|error| RemoteError::Keychain(error.to_string()))?;
+        set_private_permissions(&self.directory, true)?;
+        let path = self.path(identity.machine_id);
+        let temporary = self.directory.join(format!(".{}.tmp", Uuid::new_v4()));
+        fs::write(&temporary, identity.private_blob()?)
+            .map_err(|error| RemoteError::Keychain(error.to_string()))?;
+        set_private_permissions(&temporary, false)?;
+        fs::rename(&temporary, &path).map_err(|error| RemoteError::Keychain(error.to_string()))?;
+        Ok(())
+    }
+
+    fn delete(&self, machine_id: Uuid) -> Result<(), RemoteError> {
+        match fs::remove_file(self.path(machine_id)) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(RemoteError::Keychain(error.to_string())),
+        }
+    }
+}
+
+fn set_private_permissions(path: &Path, directory: bool) -> Result<(), RemoteError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(
+            path,
+            fs::Permissions::from_mode(if directory { 0o700 } else { 0o600 }),
+        )
+        .map_err(|error| RemoteError::Keychain(error.to_string()))?;
+    }
+    Ok(())
+}
+
 #[cfg(target_os = "macos")]
 pub struct KeychainIdentityStore;
 #[cfg(target_os = "macos")]
@@ -641,6 +706,30 @@ fn truncate(value: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn file_identity_store_uses_private_atomic_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("ditch-identity-{}", Uuid::new_v4()));
+        let store = FileIdentityStore::new(&root);
+        let identity = MachineIdentity::generate(Uuid::new_v4());
+        store.save(&identity).unwrap();
+        assert_eq!(
+            fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        let file = root.join(format!("{}.identity", identity.machine_id));
+        assert_eq!(
+            fs::metadata(file).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            store.load(identity.machine_id).unwrap().unwrap().machine_id,
+            identity.machine_id
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn canonical_request_matches_contract_fixture() {

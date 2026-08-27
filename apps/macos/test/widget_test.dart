@@ -82,10 +82,7 @@ void main() {
         'codex_home': '/tmp/codex',
         'codex_binary': '/opt/homebrew/bin/codex',
         'build_version': '1.0.0',
-        'capabilities': [
-          'persistent_sessions_v1',
-          'always_on_web_access_v1',
-        ],
+        'capabilities': ['persistent_sessions_v1', 'always_on_web_access_v1'],
       },
     });
 
@@ -127,6 +124,25 @@ void main() {
     expect(project!.name, 'Recovered');
     expect(project.path, '/tmp/recovered');
     expect(project.gitPolicy, ProjectGitPolicy.allowOutsideGit);
+  });
+
+  test('runtime project parser preserves remote execution identity', () {
+    final project = parseRuntimeProject({
+      'id': 'remote-project',
+      'name': 'FieldOps',
+      'root': '/home/mtn/fieldops',
+      'git_policy': 'RequireRepository',
+      'execution_target': {
+        'kind': 'remote',
+        'remote_machine_id': '11111111-1111-4111-8111-111111111111',
+        'ssh_host_alias': 'dev-box',
+      },
+    });
+
+    expect(project, isNotNull);
+    expect(project!.isRemote, isTrue);
+    expect(project.sshHostAlias, 'dev-box');
+    expect(project.path, '/home/mtn/fieldops');
   });
 
   test('project reconciliation replaces duplicate ids and paths', () {
@@ -522,10 +538,7 @@ void main() {
     expect(find.byKey(const Key('onboarding-continue')), findsOneWidget);
     expect(find.byKey(const Key('first-project-add')), findsNothing);
     expect(find.widgetWithText(AlertDialog, 'Add Project'), findsNothing);
-    expect(
-      find.text('/Users/tester/Projects/example'),
-      findsNothing,
-    );
+    expect(find.text('/Users/tester/Projects/example'), findsNothing);
     expect(find.text('PROJECTS'), findsNothing);
   });
 
@@ -1136,11 +1149,36 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(find.widgetWithText(AlertDialog, 'Add Project'), findsOneWidget);
+    expect(find.text('Local Project'), findsOneWidget);
+    expect(find.text('Remote Project'), findsOneWidget);
+    await tester.tap(find.text('Local Project'));
+    await tester.pumpAndSettle();
     expect(find.text('Browse Folder…'), findsOneWidget);
     expect(find.text('Project name'), findsOneWidget);
     expect(find.text('Selected folder'), findsOneWidget);
     expect(find.text('Add & Configure'), findsOneWidget);
     expect(find.textContaining('.ditch/hooks'), findsOneWidget);
+  });
+
+  testWidgets('add project modal steps dismiss when the backdrop is clicked', (
+    tester,
+  ) async {
+    await tester.pumpWidget(_testApp());
+
+    await tester.tap(find.text('Add Project'));
+    await tester.pumpAndSettle();
+    await tester.tapAt(const Offset(4, 4));
+    await tester.pumpAndSettle();
+    expect(find.text('Local Project'), findsNothing);
+
+    await tester.tap(find.text('Add Project'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Local Project'));
+    await tester.pumpAndSettle();
+    expect(find.text('Browse Folder…'), findsOneWidget);
+    await tester.tapAt(const Offset(4, 4));
+    await tester.pumpAndSettle();
+    expect(find.text('Browse Folder…'), findsNothing);
   });
 
   testWidgets('folder picker fills the project path and inferred name', (
@@ -1160,6 +1198,8 @@ void main() {
 
     await tester.pumpWidget(_testApp());
     await tester.tap(find.text('Add Project'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Local Project'));
     await tester.pumpAndSettle();
     await tester.tap(find.text('Browse Folder…'));
     await tester.pumpAndSettle();
@@ -1871,7 +1911,8 @@ void main() {
     );
 
     await tester.enterText(find.byType(TextField), 'still a button');
-    await tester.tap(find.widgetWithText(FilledButton, 'Send'));
+    await tester.pump();
+    await tester.tap(find.text('Send'));
     await tester.pump();
     expect(submitted, 'still a button');
   });

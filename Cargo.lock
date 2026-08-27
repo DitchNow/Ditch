@@ -290,6 +290,7 @@ dependencies = [
  "chrono",
  "ditch_core",
  "ditch_protocol",
+ "ditch_ssh",
  "ditch_store",
  "serde_json",
  "uuid",
@@ -322,6 +323,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "ditch_core",
+ "ditch_ssh",
  "serde",
  "serde_json",
  "uuid",
@@ -359,6 +361,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "ditch_ssh"
+version = "0.1.0"
+dependencies = [
+ "security-framework",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.20",
+ "uuid",
+]
+
+[[package]]
 name = "ditch_store"
 version = "0.1.0"
 dependencies = [
@@ -382,6 +396,7 @@ dependencies = [
  "ditch_core",
  "ditch_protocol",
  "ditch_remote",
+ "ditch_ssh",
  "ditch_store",
  "libc",
  "portable-pty",
@@ -389,6 +404,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "sha2",
  "tungstenite",
  "ureq",
  "url",

@@ -40,6 +40,8 @@ impl DitchStore {
     pub fn open(paths: &AppPaths) -> Result<Self, StoreError> {
         let connection = Connection::open(&paths.database_path)?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
+        let schema_version: i64 =
+            connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
         connection.execute_batch(SCHEMA)?;
         ensure_column(
             &connection,
@@ -47,10 +49,23 @@ impl DitchStore {
             "git_policy",
             "TEXT NOT NULL DEFAULT '\"RequireRepository\"'",
         )?;
+        ensure_column(
+            &connection,
+            "projects",
+            "execution_target",
+            "TEXT NOT NULL DEFAULT '{\"kind\":\"local\"}'",
+        )?;
         ensure_column(&connection, "agents", "run_json", "TEXT")?;
         ensure_column(&connection, "agents", "terminal_failure", "TEXT")?;
         ensure_column(&connection, "agents", "codex_home", "TEXT")?;
-        connection.pragma_update(None, "user_version", 2)?;
+        if schema_version < 3 {
+            migrate_projects_v3(&connection)?;
+        }
+        connection.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS projects_execution_root ON projects(execution_target, root)",
+            [],
+        )?;
+        connection.pragma_update(None, "user_version", 3)?;
         let mut store = Self { connection };
         store.cleanup_polluted_permission_alerts()?;
         store.import_legacy_registry_if_empty(paths)?;
@@ -161,7 +176,7 @@ impl DitchStore {
 
     pub fn load(&self) -> Result<DurableState, StoreError> {
         let mut projects_stmt = self.connection.prepare(
-            "SELECT id, name, root, created_at, archived_at, git_policy FROM projects ORDER BY created_at",
+            "SELECT id, name, root, created_at, archived_at, git_policy, execution_target FROM projects ORDER BY created_at",
         )?;
         let projects = projects_stmt
             .query_map([], |row| {
@@ -175,6 +190,7 @@ impl DitchStore {
                         .map(parse_time)
                         .transpose()?,
                     git_policy: from_json(&row.get::<_, String>(5)?)?,
+                    execution_target: from_json(&row.get::<_, String>(6)?)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -242,9 +258,9 @@ impl DitchStore {
 
     pub fn upsert_project(&mut self, project: &Project) -> Result<(), StoreError> {
         self.connection.execute(
-            "INSERT INTO projects(id,name,root,created_at,archived_at,git_policy) VALUES(?1,?2,?3,?4,?5,?6)
-             ON CONFLICT(id) DO UPDATE SET name=excluded.name,root=excluded.root,archived_at=excluded.archived_at,git_policy=excluded.git_policy",
-            params![project.id.0.to_string(), project.name, project.root.to_string_lossy(), project.created_at.to_rfc3339(), project.archived_at.map(|v| v.to_rfc3339()), to_json(&project.git_policy)?],
+            "INSERT INTO projects(id,name,root,created_at,archived_at,git_policy,execution_target) VALUES(?1,?2,?3,?4,?5,?6,?7)
+             ON CONFLICT(id) DO UPDATE SET name=excluded.name,root=excluded.root,archived_at=excluded.archived_at,git_policy=excluded.git_policy,execution_target=excluded.execution_target",
+            params![project.id.0.to_string(), project.name, project.root.to_string_lossy(), project.created_at.to_rfc3339(), project.archived_at.map(|v| v.to_rfc3339()), to_json(&project.git_policy)?, to_json(&project.execution_target)?],
         )?;
         Ok(())
     }
@@ -623,6 +639,33 @@ impl DitchStore {
     }
 }
 
+fn migrate_projects_v3(connection: &Connection) -> Result<(), StoreError> {
+    connection.pragma_update(None, "foreign_keys", "OFF")?;
+    let result = connection.execute_batch(
+        r#"
+        BEGIN IMMEDIATE;
+        CREATE TABLE projects_v3 (
+          id TEXT PRIMARY KEY,
+          name TEXT NOT NULL,
+          root TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          archived_at TEXT,
+          git_policy TEXT NOT NULL,
+          execution_target TEXT NOT NULL DEFAULT '{"kind":"local"}'
+        );
+        INSERT INTO projects_v3(id,name,root,created_at,archived_at,git_policy,execution_target)
+          SELECT id,name,root,created_at,archived_at,git_policy,execution_target FROM projects;
+        DROP TABLE projects;
+        ALTER TABLE projects_v3 RENAME TO projects;
+        CREATE UNIQUE INDEX projects_execution_root
+          ON projects(execution_target, root);
+        COMMIT;
+        "#,
+    );
+    connection.pragma_update(None, "foreign_keys", "ON")?;
+    result.map_err(StoreError::from)
+}
+
 #[derive(Clone, Debug)]
 pub struct RemoteMachineRecord {
     pub machine_id: uuid::Uuid,
@@ -723,8 +766,27 @@ pub const PROJECT_REGISTRY_FILE: &str = "projects.json";
 
 pub fn ensure_app_dirs(paths: &AppPaths) -> Result<(), StoreError> {
     fs::create_dir_all(&paths.data_dir)?;
+    if let Some(parent) = paths.database_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    if let Some(parent) = paths.socket_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
     fs::create_dir_all(&paths.logs_dir)?;
     fs::create_dir_all(&paths.scrollback_dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for directory in [
+            &paths.data_dir,
+            paths.database_path.parent().unwrap_or(&paths.data_dir),
+            paths.socket_path.parent().unwrap_or(&paths.data_dir),
+            &paths.logs_dir,
+            &paths.scrollback_dir,
+        ] {
+            fs::set_permissions(directory, fs::Permissions::from_mode(0o700))?;
+        }
+    }
     Ok(())
 }
 
@@ -845,6 +907,72 @@ pub fn is_project_metadata_path(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_and_remote_projects_can_share_a_textual_path_without_identity_collision() {
+        let root =
+            std::env::temp_dir().join(format!("ditch-store-targets-{}", uuid::Uuid::new_v4()));
+        let paths = AppPaths {
+            data_dir: root.clone(),
+            database_path: root.join("ditch.sqlite3"),
+            socket_path: root.join("ditchd.sock"),
+            logs_dir: root.join("logs"),
+            scrollback_dir: root.join("scrollback"),
+        };
+        ensure_app_dirs(&paths).unwrap();
+        let mut store = DitchStore::open(&paths).unwrap();
+        let local = Project::new("Local", "/srv/app");
+        let remote = Project::new_remote(
+            ProjectId::new(),
+            "Remote",
+            "/srv/app",
+            uuid::Uuid::new_v4(),
+            "dev-box",
+        );
+        store.upsert_project(&local).unwrap();
+        store.upsert_project(&remote).unwrap();
+
+        let durable = store.load().unwrap();
+        assert_eq!(durable.projects.len(), 2);
+        assert!(durable.projects.iter().any(Project::is_remote));
+        assert!(durable.projects.iter().any(|project| !project.is_remote()));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn migrates_v2_projects_to_local_execution_targets_without_losing_ids() {
+        let root = std::env::temp_dir().join(format!("ditch-store-v2-{}", uuid::Uuid::new_v4()));
+        let paths = AppPaths {
+            data_dir: root.clone(),
+            database_path: root.join("ditch.sqlite3"),
+            socket_path: root.join("ditchd.sock"),
+            logs_dir: root.join("logs"),
+            scrollback_dir: root.join("scrollback"),
+        };
+        ensure_app_dirs(&paths).unwrap();
+        let id = ProjectId::new();
+        let connection = Connection::open(&paths.database_path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE projects(
+                id TEXT PRIMARY KEY, name TEXT NOT NULL, root TEXT NOT NULL UNIQUE,
+                created_at TEXT NOT NULL, archived_at TEXT, git_policy TEXT NOT NULL
+             ); PRAGMA user_version=2;",
+            )
+            .unwrap();
+        connection.execute(
+            "INSERT INTO projects(id,name,root,created_at,git_policy) VALUES(?1,'Legacy','/tmp/legacy',?2,'\"RequireRepository\"')",
+            params![id.0.to_string(), Utc::now().to_rfc3339()],
+        ).unwrap();
+        drop(connection);
+
+        let store = DitchStore::open(&paths).unwrap();
+        let projects = store.load().unwrap().projects;
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].id, id);
+        assert!(!projects[0].is_remote());
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn creates_and_verifies_all_project_metadata_directories() {
@@ -1106,10 +1234,11 @@ pub const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS projects (
   id TEXT PRIMARY KEY,
   name TEXT NOT NULL,
-  root TEXT NOT NULL UNIQUE,
+  root TEXT NOT NULL,
   created_at TEXT NOT NULL,
   archived_at TEXT,
   git_policy TEXT NOT NULL
+  ,execution_target TEXT NOT NULL DEFAULT '{"kind":"local"}'
 );
 
 CREATE TABLE IF NOT EXISTS tasks (
