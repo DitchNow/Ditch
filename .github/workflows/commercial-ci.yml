@@ -1,0 +1,51 @@
+name: Commercial CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  commercial:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - run: scripts/verify-community-pin --release
+      - name: Bind build to Community revision
+        run: echo "DITCH_COMMUNITY_REVISION=$(tr -d '\r\n' < COMMUNITY_REVISION)" >> "$GITHUB_ENV"
+      - working-directory: community
+        run: cargo fmt --all -- --check
+      - working-directory: community
+        run: cargo test --locked --workspace
+      - working-directory: community
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - run: cargo fmt --all -- --check
+      - run: cargo test --locked --workspace
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - working-directory: community/apps/macos
+        run: flutter test
+      - working-directory: community/apps/macos
+        run: flutter analyze
+      - working-directory: apps/macos
+        run: flutter pub get
+      - working-directory: apps/macos
+        run: flutter analyze
+      - working-directory: apps/macos
+        run: flutter test
+      - working-directory: apps/macos
+        run: flutter build macos --release
+      - run: cargo build --locked --release -p ditchd
+        env:
+          DITCH_BUILD_IDENTIFIER: commercial-${{ github.sha }}
+      - run: test "$(find target/release -maxdepth 1 -type f -name ditchd 2>/dev/null | wc -l | tr -d ' ')" -eq 1
+      - run: test -z "$(find . -type f -name 'ditch-servicesd' -not -path './target/*' -print -quit)"

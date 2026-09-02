@@ -2,6 +2,7 @@ import Cocoa
 import Darwin
 import FlutterMacOS
 import ServiceManagement
+import Sparkle
 import UserNotifications
 
 /// Native shell for the foreground control surface.
@@ -10,21 +11,179 @@ import UserNotifications
 /// `ditchd` menu-bar process.
 /// Terminating this process must never stop The Ditch Runtime or its agents.
 @main
-class AppDelegate: FlutterAppDelegate {
+class AppDelegate: FlutterAppDelegate, SPUUpdaterDelegate {
+  private struct DeploymentConfiguration {
+    let environment: String
+    let edition: String
+    let relayOrigin: String
+    let allowedUpdateHosts: Set<String>
+    let buildIdentifier: String
+    let buildNumber: String
+    let releaseSequence: Int
+    let communityRevision: String
+
+    static func load() -> DeploymentConfiguration {
+      let production = DeploymentConfiguration(
+        environment: "production",
+        edition: "community",
+        relayOrigin: "https://relay.ditchnow.nl",
+        allowedUpdateHosts: ["relay.ditchnow.nl"],
+        buildIdentifier: "",
+        buildNumber: "",
+        releaseSequence: 0,
+        communityRevision: "")
+      let invalid = DeploymentConfiguration(
+        environment: "invalid",
+        edition: "invalid",
+        relayOrigin: "",
+        allowedUpdateHosts: [],
+        buildIdentifier: "",
+        buildNumber: "",
+        releaseSequence: 0,
+        communityRevision: "")
+      guard let url = Bundle.main.url(forResource: "DitchEnvironment", withExtension: "plist"),
+        let data = try? Data(contentsOf: url),
+        let propertyList = try? PropertyListSerialization.propertyList(
+          from: data,
+          options: [],
+          format: nil),
+        let values = propertyList as? [String: Any],
+        let environment = values["DeploymentEnvironment"] as? String,
+        let edition = values["Edition"] as? String,
+        let relayOrigin = values["RelayOrigin"] as? String,
+        let rawHosts = values["AllowedUpdateHosts"] as? String,
+        let buildIdentifier = values["BuildIdentifier"] as? String,
+        let buildNumber = values["BuildNumber"] as? String,
+        let releaseSequence = values["ReleaseSequence"] as? NSNumber,
+        let communityRevision = values["CommunityRevision"] as? String
+      else { return invalid }
+
+      let hosts = Set(
+        rawHosts.split(separator: ",")
+          .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+          .filter { !$0.isEmpty })
+      guard ["staging", "production"].contains(environment),
+        ["community", "commercial"].contains(edition),
+        let origin = URL(string: relayOrigin),
+        origin.scheme == "https",
+        let relayHost = origin.host?.lowercased(),
+        hosts.contains(relayHost),
+        environment != "production" || relayOrigin == production.relayOrigin,
+        environment != "staging" || relayOrigin != production.relayOrigin,
+        !buildIdentifier.isEmpty,
+        !buildNumber.isEmpty,
+        releaseSequence.intValue >= 0,
+        !communityRevision.isEmpty
+      else { return invalid }
+
+      return DeploymentConfiguration(
+        environment: environment,
+        edition: edition,
+        relayOrigin: relayOrigin,
+        allowedUpdateHosts: hosts,
+        buildIdentifier: buildIdentifier,
+        buildNumber: buildNumber,
+        releaseSequence: releaseSequence.intValue,
+        communityRevision: communityRevision)
+    }
+  }
+
+  private struct RunningRuntimeStatus {
+    let activeSessionCount: Int
+    let edition: String
+    let deploymentEnvironment: String
+    let buildIdentifier: String
+    let buildNumber: String
+    let releaseSequence: Int
+    let communityRevision: String?
+
+    func matches(_ configuration: DeploymentConfiguration) -> Bool {
+      edition == configuration.edition
+        && deploymentEnvironment == configuration.environment
+        && buildIdentifier == configuration.buildIdentifier
+        && buildNumber == configuration.buildNumber
+        && releaseSequence == configuration.releaseSequence
+        && communityRevision == configuration.communityRevision
+    }
+  }
+
+  private struct AuthorizedUpdateContext {
+    let releaseID: String
+    let appcastURL: URL
+    let artifactURL: URL
+    let artifactSize: UInt64
+    let version: String
+    let build: String
+    let channel: String
+    let bearer: String
+    let expiresAt: Date
+
+    func matches(_ item: SUAppcastItem) -> Bool {
+      item.fileURL == artifactURL
+        && item.contentLength == artifactSize
+        && item.displayVersionString == version
+        && item.versionString == build
+        && (item.channel ?? "stable") == channel
+    }
+  }
+
   private static let runtimeLoginItemIdentifier = "ai.theditch.runtime"
   private static let obsoleteLoginItemIdentifier = "ai.theditch.status"
   private static let processTimeoutExitCode: Int32 = 124
   private static let notificationControlSocketName = "notification-control.sock"
+  private static let runtimeDeploymentEnvironmentDefaultsKey =
+    "runtimeDeploymentEnvironment"
+  private static let highestAcceptedReleaseSequenceDefaultsKey =
+    "highestAcceptedReleaseSequence"
 
   private var applicationChannel: FlutterMethodChannel?
+  private var authorizedUpdateContext: AuthorizedUpdateContext?
+  private lazy var deploymentConfiguration = DeploymentConfiguration.load()
+  private lazy var updaterController = SPUStandardUpdaterController(
+    startingUpdater: hasUpdateVerificationKey,
+    updaterDelegate: self,
+    userDriverDelegate: nil)
   private var pendingAgentNavigation: [String: String]?
   private var uninstallInProgress = false
 
+  private var hasUpdateVerificationKey: Bool {
+    (Bundle.main.object(forInfoDictionaryKey: "SUPublicEDKey") as? String)?
+      .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+  }
+
   override func applicationDidFinishLaunching(_ notification: Notification) {
+    _ = updaterController
+    NSLog(
+      "Ditch \(deploymentConfiguration.edition) \(deploymentConfiguration.buildIdentifier) in \(deploymentConfiguration.environment); Relay: \(deploymentConfiguration.relayOrigin)")
+    guard acceptBundledReleaseSequence() else { return }
     applyThemeMode(UserDefaults.standard.string(forKey: "themeMode") ?? "system")
     persistRuntimeEnvironment()
     registerStatusHelper()
     configureUninstallMenuItem()
+  }
+
+  private func acceptBundledReleaseSequence() -> Bool {
+    let sequence = deploymentConfiguration.releaseSequence
+    // Zero identifies an ordinary local development build. Official staging
+    // and production publication requires a positive global sequence.
+    guard sequence > 0 else { return true }
+    let defaults = UserDefaults.standard
+    let highest = defaults.integer(forKey: Self.highestAcceptedReleaseSequenceDefaultsKey)
+    guard sequence >= highest else {
+      let alert = NSAlert()
+      alert.messageText = "Ditch refused an older release"
+      alert.informativeText =
+        "This installation has already accepted release \(highest), but the opened app is release \(sequence). Install the latest official Ditch build."
+      alert.alertStyle = .critical
+      alert.addButton(withTitle: "Quit")
+      alert.runModal()
+      NSApp.terminate(nil)
+      return false
+    }
+    if sequence > highest {
+      defaults.set(sequence, forKey: Self.highestAcceptedReleaseSequenceDefaultsKey)
+    }
+    return true
   }
 
   /// Login items are launched by launchd and do not inherit the shell that
@@ -50,6 +209,37 @@ class AppDelegate: FlutterAppDelegate {
   }
 
   private func registerStatusHelper() {
+    let environment = deploymentConfiguration.environment
+    guard environment == "staging" || environment == "production" else {
+      NSLog("Ditch refused to register a runtime with invalid deployment configuration")
+      return
+    }
+    let defaults = UserDefaults.standard
+    let previousEnvironment = defaults.string(
+      forKey: Self.runtimeDeploymentEnvironmentDefaultsKey)
+    let runningRuntime = runningRuntimeStatus()
+    let replacingEnvironment = previousEnvironment != nil && previousEnvironment != environment
+    let replacingBuild = runningRuntime.map { !$0.matches(deploymentConfiguration) } ?? false
+    let replacingRuntime = replacingEnvironment || replacingBuild
+    if replacingRuntime {
+      let activeSessions = runningRuntime?.activeSessionCount
+      let socketExists = FileManager.default.fileExists(atPath: runtimeSocketURL.path)
+      if let activeSessions, activeSessions > 0 {
+        refuseRuntimeEnvironmentSwitch(
+          "The running \(runningRuntime?.edition ?? previousEnvironment ?? "existing") runtime has \(activeSessions) active agent\(activeSessions == 1 ? "" : "s"). Let them finish or stop them explicitly before installing Ditch \(deploymentConfiguration.edition.capitalized) \(deploymentConfiguration.buildIdentifier).")
+        return
+      }
+      if activeSessions == nil && socketExists && runtimeProcessAppearsAlive {
+        refuseRuntimeEnvironmentSwitch(
+          "Ditch could not verify whether the running runtime has active agents. Stop it explicitly before installing Ditch \(deploymentConfiguration.edition.capitalized) \(deploymentConfiguration.buildIdentifier).")
+        return
+      }
+      _ = Self.runProcess(
+        executable: bundledExecutable("ditch_cli"),
+        arguments: ["runtime", "stop"],
+        timeout: 5)
+    }
+
     if #available(macOS 13.0, *) {
       // Clean up the superseded three-process architecture. Unregistering the
       // obsolete login item does not send a shutdown request to the runtime.
@@ -58,15 +248,86 @@ class AppDelegate: FlutterAppDelegate {
         try? obsolete.unregister()
       }
       let service = SMAppService.loginItem(identifier: Self.runtimeLoginItemIdentifier)
-      guard service.status != .enabled else { return }
+      var shouldRegister = service.status != .enabled
+      if replacingRuntime,
+        service.status == .enabled || service.status == .requiresApproval
+      {
+        do {
+          try service.unregister()
+        } catch {
+          NSLog("Ditch could not replace its runtime environment: \(error)")
+          return
+        }
+        shouldRegister = true
+      }
+      guard shouldRegister else { return }
       do {
         try service.register()
+        defaults.set(environment, forKey: Self.runtimeDeploymentEnvironmentDefaultsKey)
       } catch {
         NSLog("Ditch could not register its runtime: \(error)")
       }
     } else {
+      if replacingRuntime {
+        _ = SMLoginItemSetEnabled(Self.runtimeLoginItemIdentifier as CFString, false)
+      }
       _ = SMLoginItemSetEnabled(Self.runtimeLoginItemIdentifier as CFString, true)
+      defaults.set(environment, forKey: Self.runtimeDeploymentEnvironmentDefaultsKey)
     }
+  }
+
+  private var runtimeSocketURL: URL {
+    FileManager.default.homeDirectoryForCurrentUser
+      .appendingPathComponent("Library/Application Support/The Ditch", isDirectory: true)
+      .appendingPathComponent("ditchd.sock")
+  }
+
+  private var runtimeProcessAppearsAlive: Bool {
+    let pidURL = FileManager.default.homeDirectoryForCurrentUser
+      .appendingPathComponent("Library/Application Support/The Ditch", isDirectory: true)
+      .appendingPathComponent("ditchd.pid")
+    guard let rawPID = try? String(contentsOf: pidURL, encoding: .utf8),
+      let pid = Int32(rawPID.trimmingCharacters(in: .whitespacesAndNewlines)),
+      let application = NSRunningApplication(processIdentifier: pid)
+    else { return false }
+    return application.bundleIdentifier == Self.runtimeLoginItemIdentifier
+  }
+
+  private func runningRuntimeStatus() -> RunningRuntimeStatus? {
+    let result = Self.runProcessCapturingOutput(
+      executable: bundledExecutable("ditch_cli"),
+      arguments: ["runtime", "status"],
+      timeout: 5)
+    guard result.status == 0,
+      let value = try? JSONSerialization.jsonObject(with: result.output),
+      let envelope = value as? [String: Any],
+      let status = envelope["RuntimeStatus"] as? [String: Any],
+      let count = status["active_session_count"] as? NSNumber,
+      let edition = status["edition"] as? String,
+      let deploymentEnvironment = status["deployment_environment"] as? String,
+      let buildIdentifier = status["build_identifier"] as? String,
+      let buildNumber = status["build_number"] as? String,
+      let releaseSequence = status["release_sequence"] as? NSNumber
+    else { return nil }
+    return RunningRuntimeStatus(
+      activeSessionCount: count.intValue,
+      edition: edition,
+      deploymentEnvironment: deploymentEnvironment,
+      buildIdentifier: buildIdentifier,
+      buildNumber: buildNumber,
+      releaseSequence: releaseSequence.intValue,
+      communityRevision: status["community_revision"] as? String)
+  }
+
+  private func refuseRuntimeEnvironmentSwitch(_ message: String) {
+    NSLog("Ditch refused runtime environment switch: \(message)")
+    let alert = NSAlert()
+    alert.messageText = "Ditch cannot switch environments yet"
+    alert.informativeText = message
+    alert.alertStyle = .warning
+    alert.addButton(withTitle: "Quit")
+    alert.runModal()
+    NSApp.terminate(nil)
   }
 
   private func configureUninstallMenuItem() {
@@ -296,6 +557,106 @@ class AppDelegate: FlutterAppDelegate {
           return
         }
         result(NSWorkspace.shared.open(url))
+      case "installCommercialUpdate":
+        guard self.hasUpdateVerificationKey else {
+          result(FlutterError(
+            code: "update_verification_not_configured",
+            message: "This app does not contain the public Sparkle verification key required for official updates.",
+            details: nil))
+          return
+        }
+        guard self.updaterController.updater.canCheckForUpdates,
+          self.authorizedUpdateContext == nil
+        else {
+          result(FlutterError(
+            code: "update_already_in_progress",
+            message: "A verified Commercial update is already in progress.",
+            details: nil))
+          return
+        }
+        guard let arguments = call.arguments as? [String: Any],
+          let releaseID = arguments["release_id"] as? String,
+          UUID(uuidString: releaseID)?.uuidString.lowercased() == releaseID,
+          let rawURL = arguments["appcast_url"] as? String,
+          let url = URL(string: rawURL),
+          url.scheme == "https",
+          url.user == nil,
+          url.password == nil,
+          url.port == nil,
+          url.query == nil,
+          url.fragment == nil,
+          let host = url.host
+        else {
+          result(FlutterError(
+            code: "invalid_update_feed",
+            message: "The authorized Commercial update feed is not a valid HTTPS URL.",
+            details: nil))
+          return
+        }
+        guard let rawArtifactURL = arguments["artifact_url"] as? String,
+          let artifactURL = URL(string: rawArtifactURL),
+          artifactURL.scheme == "https",
+          artifactURL.user == nil,
+          artifactURL.password == nil,
+          artifactURL.port == nil,
+          artifactURL.query == nil,
+          artifactURL.fragment == nil,
+          let artifactHost = artifactURL.host,
+          let artifactSize = arguments["artifact_size"] as? NSNumber,
+          artifactSize.int64Value > 0,
+          let version = arguments["version"] as? String,
+          !version.isEmpty,
+          let build = arguments["build"] as? String,
+          !build.isEmpty,
+          let channel = arguments["channel"] as? String,
+          channel == (self.deploymentConfiguration.environment == "staging" ? "beta" : "stable"),
+          let relayHost = URL(string: self.deploymentConfiguration.relayOrigin)?.host?.lowercased(),
+          host.lowercased() == relayHost,
+          artifactHost.lowercased() == relayHost,
+          self.deploymentConfiguration.allowedUpdateHosts.contains(host.lowercased()),
+          self.deploymentConfiguration.allowedUpdateHosts.contains(artifactHost.lowercased()),
+          url.path == "/v1/commercial/releases/\(releaseID)/appcast",
+          artifactURL.path.hasPrefix("/v1/commercial/releases/\(releaseID)/artifact/")
+        else {
+          result(FlutterError(
+            code: "unauthorized_update_host",
+            message: "The Commercial release does not match this Ditch environment.",
+            details: nil))
+          return
+        }
+        guard let bearer = arguments["authorization_bearer"] as? String,
+            bearer.count >= 32,
+            bearer.count <= 512,
+            bearer.unicodeScalars.allSatisfy({
+              CharacterSet.alphanumerics.contains($0) || "-_.".unicodeScalars.contains($0)
+            }),
+            let rawExpiry = arguments["expires_at"] as? String,
+            let expiry = ISO8601DateFormatter().date(from: rawExpiry),
+            expiry > Date(),
+            expiry <= Date().addingTimeInterval(24 * 60 * 60)
+        else {
+          result(FlutterError(
+            code: "invalid_update_session",
+            message: "The Relay returned an invalid or expired Commercial update session.",
+            details: nil))
+          return
+        }
+        self.authorizedUpdateContext = AuthorizedUpdateContext(
+          releaseID: releaseID.lowercased(),
+          appcastURL: url,
+          artifactURL: artifactURL,
+          artifactSize: artifactSize.uint64Value,
+          version: version,
+          build: build,
+          channel: channel,
+          bearer: bearer,
+          expiresAt: expiry)
+        self.updaterController.updater.httpHeaders = [
+          "Authorization": "Bearer \(bearer)"
+        ]
+        _ = self.updaterController.updater.clearFeedURLFromUserDefaults()
+        self.updaterController.checkForUpdates(nil)
+        result(true)
       case "openCodexLogin":
         guard let binary = call.arguments as? String else {
           result(false)
@@ -315,6 +676,79 @@ class AppDelegate: FlutterAppDelegate {
         result(FlutterMethodNotImplemented)
       }
     }
+  }
+
+  func allowedChannels(for updater: SPUUpdater) -> Set<String> {
+    deploymentConfiguration.environment == "staging" ? ["beta"] : []
+  }
+
+  func feedURLString(for updater: SPUUpdater) -> String? {
+    authorizedUpdateContext?.appcastURL.absoluteString
+  }
+
+  func updater(
+    _ updater: SPUUpdater,
+    shouldProceedWithUpdate updateItem: SUAppcastItem,
+    updateCheck: SPUUpdateCheck
+  ) throws {
+    guard let context = authorizedUpdateContext,
+      context.expiresAt > Date(),
+      context.matches(updateItem)
+    else {
+      clearAuthorizedUpdateSession()
+      throw NSError(
+        domain: "ai.theditch.update-authorization",
+        code: 1,
+        userInfo: [
+          NSLocalizedDescriptionKey:
+            "The update feed did not match the release authorized by Ditch Relay."
+        ])
+    }
+    // The appcast has been authenticated. Do not let its bearer become a
+    // process-wide header for any URL Sparkle may discover in the feed.
+    updater.httpHeaders = nil
+  }
+
+  func updater(
+    _ updater: SPUUpdater,
+    shouldDownloadReleaseNotesForUpdate updateItem: SUAppcastItem
+  ) -> Bool {
+    false
+  }
+
+  func updater(
+    _ updater: SPUUpdater,
+    willDownloadUpdate item: SUAppcastItem,
+    with request: NSMutableURLRequest
+  ) {
+    request.setValue(nil, forHTTPHeaderField: "Authorization")
+    guard let context = authorizedUpdateContext,
+      context.expiresAt > Date(),
+      context.matches(item),
+      request.url == context.artifactURL
+    else {
+      request.url = nil
+      clearAuthorizedUpdateSession()
+      return
+    }
+    request.setValue("Bearer \(context.bearer)", forHTTPHeaderField: "Authorization")
+  }
+
+  func updater(
+    _ updater: SPUUpdater,
+    didFinishUpdateCycleFor updateCheck: SPUUpdateCheck,
+    error: Error?
+  ) {
+    clearAuthorizedUpdateSession()
+  }
+
+  func updater(_ updater: SPUUpdater, didAbortWithError error: Error) {
+    clearAuthorizedUpdateSession()
+  }
+
+  private func clearAuthorizedUpdateSession() {
+    updaterController.updater.httpHeaders = nil
+    authorizedUpdateContext = nil
   }
 
   private func notificationAuthorizationStatus(
@@ -700,6 +1134,39 @@ class AppDelegate: FlutterAppDelegate {
       _ = finished.wait(timeout: .now() + 0.5)
     }
     return processTimeoutExitCode
+  }
+
+  private static func runProcessCapturingOutput(
+    executable: String,
+    arguments: [String],
+    timeout: TimeInterval
+  ) -> (status: Int32, output: Data) {
+    guard FileManager.default.isExecutableFile(atPath: executable) else {
+      return (127, Data())
+    }
+    let process = Process()
+    let finished = DispatchSemaphore(value: 0)
+    let output = Pipe()
+    process.executableURL = URL(fileURLWithPath: executable)
+    process.arguments = arguments
+    process.standardOutput = output
+    process.standardError = FileHandle.nullDevice
+    process.terminationHandler = { _ in finished.signal() }
+    do {
+      try process.run()
+    } catch {
+      return (1, Data())
+    }
+
+    guard finished.wait(timeout: .now() + timeout) == .success else {
+      if process.isRunning { process.terminate() }
+      if finished.wait(timeout: .now() + 0.5) == .timedOut && process.isRunning {
+        Darwin.kill(process.processIdentifier, SIGKILL)
+        _ = finished.wait(timeout: .now() + 0.5)
+      }
+      return (processTimeoutExitCode, Data())
+    }
+    return (process.terminationStatus, output.fileHandleForReading.readDataToEndOfFile())
   }
 
   /// Starts the independent integrated runtime as an application. Launching

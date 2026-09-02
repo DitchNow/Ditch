@@ -1,0 +1,3 @@
+// Public verification value. The official release job writes the actual
+// ignored ReleaseVerification.xcconfig before building.
+DITCH_SPARKLE_PUBLIC_ED_KEY = BASE64_ED25519_PUBLIC_KEY

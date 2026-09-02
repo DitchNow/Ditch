@@ -10,9 +10,14 @@ crate-type = ["rlib", "staticlib"]
 [dependencies]
 chrono.workspace = true
 ditch_core.workspace = true
+ditch_identity.workspace = true
+ditch_commercial.workspace = true
+ditch_commercial_store.workspace = true
 ditch_protocol.workspace = true
 ditch_remote.workspace = true
 ditch_store.workspace = true
+ditch_ssh.workspace = true
+ditch_upgrade.workspace = true
 portable-pty = "0.9.0"
 rusqlite.workspace = true
 libc.workspace = true
@@ -24,3 +29,4 @@ rand_core.workspace = true
 ureq = { version = "2.12.1", features = ["json"] }
 tungstenite = { version = "0.28.0", features = ["rustls-tls-webpki-roots"] }
 url.workspace = true
+sha2.workspace = true

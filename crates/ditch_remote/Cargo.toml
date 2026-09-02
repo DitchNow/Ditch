@@ -1,5 +1,5 @@
 [package]
-name = "ditch_remote"
+name = "ditch_commercial_remote"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

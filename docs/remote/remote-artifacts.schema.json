@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://theditch.dev/remote/runtime-artifacts-v1.schema.json",
+  "title": "Ditch remote runtime artifacts",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "artifacts"],
+  "properties": {
+    "version": { "type": "string", "minLength": 1 },
+    "artifacts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["target", "sha256", "artifact"],
+        "properties": {
+          "target": {
+            "enum": [
+              "x86_64-unknown-linux-gnu",
+              "aarch64-unknown-linux-gnu",
+              "aarch64-apple-darwin",
+              "x86_64-apple-darwin"
+            ]
+          },
+          "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+          "artifact": { "type": "string", "pattern": "^ditchd-[A-Za-z0-9_-]+$" }
+        }
+      }
+    }
+  }
+}

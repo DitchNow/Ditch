@@ -1,0 +1,98 @@
+#!/bin/sh
+set -eu
+
+workspace=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
+version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' "$workspace/Cargo.toml" | head -n 1)
+community_revision=$(tr -d '\r\n' < "$workspace/COMMUNITY_REVISION")
+build_identifier=${DITCH_BUILD_IDENTIFIER:-"$version-$community_revision"}
+remote_protocol=$(sed -n 's/^pub const REMOTE_RUNTIME_PROTOCOL_VERSION: u16 = \([0-9][0-9]*\);/\1/p' "$workspace/crates/ditch_protocol/src/lib.rs" | head -n 1)
+export DITCH_COMMUNITY_REVISION="$community_revision"
+export DITCH_BUILD_IDENTIFIER="$build_identifier"
+output=${DITCH_REMOTE_ARTIFACT_OUTPUT:-"$workspace/dist/remote/$version"}
+targets=${DITCH_REMOTE_TARGETS:-"x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu aarch64-apple-darwin x86_64-apple-darwin"}
+docker_image=${DITCH_REMOTE_DOCKER_IMAGE:-"rust:1.97-bookworm"}
+docker_cache=''
+
+cleanup() {
+  if [ -n "$docker_cache" ] && [ -d "$docker_cache" ]; then
+    rm -rf "$docker_cache"
+  fi
+}
+trap cleanup EXIT HUP INT TERM
+
+target_std_available() {
+  target_libdir=$(rustc --print target-libdir --target "$1" 2>/dev/null || true)
+  [ -n "$target_libdir" ] || return 1
+  set -- "$target_libdir"/libstd-*.rlib
+  [ -f "$1" ]
+}
+
+build_linux_with_docker() {
+  target=$1
+  case "$target" in
+    x86_64-unknown-linux-gnu) platform=linux/amd64 ;;
+    aarch64-unknown-linux-gnu) platform=linux/arm64 ;;
+    *) return 1 ;;
+  esac
+  if [ -z "$docker_cache" ]; then
+    docker_cache=$(mktemp -d "${TMPDIR:-/tmp}/ditch-remote-cargo.XXXXXX")
+  fi
+  echo "Building $target in Docker ($platform)"
+  docker run --rm --platform "$platform" \
+    --user "$(id -u):$(id -g)" \
+    -e HOME=/tmp \
+    -e CARGO_HOME=/cargo \
+    -e CARGO_TARGET_DIR="/workspace/target/$target" \
+    -e DITCH_COMMUNITY_REVISION="$community_revision" \
+    -e DITCH_BUILD_IDENTIFIER="$build_identifier" \
+    -v "$workspace:/workspace" \
+    -v "$docker_cache:/cargo" \
+    -w /workspace \
+    "$docker_image" \
+    cargo build --locked --release -p ditchd
+}
+
+build_target() {
+  target=$1
+  if target_std_available "$target"; then
+    cargo build --locked --release --target "$target" -p ditchd
+    return
+  fi
+  case "$target" in
+    *-unknown-linux-gnu)
+      if command -v docker >/dev/null 2>&1; then
+        build_linux_with_docker "$target"
+        return
+      fi
+      ;;
+  esac
+  echo "error: Rust standard library for $target is unavailable." >&2
+  echo "Install the target with rustup, or install Docker for Linux artifacts." >&2
+  exit 1
+}
+
+mkdir -p "$output"
+manifest="$output/remote-artifacts.json"
+temporary="$manifest.tmp"
+
+printf '{\n  "version": "%s",\n  "edition": "commercial",\n  "build_identifier": "%s",\n  "community_revision": "%s",\n  "remote_runtime_protocol_version": %s,\n  "artifacts": [\n' \
+  "$version" "$build_identifier" "$community_revision" "$remote_protocol" > "$temporary"
+separator=''
+for target in $targets; do
+  build_target "$target"
+  source_binary="$workspace/target/$target/release/ditchd"
+  artifact="ditchd-$target"
+  cp "$source_binary" "$output/$artifact"
+  chmod 700 "$output/$artifact"
+  if command -v shasum >/dev/null 2>&1; then
+    checksum=$(shasum -a 256 "$output/$artifact" | awk '{print $1}')
+  else
+    checksum=$(sha256sum "$output/$artifact" | awk '{print $1}')
+  fi
+  printf '%s    {"target":"%s","sha256":"%s","artifact":"%s"}' \
+    "$separator" "$target" "$checksum" "$artifact" >> "$temporary"
+  separator=',\n'
+done
+printf '\n  ]\n}\n' >> "$temporary"
+mv "$temporary" "$manifest"
+printf 'Remote artifacts written to %s\n' "$output"

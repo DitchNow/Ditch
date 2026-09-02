@@ -109,17 +109,12 @@ pub enum CodexLaunchMode {
     Exec,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Default)]
 pub enum AgentApprovalPreset {
     Ask,
+    #[default]
     ApproveForMe,
     FullAccess,
-}
-
-impl Default for AgentApprovalPreset {
-    fn default() -> Self {
-        Self::ApproveForMe
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Default)]
@@ -130,17 +125,28 @@ pub struct AgentExecutionProfile {
     pub approval: AgentApprovalPreset,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Default)]
 pub enum ProjectGitPolicy {
+    #[default]
     RequireRepository,
     InitializeRepository,
     AllowOutsideGit,
 }
 
-impl Default for ProjectGitPolicy {
-    fn default() -> Self {
-        Self::RequireRepository
-    }
+/// Identifies the machine that owns a project's filesystem and runtime.
+///
+/// `root` on [`Project`] is always interpreted on this target.  Keeping the
+/// path on Project preserves the v1 wire/schema shape while preventing a
+/// second, unrelated RemoteProject model from forming in higher layers.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Default)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ProjectExecutionTarget {
+    #[default]
+    Local,
+    Remote {
+        remote_machine_id: Uuid,
+        ssh_host_alias: String,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -152,6 +158,8 @@ pub struct Project {
     pub archived_at: Option<DateTime<Utc>>,
     #[serde(default)]
     pub git_policy: ProjectGitPolicy,
+    #[serde(default)]
+    pub execution_target: ProjectExecutionTarget,
 }
 
 impl Project {
@@ -163,7 +171,33 @@ impl Project {
             created_at: Utc::now(),
             archived_at: None,
             git_policy: ProjectGitPolicy::RequireRepository,
+            execution_target: ProjectExecutionTarget::Local,
         }
+    }
+
+    pub fn new_remote(
+        id: ProjectId,
+        name: impl Into<String>,
+        remote_root: impl Into<PathBuf>,
+        remote_machine_id: Uuid,
+        ssh_host_alias: impl Into<String>,
+    ) -> Self {
+        Self {
+            id,
+            name: name.into(),
+            root: remote_root.into(),
+            created_at: Utc::now(),
+            archived_at: None,
+            git_policy: ProjectGitPolicy::RequireRepository,
+            execution_target: ProjectExecutionTarget::Remote {
+                remote_machine_id,
+                ssh_host_alias: ssh_host_alias.into(),
+            },
+        }
+    }
+
+    pub fn is_remote(&self) -> bool {
+        matches!(self.execution_target, ProjectExecutionTarget::Remote { .. })
     }
 
     pub fn ditch_dir(&self) -> PathBuf {
@@ -256,6 +290,21 @@ impl AppPaths {
             socket_path: data_dir.join("ditchd.sock"),
             logs_dir: data_dir.join("logs"),
             scrollback_dir: data_dir.join("scrollback"),
+            data_dir,
+        }
+    }
+
+    /// Per-user paths used by the portable daemon on SSH hosts.
+    pub fn for_remote_user() -> Self {
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."));
+        let data_dir = home.join(".ditch");
+        Self {
+            database_path: data_dir.join("state/ditch.sqlite3"),
+            socket_path: data_dir.join("run/ditchd.sock"),
+            logs_dir: data_dir.join("logs"),
+            scrollback_dir: data_dir.join("state/scrollback"),
             data_dir,
         }
     }

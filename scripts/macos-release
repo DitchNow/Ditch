@@ -1,0 +1,680 @@
+#!/bin/sh
+set -eu
+
+workspace=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
+
+usage() {
+  cat >&2 <<'EOF'
+usage: scripts/macos-release staging|production preflight|build|verify|publish|all VERSION BUILD MIN_COMMUNITY_VERSION MIN_COMMUNITY_BUILD [stable|beta]
+
+Required release environment:
+  apps/macos/config/.env.release.<environment>       public trust values
+  .env.release-secrets.<environment>                 local release settings
+
+The local release-settings file must be ignored by Git, owned by the current
+user, and mode 0600. A publisher token may be supplied directly or through
+DITCH_RELEASE_REGISTER_TOKEN_FILE.
+
+Optional:
+  DITCH_WRANGLER                            path to wrangler (default: wrangler)
+  DITCH_SPARKLE_KEY_ACCOUNT                 Keychain account (default: ed25519)
+  DITCH_SPARKLE_PRIVATE_KEY_FILE            mode-0600 Sparkle Ed25519 private-key file
+  DITCH_NOTARY_KEYCHAIN                     explicit notarytool Keychain path
+  DITCH_CLOUDFLARE_API_TOKEN_FILE           mode-0600 Cloudflare API token file
+EOF
+  exit 2
+}
+
+environment=${1:-}
+action=${2:-}
+version=${3:-}
+build=${4:-}
+minimum_version=${5:-}
+minimum_build=${6:-}
+channel=${7:-stable}
+
+case "$environment" in staging|production) ;; *) usage ;; esac
+case "$action" in preflight|build|verify|publish|all) ;; *) usage ;; esac
+[ -n "$version" ] && [ -n "$build" ] && [ -n "$minimum_version" ] && [ -n "$minimum_build" ] || usage
+case "$version" in *[!0-9A-Za-z.+-]*|'') echo "error: invalid release version" >&2; exit 2 ;; esac
+case "$minimum_version" in *[!0-9A-Za-z.+-]*|'') echo "error: invalid minimum version" >&2; exit 2 ;; esac
+case "$build" in *[!0-9]*|''|0) echo "error: build must be a positive integer" >&2; exit 2 ;; esac
+case "$minimum_build" in *[!0-9]*|'') echo "error: minimum build must be a non-negative integer" >&2; exit 2 ;; esac
+case "$channel" in stable|beta) ;; *) usage ;; esac
+[ "$environment:$channel" = "staging:beta" ] || [ "$environment:$channel" = "production:stable" ] || {
+  echo "error: staging releases must use beta and production releases must use stable" >&2
+  exit 2
+}
+
+valid_semver() {
+  printf '%s\n' "$1" | grep -Eq '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$'
+}
+valid_semver "$version" || { echo "error: VERSION must be valid SemVer" >&2; exit 2; }
+valid_semver "$minimum_version" || { echo "error: MIN_COMMUNITY_VERSION must be valid SemVer" >&2; exit 2; }
+
+required() {
+  name=$1
+  eval "value=\${$name:-}"
+  [ -n "$value" ] || { echo "error: required environment variable $name is missing" >&2; exit 1; }
+}
+
+hash_file() {
+  shasum -a 256 "$1" | awk '{print $1}'
+}
+
+load_public_environment() {
+  file="$workspace/apps/macos/config/.env.$environment"
+  [ -f "$file" ] || { echo "error: missing $file" >&2; exit 1; }
+  while IFS= read -r line || [ -n "$line" ]; do
+    line=$(printf '%s' "$line" | tr -d '\r')
+    case "$line" in ''|'#'*) continue ;; *=*) ;; *) exit 2 ;; esac
+    key=${line%%=*}
+    value=${line#*=}
+    case "$key" in
+      DITCH_DEPLOYMENT_ENVIRONMENT|DITCH_RELAY_ORIGIN|DITCH_UPDATE_ALLOWED_HOSTS) export "$key=$value" ;;
+      *) echo "error: unsupported key $key in $file" >&2; exit 1 ;;
+    esac
+  done < "$file"
+  [ "$DITCH_DEPLOYMENT_ENVIRONMENT" = "$environment" ] || exit 1
+}
+
+load_release_trust_environment() {
+  file="$workspace/apps/macos/config/.env.release.$environment"
+  [ -f "$file" ] || {
+    echo "error: missing public release trust configuration: $file" >&2
+    exit 1
+  }
+  while IFS= read -r line || [ -n "$line" ]; do
+    line=$(printf '%s' "$line" | tr -d '\r')
+    case "$line" in ''|'#'*) continue ;; *=*) ;; *) echo "error: invalid line in $file" >&2; exit 2 ;; esac
+    key=${line%%=*}
+    value=${line#*=}
+    case "$key" in
+      DITCH_SPARKLE_PUBLIC_ED_KEY|DITCH_RELEASE_MANIFEST_PUBLIC_KEY_SEC1_B64|DITCH_APPLE_TEAM_ID|DITCH_COMMUNITY_BUILD_SEQUENCE)
+        [ -n "$value" ] || { echo "error: $key is empty in $file" >&2; exit 1; }
+        export "$key=$value"
+        ;;
+      *) echo "error: unsupported key $key in $file" >&2; exit 1 ;;
+    esac
+  done < "$file"
+}
+
+require_private_file() {
+  file=$1
+  description=$2
+  [ -f "$file" ] || { echo "error: missing $description: $file" >&2; exit 1; }
+  [ "$(stat -f '%u' "$file")" = "$(id -u)" ] || {
+    echo "error: $description must be owned by the current user: $file" >&2
+    exit 1
+  }
+  [ "$(stat -f '%Lp' "$file")" = 600 ] || {
+    echo "error: $description must have mode 0600: $file" >&2
+    exit 1
+  }
+}
+
+load_release_secrets() {
+  file="$workspace/.env.release-secrets.$environment"
+  require_private_file "$file" "local release settings"
+  git -C "$workspace" check-ignore -q ".env.release-secrets.$environment" || {
+    echo "error: local release settings are not ignored by Git: $file" >&2
+    exit 1
+  }
+  while IFS= read -r line || [ -n "$line" ]; do
+    line=$(printf '%s' "$line" | tr -d '\r')
+    case "$line" in ''|'#'*) continue ;; *=*) ;; *) echo "error: invalid line in $file" >&2; exit 2 ;; esac
+    key=${line%%=*}
+    value=${line#*=}
+    case "$key" in
+      DITCH_CODESIGN_IDENTITY|DITCH_NOTARY_PROFILE|DITCH_NOTARY_KEYCHAIN|DITCH_RELEASE_MANIFEST_SIGNING_KEY_FILE|DITCH_R2_BUCKET|DITCH_RELEASE_REGISTER_URL|DITCH_RELEASE_REGISTER_TOKEN|DITCH_RELEASE_REGISTER_TOKEN_FILE|DITCH_CLOUDFLARE_API_TOKEN_FILE|DITCH_WRANGLER|DITCH_SPARKLE_KEY_ACCOUNT|DITCH_SPARKLE_PRIVATE_KEY_FILE|DITCH_FLUTTER)
+        [ -n "$value" ] || { echo "error: $key is empty in $file" >&2; exit 1; }
+        export "$key=$value"
+        ;;
+      *) echo "error: unsupported key $key in $file" >&2; exit 1 ;;
+    esac
+  done < "$file"
+}
+
+environment_value() {
+  file=$1
+  key=$2
+  sed -n "s/^[[:space:]]*$key[[:space:]]*=[[:space:]]*//p" "$file" | tail -n 1
+}
+
+verify_environment_isolation() {
+  other_environment=staging
+  [ "$environment" = staging ] && other_environment=production
+  other_public="$workspace/apps/macos/config/.env.release.$other_environment"
+  other_secrets="$workspace/.env.release-secrets.$other_environment"
+  [ -f "$other_public" ] || {
+    echo "error: missing public release trust configuration: $other_public" >&2
+    exit 1
+  }
+  require_private_file "$other_secrets" "other environment's local release settings"
+  other_manifest_key=$(environment_value "$other_public" DITCH_RELEASE_MANIFEST_PUBLIC_KEY_SEC1_B64)
+  other_sparkle_key=$(environment_value "$other_public" DITCH_SPARKLE_PUBLIC_ED_KEY)
+  other_sparkle_account=$(environment_value "$other_secrets" DITCH_SPARKLE_KEY_ACCOUNT)
+  other_r2_bucket=$(environment_value "$other_secrets" DITCH_R2_BUCKET)
+  other_register_token_file=$(environment_value "$other_secrets" DITCH_RELEASE_REGISTER_TOKEN_FILE)
+  other_cloudflare_token_file=$(environment_value "$other_secrets" DITCH_CLOUDFLARE_API_TOKEN_FILE)
+  [ "$DITCH_RELEASE_MANIFEST_PUBLIC_KEY_SEC1_B64" != "$other_manifest_key" ] || {
+    echo "error: staging and production must use different release-manifest signing keys" >&2
+    exit 1
+  }
+  [ "$DITCH_SPARKLE_PUBLIC_ED_KEY" != "$other_sparkle_key" ] || {
+    echo "error: staging and production must use different Sparkle signing keys" >&2
+    exit 1
+  }
+  [ "${DITCH_SPARKLE_KEY_ACCOUNT:-ed25519}" != "${other_sparkle_account:-ed25519}" ] || {
+    echo "error: staging and production must use different Sparkle Keychain accounts" >&2
+    exit 1
+  }
+  [ "$DITCH_R2_BUCKET" != "$other_r2_bucket" ] || {
+    echo "error: staging and production must use different R2 buckets" >&2
+    exit 1
+  }
+  if [ -n "${DITCH_RELEASE_REGISTER_TOKEN_FILE:-}" ] && [ -n "$other_register_token_file" ]; then
+    require_private_file "$DITCH_RELEASE_REGISTER_TOKEN_FILE" "Relay publisher token file"
+    require_private_file "$other_register_token_file" "other environment's Relay publisher token file"
+    [ "$(hash_file "$DITCH_RELEASE_REGISTER_TOKEN_FILE")" != "$(hash_file "$other_register_token_file")" ] || {
+      echo "error: staging and production must use different Relay publisher tokens" >&2
+      exit 1
+    }
+  fi
+  if [ -n "${DITCH_CLOUDFLARE_API_TOKEN_FILE:-}" ] && [ -n "$other_cloudflare_token_file" ]; then
+    require_private_file "$DITCH_CLOUDFLARE_API_TOKEN_FILE" "Cloudflare API token file"
+    require_private_file "$other_cloudflare_token_file" "other environment's Cloudflare API token file"
+    [ "$(hash_file "$DITCH_CLOUDFLARE_API_TOKEN_FILE")" != "$(hash_file "$other_cloudflare_token_file")" ] || {
+      echo "error: staging and production must use different Cloudflare API tokens" >&2
+      exit 1
+    }
+  fi
+}
+
+load_cloudflare_token() {
+  [ -n "${CLOUDFLARE_API_TOKEN:-}" ] && return 0
+  [ -n "${DITCH_CLOUDFLARE_API_TOKEN_FILE:-}" ] || return 0
+  require_private_file "$DITCH_CLOUDFLARE_API_TOKEN_FILE" "Cloudflare API token file"
+  CLOUDFLARE_API_TOKEN=$(tr -d '\r\n' < "$DITCH_CLOUDFLARE_API_TOKEN_FILE")
+  [ -n "$CLOUDFLARE_API_TOKEN" ] || {
+    echo "error: Cloudflare API token file is empty" >&2
+    exit 1
+  }
+  export CLOUDFLARE_API_TOKEN
+}
+
+load_release_register_token() {
+  [ -n "${DITCH_RELEASE_REGISTER_TOKEN:-}" ] && return 0
+  [ -n "${DITCH_RELEASE_REGISTER_TOKEN_FILE:-}" ] || return 0
+  require_private_file "$DITCH_RELEASE_REGISTER_TOKEN_FILE" "Relay publisher token file"
+  DITCH_RELEASE_REGISTER_TOKEN=$(tr -d '\r\n' < "$DITCH_RELEASE_REGISTER_TOKEN_FILE")
+  [ -n "$DITCH_RELEASE_REGISTER_TOKEN" ] || {
+    echo "error: Relay publisher token file is empty" >&2
+    exit 1
+  }
+  export DITCH_RELEASE_REGISTER_TOKEN
+}
+
+load_public_environment
+load_release_trust_environment
+load_release_secrets
+verify_environment_isolation
+export DITCH_APP_VERSION="$version"
+export DITCH_BUILD_NUMBER="$build"
+export DITCH_RELEASE_SEQUENCE="$build"
+export DITCH_RELEASE_VERSION="$version"
+export DITCH_RELEASE_BUILD="$build"
+export DITCH_RELEASE_CHANNEL="$channel"
+export DITCH_MINIMUM_COMMUNITY_VERSION="$minimum_version"
+export DITCH_MINIMUM_COMMUNITY_BUILD="$minimum_build"
+export DITCH_BUNDLE_ID=ai.theditch.app
+
+release_id_file="$workspace/dist/commercial/.current-$environment-$version-$build-release-id"
+release_time_file="$workspace/dist/commercial/.current-$environment-$version-$build-published-at"
+
+load_release_context() {
+  create=$1
+  if [ -f "$release_id_file" ]; then
+    release_id=$(tr -d '\r\n' < "$release_id_file")
+  elif [ "$create" = 1 ]; then
+    release_id=$(uuidgen | tr '[:upper:]' '[:lower:]')
+    mkdir -p "$(dirname "$release_id_file")"
+    printf '%s\n' "$release_id" > "$release_id_file"
+  else
+    echo "error: no saved release ID exists for $environment $version ($build); run build first" >&2
+    exit 1
+  fi
+  case "$release_id" in
+    ????????-????-????-????-????????????) ;;
+    *) echo "error: invalid saved release ID" >&2; exit 1 ;;
+  esac
+  if [ -f "$release_time_file" ]; then
+    release_published_at=$(tr -d '\r\n' < "$release_time_file")
+  elif [ "$create" = 1 ]; then
+    release_published_at=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+    printf '%s\n' "$release_published_at" > "$release_time_file"
+  else
+    echo "error: no saved publication timestamp exists for $environment $version ($build)" >&2
+    exit 1
+  fi
+  release_dir="$workspace/dist/commercial/releases/$release_id"
+  artifact_name="The-Ditch-Commercial-$version-$build.dmg"
+  artifact="$release_dir/$artifact_name"
+  appcast="$release_dir/appcast.xml"
+  signed_release="$release_dir/release.json"
+  registration="$release_dir/registration.json"
+  receipt="$release_dir/publish-receipt.json"
+  export DITCH_RELEASE_ID="$release_id"
+  export DITCH_RELEASE_PUBLISHED_AT="$release_published_at"
+  export DITCH_AUTHORIZED_APPCAST_URL="$DITCH_RELAY_ORIGIN/v1/commercial/releases/$release_id/appcast"
+  export DITCH_AUTHORIZED_ARTIFACT_URL="$DITCH_RELAY_ORIGIN/v1/commercial/releases/$release_id/artifact/$artifact_name"
+}
+
+verify_tree() {
+  "$workspace/scripts/verify-community-pin"
+  test -z "$(git -C "$workspace" status --porcelain --ignore-submodules=none)" || {
+    echo "error: release worktree must be clean for both staging and production" >&2
+    git -C "$workspace" status --short --ignore-submodules=none >&2
+    exit 1
+  }
+}
+
+locate_generate_appcast() {
+  tool=$(find "$workspace/apps/macos/build" "$HOME/Library/Developer/Xcode/DerivedData" \
+    -type f -name generate_appcast -perm -111 -print -quit 2>/dev/null || true)
+  [ -n "$tool" ] || {
+    echo "error: Sparkle generate_appcast was not found; resolve Swift packages by building once" >&2
+    exit 1
+  }
+  printf '%s\n' "$tool"
+}
+
+locate_generate_keys() {
+  appcast_tool=$(locate_generate_appcast)
+  tool="$(dirname "$appcast_tool")/generate_keys"
+  [ -x "$tool" ] || {
+    echo "error: Sparkle generate_keys was not found beside generate_appcast" >&2
+    exit 1
+  }
+  printf '%s\n' "$tool"
+}
+
+sparkle_public_key_from_file() {
+  private_file=$1
+  module_cache=$(mktemp -d "${TMPDIR:-/tmp}/ditch-swift-cache.XXXXXX")
+  if public_key=$(CLANG_MODULE_CACHE_PATH="$module_cache" \
+      SWIFT_MODULECACHE_PATH="$module_cache" \
+      DITCH_SPARKLE_PRIVATE_KEY_FILE="$private_file" \
+      swift -e '
+        import Foundation
+        import CryptoKit
+        let environment = ProcessInfo.processInfo.environment
+        let path = environment["DITCH_SPARKLE_PRIVATE_KEY_FILE"]!
+        let encoded = try String(contentsOfFile: path, encoding: .utf8)
+          .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let seed = Data(base64Encoded: encoded), seed.count == 32 else {
+          fatalError("Sparkle private key must be a base64-encoded 32-byte Ed25519 seed")
+        }
+        let privateKey = try Curve25519.Signing.PrivateKey(rawRepresentation: seed)
+        print(privateKey.publicKey.rawRepresentation.base64EncodedString())
+      '); then
+    rm -rf "$module_cache"
+    printf '%s\n' "$public_key"
+  else
+    rm -rf "$module_cache"
+    return 1
+  fi
+}
+
+resolve_flutter() {
+  for candidate in "${DITCH_FLUTTER:-}" "${FLUTTER_BIN:-}"; do
+    [ -n "$candidate" ] || continue
+    [ -d "$candidate" ] && candidate="$candidate/bin/flutter"
+    [ -x "$candidate" ] && { printf '%s\n' "$candidate"; return 0; }
+  done
+  if [ -n "${FLUTTER_ROOT:-}" ] && [ -x "$FLUTTER_ROOT/bin/flutter" ]; then
+    printf '%s\n' "$FLUTTER_ROOT/bin/flutter"
+    return 0
+  fi
+  command -v flutter 2>/dev/null && return 0
+  generated="$workspace/apps/macos/macos/Flutter/ephemeral/Flutter-Generated.xcconfig"
+  if [ -f "$generated" ]; then
+    root=$(sed -n 's/^FLUTTER_ROOT=//p' "$generated" | tail -n 1)
+    [ -x "$root/bin/flutter" ] && { printf '%s\n' "$root/bin/flutter"; return 0; }
+  fi
+  echo "error: Flutter was not found; set DITCH_FLUTTER" >&2
+  exit 1
+}
+
+preflight_release() {
+  verify_tree
+  for tool_name in cargo codesign curl git grep hdiutil jq security shasum spctl swift xcrun; do
+    command -v "$tool_name" >/dev/null 2>&1 || {
+      echo "error: required release tool is missing: $tool_name" >&2
+      exit 1
+    }
+  done
+  required DITCH_APPLE_TEAM_ID
+  required DITCH_CODESIGN_IDENTITY
+  required DITCH_NOTARY_PROFILE
+  required DITCH_RELEASE_MANIFEST_SIGNING_KEY_FILE
+  required DITCH_R2_BUCKET
+  required DITCH_RELEASE_REGISTER_URL
+  case "$DITCH_CODESIGN_IDENTITY" in
+    "Developer ID Application: "*) ;;
+    *) echo "error: DITCH_CODESIGN_IDENTITY must be a Developer ID Application identity" >&2; exit 1 ;;
+  esac
+  security find-identity -v -p codesigning | grep -Fq "\"$DITCH_CODESIGN_IDENTITY\"" || {
+    echo "error: Developer ID Application identity with a private key was not found: $DITCH_CODESIGN_IDENTITY" >&2
+    exit 1
+  }
+  expected_register_url="$DITCH_RELAY_ORIGIN/v1/internal/commercial/releases"
+  [ "$DITCH_RELEASE_REGISTER_URL" = "$expected_register_url" ] || {
+    echo "error: release registration URL must be $expected_register_url" >&2
+    exit 1
+  }
+  [ "$DITCH_R2_BUCKET" = "ditch-commercial-artifacts-$environment" ] || {
+    echo "error: $environment releases must use R2 bucket ditch-commercial-artifacts-$environment" >&2
+    exit 1
+  }
+  require_private_file "$DITCH_RELEASE_MANIFEST_SIGNING_KEY_FILE" "release-manifest signing key"
+  load_release_register_token
+  required DITCH_RELEASE_REGISTER_TOKEN
+  load_cloudflare_token
+  required CLOUDFLARE_API_TOKEN
+
+  capability_response=$(mktemp "${TMPDIR:-/tmp}/ditch-release-capabilities.XXXXXX")
+  capability_status=$(curl --silent --show-error --output "$capability_response" --write-out '%{http_code}' \
+    --proto '=https' --tlsv1.2 \
+    --header "authorization: Bearer $DITCH_RELEASE_REGISTER_TOKEN" \
+    "$DITCH_RELEASE_REGISTER_URL/capabilities")
+  if [ "$capability_status" != 200 ] || ! jq -e '
+      .protocol_version == 1 and
+      .client_release_ids == true and
+      .idempotent_registration == true and
+      .authenticated_sparkle_sessions == true
+    ' "$capability_response" >/dev/null 2>&1; then
+    rm -f "$capability_response"
+    echo "error: Relay does not implement the required Commercial release contract" >&2
+    echo "Required: client release IDs, idempotent registration, and authenticated Sparkle sessions" >&2
+    exit 1
+  fi
+  rm -f "$capability_response"
+
+  if [ -n "${DITCH_NOTARY_KEYCHAIN:-}" ]; then
+    xcrun notarytool history --keychain-profile "$DITCH_NOTARY_PROFILE" \
+      --keychain "$DITCH_NOTARY_KEYCHAIN" >/dev/null
+  else
+    xcrun notarytool history --keychain-profile "$DITCH_NOTARY_PROFILE" >/dev/null
+  fi
+
+  if [ -n "${DITCH_SPARKLE_PRIVATE_KEY_FILE:-}" ]; then
+    require_private_file "$DITCH_SPARKLE_PRIVATE_KEY_FILE" "Sparkle private key"
+    actual_sparkle_key=$(sparkle_public_key_from_file "$DITCH_SPARKLE_PRIVATE_KEY_FILE")
+  else
+    sparkle_keys=$(locate_generate_keys)
+    actual_sparkle_key=$("$sparkle_keys" --account "${DITCH_SPARKLE_KEY_ACCOUNT:-ed25519}" -p | tail -n 1 | tr -d '\r\n')
+  fi
+  [ "$actual_sparkle_key" = "$DITCH_SPARKLE_PUBLIC_ED_KEY" ] || {
+    echo "error: Sparkle private key does not match the public key embedded in the $environment app" >&2
+    exit 1
+  }
+
+  wrangler=${DITCH_WRANGLER:-wrangler}
+  command -v "$wrangler" >/dev/null 2>&1 || { echo "error: wrangler was not found" >&2; exit 1; }
+  WRANGLER_SEND_METRICS=false "$wrangler" whoami >/dev/null
+  WRANGLER_SEND_METRICS=false "$wrangler" r2 bucket list | awk -v expected="$DITCH_R2_BUCKET" '$1 == "name:" && $2 == expected { found=1 } END { exit(found ? 0 : 1) }' || {
+    echo "error: R2 bucket is unavailable to the configured Cloudflare account: $DITCH_R2_BUCKET" >&2
+    exit 1
+  }
+
+  flutter=$(resolve_flutter)
+  "$flutter" --version >/dev/null
+  locate_generate_appcast >/dev/null
+
+  required_remote_targets="x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu aarch64-apple-darwin x86_64-apple-darwin"
+  [ "${DITCH_REMOTE_TARGETS:-$required_remote_targets}" = "$required_remote_targets" ] || {
+    echo "error: official releases must contain every supported SSH runtime target" >&2
+    exit 1
+  }
+  export DITCH_REMOTE_TARGETS="$required_remote_targets"
+  linux_needs_docker=0
+  for target in $required_remote_targets; do
+    target_libdir=$(rustc --print target-libdir --target "$target" 2>/dev/null || true)
+    set -- "$target_libdir"/libstd-*.rlib
+    [ -n "$target_libdir" ] && [ -f "$1" ] && continue
+    case "$target" in
+      *-unknown-linux-gnu) linux_needs_docker=1 ;;
+      *)
+        echo "error: Rust standard library is missing for required target $target" >&2
+        echo "Install a rustup-managed toolchain and run: rustup target add $target" >&2
+        exit 1
+        ;;
+    esac
+  done
+  if [ "$linux_needs_docker" -eq 1 ]; then
+    command -v docker >/dev/null 2>&1 || {
+      echo "error: Docker is required to build the Linux SSH runtimes" >&2
+      exit 1
+    }
+    docker info >/dev/null 2>&1 || {
+      echo "error: Docker is installed but its daemon is not running" >&2
+      exit 1
+    }
+  fi
+  echo "$environment release preflight passed for $version ($build)"
+}
+
+build_release() {
+  preflight_release
+  load_release_context 1
+  if [ -z "${DITCH_RELEASE_MANIFEST_SIGNING_KEY_B64:-}" ]; then
+    required DITCH_RELEASE_MANIFEST_SIGNING_KEY_FILE
+    [ -f "$DITCH_RELEASE_MANIFEST_SIGNING_KEY_FILE" ] || exit 1
+    DITCH_RELEASE_MANIFEST_SIGNING_KEY_B64=$(tr -d '\r\n' < "$DITCH_RELEASE_MANIFEST_SIGNING_KEY_FILE")
+    export DITCH_RELEASE_MANIFEST_SIGNING_KEY_B64
+  fi
+  export DITCH_RELEASE_MANIFEST_SIGNING_KEY_B64
+
+  flutter=$(resolve_flutter)
+
+  (cd "$workspace/community" && cargo test --locked --workspace)
+  (cd "$workspace" && cargo test --locked --workspace)
+  (cd "$workspace/community/apps/macos" && "$flutter" --suppress-analytics test && "$flutter" --suppress-analytics analyze)
+  (cd "$workspace/apps/macos" && "$flutter" --suppress-analytics test && "$flutter" --suppress-analytics analyze)
+  verify_tree
+
+  DITCH_BUILD_IDENTIFIER="$("$workspace/scripts/build-identifier")"
+  export DITCH_BUILD_IDENTIFIER
+  "$workspace/scripts/build-remote-artifacts"
+  "$workspace/scripts/macos-app" "$environment" build \
+    --release --build-name "$version" --build-number "$build"
+
+  mkdir -p "$release_dir"
+  DITCH_DMG_OUTPUT="$artifact" "$workspace/scripts/package-commercial-dmg"
+
+  tool=$(locate_generate_appcast)
+  sparkle_key_option=--account
+  sparkle_key_value=${DITCH_SPARKLE_KEY_ACCOUNT:-ed25519}
+  if [ -n "${DITCH_SPARKLE_PRIVATE_KEY_FILE:-}" ]; then
+    sparkle_key_option=--ed-key-file
+    sparkle_key_value=$DITCH_SPARKLE_PRIVATE_KEY_FILE
+  fi
+  if [ "$channel" = beta ]; then
+    "$tool" \
+      "$sparkle_key_option" "$sparkle_key_value" \
+      --download-url-prefix "$DITCH_RELAY_ORIGIN/v1/commercial/releases/$release_id/artifact/" \
+      --channel beta \
+      --maximum-versions 1 \
+      -o "$appcast" \
+      "$release_dir"
+  else
+    # Sparkle's stable/default channel has no channel element. Naming it
+    # "stable" would make default-channel clients ignore the release.
+    "$tool" \
+      "$sparkle_key_option" "$sparkle_key_value" \
+      --download-url-prefix "$DITCH_RELAY_ORIGIN/v1/commercial/releases/$release_id/artifact/" \
+      --maximum-versions 1 \
+      -o "$appcast" \
+      "$release_dir"
+  fi
+  [ -f "$appcast" ] || exit 1
+
+  (cd "$workspace" && \
+    DITCH_COMMERCIAL_ARTIFACT="$artifact" \
+    DITCH_COMMERCIAL_MANIFEST_OUTPUT="$signed_release" \
+    DITCH_RELEASE_MANIFEST_PUBLIC_KEY_SEC1_B64="$DITCH_RELEASE_MANIFEST_PUBLIC_KEY_SEC1_B64" \
+      cargo run --locked -p ditch_commercial --bin sign_commercial_release)
+  verify_release
+}
+
+verify_release() {
+  for file in "$artifact" "$appcast" "$signed_release"; do
+    [ -f "$file" ] || { echo "error: missing release file $file" >&2; exit 1; }
+  done
+  hdiutil verify "$artifact" >/dev/null
+  xcrun stapler validate "$artifact"
+  spctl --assess --type open --context context:primary-signature --verbose=2 "$artifact"
+  actual_digest=$(hash_file "$artifact")
+  manifest_digest=$(jq -r '.manifest.artifact_sha256 // empty' "$signed_release")
+  [ "$actual_digest" = "$manifest_digest" ] || { echo "error: signed descriptor digest mismatch" >&2; exit 1; }
+  jq -e \
+    --arg release_id "$release_id" \
+    --arg version "$version" \
+    --arg build "$build" \
+    --arg channel "$channel" \
+    --arg bundle_id "$DITCH_BUNDLE_ID" \
+    --arg team_id "$DITCH_APPLE_TEAM_ID" \
+    --arg appcast_url "$DITCH_AUTHORIZED_APPCAST_URL" \
+    --arg artifact_url "$DITCH_AUTHORIZED_ARTIFACT_URL" \
+    '.manifest.release_id == $release_id and
+     .manifest.version == $version and
+     .manifest.build == $build and
+     .manifest.release_sequence == ($build | tonumber) and
+     .manifest.channel == $channel and
+     .manifest.bundle_id == $bundle_id and
+     .manifest.team_id == $team_id and
+     .manifest.appcast_url == $appcast_url and
+     .manifest.artifact_url == $artifact_url and
+     (.signature | type == "string" and length > 0)' \
+    "$signed_release" >/dev/null || {
+      echo "error: signed release descriptor does not match the requested release" >&2
+      exit 1
+    }
+  app="$workspace/apps/macos/build/macos/Build/Products/Release/Ditch.app"
+  actual_version=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Contents/Info.plist")
+  actual_build=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$app/Contents/Info.plist")
+  [ "$actual_version" = "$version" ] || { echo "error: built app version is $actual_version, expected $version" >&2; exit 1; }
+  [ "$actual_build" = "$build" ] || { echo "error: built app build is $actual_build, expected $build" >&2; exit 1; }
+  rg -q "releases/$release_id/artifact/$artifact_name" "$appcast" || {
+    echo "error: appcast enclosure is not bound to this immutable release" >&2
+    exit 1
+  }
+  rg -q 'sparkle:edSignature=' "$appcast" || { echo "error: appcast is not signed" >&2; exit 1; }
+  [ "$(find "$workspace/apps/macos/build/macos/Build/Products/Release/Ditch.app" -type f -name ditchd | wc -l | tr -d ' ')" = 1 ]
+  test -z "$(find "$workspace/apps/macos/build/macos/Build/Products/Release/Ditch.app" -name ditch-servicesd -print -quit)"
+  echo "Commercial release $release_id verified"
+}
+
+upload_object() {
+  file=$1
+  key=$2
+  content_type=$3
+  wrangler=${DITCH_WRANGLER:-wrangler}
+  command -v "$wrangler" >/dev/null 2>&1 || { echo "error: wrangler was not found" >&2; exit 1; }
+  # R2 writes are immutable. A retry may reuse an existing object only when its
+  # downloaded bytes are identical to the local release output.
+  probe=$(mktemp "${TMPDIR:-/tmp}/ditch-r2-probe.XXXXXX")
+  if "$wrangler" r2 object get "$DITCH_R2_BUCKET/$key" --remote --file "$probe" >/dev/null 2>&1; then
+    [ "$(hash_file "$file")" = "$(hash_file "$probe")" ] || {
+      rm -f "$probe"
+      echo "error: immutable R2 key contains different bytes: $key" >&2
+      exit 1
+    }
+    rm -f "$probe"
+    echo "Verified existing immutable R2 object: $key"
+    return 0
+  fi
+  rm -f "$probe"
+  "$wrangler" r2 object put "$DITCH_R2_BUCKET/$key" --remote --file "$file" --content-type "$content_type"
+  verify_copy=$(mktemp "${TMPDIR:-/tmp}/ditch-r2-verify.XXXXXX")
+  "$wrangler" r2 object get "$DITCH_R2_BUCKET/$key" --remote --file "$verify_copy" >/dev/null
+  [ "$(hash_file "$file")" = "$(hash_file "$verify_copy")" ] || {
+    rm -f "$verify_copy"
+    echo "error: uploaded R2 object digest mismatch: $key" >&2
+    exit 1
+  }
+  rm -f "$verify_copy"
+}
+
+publish_release() {
+  verify_release
+  required DITCH_R2_BUCKET
+  required DITCH_RELEASE_REGISTER_URL
+  load_release_register_token
+  required DITCH_RELEASE_REGISTER_TOKEN
+  command -v jq >/dev/null 2>&1 || { echo "error: jq is required" >&2; exit 1; }
+
+  prefix="commercial/$environment/$channel/$release_id"
+  upload_object "$artifact" "$prefix/$artifact_name" application/x-apple-diskimage
+  upload_object "$appcast" "$prefix/appcast.xml" application/xml
+  upload_object "$signed_release" "$prefix/release.json" application/json
+
+  jq -n \
+    --argjson protocol_version 1 \
+    --arg release_id "$release_id" \
+    --arg version "$version" \
+    --argjson build "$build" \
+    --arg channel "$channel" \
+    --arg artifact_key "$prefix/$artifact_name" \
+    --arg appcast_key "$prefix/appcast.xml" \
+    --arg descriptor_key "$prefix/release.json" \
+    --arg sha256 "$(hash_file "$artifact")" \
+    --arg minimum_version "$minimum_version" \
+    --argjson minimum_build "$minimum_build" \
+    --slurpfile signature_metadata "$signed_release" \
+    '{protocol_version:$protocol_version,release_id:$release_id,version:$version,build:$build,channel:$channel,
+      artifact_key:$artifact_key,appcast_key:$appcast_key,descriptor_key:$descriptor_key,
+      sha256:$sha256,minimum_version:$minimum_version,minimum_build:$minimum_build,
+      signature_metadata:$signature_metadata[0]}' > "$registration"
+
+  response=$(mktemp "${TMPDIR:-/tmp}/ditch-release-register.XXXXXX")
+  status=$(curl --silent --show-error --output "$response" --write-out '%{http_code}' \
+    --proto '=https' --tlsv1.2 \
+    --header "authorization: Bearer $DITCH_RELEASE_REGISTER_TOKEN" \
+    --header 'content-type: application/json' \
+    --data-binary "@$registration" \
+    "$DITCH_RELEASE_REGISTER_URL")
+  [ "$status" = 201 ] || {
+    echo "error: Relay release registration returned HTTP $status" >&2
+    sed -n '1,20p' "$response" >&2
+    rm -f "$response"
+    exit 1
+  }
+  registered_release_id=$(jq -r '.release_id // empty' "$response")
+  [ "$registered_release_id" = "$release_id" ] || {
+    echo "error: Relay registered release ID $registered_release_id, expected signed release ID $release_id" >&2
+    rm -f "$response"
+    exit 1
+  }
+  jq -n \
+    --arg release_id "$release_id" \
+    --arg environment "$environment" \
+    --arg channel "$channel" \
+    --arg version "$version" \
+    --arg build "$build" \
+    --arg artifact_sha256 "$(hash_file "$artifact")" \
+    --arg published_at "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+    '{release_id:$release_id,environment:$environment,channel:$channel,version:$version,
+      build:$build,artifact_sha256:$artifact_sha256,published_at:$published_at}' > "$receipt"
+  rm -f "$response"
+  echo "Published Commercial $version ($build) as $release_id"
+}
+
+case "$action" in
+  preflight) preflight_release ;;
+  build) build_release ;;
+  verify) preflight_release; load_release_context 0; verify_release ;;
+  publish) preflight_release; load_release_context 0; publish_release ;;
+  all) build_release; publish_release ;;
+esac

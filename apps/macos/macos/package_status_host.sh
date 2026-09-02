@@ -12,6 +12,51 @@ case "$BUILD_ARCH" in
   ""|undefined_arch) BUILD_ARCH="$(uname -m)" ;;
 esac
 
+# These values are public build configuration, not credentials. Direct Flutter
+# and Xcode builds retain the historical production default. The
+# scripts/macos-app wrapper sets all three explicitly for staging/production.
+DITCH_DEPLOYMENT_ENVIRONMENT="${DITCH_DEPLOYMENT_ENVIRONMENT:-production}"
+DITCH_EDITION="${DITCH_EDITION:-commercial}"
+DITCH_RELAY_ORIGIN="${DITCH_RELAY_ORIGIN:-https://relay.ditchnow.nl}"
+DITCH_UPDATE_ALLOWED_HOSTS="${DITCH_UPDATE_ALLOWED_HOSTS:-relay.ditchnow.nl,downloads.ditchnow.nl,updates.ditchnow.nl}"
+
+case "$DITCH_DEPLOYMENT_ENVIRONMENT" in
+  staging|production) ;;
+  *) echo "error: DITCH_DEPLOYMENT_ENVIRONMENT must be staging or production" >&2; exit 1 ;;
+esac
+case "$DITCH_RELAY_ORIGIN" in
+  https://*) ;;
+  *) echo "error: DITCH_RELAY_ORIGIN must be an HTTPS origin" >&2; exit 1 ;;
+esac
+DITCH_RELAY_HOST=${DITCH_RELAY_ORIGIN#https://}
+case "$DITCH_RELAY_HOST" in
+  ""|*/*|*'?'*|*'#'*|*'@'*|*:*)
+    echo "error: DITCH_RELAY_ORIGIN must contain only an HTTPS scheme and hostname" >&2
+    exit 1
+    ;;
+esac
+case "$DITCH_UPDATE_ALLOWED_HOSTS" in
+  *[!A-Za-z0-9.,-]*)
+    echo "error: DITCH_UPDATE_ALLOWED_HOSTS contains an invalid character" >&2
+    exit 1
+    ;;
+esac
+case ",$DITCH_UPDATE_ALLOWED_HOSTS," in
+  *,"$DITCH_RELAY_HOST",*) ;;
+  *) echo "error: DITCH_UPDATE_ALLOWED_HOSTS must include $DITCH_RELAY_HOST" >&2; exit 1 ;;
+esac
+
+PRODUCTION_RELAY_ORIGIN=https://relay.ditchnow.nl
+if [ "$DITCH_DEPLOYMENT_ENVIRONMENT" = production ] && [ "$DITCH_RELAY_ORIGIN" != "$PRODUCTION_RELAY_ORIGIN" ]; then
+  echo "error: production must use $PRODUCTION_RELAY_ORIGIN" >&2
+  exit 1
+fi
+if [ "$DITCH_DEPLOYMENT_ENVIRONMENT" = staging ] && [ "$DITCH_RELAY_ORIGIN" = "$PRODUCTION_RELAY_ORIGIN" ]; then
+  echo "error: staging must not use the production Relay" >&2
+  exit 1
+fi
+export DITCH_DEPLOYMENT_ENVIRONMENT DITCH_EDITION DITCH_RELAY_ORIGIN DITCH_UPDATE_ALLOWED_HOSTS
+
 # Keep every object linked into the nested helper on the same explicit minimum
 # OS version. Without this, a newer Xcode stamps its own host OS as the Swift
 # executable's minimum even when the enclosing Flutter app supports older Macs.
@@ -57,6 +102,15 @@ case "${CONFIGURATION:-Debug}" in
 esac
 
 cd "$WORKSPACE_ROOT"
+DITCH_BUILD_IDENTIFIER="${DITCH_BUILD_IDENTIFIER:-$("$WORKSPACE_ROOT/scripts/build-identifier")}"
+case "$DITCH_BUILD_IDENTIFIER" in
+  *[!A-Za-z0-9._-]*) echo 'error: invalid DITCH_BUILD_IDENTIFIER' >&2; exit 1 ;;
+esac
+DITCH_BUILD_NUMBER="${DITCH_BUILD_NUMBER:-${FLUTTER_BUILD_NUMBER:-0}}"
+DITCH_APP_VERSION="${DITCH_APP_VERSION:-${FLUTTER_BUILD_NAME:-0.1.0}}"
+DITCH_RELEASE_SEQUENCE="${DITCH_RELEASE_SEQUENCE:-$DITCH_BUILD_NUMBER}"
+DITCH_COMMUNITY_REVISION="${DITCH_COMMUNITY_REVISION:-$(tr -d '\r\n' < "$WORKSPACE_ROOT/COMMUNITY_REVISION")}"
+export DITCH_APP_VERSION DITCH_BUILD_IDENTIFIER DITCH_BUILD_NUMBER DITCH_RELEASE_SEQUENCE DITCH_COMMUNITY_REVISION
 # The app must never package whatever happens to be left in target/. Build the
 # runtime used by this exact app build first, and fail if Cargo cannot produce it.
 "$CARGO_BIN" build --locked -p ditchd -p ditch_cli $CARGO_FLAGS
@@ -66,8 +120,46 @@ DITCH_CLI_SOURCE="$WORKSPACE_ROOT/target/$CARGO_PROFILE/ditch_cli"
 test -x "$DITCHD_SOURCE"
 test -f "$DITCHD_LIBRARY"
 test -x "$DITCH_CLI_SOURCE"
+case "$BUILD_ARCH" in
+  arm64|aarch64) HOST_REMOTE_TARGET="aarch64-apple-darwin" ;;
+  x86_64) HOST_REMOTE_TARGET="x86_64-apple-darwin" ;;
+  *) echo "error: unsupported remote runtime architecture $BUILD_ARCH" >&2; exit 1 ;;
+esac
 
 mkdir -p "$HELPER_MACOS"
+HELPER_RESOURCES="$HELPER_CONTENTS/Resources/RemoteRuntimes"
+MAIN_RESOURCES="$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH"
+mkdir -p "$MAIN_RESOURCES"
+rm -f "$MAIN_MACOS/ditchd"
+
+# AppKit independently validates the short-lived Commercial update feed. Give
+# it the same build environment and Relay host that were compiled into Rust.
+cat > "$MAIN_RESOURCES/DitchEnvironment.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>DeploymentEnvironment</key>
+  <string>$DITCH_DEPLOYMENT_ENVIRONMENT</string>
+  <key>Edition</key>
+  <string>$DITCH_EDITION</string>
+  <key>RelayOrigin</key>
+  <string>$DITCH_RELAY_ORIGIN</string>
+  <key>AllowedUpdateHosts</key>
+  <string>$DITCH_UPDATE_ALLOWED_HOSTS</string>
+  <key>BuildIdentifier</key>
+  <string>$DITCH_BUILD_IDENTIFIER</string>
+  <key>BuildNumber</key>
+  <string>$DITCH_BUILD_NUMBER</string>
+  <key>ReleaseSequence</key>
+  <integer>$DITCH_RELEASE_SEQUENCE</integer>
+  <key>CommunityRevision</key>
+  <string>$DITCH_COMMUNITY_REVISION</string>
+</dict>
+</plist>
+PLIST
+/usr/bin/plutil -lint "$MAIN_RESOURCES/DitchEnvironment.plist" >/dev/null
 
 # Xcode's user-script sandbox cannot write Swift's default module cache under
 # ~/.cache. Keep all compiler intermediates inside this build.
@@ -120,14 +212,37 @@ PLIST
 
 cp "$DITCH_CLI_SOURCE" "$HELPER_MACOS/ditch_cli"
 cp "$DITCH_CLI_SOURCE" "$MAIN_MACOS/ditch_cli"
-cp "$HELPER_MACOS/ditchd" "$MAIN_MACOS/ditchd"
+# The remote artifact must be the portable Rust daemon, not the macOS status
+# host wrapper. Its target-qualified name prevents accidental cross-arch use.
+cp "$DITCHD_SOURCE" "$MAIN_MACOS/ditchd-remote-$HOST_REMOTE_TARGET"
+cp "$DITCHD_SOURCE" "$HELPER_MACOS/ditchd-remote-$HOST_REMOTE_TARGET"
+
+# Release automation may stage the cross-built Linux/macOS matrix produced by
+# scripts/build-remote-artifacts. Keep these as checksum-verified resources;
+# the host-native sibling above remains available for ordinary development.
+WORKSPACE_VERSION=$(sed -n 's/^version = "\([^"]*\)"/\1/p' "$WORKSPACE_ROOT/Cargo.toml" | head -n 1)
+REMOTE_ARTIFACT_SOURCE="${DITCH_REMOTE_ARTIFACT_DIR:-$WORKSPACE_ROOT/dist/remote/$WORKSPACE_VERSION}"
+if [ -f "$REMOTE_ARTIFACT_SOURCE/remote-artifacts.json" ]; then
+  ARTIFACT_BUILD_IDENTIFIER=$(sed -n 's/.*"build_identifier": "\([^"]*\)".*/\1/p' "$REMOTE_ARTIFACT_SOURCE/remote-artifacts.json" | head -n 1)
+  if [ "$ARTIFACT_BUILD_IDENTIFIER" != "$DITCH_BUILD_IDENTIFIER" ]; then
+    echo "error: remote runtime artifacts are stale for this source build." >&2
+    echo "Run scripts/build-remote-artifacts before building the macOS app." >&2
+    exit 1
+  fi
+  mkdir -p "$HELPER_RESOURCES"
+  cp "$REMOTE_ARTIFACT_SOURCE/remote-artifacts.json" "$HELPER_RESOURCES/remote-artifacts.json"
+  for ARTIFACT in "$REMOTE_ARTIFACT_SOURCE"/ditchd-*; do
+    [ -f "$ARTIFACT" ] || continue
+    cp "$ARTIFACT" "$HELPER_RESOURCES/$(basename "$ARTIFACT")"
+    chmod 600 "$HELPER_RESOURCES/$(basename "$ARTIFACT")"
+  done
+fi
 
 # Verify the copies before signing (codesign changes Mach-O bytes). `cmp` is
 # killed by Xcode's script sandbox for Mach-O inputs, so verify executability
 # and exact byte size here; `cp` itself already exits nonzero on write failure.
-test -x "$MAIN_MACOS/ditchd"
 test -x "$MAIN_MACOS/ditch_cli"
-test "$(stat -f %z "$HELPER_MACOS/ditchd")" = "$(stat -f %z "$MAIN_MACOS/ditchd")"
+test -x "$HELPER_MACOS/ditchd"
 test "$(stat -f %z "$DITCH_CLI_SOURCE")" = "$(stat -f %z "$MAIN_MACOS/ditch_cli")"
 
 # Every executable inside a notarized app must carry a hardened signature.
@@ -137,8 +252,9 @@ SIGNING_IDENTITY="${EXPANDED_CODE_SIGN_IDENTITY:--}"
 if [ -z "$SIGNING_IDENTITY" ]; then
   SIGNING_IDENTITY="-"
 fi
-/usr/bin/codesign --force --sign "$SIGNING_IDENTITY" --options runtime "$MAIN_MACOS/ditchd"
 /usr/bin/codesign --force --sign "$SIGNING_IDENTITY" --options runtime "$MAIN_MACOS/ditch_cli"
+/usr/bin/codesign --force --sign "$SIGNING_IDENTITY" --options runtime "$MAIN_MACOS/ditchd-remote-$HOST_REMOTE_TARGET"
+/usr/bin/codesign --force --sign "$SIGNING_IDENTITY" --options runtime "$HELPER_MACOS/ditchd-remote-$HOST_REMOTE_TARGET"
 /usr/bin/codesign --force --sign "$SIGNING_IDENTITY" --options runtime "$HELPER_MACOS/ditch_cli"
 /usr/bin/codesign --force --sign "$SIGNING_IDENTITY" --options runtime "$HELPER_APP"
 

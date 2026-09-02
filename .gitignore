@@ -4,11 +4,19 @@
 .packages
 build/
 target/
+dist/
+.wrangler/
 
 .DS_Store
 .env
 .env.*
+.release-keys/
 !.env.example
+!apps/macos/config/.env.staging
+!apps/macos/config/.env.production
+!apps/macos/config/.env.release.staging
+!apps/macos/config/.env.release.production
+!apps/macos/config/.env.release.example
 
 *.iml
 *.log
@@ -16,6 +24,8 @@ target/
 
 apps/macos/macos/Flutter/ephemeral/
 apps/macos/macos/Pods/
+apps/macos/pubspec_overrides.yaml
+apps/macos/macos/Runner/Configs/ReleaseVerification.xcconfig
 !.ditch/
 !.ditch/agents/
 !.ditch/hooks/

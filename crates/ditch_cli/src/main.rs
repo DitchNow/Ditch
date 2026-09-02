@@ -6,6 +6,12 @@ use std::os::unix::net::UnixStream;
 use uuid::Uuid;
 
 fn main() {
+    if std::env::var_os("DITCH_SSH_ASKPASS_SOCKET").is_some() {
+        if ditch_ssh::askpass_main().is_err() {
+            std::process::exit(1);
+        }
+        return;
+    }
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     let result = match args.as_slice() {
         [] => print_help(),
