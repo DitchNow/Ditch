@@ -1,0 +1,82 @@
+name: Community Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version being released
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-15
+    environment: community-release
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - run: cargo fmt --all -- --check
+      - run: scripts/check-commercial-offer-contract
+      - run: scripts/check-community-clean-checkout
+      - run: cargo build --locked -p ditchd -p ditch_cli
+      - run: cargo test --locked --workspace
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - working-directory: apps/macos
+        run: flutter pub get
+      - name: Configure public release verification keys
+        working-directory: apps/macos/macos/Runner/Configs
+        env:
+          SPARKLE_PUBLIC_KEY: ${{ secrets.DITCH_SPARKLE_PUBLIC_ED_KEY }}
+          MANIFEST_PUBLIC_KEY: ${{ secrets.DITCH_RELEASE_MANIFEST_PUBLIC_KEY_SEC1_B64 }}
+          APPLE_TEAM_ID: ${{ secrets.DITCH_APPLE_TEAM_ID }}
+          BUILD_SEQUENCE: ${{ github.run_number }}
+        run: |
+          printf '%s\n' \
+            "DITCH_SPARKLE_PUBLIC_ED_KEY = $SPARKLE_PUBLIC_KEY" \
+            "DITCH_RELEASE_MANIFEST_PUBLIC_KEY_SEC1_B64 = $MANIFEST_PUBLIC_KEY" \
+            "DITCH_APPLE_TEAM_ID = $APPLE_TEAM_ID" \
+            "DITCH_COMMUNITY_BUILD_SEQUENCE = $BUILD_SEQUENCE" \
+            > ReleaseVerification.xcconfig
+      - working-directory: apps/macos
+        run: flutter test
+      - working-directory: apps/macos
+        run: flutter analyze
+      - working-directory: apps/macos
+        run: flutter build macos --release
+      - run: scripts/check-community-leakage
+      - run: scripts/package-community-dmg
+        env:
+          DITCH_CODESIGN_IDENTITY: ${{ secrets.DITCH_CODESIGN_IDENTITY }}
+          DITCH_NOTARY_PROFILE: ${{ secrets.DITCH_NOTARY_PROFILE }}
+      - name: Generate signed Community appcast
+        env:
+          SPARKLE_PRIVATE_KEY: ${{ secrets.DITCH_SPARKLE_PRIVATE_KEY }}
+        run: |
+          tool=$(find apps/macos/build "$HOME/Library/Developer/Xcode/DerivedData" -type f -name generate_appcast -perm -111 -print -quit)
+          test -n "$tool"
+          key_file=$(mktemp "$RUNNER_TEMP/ditch-sparkle-key.XXXXXX")
+          trap 'rm -f "$key_file"' EXIT
+          printf '%s' "$SPARKLE_PRIVATE_KEY" > "$key_file"
+          "$tool" --ed-key-file "$key_file" dist/community
+          test -f dist/community/appcast.xml
+      - name: Publish Community update feed
+        env:
+          DMG_UPLOAD_URL: ${{ secrets.DITCH_COMMUNITY_DMG_UPLOAD_URL }}
+          APPCAST_UPLOAD_URL: ${{ secrets.DITCH_COMMUNITY_APPCAST_UPLOAD_URL }}
+        run: |
+          curl --fail-with-body --proto '=https' --tlsv1.2 --upload-file dist/community/The-Ditch.dmg "$DMG_UPLOAD_URL"
+          curl --fail-with-body --proto '=https' --tlsv1.2 --upload-file dist/community/appcast.xml "$APPCAST_UPLOAD_URL"
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ inputs.version }}
+          files: |
+            dist/community/The-Ditch.dmg
+            dist/community/appcast.xml

@@ -1,0 +1,17 @@
+[package]
+name = "ditch_identity"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+base64.workspace = true
+p256 = { workspace = true, features = ["ecdsa", "pkcs8"] }
+rand_core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "3.5.1"

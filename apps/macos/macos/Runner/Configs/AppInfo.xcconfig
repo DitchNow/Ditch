@@ -1,0 +1,23 @@
+// Application-level settings for the Runner target.
+//
+// This may be replaced with something auto-generated from metadata (e.g., pubspec.yaml) in the
+// future. If not, the values below would default to using the project name when this becomes a
+// 'flutter create' template.
+
+// The application's name. By default this is also the title of the Flutter window.
+PRODUCT_NAME = Ditch
+
+// The application's bundle identifier
+PRODUCT_BUNDLE_IDENTIFIER = ai.theditch.app
+
+// The copyright displayed in application information
+PRODUCT_COPYRIGHT = Copyright © 2026 Ditch. All rights reserved.
+
+// Public verification keys are injected by the official release job. Source
+// builds remain fully functional but cannot install an official Commercial
+// artifact unless built with the published verification configuration.
+DITCH_SPARKLE_PUBLIC_ED_KEY =
+DITCH_RELEASE_MANIFEST_PUBLIC_KEY_SEC1_B64 =
+DITCH_APPLE_TEAM_ID =
+DITCH_COMMUNITY_BUILD_SEQUENCE = 0
+#include? "ReleaseVerification.xcconfig"
