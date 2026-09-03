@@ -8,7 +8,7 @@
 
 Ditch Community Edition is pre-release software under active development. It currently supports macOS 11 or later and Codex CLI. The macOS beta is distributed as a `.dmg` through [theditch.dev](https://theditch.dev/#beta), and the app can also be built from source.
 
-Today it can register multiple local projects, run concurrent Codex sessions, preserve their transcripts and Codex thread IDs, resume completed threads, post local completion and failure notifications, and provide a project shell and small text-file editor. The background runtime remains alive when the main window closes.
+Today it can register multiple local or SSH-hosted projects, run concurrent Codex sessions locally or on remote Linux/macOS hosts, preserve their transcripts and Codex thread IDs, resume completed threads, post local completion and failure notifications, and provide project shells and a small text-file editor. The background runtime remains alive when the main window closes.
 
 Current limitations are:
 
@@ -16,7 +16,7 @@ Current limitations are:
 - Codex runs through a separate `codex exec` process for each turn. Interactive approval requests are not supported; the UI disables **Ask for approval**.
 - Closing the foreground window preserves work, but explicitly quitting the menu-bar runtime stops active agents. After an unexpected runtime restart, previously active runs are marked stale and can only be continued when Codex supplied a resumable thread ID.
 - The repository contains types and placeholder directories for other providers, hooks, MCP, tasks, and worktrees, but those are not complete user-facing features.
-- There is no GitHub release workflow or CI workflow in the repository yet.
+- Community CI and release workflows are committed; official distribution still requires DitchNow's Apple signing/notarization credentials and published verification keys.
 
 ## Why Ditch
 
@@ -69,6 +69,10 @@ The menu-bar helper shows the runtime's active-session and unread-attention coun
 
 Each project can open one daemon-owned login-shell PTY in its repository root. The embedded terminal supports input, output, and resize events and can be docked, split alongside the workspace, or maximized.
 
+### Run projects over SSH
+
+SSH remote projects are part of Community Edition. Ditch discovers OpenSSH hosts, installs a matching Community runtime under `~/.ditch` on Linux or macOS, and runs Codex on that host while the Mac remains the control surface. SSH execution hosts are unlimited and do not consume Commercial Mac license slots.
+
 ### Inspect and edit project files
 
 The project browser lists files while excluding common generated and internal directories. Its editor handles existing UTF-8 text files up to 1 MB, checks revisions before saving, preserves file permissions, and prevents paths from escaping the selected project root.
@@ -100,9 +104,7 @@ Projects, session metadata, transcripts, attention state, and selected runtime s
 
 ## Local-First & Privacy
 
-The application, runtime, socket, primary database, project access, and agent execution run on the Mac. Optional Remote Control is an explicit opt-in connectivity feature: it sends anonymous machine/device identity, sanitized project/session/attention status, push tokens, and privacy-safe audit metadata to a Ditch-managed relay. Sensitive prompts and transcript pages are relayed end-to-end encrypted and full transcript bodies are not stored by that service. The relay is built and deployed independently from the `TheDitchRelay` repository; this Mac repository contains only the daemon client, desktop UI, and shared Remote Protocol contract. The repository contains no analytics SDK or crash-reporting integration.
-
-Release builds use `https://relay.ditchnow.nl` as the built-in Remote Control origin; users do not configure Cloudflare or a relay address. Developers may override it at process startup with `DITCH_REMOTE_RELAY_ORIGIN`. Overrides must be an HTTPS origin without credentials, path, query, or fragment. Plain HTTP is accepted only for loopback development (`localhost`, `127.0.0.1`, or `::1`).
+The application, runtime, socket, primary database, project access, local agent execution, and SSH control path belong to Community Edition. This repository contains no iPhone pairing, mobile command, Relay WebSocket, device encryption, mobile projection, or push-notification implementation. It contains only the narrow public client needed to discover, purchase, verify, and install an authorized Commercial build. The repository contains no analytics SDK or crash-reporting integration.
 
 The download website is a separate boundary: its beta form collects an email address to send access and states that it records whether the download link is opened.
 
@@ -116,7 +118,7 @@ The in-app **Uninstall Ditch…** command stops active agents, unregisters the h
 
 ## Open Source
 
-This repository contains Ditch Community Edition: the complete current local product described above, including the macOS application, local runtime, Codex integration, persistence, terminal, file tools, and notifications. It is open-source software licensed under the GNU Affero General Public License v3.0.
+This repository contains Ditch Community Edition: the complete local and SSH product described above, including the macOS application, Community runtimes, Codex integration, persistence, terminals, file tools, notifications, and optional Commercial upgrade bootstrap. It is open-source software licensed under `AGPL-3.0-only`. Commercial distributions are produced separately by DitchNow under a proprietary license.
 
 ## Build From Source
 
@@ -131,6 +133,31 @@ flutter pub get
 flutter run -d macos
 ```
 
+The direct Flutter commands retain the production Relay default. Maintainers
+can explicitly run or build the macOS app against the isolated staging Relay or
+the production Relay from the repository root:
+
+```sh
+scripts/macos-app staging run
+scripts/macos-app production run
+scripts/macos-app staging build
+scripts/macos-app production build
+```
+
+The public configuration lives in `apps/macos/config/.env.staging` and
+`apps/macos/config/.env.production`. These files contain only the deployment
+name, Relay HTTPS origin, and allowed Commercial-update hosts. Stripe keys,
+webhook secrets, Cloudflare credentials, Apple signing credentials, and other
+secrets belong in the Relay or protected release environment and must never be
+added to the app configuration. The build wrapper makes the selected values
+available to Flutter's Xcode build, compiles the Relay origin into `ditchd`, and
+embeds the same update-host policy for the AppKit installer. It fails if staging
+points at production or production points at a non-official Relay.
+Staging and production use the same local Ditch state and are intended to run
+one at a time. Switching environments causes the app to replace the persistent
+runtime with the matching build; it does not create a second daemon. A switch is
+refused while agents are active or their status cannot be verified.
+
 The macOS Xcode build phase runs the equivalent of the following for its bundled native components:
 
 ```sh
@@ -142,7 +169,10 @@ Useful checks from the repository root are:
 
 ```sh
 cargo fmt --all -- --check
+cargo build --locked -p ditchd -p ditch_cli
 cargo test --workspace
+cargo clippy --workspace --all-targets
+scripts/check-community-leakage
 
 cd apps/macos
 flutter analyze
@@ -159,13 +189,17 @@ crates/ditchd/              Runtime server, Codex execution, PTYs, files, and li
 crates/ditch_protocol/      Versioned local requests, responses, and events
 crates/ditch_store/         SQLite persistence and per-project .ditch metadata
 crates/ditch_core/          Shared domain types and application paths
+crates/ditch_identity/      Community-safe installation and SSH host identity
+crates/ditch_product/       Central capability and edition metadata
+crates/ditch_upgrade/       Public Commercial purchase and artifact bootstrap
+crates/ditch_ssh/           OpenSSH discovery, credentials, and fixed setup actions
 crates/ditch_cli/           Local command-line client used by the helper and diagnostics
 crates/ditch_agents/        Early provider adapter abstractions
 crates/ditch_runtime/       Early generic runtime/PTY abstractions
 crates/ditch_orchestrator/  Early orchestration abstractions
 ```
 
-The production path currently concentrates in `apps/macos`, `ditchd`, `ditch_protocol`, and `ditch_store`. Some generic crates describe a broader architecture but are not yet the path used by the shipped UI.
+The production path concentrates in `apps/macos`, `ditchd`, `ditch_protocol`, and `ditch_store`; `ditch_identity`, `ditch_product`, `ditch_upgrade`, and `ditch_ssh` are also active production boundaries. The remaining generic crates describe broader runtime/provider abstractions that are not yet the path used by the shipped UI.
 
 ## Roadmap
 

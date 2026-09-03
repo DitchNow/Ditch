@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 pub const PROTOCOL_VERSION: u16 = 1;
-pub const REMOTE_RUNTIME_PROTOCOL_VERSION: u16 = 1;
+pub const REMOTE_RUNTIME_PROTOCOL_VERSION: u16 = 2;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Envelope<T> {
@@ -81,6 +81,11 @@ pub enum ClientRequest {
     InstallRemoteGit {
         alias: String,
     },
+    OpenRemoteCodexSandboxSetup {
+        alias: String,
+        columns: u16,
+        rows: u16,
+    },
     OpenRemoteCodexAuthentication {
         alias: String,
         columns: u16,
@@ -89,6 +94,12 @@ pub enum ClientRequest {
     /// Internal remote-daemon command. It can only launch the fixed Codex
     /// login flow and is not a generic PTY/shell launcher.
     OpenCodexAuthentication {
+        columns: u16,
+        rows: u16,
+    },
+    /// Internal remote-daemon command. It can only launch the fixed Codex
+    /// Linux sandbox prerequisite installer.
+    OpenCodexSandboxSetup {
         columns: u16,
         rows: u16,
     },
@@ -221,40 +232,18 @@ pub enum ClientRequest {
         attention_ids: Vec<Uuid>,
     },
     MarkAllAttentionRead,
-    RemoteControlStatus,
-    EnsureRemoteMachineIdentity,
-    RemoteMachineControlStatus {
-        alias: String,
+    HostIdentityStatus,
+    CommercialOffers,
+    CreateCommercialCheckout {
+        offer_id: String,
     },
-    CreateRemoteMachinePairing {
-        alias: String,
+    CommercialEntitlement,
+    RedeemCommercialLicense {
+        license_key: String,
     },
-    GetRemoteMachinePairing {
-        alias: String,
-        pairing_id: Uuid,
-    },
-    ConfirmRemoteMachinePairing {
-        alias: String,
-        pairing_id: Uuid,
-    },
-    CancelRemoteMachinePairing {
-        alias: String,
-        pairing_id: Uuid,
-    },
-    CreateRemotePairing,
-    GetRemotePairing {
-        pairing_id: Uuid,
-    },
-    ConfirmRemotePairing {
-        pairing_id: Uuid,
-    },
-    CancelRemotePairing {
-        pairing_id: Uuid,
-    },
-    RevokeRemoteDevice {
-        device_id: Uuid,
-    },
-    DisableRemoteControl,
+    CommercialBillingManagement,
+    CheckCommercialRelease,
+    CurrentCommercialRelease,
     ApprovePermission {
         request_id: Uuid,
     },
@@ -287,8 +276,12 @@ pub enum ServerResponse {
     ProjectCreated(Project),
     AgentStarted(AgentRun),
     AgentMessages(AgentMessagePage),
-    RemoteControlStatus(RemoteControlStatus),
-    RemotePairing(RemotePairing),
+    HostIdentity(HostIdentityStatus),
+    CommercialOffers(ditch_upgrade::CommercialOfferCatalog),
+    CommercialCheckout(ditch_upgrade::CheckoutSession),
+    CommercialEntitlement(ditch_upgrade::EntitlementSummary),
+    CommercialBillingManagement(ditch_upgrade::BillingManagementSession),
+    CommercialRelease(ditch_upgrade::SignedCommercialRelease),
     Accepted,
     Error(ProtocolError),
 }
@@ -472,6 +465,18 @@ pub struct Snapshot {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RuntimeStatus {
     pub identity: String,
+    #[serde(default)]
+    pub edition: String,
+    #[serde(default)]
+    pub deployment_environment: String,
+    #[serde(default)]
+    pub build_identifier: String,
+    #[serde(default)]
+    pub build_number: String,
+    #[serde(default)]
+    pub release_sequence: u64,
+    #[serde(default)]
+    pub community_revision: Option<String>,
     pub pid: u32,
     pub socket_path: String,
     pub active_session_count: usize,
@@ -605,38 +610,51 @@ pub struct ProtocolError {
     pub message: String,
 }
 
+/// Community-safe stable identity for a local or SSH runtime. It carries no
+/// device enrollment or transport data.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct RemoteDeviceSummary {
-    pub device_id: Uuid,
-    pub name: String,
-    pub state: String,
-    pub last_seen_at: Option<DateTime<Utc>>,
-    pub currently_connected: bool,
+pub struct HostIdentityStatus {
+    pub installation_id: Uuid,
+    pub signing_public_key: String,
+    pub key_version: u16,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct RemoteControlStatus {
-    pub configured: bool,
-    pub enabled: bool,
-    pub machine_id: Option<Uuid>,
-    pub owner_id: Option<Uuid>,
-    pub machine_name: String,
-    /// Online means the daemon has a currently authenticated relay socket, not
-    /// merely that D1 contains an old last-seen timestamp.
-    pub online: bool,
-    pub relay_origin: Option<String>,
-    pub devices: Vec<RemoteDeviceSummary>,
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct RemotePairing {
-    pub pairing_id: Uuid,
-    pub machine_id: Uuid,
-    pub state: String,
-    pub expires_at: DateTime<Utc>,
-    /// Present only on initial creation so Flutter can render it as a QR. It is
-    /// never persisted locally and is omitted after a claim or restart.
-    pub qr_payload: Option<String>,
-    pub pending_device_name: Option<String>,
-    pub pending_device_id: Option<Uuid>,
+    const COMMERCIAL_OFFER_FIXTURE: &str =
+        include_str!("../../../docs/contracts/commercial-offers-v1.json");
+
+    #[test]
+    fn commercial_offer_catalog_round_trips_through_local_ipc_canonically() {
+        let catalog = serde_json::from_str(COMMERCIAL_OFFER_FIXTURE).unwrap();
+        let response = ServerResponse::CommercialOffers(catalog);
+        let encoded = serde_json::to_value(response).unwrap();
+        let catalog = &encoded["CommercialOffers"];
+
+        assert_eq!(catalog["protocol_version"], 1);
+        assert_eq!(catalog["refreshed_at"], "2026-08-30T08:00:00Z");
+        assert_eq!(catalog["offers"][0]["base_amount_minor"], "1500");
+        assert_eq!(catalog["offers"][0]["minor_unit_exponent"], 2);
+        assert_eq!(
+            catalog["offers"][1]["introductory_price"]["amount_minor"],
+            "750"
+        );
+        assert!(
+            catalog["offers"][0]["entitlement"]["ssh_hosts_unlimited"]
+                .as_bool()
+                .unwrap()
+        );
+
+        let text = serde_json::to_string(&encoded).unwrap();
+        for obsolete in [
+            "normal_unit_amount",
+            "introductory_unit_amount",
+            "macs_per_unit",
+            "ssh_remote_nodes",
+        ] {
+            assert!(!text.contains(obsolete));
+        }
+    }
 }

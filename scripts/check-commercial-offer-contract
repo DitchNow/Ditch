@@ -1,0 +1,29 @@
+#!/bin/sh
+set -eu
+
+workspace=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
+cd "$workspace"
+
+fail() {
+  echo "Commercial offer contract gate: $*" >&2
+  exit 1
+}
+
+contract_dir=docs/contracts
+fixture=$contract_dir/commercial-offers-v1.json
+schema=$contract_dir/commercial-offers-v1.schema.json
+checksums=$contract_dir/CHECKSUMS.sha256
+
+for path in "$fixture" "$schema" "$checksums"; do
+  [ -f "$path" ] || fail "missing $path"
+done
+
+shasum -a 256 -c "$checksums" >/dev/null || fail "contract checksum mismatch"
+
+python3 -m json.tool "$fixture" >/dev/null || fail "fixture is not valid JSON"
+python3 -m json.tool "$schema" >/dev/null || fail "schema is not valid JSON"
+
+cargo test --locked --quiet -p ditch_upgrade commercial_offer_contract \
+  || fail "Rust canonical contract validation failed"
+
+echo "Commercial offer contract gate passed."

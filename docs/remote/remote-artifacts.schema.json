@@ -4,9 +4,29 @@
   "title": "Ditch remote runtime artifacts",
   "type": "object",
   "additionalProperties": false,
-  "required": ["version", "artifacts"],
+  "required": [
+    "edition",
+    "version",
+    "build_identifier",
+    "community_revision",
+    "remote_runtime_protocol_version",
+    "artifacts"
+  ],
   "properties": {
+    "edition": { "const": "community" },
     "version": { "type": "string", "minLength": 1 },
+    "build_identifier": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9._-]+$"
+    },
+    "community_revision": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{40}$"
+    },
+    "remote_runtime_protocol_version": {
+      "type": "integer",
+      "minimum": 1
+    },
     "artifacts": {
       "type": "array",
       "items": {

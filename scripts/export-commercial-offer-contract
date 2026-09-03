@@ -1,0 +1,64 @@
+#!/bin/sh
+set -eu
+
+workspace=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
+[ "$#" -eq 1 ] || {
+  echo "usage: $0 OUTPUT_DIRECTORY" >&2
+  exit 2
+}
+
+destination=$1
+case "$destination" in
+  ""|/|"$workspace")
+    echo "refusing unsafe contract export destination: $destination" >&2
+    exit 2
+    ;;
+esac
+
+"$workspace/scripts/check-commercial-offer-contract"
+
+mkdir -p "$destination"
+destination=$(CDPATH= cd -- "$destination" && pwd)
+contract_dir=$workspace/docs/contracts
+fixture_name=commercial-offers-v1.json
+schema_name=commercial-offers-v1.schema.json
+
+for source_path in \
+  docs/contracts/$fixture_name \
+  docs/contracts/$schema_name \
+  docs/contracts/CHECKSUMS.sha256
+do
+  git -C "$workspace" ls-files --error-unmatch "$source_path" >/dev/null 2>&1 || {
+    echo "contract export requires committed source: $source_path" >&2
+    exit 1
+  }
+done
+git -C "$workspace" diff --quiet HEAD -- \
+  docs/contracts/$fixture_name \
+  docs/contracts/$schema_name \
+  docs/contracts/CHECKSUMS.sha256 || {
+    echo "contract export requires a clean committed contract" >&2
+    exit 1
+  }
+
+cp "$contract_dir/$fixture_name" "$destination/$fixture_name"
+cp "$contract_dir/$schema_name" "$destination/$schema_name"
+
+revision=$(git -C "$workspace" rev-parse HEAD)
+fixture_sha=$(shasum -a 256 "$contract_dir/$fixture_name" | awk '{print $1}')
+schema_sha=$(shasum -a 256 "$contract_dir/$schema_name" | awk '{print $1}')
+
+manifest=$destination/commercial-offers-v1.manifest.json
+{
+  printf '{\n'
+  printf '  "protocol_version": 1,\n'
+  printf '  "community_revision": "%s",\n' "$revision"
+  printf '  "source_path": "docs/contracts/commercial-offers-v1.json",\n'
+  printf '  "artifacts": {\n'
+  printf '    "%s": "%s",\n' "$fixture_name" "$fixture_sha"
+  printf '    "%s": "%s"\n' "$schema_name" "$schema_sha"
+  printf '  }\n'
+  printf '}\n'
+} > "$manifest"
+
+echo "Exported Commercial offer contract from Community $revision to $destination"

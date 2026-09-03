@@ -36,6 +36,9 @@ codex_binary=$(command -v codex 2>/dev/null || true)
 if [ -n "$codex_binary" ]; then
   printf 'codex\t%s\n' "$("$codex_binary" --version 2>/dev/null | head -n 1)"
   if "$codex_binary" login status >/dev/null 2>&1; then printf 'codex_auth\tready\n'; else printf 'codex_auth\trequired\n'; fi
+  if [ "$(uname -s 2>/dev/null || true)" != Linux ]; then printf 'codex_sandbox\tready\n';
+  elif "$codex_binary" sandbox -P :workspace -C "$HOME" /bin/true >/dev/null 2>&1; then printf 'codex_sandbox\tready\n';
+  else printf 'codex_sandbox\tunavailable\n'; fi
 else printf 'codex\tmissing\n'; printf 'codex_auth\tunavailable\n'; fi
 if [ -x "$HOME/.ditch/bin/current/ditchd" ]; then
   printf 'runtime\t%s\n' "$("$HOME/.ditch/bin/current/ditchd" version-json 2>/dev/null || printf invalid)"
@@ -426,6 +429,33 @@ pub fn check_setup(
         codex,
         None,
     ));
+    let codex_sandbox = values
+        .get("codex_sandbox")
+        .map(String::as_str)
+        .unwrap_or("unavailable");
+    let sandbox_install_available =
+        os == "Linux" && codex != "missing" && matches!(package_manager, "apt" | "dnf");
+    checks.push(check(
+        "codex_sandbox",
+        "Codex Sandbox",
+        if codex_sandbox == "ready" {
+            RemoteCheckState::Ready
+        } else if sandbox_install_available {
+            RemoteCheckState::InstallAvailable
+        } else {
+            RemoteCheckState::ManualActionRequired
+        },
+        if codex_sandbox == "ready" {
+            "Ready"
+        } else if sandbox_install_available {
+            "Ditch can configure the required Linux command sandbox"
+        } else {
+            "This host cannot currently provide the Codex command sandbox"
+        },
+        (codex_sandbox != "ready").then(|| {
+            "Approve for me keeps Codex inside the remote project with workspace-write and disables approval prompts. Linux requires a working distribution Bubblewrap installation to enforce that boundary; Ditch never falls back to unrestricted execution.".to_owned()
+        }),
+    ));
     let persistence = values
         .get("persistence")
         .map(String::as_str)
@@ -486,16 +516,10 @@ pub fn check_setup(
         {
             daemon_epoch = Some(status.instance_id);
         }
-        let identity_status =
-            match connections.request(alias, ClientRequest::EnsureRemoteMachineIdentity) {
-                Ok(ServerResponse::RemoteControlStatus(status)) => Some(status),
-                _ => match connections.request(alias, ClientRequest::RemoteControlStatus) {
-                    Ok(ServerResponse::RemoteControlStatus(status)) => Some(status),
-                    _ => None,
-                },
-            };
-        if let Some(status) = identity_status {
-            machine_id = status.machine_id;
+        if let Ok(ServerResponse::HostIdentity(status)) =
+            connections.request(alias, ClientRequest::HostIdentityStatus)
+        {
+            machine_id = Some(status.installation_id);
         }
     }
     let ready = desktop_project_setup_ready(
@@ -621,14 +645,25 @@ pub fn install_remote_runtime(
         values.get("os").map(String::as_str).unwrap_or(""),
         values.get("arch").map(String::as_str).unwrap_or(""),
     )?;
-    if let Ok(ServerResponse::RuntimeStatus(status)) =
-        connections.request(alias, ClientRequest::RuntimeStatus)
-        && status.active_session_count > 0
+    if values
+        .get("runtime")
+        .is_some_and(|value| value != "missing")
     {
-        return Err(SshError::Failed(format!(
-            "Remote runtime update required, but {} agent(s) are still running. Their work will not be interrupted.",
-            status.active_session_count
-        )));
+        match connections.request(alias, ClientRequest::RuntimeStatus) {
+            Ok(ServerResponse::RuntimeStatus(status)) if status.active_session_count == 0 => {}
+            Ok(ServerResponse::RuntimeStatus(status)) => {
+                return Err(SshError::Failed(format!(
+                    "Remote runtime update deferred because {} agent(s) are still running. Their work will not be interrupted.",
+                    status.active_session_count
+                )));
+            }
+            _ => {
+                return Err(SshError::Failed(
+                    "Remote runtime update deferred because Ditch could not prove that the existing runtime is idle."
+                        .into(),
+                ));
+            }
+        }
     }
 
     let artifact = locate_artifact(target)?;
@@ -705,11 +740,15 @@ fn rollback_remote_runtime(
 root="$HOME/.ditch"
 previous=$(cat "$root/run/previous-runtime" 2>/dev/null || true)
 [ -n "$previous" ] || exit 0
-ln -sfn "$previous" "$root/bin/current.next"
-mv -f "$root/bin/current.next" "$root/bin/current"
+rm -f "$root/bin/current.next"
+ln -s "$previous" "$root/bin/current.next"
 case "$(uname -s)" in
-  Linux) systemctl --user restart the-ditch.service ;;
+  Linux)
+    mv -Tf "$root/bin/current.next" "$root/bin/current"
+    systemctl --user restart the-ditch.service
+    ;;
   Darwin)
+    mv -fh "$root/bin/current.next" "$root/bin/current"
     uid=$(id -u)
     launchctl kickstart -k "user/$uid/dev.theditch.runtime.remote"
     ;;
@@ -789,6 +828,32 @@ fn verify_artifact_metadata(artifact: &Path, target: &str, checksum: &str) -> Re
                 "remote artifact manifest version does not match this Ditch build".into(),
             ));
         }
+        if value.get("edition").and_then(|value| value.as_str()) != Some(crate::RUNTIME_EDITION) {
+            return Err(SshError::Failed(format!(
+                "remote artifact manifest edition does not match this {} build",
+                crate::RUNTIME_EDITION
+            )));
+        }
+        let local_build =
+            option_env!("DITCH_BUILD_IDENTIFIER").unwrap_or(env!("CARGO_PKG_VERSION"));
+        if value
+            .get("build_identifier")
+            .and_then(|value| value.as_str())
+            != Some(local_build)
+        {
+            return Err(SshError::Failed(
+                "remote artifact manifest build identifier does not match this Ditch build".into(),
+            ));
+        }
+        if value
+            .get("remote_runtime_protocol_version")
+            .and_then(|value| value.as_u64())
+            != Some(u64::from(ditch_protocol::REMOTE_RUNTIME_PROTOCOL_VERSION))
+        {
+            return Err(SshError::Failed(
+                "remote artifact manifest protocol does not match this Ditch build".into(),
+            ));
+        }
         let artifact_name = artifact
             .file_name()
             .and_then(|name| name.to_str())
@@ -809,8 +874,11 @@ fn verify_artifact_metadata(artifact: &Path, target: &str, checksum: &str) -> Re
                 "remote artifact checksum is not present in the exact-version manifest".into(),
             ));
         }
+        return Ok(());
     }
-    Ok(())
+    Err(SshError::Failed(
+        "remote runtime installation requires an exact release artifact manifest".into(),
+    ))
 }
 
 fn host_target() -> &'static str {
@@ -1006,7 +1074,8 @@ expected=$3
 upload=$4
 umask 077
 root="$HOME/.ditch"
-mkdir -p "$root/bin/versions/$version/$target" "$root/state" "$root/run" "$root/logs" "$root/identity"
+release="versions/$version/$target/$expected"
+mkdir -p "$root/bin/$release" "$root/state" "$root/run" "$root/logs" "$root/identity"
 chmod 700 "$root" "$root/bin" "$root/bin/versions" "$root/state" "$root/run" "$root/logs" "$root/identity"
 if command -v sha256sum >/dev/null 2>&1; then
   actual=$(sha256sum "$upload" | awk '{print $1}')
@@ -1017,14 +1086,22 @@ else
   exit 41
 fi
 [ "$actual" = "$expected" ] || { echo 'Runtime artifact checksum mismatch' >&2; rm -f "$upload"; exit 42; }
-destination="$root/bin/versions/$version/$target/ditchd"
+destination="$root/bin/$release/ditchd"
 temporary="$destination.tmp"
 mv "$upload" "$temporary"
 chmod 700 "$temporary"
 mv "$temporary" "$destination"
 [ ! -L "$root/bin/current" ] || readlink "$root/bin/current" > "$root/run/previous-runtime"
-ln -sfn "versions/$version/$target" "$root/bin/current.next"
-mv -f "$root/bin/current.next" "$root/bin/current"
+rm -f "$root/bin/current.next"
+ln -s "$release" "$root/bin/current.next"
+case "$(uname -s)" in
+  Linux) mv -Tf "$root/bin/current.next" "$root/bin/current" ;;
+  Darwin) mv -fh "$root/bin/current.next" "$root/bin/current" ;;
+esac
+# Remove the nested symlink produced by the pre-checksum updater. This path is
+# never a release and is scoped to the exact version/target being installed.
+legacy_nested_next="$root/bin/versions/$version/$target/current.next"
+[ ! -L "$legacy_nested_next" ] || rm -f "$legacy_nested_next"
 case "$(uname -s)" in
   Linux)
     if command -v systemctl >/dev/null 2>&1 && systemctl --user show-environment >/dev/null 2>&1; then
@@ -1045,7 +1122,8 @@ NoNewPrivileges=true
 WantedBy=default.target
 UNIT
       systemctl --user daemon-reload
-      systemctl --user enable --now the-ditch.service
+      systemctl --user enable the-ditch.service
+      systemctl --user restart the-ditch.service
     else
       echo 'A persistent user service manager is unavailable' >&2
       exit 43
@@ -1107,10 +1185,57 @@ mod tests {
     }
 
     #[test]
-    fn desktop_project_setup_does_not_require_cloud_or_lingering() {
+    fn infrastructure_setup_keeps_sandbox_readiness_profile_specific() {
         assert!(desktop_project_setup_ready(
             true, true, true, true, true, true
         ));
+    }
+
+    #[test]
+    fn artifact_manifest_must_match_the_exact_build_and_remote_protocol() {
+        let root = std::env::temp_dir().join(format!("ditch-artifact-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let artifact = root.join("ditchd-x86_64-unknown-linux-gnu");
+        fs::write(&artifact, b"runtime").unwrap();
+        let checksum = format!("{:x}", Sha256::digest(b"runtime"));
+        let local_build =
+            option_env!("DITCH_BUILD_IDENTIFIER").unwrap_or(env!("CARGO_PKG_VERSION"));
+        fs::write(
+            root.join("remote-artifacts.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "version": env!("CARGO_PKG_VERSION"),
+                "edition": crate::RUNTIME_EDITION,
+                "build_identifier": local_build,
+                "community_revision": "0123456789012345678901234567890123456789",
+                "remote_runtime_protocol_version": ditch_protocol::REMOTE_RUNTIME_PROTOCOL_VERSION,
+                "artifacts": [{
+                    "target": "x86_64-unknown-linux-gnu",
+                    "sha256": checksum,
+                    "artifact": "ditchd-x86_64-unknown-linux-gnu"
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(verify_artifact_metadata(&artifact, "x86_64-unknown-linux-gnu", &checksum).is_ok());
+
+        let mismatched = serde_json::json!({
+            "version": env!("CARGO_PKG_VERSION"),
+            "edition": crate::RUNTIME_EDITION,
+            "build_identifier": local_build,
+            "community_revision": "0123456789012345678901234567890123456789",
+            "remote_runtime_protocol_version": ditch_protocol::REMOTE_RUNTIME_PROTOCOL_VERSION + 1,
+            "artifacts": []
+        });
+        fs::write(
+            root.join("remote-artifacts.json"),
+            serde_json::to_vec(&mismatched).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            verify_artifact_metadata(&artifact, "x86_64-unknown-linux-gnu", &checksum).is_err()
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

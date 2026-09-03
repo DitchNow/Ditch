@@ -1,0 +1,118 @@
+name: Staging Community Distribution
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Human-readable staging version
+        required: true
+      build_sequence:
+        description: Global monotonically increasing Ditch build number
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  staging-distribution:
+    runs-on: macos-15
+    environment: staging-release
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - name: Validate release inputs
+        env:
+          VERSION: ${{ inputs.version }}
+          BUILD_SEQUENCE: ${{ inputs.build_sequence }}
+        run: |
+          printf '%s\n' "$VERSION" | grep -Eq '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+          case "$BUILD_SEQUENCE" in *[!0-9]*|''|0) exit 1 ;; esac
+          test "$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)" = "$VERSION"
+      - name: Install Developer ID certificate
+        env:
+          CERTIFICATE_B64: ${{ secrets.DITCH_DEVELOPER_ID_APPLICATION_P12_B64 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.DITCH_DEVELOPER_ID_APPLICATION_P12_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.DITCH_SIGNING_KEYCHAIN_PASSWORD }}
+        run: |
+          certificate="$RUNNER_TEMP/ditch-developer-id.p12"
+          keychain="$RUNNER_TEMP/ditch-signing.keychain-db"
+          printf '%s' "$CERTIFICATE_B64" | base64 --decode > "$certificate"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$keychain"
+          security import "$certificate" -P "$CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$keychain"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$keychain"
+          security list-keychains -d user -s "$keychain"
+          rm -f "$certificate"
+      - name: Configure notarization credentials
+        env:
+          NOTARY_KEY_B64: ${{ secrets.DITCH_NOTARY_API_PRIVATE_KEY_B64 }}
+          NOTARY_KEY_ID: ${{ secrets.DITCH_NOTARY_API_KEY_ID }}
+          NOTARY_ISSUER: ${{ secrets.DITCH_NOTARY_API_ISSUER_ID }}
+        run: |
+          notary_key="$RUNNER_TEMP/ditch-notary-key.p8"
+          printf '%s' "$NOTARY_KEY_B64" | base64 --decode > "$notary_key"
+          xcrun notarytool store-credentials ditch-staging-ci \
+            --key "$notary_key" --key-id "$NOTARY_KEY_ID" --issuer "$NOTARY_ISSUER"
+          rm -f "$notary_key"
+      - name: Configure public update verification
+        env:
+          SPARKLE_PUBLIC_KEY: ${{ secrets.DITCH_SPARKLE_PUBLIC_ED_KEY }}
+          MANIFEST_PUBLIC_KEY: ${{ secrets.DITCH_RELEASE_MANIFEST_PUBLIC_KEY_SEC1_B64 }}
+          APPLE_TEAM_ID: ${{ secrets.DITCH_APPLE_TEAM_ID }}
+          BUILD_SEQUENCE: ${{ inputs.build_sequence }}
+        run: |
+          mkdir -p apps/macos/config
+          printf '%s\n' \
+            "DITCH_DEPLOYMENT_ENVIRONMENT=staging" \
+            "DITCH_RELAY_ORIGIN=https://ditch-remote-relay-staging.matin-1a7.workers.dev" \
+            "DITCH_UPDATE_ALLOWED_HOSTS=ditch-remote-relay-staging.matin-1a7.workers.dev" \
+            > apps/macos/config/.env.staging
+          printf '%s\n' \
+            "DITCH_SPARKLE_PUBLIC_ED_KEY=$SPARKLE_PUBLIC_KEY" \
+            "DITCH_RELEASE_MANIFEST_PUBLIC_KEY_SEC1_B64=$MANIFEST_PUBLIC_KEY" \
+            "DITCH_APPLE_TEAM_ID=$APPLE_TEAM_ID" \
+            "DITCH_COMMUNITY_BUILD_SEQUENCE=$BUILD_SEQUENCE" \
+            > apps/macos/config/.env.release.staging
+      - run: cargo fmt --all -- --check
+      - run: cargo test --locked --workspace
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - working-directory: apps/macos
+        run: flutter pub get
+      - working-directory: apps/macos
+        run: flutter analyze
+      - working-directory: apps/macos
+        run: flutter test
+      - name: Build signed staging application
+        env:
+          DITCH_FLUTTER: ${{ env.FLUTTER_ROOT }}
+        run: scripts/macos-app staging build --release --build-name '${{ inputs.version }}' --build-number '${{ inputs.build_sequence }}'
+      - run: scripts/check-community-leakage
+      - name: Verify application signature
+        env:
+          APPLE_TEAM_ID: ${{ secrets.DITCH_APPLE_TEAM_ID }}
+        run: |
+          app='apps/macos/build/macos/Build/Products/Release/Ditch.app'
+          codesign --verify --deep --strict --verbose=2 "$app"
+          actual_team=$(codesign -dv --verbose=4 "$app" 2>&1 | sed -n 's/^TeamIdentifier=//p')
+          test "$actual_team" = "$APPLE_TEAM_ID"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Contents/Info.plist")" = '${{ inputs.version }}'
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$app/Contents/Info.plist")" = '${{ inputs.build_sequence }}'
+          test "$(/usr/libexec/PlistBuddy -c 'Print :ReleaseSequence' "$app/Contents/Resources/DitchEnvironment.plist")" = '${{ inputs.build_sequence }}'
+      - name: Package and notarize staging DMG
+        env:
+          DITCH_CODESIGN_IDENTITY: Developer ID Application
+          DITCH_APPLE_TEAM_ID: ${{ secrets.DITCH_APPLE_TEAM_ID }}
+          DITCH_NOTARY_PROFILE: ditch-staging-ci
+          DITCH_DMG_OUTPUT: ${{ github.workspace }}/dist/community/The-Ditch-Staging.dmg
+        run: scripts/package-community-dmg
+      - uses: actions/upload-artifact@v4
+        with:
+          name: The-Ditch-Staging-${{ inputs.version }}-${{ inputs.build_sequence }}
+          path: dist/community/The-Ditch-Staging.dmg
+          if-no-files-found: error
+          retention-days: 14

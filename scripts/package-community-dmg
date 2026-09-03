@@ -1,0 +1,43 @@
+#!/bin/sh
+set -eu
+
+workspace=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
+app=${DITCH_APP_PATH:-"$workspace/apps/macos/build/macos/Build/Products/Release/Ditch.app"}
+output=${DITCH_DMG_OUTPUT:-"$workspace/dist/community/The-Ditch.dmg"}
+
+[ -d "$app" ] || { echo "error: Community app not found at $app" >&2; exit 1; }
+case "$output" in
+  "$workspace"/dist/community/*.dmg) ;;
+  *) echo "error: DMG output must be inside dist/community" >&2; exit 1 ;;
+esac
+
+if [ -n "${DITCH_CODESIGN_IDENTITY:-}" ]; then
+  codesign --verify --deep --strict --verbose=2 "$app"
+  actual_team_id=$(codesign -dv --verbose=4 "$app" 2>&1 | sed -n 's/^TeamIdentifier=//p' | tail -n 1)
+  [ -n "$actual_team_id" ] || { echo "error: signed app has no Apple Team ID" >&2; exit 1; }
+  if [ -n "${DITCH_APPLE_TEAM_ID:-}" ] && [ "$actual_team_id" != "$DITCH_APPLE_TEAM_ID" ]; then
+    echo "error: app Team ID $actual_team_id does not match expected Team ID $DITCH_APPLE_TEAM_ID" >&2
+    exit 1
+  fi
+fi
+
+staging=$(mktemp -d "${TMPDIR:-/tmp}/ditch-community-dmg.XXXXXX")
+cleanup() { rm -rf "$staging"; }
+trap cleanup EXIT HUP INT TERM
+
+mkdir -p "$(dirname "$output")"
+ditto "$app" "$staging/The Ditch.app"
+ln -s /Applications "$staging/Applications"
+hdiutil create -quiet -volname "The Ditch" -srcfolder "$staging" -format UDZO -ov "$output"
+
+if [ -n "${DITCH_CODESIGN_IDENTITY:-}" ]; then
+  codesign --force --timestamp --sign "$DITCH_CODESIGN_IDENTITY" "$output"
+fi
+
+if [ -n "${DITCH_NOTARY_PROFILE:-}" ]; then
+  xcrun notarytool submit "$output" --keychain-profile "$DITCH_NOTARY_PROFILE" --wait
+  xcrun stapler staple "$output"
+  xcrun stapler validate "$output"
+fi
+
+echo "Community DMG written to $output"

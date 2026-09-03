@@ -1,0 +1,25 @@
+[package]
+name = "ditch_upgrade"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+base64.workspace = true
+chrono.workspace = true
+ditch_identity.workspace = true
+ditch_product.workspace = true
+p256 = { workspace = true, features = ["ecdsa"] }
+rand_core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+semver.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+ureq = { version = "2.12.1", features = ["json"] }
+url.workspace = true
+uuid.workspace = true
+zeroize = "1.8.2"
+
+[dev-dependencies]
+jsonschema = { version = "0.52.1", default-features = false }

@@ -60,12 +60,25 @@ Once required checks pass, the wizard automatically replaces the checklist
 with a directory-only browser rooted initially at the remote user's `$HOME`;
 no extra "Check Again" action is part of the successful path.
 
-Runtime artifacts are exact-version, target-qualified, SHA-256 verified, and
-installed into a version directory before an atomic `current` symlink switch.
-The previous symlink is retained for rollback. Updates refuse to proceed while
-the daemon reports active sessions. `scripts/build-remote-artifacts` emits the
-release artifacts and manifest; the app packages its native macOS Rust daemon
-artifact separately from the Swift status-host executable.
+The default `ApproveForMe` execution profile is identical on local and remote
+projects: Codex receives `--sandbox workspace-write --ask-for-approval never`
+with workspace network access enabled. On Linux, Ditch validates the official
+Bubblewrap/user-namespace prerequisite during onboarding and automatically
+opens the narrowly scoped setup terminal before directory selection when it is
+missing. Ubuntu may require a one-time sudo authorization to install the
+distribution Bubblewrap and AppArmor packages; that credential stays in the
+remote PTY and is never stored. Ditch never converts a failed workspace
+sandbox into unrestricted execution.
+
+Runtime artifacts are exact-build, target-qualified, SHA-256 verified, and
+installed into a checksum-qualified version directory before an atomic
+`current` symlink switch. The previous immutable symlink target is retained for
+rollback. The manifest binds each artifact to the source-derived build
+identifier and remote protocol version, and the macOS build refuses to package
+stale artifacts. Updates refuse to proceed while the daemon reports active
+sessions. `scripts/build-remote-artifacts` emits the release artifacts and
+manifest; the app packages its native macOS Rust daemon artifact separately
+from the Swift status-host executable.
 
 Remote machine identity is generated on the remote host. macOS stores its
 private identity in Keychain; headless Linux uses an atomic 0600 file under the
@@ -87,7 +100,8 @@ remote project from the desktop app.
   SSHFS, rsync, generic remote shell, remote source editor, or offline command
   queue is provided.
 - The interactive PTY exposed during setup can launch only the fixed remote
-  `codex login` flow. The remote daemon owns that PTY.
+  `codex login` or Linux Codex sandbox-prerequisite flow. The remote daemon
+  owns that PTY.
 - Linux Git installation remains manual when elevation is required; exact
   package-manager instructions are shown. User-owned Homebrew installation is
   the only automatic Git path in v1.

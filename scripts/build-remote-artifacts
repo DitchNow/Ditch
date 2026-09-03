@@ -3,6 +3,14 @@ set -eu
 
 workspace=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
 version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' "$workspace/Cargo.toml" | head -n 1)
+DITCH_BUILD_IDENTIFIER=${DITCH_BUILD_IDENTIFIER:-$("$workspace/scripts/build-identifier")}
+case "$DITCH_BUILD_IDENTIFIER" in
+  *[!A-Za-z0-9._-]*) echo 'error: invalid DITCH_BUILD_IDENTIFIER' >&2; exit 1 ;;
+esac
+export DITCH_BUILD_IDENTIFIER
+remote_protocol=$(sed -n 's/^pub const REMOTE_RUNTIME_PROTOCOL_VERSION: u16 = \([0-9][0-9]*\);/\1/p' "$workspace/crates/ditch_protocol/src/lib.rs")
+[ -n "$remote_protocol" ] || { echo 'error: remote runtime protocol version was not found' >&2; exit 1; }
+community_revision=$(git -C "$workspace" rev-parse HEAD)
 output=${DITCH_REMOTE_ARTIFACT_OUTPUT:-"$workspace/dist/remote/$version"}
 targets=${DITCH_REMOTE_TARGETS:-"x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu aarch64-apple-darwin x86_64-apple-darwin"}
 docker_image=${DITCH_REMOTE_DOCKER_IMAGE:-"rust:1.97-bookworm"}
@@ -37,6 +45,7 @@ build_linux_with_docker() {
     --user "$(id -u):$(id -g)" \
     -e HOME=/tmp \
     -e CARGO_HOME=/cargo \
+    -e DITCH_BUILD_IDENTIFIER="$DITCH_BUILD_IDENTIFIER" \
     -e CARGO_TARGET_DIR="/workspace/target/$target" \
     -v "$workspace:/workspace" \
     -v "$docker_cache:/cargo" \
@@ -68,7 +77,8 @@ mkdir -p "$output"
 manifest="$output/remote-artifacts.json"
 temporary="$manifest.tmp"
 
-printf '{\n  "version": "%s",\n  "artifacts": [\n' "$version" > "$temporary"
+printf '{\n  "edition": "community",\n  "version": "%s",\n  "build_identifier": "%s",\n  "community_revision": "%s",\n  "remote_runtime_protocol_version": %s,\n  "artifacts": [\n' \
+  "$version" "$DITCH_BUILD_IDENTIFIER" "$community_revision" "$remote_protocol" > "$temporary"
 separator=''
 for target in $targets; do
   build_target "$target"
