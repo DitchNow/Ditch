@@ -1,0 +1,12 @@
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Deterministic protocol fixture data"
+paths = [
+  '''^docs/remote/fixtures/v1\.json$''',
+]
+regexTarget = "secret"
+regexes = [
+  '''^fixture-idempotency-0001$''',
+]

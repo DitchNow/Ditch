@@ -212,6 +212,17 @@ impl MachineIdentity {
             agreement: SecretKey::random(&mut OsRng),
         }
     }
+    pub fn from_private_scalars(
+        machine_id: Uuid,
+        signing: &[u8],
+        agreement: &[u8],
+    ) -> Result<Self, RemoteError> {
+        Ok(Self {
+            machine_id,
+            signing: SigningKey::from_slice(signing).map_err(|_| RemoteError::InvalidKey)?,
+            agreement: SecretKey::from_slice(agreement).map_err(|_| RemoteError::InvalidKey)?,
+        })
+    }
     pub fn signing_public_key(&self) -> String {
         URL_SAFE_NO_PAD.encode(
             VerifyingKey::from(&self.signing)

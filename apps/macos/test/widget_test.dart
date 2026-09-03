@@ -3,7 +3,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/gestures.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
-import 'package:the_ditch/main.dart';
+import 'package:the_ditch_commercial/main.dart';
 import 'package:the_ditch/application/command_center_controller.dart';
 import 'package:the_ditch/data/runtime_models.dart';
 import 'package:the_ditch/design_system/ditch_theme.dart';
@@ -18,12 +18,147 @@ const _testProject = DitchProject(
   path: '/tmp/the-ditch-test-project',
 );
 
+class _ExpiredCommercialClient extends DitchRuntimeClient {
+  _ExpiredCommercialClient()
+    : super(socketPath: '/tmp/ditch-expired-commercial.sock');
+
+  @override
+  Future<Map<String, dynamic>> request(Object body) {
+    if (body == 'CommercialBillingManagement') {
+      return Future.value({
+        'CommercialBillingManagement': {
+          'billing_management_url':
+              'https://payments.example.test/ditch/renewal',
+        },
+      });
+    }
+    throw StateError(
+      'Commercial subscription expired. Local and SSH Ditch continue to work.',
+    );
+  }
+}
+
+class _ActiveCommercialClient extends DitchRuntimeClient {
+  _ActiveCommercialClient()
+    : super(socketPath: '/tmp/ditch-active-commercial.sock');
+
+  @override
+  Future<Map<String, dynamic>> request(Object body) async {
+    if (body == 'CommercialBillingManagement') {
+      return {
+        'CommercialBillingManagement': {
+          'billing_management_url':
+              'https://payments.example.test/ditch/management',
+        },
+      };
+    }
+    if (body == 'RemoteControlStatus') {
+      return {
+        'RemoteControlStatus': {
+          'configured': true,
+          'online': true,
+          'machine_name': 'Test Mac',
+          'devices': <Object>[],
+        },
+      };
+    }
+    throw StateError('Unexpected request: $body');
+  }
+}
+
 Widget _testApp() => const TheDitchApp(
   connectRuntimeOnStart: false,
   initialProjects: [_testProject],
 );
 
 void main() {
+  testWidgets('expired Commercial keeps local and SSH reassurance visible', (
+    tester,
+  ) async {
+    await tester.pumpWidget(
+      MaterialApp(
+        home: RemoteSettingsDialog(client: _ExpiredCommercialClient()),
+      ),
+    );
+    await tester.pump();
+
+    expect(find.text('Commercial subscription expired.'), findsOneWidget);
+    expect(find.text('Local and SSH Ditch continue to work.'), findsOneWidget);
+    expect(find.text('Renew'), findsOneWidget);
+  });
+
+  testWidgets('renewal opens only the Relay-provided billing URL', (
+    tester,
+  ) async {
+    final opened = <MethodCall>[];
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(
+          const MethodChannel('the_ditch/application'),
+          (call) async {
+            opened.add(call);
+            return true;
+          },
+        );
+    addTearDown(
+      () => TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(
+            const MethodChannel('the_ditch/application'),
+            null,
+          ),
+    );
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: RemoteSettingsDialog(client: _ExpiredCommercialClient()),
+      ),
+    );
+    await tester.pump();
+    await tester.tap(find.byKey(const Key('renew-commercial')));
+    await tester.pump();
+
+    expect(opened, hasLength(1));
+    expect(opened.single.method, 'openURL');
+    expect(
+      opened.single.arguments,
+      'https://payments.example.test/ditch/renewal',
+    );
+    expect(find.text('Local and SSH Ditch continue to work.'), findsOneWidget);
+  });
+
+  testWidgets('Manage Billing is provider-neutral and Relay-controlled', (
+    tester,
+  ) async {
+    final openedUrls = <String>[];
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(
+          const MethodChannel('the_ditch/application'),
+          (call) async {
+            if (call.method == 'openURL') {
+              openedUrls.add(call.arguments as String);
+            }
+            return true;
+          },
+        );
+    addTearDown(
+      () => TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(
+            const MethodChannel('the_ditch/application'),
+            null,
+          ),
+    );
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: RemoteSettingsDialog(client: _ActiveCommercialClient()),
+      ),
+    );
+    await tester.pump();
+    await tester.tap(find.byKey(const Key('manage-commercial-billing')));
+    await tester.pump();
+
+    expect(openedUrls, ['https://payments.example.test/ditch/management']);
+  });
+
   test('agent execution settings expose model and approval controls', () {
     final settings = AgentExecutionSettings();
 

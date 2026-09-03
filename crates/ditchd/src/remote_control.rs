@@ -1,19 +1,15 @@
 use super::{RuntimeState, protocol_error};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{TimeZone, Utc};
+use ditch_commercial_store::{CommercialStoreExt, RemoteDeviceRecord, RemoteMachineRecord};
 use ditch_protocol::{RemoteControlStatus, RemoteDeviceSummary, RemotePairing, ServerResponse};
-#[cfg(not(target_os = "macos"))]
-use ditch_remote::FileIdentityStore;
-#[cfg(target_os = "macos")]
-use ditch_remote::KeychainIdentityStore;
 use ditch_remote::{
     Aad, AttentionProjection, ConfirmationClass, PairwiseContext, ProjectProjection, RemoteCommand,
     RemoteCommandType, RemoteProjector, SessionProjection, SessionPromptPayload,
     SessionStartPayload, SessionTargetPayload, TranscriptQueryPayload, decrypt, encrypt,
     validate_p256_public_key,
 };
-use ditch_remote::{IdentityStore, MachineIdentity, canonical_request};
-use ditch_store::{RemoteDeviceRecord, RemoteMachineRecord};
+use ditch_remote::{MachineIdentity, canonical_request};
 use rand_core::{OsRng, RngCore};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -27,7 +23,6 @@ use tungstenite::{Message, stream::MaybeTlsStream};
 use url::Url;
 use uuid::Uuid;
 
-const PRODUCTION_RELAY_ORIGIN: &str = "https://relay.ditchnow.nl";
 const HEARTBEAT_INTERVAL: StdDuration = StdDuration::from_secs(20);
 const PROJECTION_ACK_TIMEOUT: StdDuration = StdDuration::from_secs(30);
 const MAX_INCREMENTAL_RECORDS: usize = 32;
@@ -42,8 +37,16 @@ pub(super) struct RemoteController {
 
 impl RemoteController {
     pub(super) fn new() -> Self {
-        let relay_origin =
-            configured_relay_origin(std::env::var("DITCH_REMOTE_RELAY_ORIGIN").ok().as_deref());
+        // Official Release builds use the origin compiled into the edition.
+        // Debug builds retain a local override for Relay development only.
+        #[cfg(debug_assertions)]
+        let development_override = std::env::var("DITCH_REMOTE_RELAY_ORIGIN").ok();
+        #[cfg(not(debug_assertions))]
+        let development_override: Option<String> = None;
+        let relay_origin = configured_relay_origin(
+            development_override.as_deref(),
+            ditch_commercial::CONFIGURED_RELAY_ORIGIN,
+        );
         if let Err(error) = &relay_origin {
             eprintln!("ditchd ignored invalid DITCH_REMOTE_RELAY_ORIGIN: {error}");
         }
@@ -57,11 +60,14 @@ impl RemoteController {
     }
 }
 
-fn configured_relay_origin(override_value: Option<&str>) -> Result<String, String> {
+fn configured_relay_origin(
+    override_value: Option<&str>,
+    compiled_origin: &str,
+) -> Result<String, String> {
     let candidate = override_value
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .unwrap_or(PRODUCTION_RELAY_ORIGIN);
+        .unwrap_or(compiled_origin);
     let parsed = Url::parse(candidate).map_err(|_| "expected an absolute URL".to_owned())?;
     let local_development = parsed.scheme() == "http"
         && parsed
@@ -82,7 +88,38 @@ fn configured_relay_origin(override_value: Option<&str>) -> Result<String, Strin
     Ok(parsed.origin().ascii_serialization())
 }
 
+fn has_remote_control_entitlement(state: &Arc<Mutex<RuntimeState>>) -> bool {
+    state.lock().is_ok_and(|guard| {
+        guard
+            .edition
+            .commercial_allows(ditch_commercial::CommercialCapabilityId::REMOTE_CONTROL)
+    })
+}
+
+fn entitlement_required() -> ServerResponse {
+    protocol_error(
+        "commercial_entitlement_required",
+        "Commercial subscription expired. Local and SSH Ditch continue to work.",
+    )
+}
+
+pub(super) fn entitlement_changed(state: Arc<Mutex<RuntimeState>>, active: bool) {
+    if active {
+        start_connection(state);
+        return;
+    }
+    if let Ok(mut guard) = state.lock() {
+        guard.edition.remote.authenticated_socket_live = false;
+        if let Some(sender) = guard.edition.remote.projection_wakeup.as_ref() {
+            let _ = sender.try_send(());
+        }
+    }
+}
+
 pub(super) fn status(state: Arc<Mutex<RuntimeState>>) -> ServerResponse {
+    if !has_remote_control_entitlement(&state) {
+        return entitlement_required();
+    }
     let should_reconcile = state
         .lock()
         .expect("runtime state lock should not be poisoned")
@@ -107,11 +144,14 @@ pub(super) fn status(state: Arc<Mutex<RuntimeState>>) -> ServerResponse {
 }
 
 pub(super) fn ensure_machine_identity(state: Arc<Mutex<RuntimeState>>) -> ServerResponse {
+    if !has_remote_control_entitlement(&state) {
+        return entitlement_required();
+    }
     let (origin, identity, name) = {
         let mut guard = state
             .lock()
             .expect("runtime state lock should not be poisoned");
-        let Some(origin) = guard.remote.relay_origin.clone() else {
+        let Some(origin) = guard.edition.remote.relay_origin.clone() else {
             return protocol_error(
                 "remote_relay_unavailable",
                 "The remote relay configuration is invalid.",
@@ -151,7 +191,7 @@ fn status_from_local_store(state: Arc<Mutex<RuntimeState>>) -> ServerResponse {
         Err(error) => return protocol_error("remote_store_failed", error.to_string()),
     };
     ServerResponse::RemoteControlStatus(RemoteControlStatus {
-        configured: state.remote.relay_origin.is_some(),
+        configured: state.edition.remote.relay_origin.is_some(),
         enabled: machine.as_ref().is_some_and(|value| value.enabled),
         machine_id: machine.as_ref().map(|value| value.machine_id),
         owner_id: machine.as_ref().and_then(|value| value.owner_id),
@@ -159,8 +199,8 @@ fn status_from_local_store(state: Arc<Mutex<RuntimeState>>) -> ServerResponse {
             .as_ref()
             .map(|value| value.name.clone())
             .unwrap_or_else(machine_name),
-        online: state.remote.authenticated_socket_live,
-        relay_origin: state.remote.relay_origin.clone(),
+        online: state.edition.remote.authenticated_socket_live,
+        relay_origin: state.edition.remote.relay_origin.clone(),
         devices: devices
             .into_iter()
             .map(|device| RemoteDeviceSummary {
@@ -274,11 +314,14 @@ fn active_devices_from_response(value: &Value) -> Result<Vec<RemoteDeviceRecord>
 }
 
 pub(super) fn create_pairing(state: Arc<Mutex<RuntimeState>>) -> ServerResponse {
+    if !has_remote_control_entitlement(&state) {
+        return entitlement_required();
+    }
     let (origin, identity, machine_name) = {
         let mut state = state
             .lock()
             .expect("runtime state lock should not be poisoned");
-        let Some(origin) = state.remote.relay_origin.clone() else {
+        let Some(origin) = state.edition.remote.relay_origin.clone() else {
             return protocol_error(
                 "remote_not_configured",
                 "The remote relay configuration is invalid.",
@@ -306,6 +349,7 @@ pub(super) fn create_pairing(state: Arc<Mutex<RuntimeState>>) -> ServerResponse 
         .lock()
         .expect("runtime state lock should not be poisoned");
     state
+        .edition
         .remote
         .pairings
         .insert(pairing.pairing_id, pairing.clone());
@@ -313,6 +357,9 @@ pub(super) fn create_pairing(state: Arc<Mutex<RuntimeState>>) -> ServerResponse 
 }
 
 pub(super) fn get_pairing(state: Arc<Mutex<RuntimeState>>, pairing_id: Uuid) -> ServerResponse {
+    if !has_remote_control_entitlement(&state) {
+        return entitlement_required();
+    }
     let (origin, identity) = match remote_identity(&state) {
         Ok(value) => value,
         Err(response) => return response,
@@ -329,6 +376,7 @@ pub(super) fn get_pairing(state: Arc<Mutex<RuntimeState>>, pairing_id: Uuid) -> 
     state
         .lock()
         .expect("runtime state lock should not be poisoned")
+        .edition
         .remote
         .pairings
         .insert(pairing_id, pairing.clone());
@@ -336,6 +384,9 @@ pub(super) fn get_pairing(state: Arc<Mutex<RuntimeState>>, pairing_id: Uuid) -> 
 }
 
 pub(super) fn confirm_pairing(state: Arc<Mutex<RuntimeState>>, pairing_id: Uuid) -> ServerResponse {
+    if !has_remote_control_entitlement(&state) {
+        return entitlement_required();
+    }
     let (origin, identity) = match remote_identity(&state) {
         Ok(value) => value,
         Err(response) => return response,
@@ -409,7 +460,11 @@ pub(super) fn confirm_pairing(state: Arc<Mutex<RuntimeState>>, pairing_id: Uuid)
         pending_device_name: Some(device.name),
         pending_device_id: Some(device_id),
     };
-    guard.remote.pairings.insert(pairing_id, pairing.clone());
+    guard
+        .edition
+        .remote
+        .pairings
+        .insert(pairing_id, pairing.clone());
     drop(guard);
     start_connection(Arc::clone(&state));
     ServerResponse::RemotePairing(pairing)
@@ -427,6 +482,7 @@ pub(super) fn cancel_pairing(state: Arc<Mutex<RuntimeState>>, pairing_id: Uuid) 
     state
         .lock()
         .expect("runtime state lock should not be poisoned")
+        .edition
         .remote
         .pairings
         .remove(&pairing_id);
@@ -462,7 +518,7 @@ pub(super) fn disable(state: Arc<Mutex<RuntimeState>>) -> ServerResponse {
     let mut state = state
         .lock()
         .expect("runtime state lock should not be poisoned");
-    state.remote.authenticated_socket_live = false;
+    state.edition.remote.authenticated_socket_live = false;
     if let Err(error) = state.store.set_remote_enabled(false) {
         return protocol_error("remote_store_failed", error.to_string());
     }
@@ -477,30 +533,14 @@ fn ensure_identity(state: &mut RuntimeState) -> Result<MachineIdentity, String> 
         .store
         .remote_machine()
         .map_err(|error| error.to_string())?;
-    let machine_id = existing
-        .as_ref()
-        .map(|value| value.machine_id)
-        .unwrap_or_else(Uuid::new_v4);
-    #[cfg(target_os = "macos")]
-    let identity_store = KeychainIdentityStore;
-    #[cfg(not(target_os = "macos"))]
-    let identity_store = FileIdentityStore::new(state.paths.data_dir.join("identity"));
-    let identity = match identity_store
-        .load(machine_id)
-        .map_err(|error| error.to_string())?
-    {
-        Some(value) => value,
-        None => {
-            let value = MachineIdentity::generate(machine_id);
-            identity_store
-                .save(&value)
-                .map_err(|error| error.to_string())?;
-            value
-        }
-    };
+    let identity = ditch_commercial::remote_machine_identity(&state.installation_identity)?;
+    let machine_id = identity.machine_id;
     let record = RemoteMachineRecord {
         machine_id,
-        owner_id: existing.as_ref().and_then(|value| value.owner_id),
+        owner_id: existing
+            .as_ref()
+            .filter(|value| value.machine_id == machine_id)
+            .and_then(|value| value.owner_id),
         name: existing
             .as_ref()
             .map(|value| value.name.clone())
@@ -525,13 +565,14 @@ fn ensure_identity(state: &mut RuntimeState) -> Result<MachineIdentity, String> 
     Ok(identity)
 }
 
+#[allow(clippy::result_large_err)]
 fn remote_identity(
     state: &Arc<Mutex<RuntimeState>>,
 ) -> Result<(String, MachineIdentity), ServerResponse> {
     let mut state = state
         .lock()
         .expect("runtime state lock should not be poisoned");
-    let Some(origin) = state.remote.relay_origin.clone() else {
+    let Some(origin) = state.edition.remote.relay_origin.clone() else {
         return Err(protocol_error(
             "remote_not_configured",
             "The remote relay configuration is invalid.",
@@ -665,6 +706,9 @@ fn machine_name() -> String {
 }
 
 pub(super) fn start_connection(state: Arc<Mutex<RuntimeState>>) {
+    if !has_remote_control_entitlement(&state) {
+        return;
+    }
     let receiver = {
         let mut guard = state
             .lock()
@@ -675,7 +719,10 @@ pub(super) fn start_connection(state: Arc<Mutex<RuntimeState>>) {
             .ok()
             .flatten()
             .is_some_and(|machine| machine.enabled && machine.owner_id.is_some());
-        if !enabled || guard.remote.connection_started || guard.remote.relay_origin.is_none() {
+        if !enabled
+            || guard.edition.remote.connection_started
+            || guard.edition.remote.relay_origin.is_none()
+        {
             return;
         }
         // Capacity one coalesces any number of local domain events into one
@@ -683,24 +730,30 @@ pub(super) fn start_connection(state: Arc<Mutex<RuntimeState>>) {
         // authoritative runtime, so projection payloads cannot accumulate in
         // an unbounded channel.
         let (sender, receiver) = mpsc::sync_channel(1);
-        guard.remote.projection_wakeup = Some(sender);
-        guard.remote.connection_started = true;
+        guard.edition.remote.projection_wakeup = Some(sender);
+        guard.edition.remote.connection_started = true;
         receiver
     };
     thread::spawn(move || connection_loop(state, receiver));
 }
 
 pub(super) fn publish_projection(state: &mut RuntimeState) {
-    if !state.remote.authenticated_socket_live {
+    if !state
+        .edition
+        .commercial_allows(ditch_commercial::CommercialCapabilityId::REMOTE_CONTROL)
+    {
         return;
     }
-    let Some(sender) = state.remote.projection_wakeup.clone() else {
+    if !state.edition.remote.authenticated_socket_live {
+        return;
+    }
+    let Some(sender) = state.edition.remote.projection_wakeup.clone() else {
         return;
     };
     match sender.try_send(()) {
         Ok(()) | Err(TrySendError::Full(())) => {}
         Err(TrySendError::Disconnected(())) => {
-            state.remote.authenticated_socket_live = false;
+            state.edition.remote.authenticated_socket_live = false;
         }
     }
 }
@@ -1026,11 +1079,17 @@ fn persist_projection_progress(
 fn connection_loop(state: Arc<Mutex<RuntimeState>>, receiver: Receiver<()>) {
     let mut backoff = 1_u64;
     loop {
-        let enabled = state
-            .lock()
-            .ok()
-            .and_then(|guard| guard.store.remote_machine().ok().flatten())
-            .is_some_and(|machine| machine.enabled);
+        let enabled = state.lock().ok().is_some_and(|guard| {
+            guard
+                .edition
+                .commercial_allows(ditch_commercial::CommercialCapabilityId::REMOTE_CONTROL)
+                && guard
+                    .store
+                    .remote_machine()
+                    .ok()
+                    .flatten()
+                    .is_some_and(|machine| machine.enabled)
+        });
         if !enabled {
             break;
         }
@@ -1042,7 +1101,7 @@ fn connection_loop(state: Arc<Mutex<RuntimeState>>, receiver: Receiver<()>) {
                     super::RUNTIME_IDENTITY
                 );
                 if let Ok(mut guard) = state.lock() {
-                    guard.remote.authenticated_socket_live = false;
+                    guard.edition.remote.authenticated_socket_live = false;
                 }
                 let mut jitter = [0_u8; 1];
                 OsRng.fill_bytes(&mut jitter);
@@ -1054,13 +1113,16 @@ fn connection_loop(state: Arc<Mutex<RuntimeState>>, receiver: Receiver<()>) {
         }
     }
     if let Ok(mut guard) = state.lock() {
-        guard.remote.authenticated_socket_live = false;
-        guard.remote.connection_started = false;
-        guard.remote.projection_wakeup = None;
+        guard.edition.remote.authenticated_socket_live = false;
+        guard.edition.remote.connection_started = false;
+        guard.edition.remote.projection_wakeup = None;
     }
 }
 
 fn connect_once(state: &Arc<Mutex<RuntimeState>>, receiver: &Receiver<()>) -> Result<(), String> {
+    if !has_remote_control_entitlement(state) {
+        return Err("commercial entitlement is inactive".to_owned());
+    }
     let (origin, identity) =
         remote_identity(state).map_err(|_| "remote identity unavailable".to_owned())?;
     let epoch = Uuid::new_v4();
@@ -1101,7 +1163,7 @@ fn connect_once(state: &Arc<Mutex<RuntimeState>>, receiver: &Receiver<()>) -> Re
             .map_err(|error| error.to_string())?
             .ok_or("remote identity unavailable")?;
         let owner_id = machine.owner_id.ok_or("remote owner unavailable")?;
-        guard.remote.authenticated_socket_live = true;
+        guard.edition.remote.authenticated_socket_live = true;
         ProjectionTransport::new(
             owner_id,
             machine.machine_id,
@@ -1110,6 +1172,9 @@ fn connect_once(state: &Arc<Mutex<RuntimeState>>, receiver: &Receiver<()>) -> Re
     };
     let mut last_heartbeat = Instant::now();
     loop {
+        if !has_remote_control_entitlement(state) {
+            return Err("commercial entitlement expired".to_owned());
+        }
         match socket.read() {
             Ok(Message::Text(text)) => {
                 match handle_socket_frame(state, &identity, &mut socket, text.as_str())? {
@@ -1305,7 +1370,7 @@ fn handle_socket_frame<S: std::io::Read + std::io::Write>(
         let mut guard = state
             .lock()
             .map_err(|_| "runtime lock poisoned".to_owned())?;
-        guard.remote.authenticated_socket_live = false;
+        guard.edition.remote.authenticated_socket_live = false;
         guard
             .store
             .set_remote_enabled(false)
@@ -1657,7 +1722,7 @@ fn remote_error_code(error: &ditch_remote::RemoteError) -> &'static str {
 #[cfg(test)]
 mod relay_origin_tests {
     use super::{
-        PRODUCTION_RELAY_ORIGIN, ProjectionAckOutcome, ProjectionSnapshot, ProjectionTransport,
+        ProjectionAckOutcome, ProjectionSnapshot, ProjectionTransport,
         active_devices_from_response, configured_relay_origin, machine_device_path,
         machine_devices_path,
     };
@@ -1740,12 +1805,13 @@ mod relay_origin_tests {
 
     #[test]
     fn production_relay_is_the_default() {
+        const PRODUCTION_RELAY_ORIGIN: &str = "https://relay.ditchnow.nl";
         assert_eq!(
-            configured_relay_origin(None).as_deref(),
+            configured_relay_origin(None, PRODUCTION_RELAY_ORIGIN).as_deref(),
             Ok(PRODUCTION_RELAY_ORIGIN)
         );
         assert_eq!(
-            configured_relay_origin(Some("   ")).as_deref(),
+            configured_relay_origin(Some("   "), PRODUCTION_RELAY_ORIGIN).as_deref(),
             Ok(PRODUCTION_RELAY_ORIGIN)
         );
     }
@@ -1753,11 +1819,16 @@ mod relay_origin_tests {
     #[test]
     fn secure_environment_override_is_normalized() {
         assert_eq!(
-            configured_relay_origin(Some(" https://staging-relay.ditchnow.nl/ ")).as_deref(),
+            configured_relay_origin(
+                Some(" https://staging-relay.ditchnow.nl/ "),
+                "https://relay.ditchnow.nl",
+            )
+            .as_deref(),
             Ok("https://staging-relay.ditchnow.nl")
         );
         assert_eq!(
-            configured_relay_origin(Some("http://localhost:8787/")).as_deref(),
+            configured_relay_origin(Some("http://localhost:8787/"), "https://relay.ditchnow.nl",)
+                .as_deref(),
             Ok("http://localhost:8787")
         );
     }
@@ -1772,7 +1843,10 @@ mod relay_origin_tests {
             "https://example.test?environment=staging",
             "https://example.test/#fragment",
         ] {
-            assert!(configured_relay_origin(Some(value)).is_err(), "{value}");
+            assert!(
+                configured_relay_origin(Some(value), "https://relay.ditchnow.nl").is_err(),
+                "{value}"
+            );
         }
     }
 

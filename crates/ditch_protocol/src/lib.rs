@@ -1,14 +1,18 @@
 use chrono::{DateTime, Utc};
 use ditch_core::{
-    AgentExecutionProfile, AgentId, AgentRun, AppPaths, AttentionKind, CodexLaunchMode,
-    PermissionRequest, Project, ProjectGitPolicy, ProjectId, Task,
+    AgentExecutionProfile, AgentId, AgentRun, AppPaths, CodexLaunchMode, PermissionRequest,
+    Project, ProjectGitPolicy, ProjectId, Task,
 };
 use ditch_ssh::{NewSshHost, ResolvedSshHost, SshHostSummary};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+pub use ditch_community_protocol::{
+    AgentChatMessage, AgentChatRole, AgentMessagePage, RuntimeAttention, SequencedAgentMessage,
+};
+
 pub const PROTOCOL_VERSION: u16 = 1;
-pub const REMOTE_RUNTIME_PROTOCOL_VERSION: u16 = 1;
+pub const REMOTE_RUNTIME_PROTOCOL_VERSION: u16 = 2;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Envelope<T> {
@@ -81,6 +85,11 @@ pub enum ClientRequest {
     InstallRemoteGit {
         alias: String,
     },
+    OpenRemoteCodexSandboxSetup {
+        alias: String,
+        columns: u16,
+        rows: u16,
+    },
     OpenRemoteCodexAuthentication {
         alias: String,
         columns: u16,
@@ -89,6 +98,11 @@ pub enum ClientRequest {
     /// Internal remote-daemon command. It can only launch the fixed Codex
     /// login flow and is not a generic PTY/shell launcher.
     OpenCodexAuthentication {
+        columns: u16,
+        rows: u16,
+    },
+    /// Internal remote-daemon command for fixed Linux sandbox prerequisites.
+    OpenCodexSandboxSetup {
         columns: u16,
         rows: u16,
     },
@@ -221,6 +235,18 @@ pub enum ClientRequest {
         attention_ids: Vec<Uuid>,
     },
     MarkAllAttentionRead,
+    HostIdentityStatus,
+    CommercialOffers,
+    CreateCommercialCheckout {
+        offer_id: String,
+    },
+    CommercialEntitlement,
+    RedeemCommercialLicense {
+        license_key: String,
+    },
+    CommercialBillingManagement,
+    CheckCommercialRelease,
+    CurrentCommercialRelease,
     RemoteControlStatus,
     EnsureRemoteMachineIdentity,
     RemoteMachineControlStatus {
@@ -287,6 +313,12 @@ pub enum ServerResponse {
     ProjectCreated(Project),
     AgentStarted(AgentRun),
     AgentMessages(AgentMessagePage),
+    HostIdentity(HostIdentityStatus),
+    CommercialOffers(ditch_upgrade::CommercialOfferCatalog),
+    CommercialCheckout(ditch_upgrade::CheckoutSession),
+    CommercialEntitlement(ditch_upgrade::EntitlementSummary),
+    CommercialBillingManagement(ditch_upgrade::BillingManagementSession),
+    CommercialRelease(ditch_upgrade::SignedCommercialRelease),
     RemoteControlStatus(RemoteControlStatus),
     RemotePairing(RemotePairing),
     Accepted,
@@ -472,6 +504,18 @@ pub struct Snapshot {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RuntimeStatus {
     pub identity: String,
+    #[serde(default)]
+    pub edition: String,
+    #[serde(default)]
+    pub deployment_environment: String,
+    #[serde(default)]
+    pub build_identifier: String,
+    #[serde(default)]
+    pub build_number: String,
+    #[serde(default)]
+    pub release_sequence: u64,
+    #[serde(default)]
+    pub community_revision: Option<String>,
     pub pid: u32,
     pub socket_path: String,
     pub active_session_count: usize,
@@ -497,54 +541,6 @@ pub struct RuntimeStatus {
     pub platform: String,
     #[serde(default)]
     pub architecture: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub enum AgentChatRole {
-    User,
-    Assistant,
-    System,
-    Tool,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct AgentChatMessage {
-    pub agent_id: AgentId,
-    pub role: AgentChatRole,
-    pub text: String,
-    pub created_at: DateTime<Utc>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct SequencedAgentMessage {
-    pub sequence: u64,
-    pub message: AgentChatMessage,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct AgentMessagePage {
-    pub agent_id: AgentId,
-    pub messages: Vec<SequencedAgentMessage>,
-    pub next_before_sequence: Option<u64>,
-    pub has_more: bool,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct RuntimeAttention {
-    pub id: Uuid,
-    pub kind: AttentionKind,
-    pub agent_id: Option<AgentId>,
-    #[serde(default)]
-    pub project_id: Option<ProjectId>,
-    #[serde(default)]
-    pub project_name: Option<String>,
-    #[serde(default)]
-    pub agent_name: Option<String>,
-    pub title: String,
-    pub body: String,
-    pub created_at: DateTime<Utc>,
-    #[serde(default)]
-    pub read_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -603,6 +599,13 @@ pub struct RemoteHostPresence {
 pub struct ProtocolError {
     pub code: String,
     pub message: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct HostIdentityStatus {
+    pub installation_id: Uuid,
+    pub signing_public_key: String,
+    pub key_version: u16,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

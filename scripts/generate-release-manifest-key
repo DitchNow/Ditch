@@ -1,0 +1,106 @@
+#!/bin/sh
+set -eu
+
+usage() {
+  cat >&2 <<'EOF'
+usage: scripts/generate-release-manifest-key staging|production
+
+Generates the P-256 key pair used to sign Commercial release descriptors.
+The private key is stored outside the repository by default and is never
+printed. Set DITCH_RELEASE_KEY_DIR to choose a different protected directory.
+EOF
+  exit 2
+}
+
+environment=${1:-}
+case "$environment" in
+  staging|production) ;;
+  *) usage ;;
+esac
+[ "$#" -eq 1 ] || usage
+
+key_directory=${DITCH_RELEASE_KEY_DIR:-"${HOME:?}/Library/Application Support/DitchNow/ReleaseKeys/$environment"}
+private_key="$key_directory/manifest-private.b64"
+public_key="$key_directory/manifest-public-sec1.b64"
+
+if [ -e "$private_key" ] || [ -e "$public_key" ]; then
+  echo "error: refusing to overwrite an existing release-manifest key pair" >&2
+  echo "key directory: $key_directory" >&2
+  exit 1
+fi
+
+umask 077
+mkdir -p "$key_directory"
+chmod 700 "$key_directory"
+
+module_cache=$(mktemp -d "${TMPDIR:-/private/tmp}/ditch-swift-module-cache.XXXXXX")
+cleanup() {
+  find "$module_cache" -depth -delete 2>/dev/null || true
+}
+trap cleanup EXIT HUP INT TERM
+
+DITCH_KEY_DIR="$key_directory" \
+SWIFT_MODULECACHE_PATH="$module_cache" \
+CLANG_MODULE_CACHE_PATH="$module_cache" \
+xcrun swift -module-cache-path "$module_cache" - <<'SWIFT'
+import CryptoKit
+import Foundation
+
+func base64URLWithoutPadding(_ data: Data) -> String {
+  data.base64EncodedString()
+    .replacingOccurrences(of: "+", with: "-")
+    .replacingOccurrences(of: "/", with: "_")
+    .replacingOccurrences(of: "=", with: "")
+}
+
+guard let keyDirectory = ProcessInfo.processInfo.environment["DITCH_KEY_DIR"] else {
+  fatalError("DITCH_KEY_DIR is missing")
+}
+
+let directory = URL(fileURLWithPath: keyDirectory, isDirectory: true)
+let privateKey = P256.Signing.PrivateKey()
+let privateURL = directory.appendingPathComponent("manifest-private.b64")
+let publicURL = directory.appendingPathComponent("manifest-public-sec1.b64")
+
+try base64URLWithoutPadding(privateKey.rawRepresentation)
+  .write(to: privateURL, atomically: true, encoding: .utf8)
+try privateKey.publicKey.x963Representation.base64EncodedString()
+  .write(to: publicURL, atomically: true, encoding: .utf8)
+try FileManager.default.setAttributes(
+  [.posixPermissions: 0o600],
+  ofItemAtPath: privateURL.path
+)
+try FileManager.default.setAttributes(
+  [.posixPermissions: 0o644],
+  ofItemAtPath: publicURL.path
+)
+SWIFT
+
+private_value=$(tr -d '\r\n' < "$private_key")
+case "$private_value" in
+  *[!A-Za-z0-9_-]*|'')
+    echo "error: generated private key has an invalid base64url encoding" >&2
+    exit 1
+    ;;
+esac
+[ "${#private_value}" -eq 43 ] || {
+  echo "error: generated private key is not a raw 32-byte P-256 scalar" >&2
+  exit 1
+}
+
+public_bytes=$(openssl base64 -d -A -in "$public_key" | wc -c | tr -d ' ')
+[ "$public_bytes" -eq 65 ] || {
+  echo "error: generated public key is not a 65-byte SEC1 point" >&2
+  exit 1
+}
+
+echo "Generated $environment Commercial release-manifest key pair."
+echo "Private key: $private_key"
+echo "Public key:  $public_key"
+echo
+echo "DITCH_RELEASE_MANIFEST_PUBLIC_KEY_SEC1_B64=$(tr -d '\r\n' < "$public_key")"
+echo
+echo "For release signing, export:"
+echo "DITCH_RELEASE_MANIFEST_SIGNING_KEY_FILE=$private_key"
+echo
+echo "Back up the private key securely. Never commit or share it."

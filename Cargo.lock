@@ -274,22 +274,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "ditch_agents"
-version = "0.1.0"
-dependencies = [
- "ditch_core",
- "ditch_runtime",
- "serde",
- "thiserror 2.0.20",
-]
-
-[[package]]
 name = "ditch_cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "chrono",
+ "ditch_commercial_protocol",
  "ditch_core",
- "ditch_protocol",
  "ditch_ssh",
  "ditch_store",
  "serde_json",
@@ -297,47 +287,47 @@ dependencies = [
 ]
 
 [[package]]
-name = "ditch_core"
-version = "0.1.0"
+name = "ditch_commercial"
+version = "0.1.1"
 dependencies = [
+ "base64",
  "chrono",
+ "ditch_commercial_remote",
+ "ditch_identity",
+ "p256",
+ "rand_core 0.6.4",
+ "semver",
  "serde",
+ "serde_json",
+ "sha2",
+ "ureq",
+ "url",
  "uuid",
 ]
 
 [[package]]
-name = "ditch_orchestrator"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "ditch_agents",
- "ditch_core",
- "ditch_runtime",
- "serde",
- "thiserror 2.0.20",
-]
-
-[[package]]
-name = "ditch_protocol"
-version = "0.1.0"
+name = "ditch_commercial_protocol"
+version = "0.1.1"
 dependencies = [
  "chrono",
  "ditch_core",
+ "ditch_protocol",
  "ditch_ssh",
+ "ditch_upgrade",
  "serde",
  "serde_json",
  "uuid",
 ]
 
 [[package]]
-name = "ditch_remote"
-version = "0.1.0"
+name = "ditch_commercial_remote"
+version = "0.1.1"
 dependencies = [
  "aes-gcm",
  "base64",
  "chrono",
+ "ditch_commercial_protocol",
  "ditch_core",
- "ditch_protocol",
  "hkdf",
  "p256",
  "rand_core 0.6.4",
@@ -350,19 +340,64 @@ dependencies = [
 ]
 
 [[package]]
-name = "ditch_runtime"
-version = "0.1.0"
+name = "ditch_commercial_store"
+version = "0.1.1"
 dependencies = [
  "chrono",
+ "ditch_commercial_remote",
  "ditch_core",
+ "ditch_store",
+ "rusqlite",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
+name = "ditch_core"
+version = "0.1.1"
+dependencies = [
+ "chrono",
  "serde",
+ "uuid",
+]
+
+[[package]]
+name = "ditch_identity"
+version = "0.1.1"
+dependencies = [
+ "base64",
+ "p256",
+ "rand_core 0.6.4",
+ "security-framework",
+ "serde",
+ "serde_json",
  "thiserror 2.0.20",
  "uuid",
 ]
 
 [[package]]
+name = "ditch_product"
+version = "0.1.1"
+dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "ditch_protocol"
+version = "0.1.1"
+dependencies = [
+ "chrono",
+ "ditch_core",
+ "ditch_ssh",
+ "ditch_upgrade",
+ "serde",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
 name = "ditch_ssh"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "security-framework",
  "serde",
@@ -374,12 +409,11 @@ dependencies = [
 
 [[package]]
 name = "ditch_store"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "chrono",
  "ditch_core",
  "ditch_protocol",
- "ditch_remote",
  "rusqlite",
  "serde",
  "serde_json",
@@ -388,16 +422,41 @@ dependencies = [
 ]
 
 [[package]]
-name = "ditchd"
-version = "0.1.0"
+name = "ditch_upgrade"
+version = "0.1.1"
 dependencies = [
  "base64",
  "chrono",
+ "ditch_identity",
+ "ditch_product",
+ "p256",
+ "rand_core 0.6.4",
+ "semver",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.20",
+ "ureq",
+ "url",
+ "uuid",
+ "zeroize",
+]
+
+[[package]]
+name = "ditchd"
+version = "0.1.1"
+dependencies = [
+ "base64",
+ "chrono",
+ "ditch_commercial",
+ "ditch_commercial_protocol",
+ "ditch_commercial_remote",
+ "ditch_commercial_store",
  "ditch_core",
- "ditch_protocol",
- "ditch_remote",
+ "ditch_identity",
  "ditch_ssh",
  "ditch_store",
+ "ditch_upgrade",
  "libc",
  "portable-pty",
  "rand_core 0.6.4",
@@ -1199,6 +1258,12 @@ dependencies = [
  "core-foundation-sys",
  "libc",
 ]
+
+[[package]]
+name = "semver"
+version = "1.0.28"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8a7852d02fc848982e0c167ef163aaff9cd91dc640ba85e263cb1ce46fae51cd"
 
 [[package]]
 name = "serde"

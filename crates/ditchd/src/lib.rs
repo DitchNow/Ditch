@@ -5,6 +5,8 @@
 //! runs the socket server on a background thread while AppKit owns the main
 //! thread.
 
+#![allow(clippy::items_after_test_module)]
+
 include!("main.rs");
 
 #[unsafe(no_mangle)]
