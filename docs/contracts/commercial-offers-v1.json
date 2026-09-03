@@ -1,0 +1,74 @@
+{
+  "protocol_version": 1,
+  "stale": false,
+  "refreshed_at": "2026-08-30T08:00:00Z",
+  "offers": [
+    {
+      "offer_id": "offer_monthly_standard",
+      "kind": "commercial_monthly",
+      "title": "Commercial Monthly",
+      "description": "Ditch Commercial Remote Control",
+      "currency": "EUR",
+      "base_amount_minor": "1500",
+      "minor_unit_exponent": 2,
+      "billing_type": "recurring",
+      "recurring_interval": "month",
+      "recurring_interval_count": 1,
+      "introductory_price": null,
+      "purchase_action": "acquire",
+      "eligible": true,
+      "ineligible_reason": null,
+      "entitlement": {
+        "mac_slots": 1,
+        "iphone_slots": 1,
+        "ssh_hosts_unlimited": true
+      }
+    },
+    {
+      "offer_id": "offer_monthly_intro",
+      "kind": "commercial_monthly",
+      "title": "Commercial Monthly · Introductory offer",
+      "description": "Ditch Commercial Remote Control",
+      "currency": "EUR",
+      "base_amount_minor": "1500",
+      "minor_unit_exponent": 2,
+      "billing_type": "recurring",
+      "recurring_interval": "month",
+      "recurring_interval_count": 1,
+      "introductory_price": {
+        "amount_minor": "750",
+        "duration_count": 3,
+        "duration_unit": "month"
+      },
+      "purchase_action": "acquire",
+      "eligible": true,
+      "ineligible_reason": null,
+      "entitlement": {
+        "mac_slots": 1,
+        "iphone_slots": 1,
+        "ssh_hosts_unlimited": true
+      }
+    },
+    {
+      "offer_id": "offer_lifetime",
+      "kind": "commercial_lifetime",
+      "title": "Commercial Lifetime",
+      "description": "Ditch Commercial Remote Control",
+      "currency": "EUR",
+      "base_amount_minor": "25000",
+      "minor_unit_exponent": 2,
+      "billing_type": "one_time",
+      "recurring_interval": null,
+      "recurring_interval_count": null,
+      "introductory_price": null,
+      "purchase_action": "acquire",
+      "eligible": true,
+      "ineligible_reason": null,
+      "entitlement": {
+        "mac_slots": 2,
+        "iphone_slots": 2,
+        "ssh_hosts_unlimited": true
+      }
+    }
+  ]
+}

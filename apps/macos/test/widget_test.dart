@@ -1,3 +1,7 @@
+import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
+
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/gestures.dart';
@@ -18,17 +22,1314 @@ const _testProject = DitchProject(
   path: '/tmp/the-ditch-test-project',
 );
 
+class _PendingRemoteSetupClient extends DitchRuntimeClient {
+  _PendingRemoteSetupClient()
+    : super(socketPath: '/tmp/ditch-pending-remote-setup.sock');
+
+  final pending = Completer<Map<String, dynamic>>();
+
+  @override
+  Future<Map<String, dynamic>> checkRemoteSetup({
+    required String alias,
+    String? password,
+    bool rememberPassword = false,
+    bool trustUnknownHost = false,
+  }) => pending.future;
+}
+
+class _CommercialOffersClient extends DitchRuntimeClient {
+  _CommercialOffersClient({
+    this.initiallyActive = false,
+    this.status,
+    this.catalog,
+  }) : super(socketPath: '/tmp/ditch-commercial-offers.sock');
+
+  final bool initiallyActive;
+  final String? status;
+  final CommercialOfferCatalog? catalog;
+
+  @override
+  Future<CommercialOfferCatalog> commercialOffers() async =>
+      catalog ?? _testCatalog();
+
+  @override
+  Future<Map<String, dynamic>> commercialEntitlement() async => {
+    'active': initiallyActive,
+    'plan': initiallyActive ? 'commercial_monthly' : null,
+    'status': status ?? (initiallyActive ? 'active' : 'inactive'),
+    'expires_at': null,
+    'mac_slots': initiallyActive ? 1 : 0,
+    'iphone_slots': initiallyActive ? 1 : 0,
+    'billing_management_available': initiallyActive,
+  };
+
+  @override
+  Future<Map<String, dynamic>> commercialBillingManagement() async => {
+    'billing_management_url':
+        'https://billing.example.test/ditch/customer-session',
+  };
+}
+
+class _CatalogFailureClient extends _CommercialOffersClient {
+  @override
+  Future<CommercialOfferCatalog> commercialOffers() async {
+    throw StateError('fixture catalog unavailable');
+  }
+}
+
+class _RecoveringCatalogClient extends _CommercialOffersClient {
+  int attempts = 0;
+
+  @override
+  Future<CommercialOfferCatalog> commercialOffers() async {
+    attempts += 1;
+    if (attempts == 1) throw StateError('fixture catalog unavailable');
+    return _testCatalog();
+  }
+}
+
+class _RelayUpgradeClient extends _CommercialOffersClient {
+  _RelayUpgradeClient({
+    this.entitlementActivates = true,
+    this.failCheckout = false,
+    super.initiallyActive = false,
+  }) : _active = initiallyActive;
+
+  final bool entitlementActivates;
+  final bool failCheckout;
+  bool _active;
+  bool _checkoutCreated = false;
+  final selectedOffers = <String>[];
+  String? redeemedLicense;
+
+  @override
+  Future<CommercialOfferCatalog> commercialOffers() async {
+    if (_checkoutCreated && !_active && !entitlementActivates) {
+      return _testCatalog(
+        offers: [
+          _testOffer(
+            id: 'offer_monthly_standard',
+            kind: 'commercial_monthly',
+            title: 'Commercial Monthly',
+            amountMinor: '1500',
+            billingType: 'recurring',
+            interval: 'month',
+            macSlots: 1,
+            iPhoneSlots: 1,
+            eligible: false,
+            ineligibleReason: 'checkout_in_progress',
+          ),
+          _testOffer(
+            id: 'offer_lifetime',
+            kind: 'commercial_lifetime',
+            title: 'Commercial Lifetime',
+            amountMinor: '25000',
+            billingType: 'one_time',
+            macSlots: 2,
+            iPhoneSlots: 2,
+          ),
+        ],
+      );
+    }
+    return super.commercialOffers();
+  }
+
+  @override
+  Future<Map<String, dynamic>> createCommercialCheckout(String offerId) async {
+    selectedOffers.add(offerId);
+    if (failCheckout) throw StateError('Ditch checkout was not created.');
+    _checkoutCreated = true;
+    return {
+      'id': '00000000-0000-4000-8000-000000000001',
+      'hosted_url': 'https://payments.example.test/ditch/$offerId',
+      'expires_at': DateTime.now()
+          .toUtc()
+          .add(const Duration(minutes: 35))
+          .toIso8601String(),
+    };
+  }
+
+  @override
+  Future<Map<String, dynamic>> commercialEntitlement() async {
+    if (_checkoutCreated && entitlementActivates) _active = true;
+    return {
+      'active': _active,
+      'plan': _active ? 'commercial_monthly' : null,
+      'status': _active ? 'active' : 'inactive',
+      'expires_at': null,
+      'mac_slots': _active ? 1 : 0,
+      'iphone_slots': _active ? 1 : 0,
+      'billing_management_available': _active,
+    };
+  }
+
+  @override
+  Future<Map<String, dynamic>> redeemCommercialLicense(
+    String licenseKey,
+  ) async {
+    redeemedLicense = licenseKey;
+    _active = true;
+    return commercialEntitlement();
+  }
+
+  @override
+  Future<Map<String, dynamic>> commercialBillingManagement() async => {
+    'billing_management_url':
+        'https://billing.example.test/ditch/customer-session',
+  };
+
+  @override
+  Future<Map<String, dynamic>> currentCommercialRelease() async => {
+    'manifest': {
+      'release_id': '11111111-1111-4111-8111-111111111111',
+      'appcast_url':
+          'https://relay.ditchnow.nl/v1/commercial/releases/11111111-1111-4111-8111-111111111111/appcast',
+      'artifact_url':
+          'https://relay.ditchnow.nl/v1/commercial/releases/11111111-1111-4111-8111-111111111111/artifact/ditch.dmg',
+      'artifact_size': 4096,
+      'version': '1.2.3',
+      'build': '123',
+      'channel': 'stable',
+    },
+    'signature': 'test-signature',
+    'update_session': {
+      'bearer': 'a-secure-test-bearer-with-at-least-32-characters',
+      'expires_at': DateTime.now()
+          .toUtc()
+          .add(const Duration(minutes: 5))
+          .toIso8601String(),
+    },
+  };
+}
+
+class _ReleasedCheckoutClient extends _RelayUpgradeClient {
+  _ReleasedCheckoutClient() : super(entitlementActivates: false);
+
+  var _postCheckoutCatalogCalls = 0;
+
+  @override
+  Future<CommercialOfferCatalog> commercialOffers() async {
+    if (!_checkoutCreated) return super.commercialOffers();
+    _postCheckoutCatalogCalls += 1;
+    if (_postCheckoutCatalogCalls == 1) return super.commercialOffers();
+    return _testCatalog();
+  }
+}
+
+class _DeferredCommercialReleaseClient extends _RelayUpgradeClient {
+  _DeferredCommercialReleaseClient() : super(initiallyActive: true);
+
+  var releaseRequests = 0;
+
+  @override
+  Future<Map<String, dynamic>> currentCommercialRelease() async {
+    releaseRequests += 1;
+    if (releaseRequests == 1) {
+      throw const DitchRuntimeException(
+        'commercial_upgrade_deferred',
+        'Commercial installation is waiting for 1 active agent to finish. Ditch will not interrupt running work.',
+      );
+    }
+    return super.currentCommercialRelease();
+  }
+}
+
+class _UnavailableCommercialReleaseClient extends _RelayUpgradeClient {
+  _UnavailableCommercialReleaseClient() : super(initiallyActive: true);
+
+  @override
+  Future<Map<String, dynamic>> currentCommercialRelease() async {
+    throw const DitchRuntimeException(
+      'commercial_release_unavailable',
+      'Ditch Relay rejected the request (release_unavailable)',
+    );
+  }
+}
+
+CommercialOfferCatalog _testCatalog({
+  bool stale = false,
+  List<Map<String, dynamic>>? offers,
+}) {
+  if (offers == null && !stale) {
+    return CommercialOfferCatalog.fromJson(_canonicalCatalogJson());
+  }
+  return CommercialOfferCatalog.fromJson({
+    'protocol_version': 1,
+    'stale': stale,
+    'refreshed_at': '2026-08-30T08:00:00Z',
+    'offers':
+        offers ??
+        [
+          _testOffer(
+            id: 'offer_monthly_standard',
+            kind: 'commercial_monthly',
+            title: 'Commercial Monthly',
+            amountMinor: '1500',
+            billingType: 'recurring',
+            interval: 'month',
+            macSlots: 1,
+            iPhoneSlots: 1,
+          ),
+          _testOffer(
+            id: 'offer_monthly_intro',
+            kind: 'commercial_monthly',
+            title: 'Commercial Monthly · Introductory offer',
+            amountMinor: '1500',
+            billingType: 'recurring',
+            interval: 'month',
+            macSlots: 1,
+            iPhoneSlots: 1,
+            introductory: const {
+              'amount_minor': '750',
+              'duration_count': 3,
+              'duration_unit': 'month',
+            },
+          ),
+          _testOffer(
+            id: 'offer_lifetime',
+            kind: 'commercial_lifetime',
+            title: 'Commercial Lifetime',
+            amountMinor: '25000',
+            billingType: 'one_time',
+            macSlots: 2,
+            iPhoneSlots: 2,
+          ),
+        ],
+  });
+}
+
+Map<String, dynamic> _canonicalCatalogJson() =>
+    (jsonDecode(
+              File(
+                '../../docs/contracts/commercial-offers-v1.json',
+              ).readAsStringSync(),
+            )
+            as Map)
+        .cast<String, dynamic>();
+
+Map<String, dynamic> _testOffer({
+  required String id,
+  required String kind,
+  required String title,
+  required String amountMinor,
+  required String billingType,
+  required int macSlots,
+  required int iPhoneSlots,
+  String? interval,
+  Map<String, dynamic>? introductory,
+  String purchaseAction = 'acquire',
+  bool eligible = true,
+  String? ineligibleReason,
+}) => {
+  'offer_id': id,
+  'kind': kind,
+  'title': title,
+  'description': 'Ditch Commercial Remote Control',
+  'currency': 'EUR',
+  'base_amount_minor': amountMinor,
+  'minor_unit_exponent': 2,
+  'billing_type': billingType,
+  'recurring_interval': interval,
+  'recurring_interval_count': interval == null ? null : 1,
+  'introductory_price': introductory,
+  'purchase_action': purchaseAction,
+  'eligible': eligible,
+  'ineligible_reason': eligible ? null : (ineligibleReason ?? 'not_eligible'),
+  'entitlement': {
+    'mac_slots': macSlots,
+    'iphone_slots': iPhoneSlots,
+    'ssh_hosts_unlimited': true,
+  },
+};
+
+class _RelayContractClient extends DitchRuntimeClient {
+  _RelayContractClient() : super(socketPath: '/tmp/ditch-relay-contract.sock');
+
+  Object? lastRequest;
+
+  @override
+  Future<Map<String, dynamic>> request(Object body) async {
+    lastRequest = body;
+    return {
+      'CommercialCheckout': {
+        'id': '00000000-0000-4000-8000-000000000002',
+        'hosted_url': 'https://payments.example.test/ditch/add-on',
+        'expires_at': DateTime.now()
+            .toUtc()
+            .add(const Duration(minutes: 35))
+            .toIso8601String(),
+      },
+    };
+  }
+}
+
 Widget _testApp() => const TheDitchApp(
   connectRuntimeOnStart: false,
   initialProjects: [_testProject],
 );
 
 void main() {
+  test('authorized update binds every signed release field to native code', () {
+    final expiresAt = DateTime.utc(2026, 1, 1).toIso8601String();
+    final arguments = authorizedCommercialUpdateArguments({
+      'manifest': {
+        'release_id': '11111111-1111-4111-8111-111111111111',
+        'appcast_url': 'https://relay.example.test/release/appcast',
+        'artifact_url': 'https://relay.example.test/release/artifact/ditch.dmg',
+        'artifact_size': 4096,
+        'version': '1.2.3',
+        'build': '123',
+        'channel': 'stable',
+      },
+      'update_session': {
+        'bearer': 'test-bearer',
+        'expires_at': expiresAt,
+      },
+    });
+
+    expect(arguments, {
+      'release_id': '11111111-1111-4111-8111-111111111111',
+      'appcast_url': 'https://relay.example.test/release/appcast',
+      'artifact_url': 'https://relay.example.test/release/artifact/ditch.dmg',
+      'artifact_size': 4096,
+      'version': '1.2.3',
+      'build': '123',
+      'channel': 'stable',
+      'authorization_bearer': 'test-bearer',
+      'expires_at': expiresAt,
+    });
+  });
+
+  test('authorized update rejects incomplete release metadata', () {
+    expect(
+      () => authorizedCommercialUpdateArguments({
+        'manifest': {'appcast_url': 'https://relay.example.test/appcast'},
+        'update_session': {
+          'bearer': 'test-bearer',
+          'expires_at': '2026-01-01T00:00:00Z',
+        },
+      }),
+      throwsFormatException,
+    );
+  });
+
+  test('production upgrade surfaces contain no fallback price catalog', () {
+    final flutterSource = File('lib/main.dart').readAsStringSync();
+    final moneySource = File(
+      'lib/data/commercial_models.dart',
+    ).readAsStringSync();
+    final rustSource = File(
+      '../../crates/ditch_upgrade/src/lib.rs',
+    ).readAsStringSync();
+
+    for (final source in [flutterSource, moneySource, rustSource]) {
+      expect(source, isNot(contains('price_eur_cents')));
+      expect(source, isNot(contains('fallback_offers')));
+    }
+    expect(RegExp(r'€\s*\d').hasMatch(flutterSource), isFalse);
+    expect(RegExp(r'€\s*\d').hasMatch(moneySource), isFalse);
+  });
+
+  test('canonical Commercial fixture parses exact money and UTC freshness', () {
+    final catalog = CommercialOfferCatalog.fromJson(_canonicalCatalogJson());
+
+    expect(catalog.refreshedAt, DateTime.utc(2026, 8, 30, 8));
+    expect(catalog.offers, hasLength(3));
+    expect(catalog.offers[1].baseAmountMinor, BigInt.from(1500));
+    expect(catalog.offers[1].introductoryPrice?.amountMinor, BigInt.from(750));
+    expect(catalog.offers[2].entitlement.macSlots, 2);
+  });
+
+  test(
+    'catalog rejects numeric, malformed, and non-UTC refresh timestamps',
+    () {
+      for (final invalid in [
+        1788085651552,
+        'not-a-timestamp',
+        '2026-08-30T10:00:00+02:00',
+      ]) {
+        final json = _canonicalCatalogJson()..['refreshed_at'] = invalid;
+        expect(
+          () => CommercialOfferCatalog.fromJson(json),
+          throwsA(isA<FormatException>()),
+        );
+      }
+    },
+  );
+
+  test('catalog rejects obsolete Relay fields and malformed offer entries', () {
+    final obsolete = _canonicalCatalogJson();
+    final first = (obsolete['offers'] as List).first as Map<String, dynamic>;
+    first['normal_unit_amount'] = first.remove('base_amount_minor');
+    expect(
+      () => CommercialOfferCatalog.fromJson(obsolete),
+      throwsA(isA<FormatException>()),
+    );
+
+    final malformed = _canonicalCatalogJson();
+    (malformed['offers'] as List).add('not-an-offer');
+    expect(
+      () => CommercialOfferCatalog.fromJson(malformed),
+      throwsA(isA<FormatException>()),
+    );
+  });
+
+  test('money formatting obeys Relay currency exponent without floats', () {
+    expect(
+      CommercialMoney(
+        currency: 'EUR',
+        amountMinor: BigInt.from(1500),
+        minorUnitExponent: 2,
+      ).format(const Locale('en', 'US')),
+      '€15',
+    );
+    expect(
+      CommercialMoney(
+        currency: 'JPY',
+        amountMinor: BigInt.from(1500),
+        minorUnitExponent: 0,
+      ).format(const Locale('en', 'US')),
+      '¥1,500',
+    );
+  });
+
+  test('offer validation rejects malformed currency, exponent, and intro', () {
+    final fixture = _canonicalCatalogJson();
+    final first = (fixture['offers'] as List).first as Map<String, dynamic>;
+    first['currency'] = 'euro';
+    expect(
+      () => CommercialOfferCatalog.fromJson(fixture),
+      throwsA(isA<FormatException>()),
+    );
+
+    final exponent = _canonicalCatalogJson();
+    ((exponent['offers'] as List).first
+            as Map<String, dynamic>)['minor_unit_exponent'] =
+        7;
+    expect(
+      () => CommercialOfferCatalog.fromJson(exponent),
+      throwsA(isA<FormatException>()),
+    );
+
+    final intro = _canonicalCatalogJson();
+    (((intro['offers'] as List)[1]
+                as Map<String, dynamic>)['introductory_price']
+            as Map<String, dynamic>)['amount_minor'] =
+        '1500';
+    expect(
+      () => CommercialOfferCatalog.fromJson(intro),
+      throwsA(isA<FormatException>()),
+    );
+  });
+
+  testWidgets('Community presents restrained Commercial upgrade choices', (
+    tester,
+  ) async {
+    await tester.pumpWidget(
+      MaterialApp(
+        home: CommercialUpgradeDialog(client: _CommercialOffersClient()),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    expect(find.text('Remote Control'), findsOneWidget);
+    expect(find.text('TEST MODE'), findsNothing);
+    expect(
+      find.byKey(const Key('commercial-staging-relay-link')),
+      findsNothing,
+    );
+    expect(find.text('€15/month'), findsWidgets);
+    expect(find.text('€7.50/month'), findsOneWidget);
+    expect(find.text('+ VAT'), findsNWidgets(3));
+    expect(
+      find.text('VAT is calculated at checkout for your billing location.'),
+      findsNWidgets(3),
+    );
+    expect(find.text('for the first 3 months'), findsOneWidget);
+    expect(find.text('Then €15/month + VAT'), findsOneWidget);
+    expect(find.text('€250 once'), findsOneWidget);
+    expect(
+      find.byKey(const Key('commercial-offer-action-offer_monthly_standard')),
+      findsOneWidget,
+    );
+    expect(
+      find.byKey(const Key('commercial-offer-action-offer_lifetime')),
+      findsOneWidget,
+    );
+    expect(find.byKey(const Key('commercial-license-key')), findsOneWidget);
+    expect(
+      find.textContaining('SSH execution hosts are unlimited'),
+      findsOneWidget,
+    );
+    expect(find.textContaining('remain Community features'), findsOneWidget);
+
+    final basePrice = tester.widget<Text>(
+      find.byKey(const Key('commercial-base-price-offer_monthly_intro')),
+    );
+    expect(basePrice.style?.decoration, TextDecoration.lineThrough);
+    expect(find.textContaining('free trial'), findsNothing);
+  });
+
+  testWidgets('staging pricing identifies test mode and its Relay', (
+    tester,
+  ) async {
+    const relayOrigin =
+        'https://ditch-remote-relay-staging.matin-1a7.workers.dev';
+    final calls = <MethodCall>[];
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(
+          const MethodChannel('the_ditch/application'),
+          (call) async {
+            calls.add(call);
+            return true;
+          },
+        );
+    addTearDown(
+      () => TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(
+            const MethodChannel('the_ditch/application'),
+            null,
+          ),
+    );
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: CommercialUpgradeDialog(
+          client: _CommercialOffersClient(),
+          deploymentEnvironment: 'staging',
+          relayOrigin: relayOrigin,
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    expect(find.text('TEST MODE'), findsOneWidget);
+    expect(find.text('Relay'), findsOneWidget);
+    expect(find.text(relayOrigin), findsOneWidget);
+
+    await tester.tap(find.byKey(const Key('commercial-staging-relay-link')));
+    await tester.pump();
+
+    expect(
+      calls.where((call) => call.method == 'openURL').single.arguments,
+      relayOrigin,
+    );
+  });
+
+  testWidgets(
+    'active subscriber sees status and billing without acquisition cards',
+    (tester) async {
+      final client = _CommercialOffersClient(initiallyActive: true);
+      final calls = <MethodCall>[];
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(
+            const MethodChannel('the_ditch/application'),
+            (call) async {
+              calls.add(call);
+              return true;
+            },
+          );
+      addTearDown(
+        () => TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+            .setMockMethodCallHandler(
+              const MethodChannel('the_ditch/application'),
+              null,
+            ),
+      );
+
+      await tester.pumpWidget(
+        MaterialApp(home: CommercialUpgradeDialog(client: client)),
+      );
+      await tester.pumpAndSettle();
+
+      expect(find.byKey(const Key('commercial-active-status')), findsOneWidget);
+      expect(find.text('€15/month'), findsNothing);
+      expect(find.text('€250 once'), findsNothing);
+      expect(find.byKey(const Key('commercial-license-key')), findsNothing);
+      expect(find.text('Available upgrade'), findsNothing);
+
+      await tester.tap(find.byKey(const Key('manage-commercial-billing')));
+      await tester.pumpAndSettle();
+      expect(
+        calls.where((call) => call.method == 'openURL').single.arguments,
+        'https://billing.example.test/ditch/customer-session',
+      );
+    },
+  );
+
+  testWidgets('active Lifetime owner sees capacity separately from plans', (
+    tester,
+  ) async {
+    final catalog = _testCatalog(
+      offers: [
+        _testOffer(
+          id: 'offer_extra_pair',
+          kind: 'lifetime_extra_pair',
+          title: 'Lifetime extra pair',
+          amountMinor: '5000',
+          billingType: 'one_time',
+          macSlots: 1,
+          iPhoneSlots: 1,
+          purchaseAction: 'add_capacity',
+        ),
+        _testOffer(
+          id: 'offer_monthly_hidden',
+          kind: 'commercial_monthly',
+          title: 'Commercial Monthly',
+          amountMinor: '1500',
+          billingType: 'recurring',
+          interval: 'month',
+          macSlots: 1,
+          iPhoneSlots: 1,
+        ),
+      ],
+    );
+    final client = _CommercialOffersClient(
+      initiallyActive: true,
+      catalog: catalog,
+    );
+
+    await tester.pumpWidget(
+      MaterialApp(home: CommercialUpgradeDialog(client: client)),
+    );
+    await tester.pumpAndSettle();
+
+    expect(find.text('Add capacity'), findsOneWidget);
+    expect(find.text('Lifetime extra pair'), findsOneWidget);
+    expect(find.text('€50 once'), findsOneWidget);
+    expect(
+      find.byKey(const Key('commercial-offer-offer_monthly_hidden')),
+      findsNothing,
+    );
+    expect(find.text('Choose Commercial'), findsNothing);
+  });
+
+  testWidgets('catalog failure shows Retry without fabricated prices', (
+    tester,
+  ) async {
+    await tester.pumpWidget(
+      MaterialApp(
+        home: CommercialUpgradeDialog(client: _CatalogFailureClient()),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    expect(find.text('Pricing is temporarily unavailable.'), findsOneWidget);
+    expect(find.byKey(const Key('commercial-pricing-retry')), findsOneWidget);
+    expect(find.textContaining('€'), findsNothing);
+    expect(
+      find.text('Commercial status is temporarily unavailable.'),
+      findsNothing,
+    );
+  });
+
+  testWidgets('Retry replaces a transient catalog error with Relay offers', (
+    tester,
+  ) async {
+    final client = _RecoveringCatalogClient();
+    await tester.pumpWidget(
+      MaterialApp(home: CommercialUpgradeDialog(client: client)),
+    );
+    await tester.pumpAndSettle();
+
+    expect(find.text('Pricing is temporarily unavailable.'), findsOneWidget);
+    await tester.tap(find.byKey(const Key('commercial-pricing-retry')));
+    await tester.pumpAndSettle();
+
+    expect(client.attempts, 2);
+    expect(find.text('Pricing is temporarily unavailable.'), findsNothing);
+    expect(find.text('€15/month'), findsWidgets);
+    expect(find.text('€250 once'), findsOneWidget);
+  });
+
+  testWidgets('stale catalog is identified without replacing Relay prices', (
+    tester,
+  ) async {
+    await tester.pumpWidget(
+      MaterialApp(
+        home: CommercialUpgradeDialog(
+          client: _CommercialOffersClient(catalog: _testCatalog(stale: true)),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    expect(find.text('€15/month'), findsWidgets);
+    expect(find.textContaining('last verified pricing'), findsOneWidget);
+  });
+
+  testWidgets('future upgrade is rendered only in the upgrade section', (
+    tester,
+  ) async {
+    final catalog = _testCatalog(
+      offers: [
+        _testOffer(
+          id: 'offer_future_upgrade',
+          kind: 'commercial_lifetime',
+          title: 'Future Commercial tier',
+          amountMinor: '30000',
+          billingType: 'one_time',
+          macSlots: 3,
+          iPhoneSlots: 3,
+          purchaseAction: 'upgrade',
+        ),
+        _testOffer(
+          id: 'offer_acquisition_hidden',
+          kind: 'commercial_lifetime',
+          title: 'First-purchase Lifetime',
+          amountMinor: '25000',
+          billingType: 'one_time',
+          macSlots: 2,
+          iPhoneSlots: 2,
+        ),
+      ],
+    );
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: CommercialUpgradeDialog(
+          client: _CommercialOffersClient(
+            initiallyActive: true,
+            catalog: catalog,
+          ),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    expect(find.text('Available upgrade'), findsOneWidget);
+    expect(find.text('Future Commercial tier'), findsOneWidget);
+    expect(find.text('First-purchase Lifetime'), findsNothing);
+  });
+
+  testWidgets('ineligible introductory offer is not displayed', (tester) async {
+    final catalog = _testCatalog(
+      offers: [
+        _testOffer(
+          id: 'offer_intro_ineligible',
+          kind: 'commercial_monthly',
+          title: 'Introductory offer',
+          amountMinor: '1500',
+          billingType: 'recurring',
+          interval: 'month',
+          macSlots: 1,
+          iPhoneSlots: 1,
+          introductory: const {
+            'amount_minor': '750',
+            'duration_count': 3,
+            'duration_unit': 'month',
+          },
+          eligible: false,
+        ),
+        _testOffer(
+          id: 'offer_standard_eligible',
+          kind: 'commercial_monthly',
+          title: 'Standard Monthly',
+          amountMinor: '1500',
+          billingType: 'recurring',
+          interval: 'month',
+          macSlots: 1,
+          iPhoneSlots: 1,
+        ),
+      ],
+    );
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: CommercialUpgradeDialog(
+          client: _CommercialOffersClient(catalog: catalog),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    expect(find.text('Introductory offer'), findsNothing);
+    expect(find.text('€7.50/month'), findsNothing);
+    expect(find.text('Standard Monthly'), findsOneWidget);
+  });
+
+  testWidgets(
+    'pending checkout keeps its package visible with explicit progress',
+    (tester) async {
+      final catalog = _testCatalog(
+        offers: [
+          _testOffer(
+            id: 'offer_monthly_pending',
+            kind: 'commercial_monthly',
+            title: 'Commercial Monthly',
+            amountMinor: '1500',
+            billingType: 'recurring',
+            interval: 'month',
+            macSlots: 1,
+            iPhoneSlots: 1,
+            eligible: false,
+            ineligibleReason: 'checkout_in_progress',
+          ),
+          _testOffer(
+            id: 'offer_lifetime',
+            kind: 'commercial_lifetime',
+            title: 'Commercial Lifetime',
+            amountMinor: '25000',
+            billingType: 'one_time',
+            macSlots: 2,
+            iPhoneSlots: 2,
+          ),
+        ],
+      );
+
+      await tester.pumpWidget(
+        MaterialApp(
+          home: CommercialUpgradeDialog(
+            client: _CommercialOffersClient(catalog: catalog),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      expect(find.text('Commercial Monthly'), findsOneWidget);
+      expect(
+        find.text('Checkout in progress — payment has not yet been confirmed.'),
+        findsOneWidget,
+      );
+      expect(find.text('Check status'), findsOneWidget);
+      expect(find.text('Commercial Lifetime'), findsOneWidget);
+    },
+  );
+
+  testWidgets(
+    'expired subscription preserves Community and offers Relay renewal',
+    (tester) async {
+      final catalog = _testCatalog(
+        offers: [
+          _testOffer(
+            id: 'offer_renew_monthly',
+            kind: 'commercial_monthly',
+            title: 'Commercial Monthly',
+            amountMinor: '1500',
+            billingType: 'recurring',
+            interval: 'month',
+            macSlots: 1,
+            iPhoneSlots: 1,
+            purchaseAction: 'renew',
+          ),
+        ],
+      );
+      final client = _CommercialOffersClient(
+        status: 'expired',
+        catalog: catalog,
+      );
+
+      await tester.pumpWidget(
+        MaterialApp(home: CommercialUpgradeDialog(client: client)),
+      );
+      await tester.pumpAndSettle();
+
+      expect(find.text('Commercial subscription expired.'), findsOneWidget);
+      expect(
+        find.text('Local and SSH Ditch continue to work.'),
+        findsOneWidget,
+      );
+      expect(find.text('Renew'), findsWidgets);
+    },
+  );
+
+  testWidgets('remote setup progress is pinned above the scrolling content', (
+    tester,
+  ) async {
+    final client = _PendingRemoteSetupClient();
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Builder(
+          builder: (context) => TextButton(
+            onPressed: () => showDialog<void>(
+              context: context,
+              builder: (context) => AddRemoteProjectDialog(
+                client: client,
+                initialAlias: 'dev-box',
+                repairOnly: true,
+              ),
+            ),
+            child: const Text('Open setup'),
+          ),
+        ),
+      ),
+    );
+    await tester.tap(find.text('Open setup'));
+    await tester.pump();
+
+    final progress = find.byKey(const Key('remote-setup-progress'));
+    expect(progress, findsOneWidget);
+    expect(
+      find.ancestor(of: progress, matching: find.byType(ListView)),
+      findsNothing,
+    );
+    final dialogMaterial = find.byWidgetPredicate(
+      (widget) => widget is Material && widget.type == MaterialType.card,
+    );
+    expect(dialogMaterial, findsOneWidget);
+    expect(
+      tester.getTopLeft(progress).dy,
+      closeTo(tester.getTopLeft(dialogMaterial).dy, 1),
+    );
+
+    client.pending.complete({'ready': false, 'checks': <Object>[]});
+    await tester.pump();
+  });
+
   test('agent execution settings expose model and approval controls', () {
     final settings = AgentExecutionSettings();
 
     expect(settings.approval, AgentApprovalPreset.approveForMe);
+    expect(settings.protocolValue['approval'], 'ApproveForMe');
     expect(settings.protocolValue.containsKey('network_access'), isFalse);
+  });
+
+  test('remote approve-for-me setup requires a ready workspace sandbox', () {
+    final base = <String, dynamic>{
+      'ready': true,
+      'checks': <Map<String, dynamic>>[
+        {'key': 'runtime', 'state': 'ready'},
+        {'key': 'codex_sandbox', 'state': 'install_available'},
+      ],
+    };
+
+    expect(
+      remoteSetupReadyForExecution(base, requireCodexSandbox: true),
+      isFalse,
+    );
+    expect(
+      remoteSetupReadyForExecution(base, requireCodexSandbox: false),
+      isTrue,
+    );
+    expect(
+      remoteSetupShouldConfigureSandbox(
+        base,
+        repairOnly: false,
+        requireCodexSandbox: true,
+        alreadyOffered: false,
+      ),
+      isTrue,
+    );
+    expect(
+      remoteSetupShouldConfigureSandbox(
+        base,
+        repairOnly: true,
+        requireCodexSandbox: true,
+        alreadyOffered: false,
+      ),
+      isFalse,
+    );
+
+    final sandboxed = <String, dynamic>{
+      ...base,
+      'checks': <Map<String, dynamic>>[
+        {'key': 'runtime', 'state': 'ready'},
+        {'key': 'codex_sandbox', 'state': 'ready'},
+      ],
+    };
+    expect(
+      remoteSetupReadyForExecution(sandboxed, requireCodexSandbox: true),
+      isTrue,
+    );
+  });
+
+  for (final checkout in [
+    (
+      'offer_monthly_standard',
+      'commercial-offer-action-offer_monthly_standard',
+    ),
+    ('offer_lifetime', 'commercial-offer-action-offer_lifetime'),
+  ]) {
+    testWidgets('${checkout.$1} opens the Relay-hosted checkout URL', (
+      tester,
+    ) async {
+      final client = _RelayUpgradeClient();
+      final calls = <MethodCall>[];
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(
+            const MethodChannel('the_ditch/application'),
+            (call) async {
+              calls.add(call);
+              return true;
+            },
+          );
+      addTearDown(
+        () => TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+            .setMockMethodCallHandler(
+              const MethodChannel('the_ditch/application'),
+              null,
+            ),
+      );
+
+      await tester.pumpWidget(
+        MaterialApp(home: CommercialUpgradeDialog(client: client)),
+      );
+      await tester.pumpAndSettle();
+      final action = find.byKey(Key(checkout.$2));
+      await tester.ensureVisible(action);
+      await tester.pump();
+      await tester.tap(action);
+      await tester.pumpAndSettle();
+
+      expect(client.selectedOffers, [checkout.$1]);
+      expect(
+        calls.where((call) => call.method == 'openURL').single.arguments,
+        'https://payments.example.test/ditch/${checkout.$1}',
+      );
+      expect(
+        calls.where((call) => call.method == 'installCommercialUpdate'),
+        hasLength(1),
+      );
+    });
+  }
+
+  test('lifetime add-on checkout remains a Ditch Relay offer', () async {
+    final client = _RelayContractClient();
+    final checkout = await client.createCommercialCheckout(
+      'commercial-lifetime-extra-pair',
+    );
+
+    expect(client.lastRequest, {
+      'CreateCommercialCheckout': {
+        'offer_id': 'commercial-lifetime-extra-pair',
+      },
+    });
+    expect(
+      checkout['hosted_url'],
+      'https://payments.example.test/ditch/add-on',
+    );
+  });
+
+  testWidgets('pending checkout waits for Relay entitlement', (tester) async {
+    final client = _RelayUpgradeClient(entitlementActivates: false);
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(
+          const MethodChannel('the_ditch/application'),
+          (_) async => true,
+        );
+    addTearDown(
+      () => TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(
+            const MethodChannel('the_ditch/application'),
+            null,
+          ),
+    );
+
+    await tester.pumpWidget(
+      MaterialApp(home: CommercialUpgradeDialog(client: client)),
+    );
+    await tester.pumpAndSettle();
+    await tester.tap(
+      find.byKey(const Key('commercial-offer-action-offer_monthly_standard')),
+    );
+    await tester.pump();
+
+    expect(find.text('Finishing upgrade…'), findsOneWidget);
+    await tester.pumpWidget(const SizedBox.shrink());
+    await tester.pump(const Duration(seconds: 2));
+  });
+
+  testWidgets('failed checkout does not claim activation', (tester) async {
+    final client = _RelayUpgradeClient(failCheckout: true);
+    await tester.pumpWidget(
+      MaterialApp(home: CommercialUpgradeDialog(client: client)),
+    );
+    await tester.pumpAndSettle();
+    await tester.tap(
+      find.byKey(const Key('commercial-offer-action-offer_monthly_standard')),
+    );
+    await tester.pump();
+
+    expect(
+      find.textContaining('Checkout could not be started'),
+      findsOneWidget,
+    );
+    expect(find.text('Finishing upgrade…'), findsNothing);
+  });
+
+  testWidgets('released pending checkout restores the package for retry', (
+    tester,
+  ) async {
+    final client = _ReleasedCheckoutClient();
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(
+          const MethodChannel('the_ditch/application'),
+          (_) async => true,
+        );
+    addTearDown(
+      () => TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(
+            const MethodChannel('the_ditch/application'),
+            null,
+          ),
+    );
+
+    await tester.pumpWidget(
+      MaterialApp(home: CommercialUpgradeDialog(client: client)),
+    );
+    await tester.pumpAndSettle();
+    await tester.tap(
+      find.byKey(const Key('commercial-offer-action-offer_monthly_standard')),
+    );
+    await tester.pump();
+    await tester.pump(const Duration(seconds: 4));
+    await tester.pumpAndSettle();
+
+    expect(
+      find.text(
+        'Payment was not completed. The plan is available to try again.',
+      ),
+      findsOneWidget,
+    );
+    expect(find.text('Finishing upgrade…'), findsNothing);
+    expect(find.text('Commercial Monthly'), findsWidgets);
+  });
+
+  testWidgets(
+    'confirmed payment identifies a missing native verification key',
+    (tester) async {
+      final client = _RelayUpgradeClient();
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(
+            const MethodChannel('the_ditch/application'),
+            (call) async {
+              if (call.method == 'openURL') return true;
+              if (call.method == 'installCommercialUpdate') {
+                throw PlatformException(
+                  code: 'update_verification_not_configured',
+                );
+              }
+              return false;
+            },
+          );
+      addTearDown(
+        () => TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+            .setMockMethodCallHandler(
+              const MethodChannel('the_ditch/application'),
+              null,
+            ),
+      );
+
+      await tester.pumpWidget(
+        MaterialApp(home: CommercialUpgradeDialog(client: client)),
+      );
+      await tester.pumpAndSettle();
+      final action = find.byKey(
+        const Key('commercial-offer-action-offer_monthly_standard'),
+      );
+      await tester.ensureVisible(action);
+      await tester.tap(action);
+      await tester.pumpAndSettle();
+
+      expect(find.byKey(const Key('commercial-active-status')), findsOneWidget);
+      expect(
+        find.textContaining('missing its public Sparkle verification key'),
+        findsOneWidget,
+      );
+      expect(
+        find.textContaining('Checkout could not be started'),
+        findsNothing,
+      );
+      expect(find.byKey(const Key('install-commercial-build')), findsOneWidget);
+    },
+  );
+
+  testWidgets('Commercial install retries after active agents finish', (
+    tester,
+  ) async {
+    final client = _DeferredCommercialReleaseClient();
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(
+          const MethodChannel('the_ditch/application'),
+          (call) async => call.method == 'installCommercialUpdate',
+        );
+    addTearDown(
+      () => TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(
+            const MethodChannel('the_ditch/application'),
+            null,
+          ),
+    );
+
+    await tester.pumpWidget(
+      MaterialApp(home: CommercialUpgradeDialog(client: client)),
+    );
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const Key('install-commercial-build')));
+    await tester.pump();
+
+    expect(
+      find.textContaining('Installation will retry automatically'),
+      findsOneWidget,
+    );
+    expect(find.text('Check again'), findsOneWidget);
+
+    await tester.pump(const Duration(seconds: 3));
+    await tester.pumpAndSettle();
+
+    expect(client.releaseRequests, 2);
+    expect(
+      find.textContaining('secure Commercial installer is ready'),
+      findsOneWidget,
+    );
+  });
+
+  testWidgets(
+    'missing staging release leaves entitlement active and explains why',
+    (tester) async {
+      final client = _UnavailableCommercialReleaseClient();
+      await tester.pumpWidget(
+        MaterialApp(home: CommercialUpgradeDialog(client: client)),
+      );
+      await tester.pumpAndSettle();
+      await tester.tap(find.byKey(const Key('install-commercial-build')));
+      await tester.pumpAndSettle();
+
+      expect(find.byKey(const Key('commercial-active-status')), findsOneWidget);
+      expect(
+        find.textContaining(
+          'no compatible Commercial build has been published',
+        ),
+        findsOneWidget,
+      );
+      expect(find.textContaining('Your purchase is safe'), findsOneWidget);
+    },
+  );
+
+  testWidgets('license redemption accepts an opaque Ditch-issued key', (
+    tester,
+  ) async {
+    final client = _RelayUpgradeClient();
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(
+          const MethodChannel('the_ditch/application'),
+          (_) async => true,
+        );
+    addTearDown(
+      () => TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(
+            const MethodChannel('the_ditch/application'),
+            null,
+          ),
+    );
+
+    await tester.pumpWidget(
+      MaterialApp(home: CommercialUpgradeDialog(client: client)),
+    );
+    await tester.pumpAndSettle();
+    await tester.enterText(
+      find.byKey(const Key('commercial-license-key')),
+      'ditch_key_with_no_provider_format',
+    );
+    final activate = find.byKey(const Key('activate-commercial-license'));
+    await tester.ensureVisible(activate);
+    await tester.pump();
+    await tester.tap(activate);
+    await tester.pumpAndSettle();
+
+    expect(client.redeemedLicense, 'ditch_key_with_no_provider_format');
+    expect(find.byKey(const Key('commercial-license-key')), findsNothing);
+    expect(find.byKey(const Key('commercial-active-status')), findsOneWidget);
   });
 
   test('presentation controller publishes immutable connection states', () {
@@ -82,10 +1383,7 @@ void main() {
         'codex_home': '/tmp/codex',
         'codex_binary': '/opt/homebrew/bin/codex',
         'build_version': '1.0.0',
-        'capabilities': [
-          'persistent_sessions_v1',
-          'always_on_web_access_v1',
-        ],
+        'capabilities': ['persistent_sessions_v1', 'always_on_web_access_v1'],
       },
     });
 
@@ -127,6 +1425,25 @@ void main() {
     expect(project!.name, 'Recovered');
     expect(project.path, '/tmp/recovered');
     expect(project.gitPolicy, ProjectGitPolicy.allowOutsideGit);
+  });
+
+  test('runtime project parser preserves remote execution identity', () {
+    final project = parseRuntimeProject({
+      'id': 'remote-project',
+      'name': 'FieldOps',
+      'root': '/home/mtn/fieldops',
+      'git_policy': 'RequireRepository',
+      'execution_target': {
+        'kind': 'remote',
+        'remote_machine_id': '11111111-1111-4111-8111-111111111111',
+        'ssh_host_alias': 'dev-box',
+      },
+    });
+
+    expect(project, isNotNull);
+    expect(project!.isRemote, isTrue);
+    expect(project.sshHostAlias, 'dev-box');
+    expect(project.path, '/home/mtn/fieldops');
   });
 
   test('project reconciliation replaces duplicate ids and paths', () {
@@ -522,10 +1839,7 @@ void main() {
     expect(find.byKey(const Key('onboarding-continue')), findsOneWidget);
     expect(find.byKey(const Key('first-project-add')), findsNothing);
     expect(find.widgetWithText(AlertDialog, 'Add Project'), findsNothing);
-    expect(
-      find.text('/Users/tester/Projects/example'),
-      findsNothing,
-    );
+    expect(find.text('/Users/tester/Projects/example'), findsNothing);
     expect(find.text('PROJECTS'), findsNothing);
   });
 
@@ -804,6 +2118,47 @@ void main() {
     await tester.tap(find.byTooltip('Dismiss notification'));
     await tester.pump();
     expect(dismissed, isTrue);
+  });
+
+  testWidgets('Commercial product update is installable from the bell', (
+    tester,
+  ) async {
+    AttentionEvent? opened;
+    final update = AttentionEvent(
+      id: 'attention-product-update-120',
+      kind: AttentionKind.completed,
+      icon: Icons.system_update_alt,
+      title: 'Ditch 1.2.0 is available',
+      body: 'A verified Commercial update is ready.',
+      action: AttentionAction.installProductUpdate,
+      createdAt: DateTime(2026),
+    );
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: Align(
+            alignment: Alignment.topRight,
+            child: NotificationCenterButton(
+              notifications: [update],
+              unreadCount: 1,
+              onViewed: () {},
+              onOpen: (event) => opened = event,
+              onDismiss: (_) {},
+              onDismissAll: () {},
+            ),
+          ),
+        ),
+      ),
+    );
+
+    await tester.tap(find.byKey(const Key('notification-bell')));
+    await tester.pump();
+    expect(find.text('Ditch 1.2.0 is available'), findsOneWidget);
+    expect(find.text('Install'), findsOneWidget);
+    expect(find.text('Open'), findsNothing);
+    await tester.tap(find.text('Install'));
+    expect(opened, same(update));
   });
 
   testWidgets('chat messages expose copy actions', (tester) async {
@@ -1136,11 +2491,36 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(find.widgetWithText(AlertDialog, 'Add Project'), findsOneWidget);
+    expect(find.text('Local Project'), findsOneWidget);
+    expect(find.text('Remote Project'), findsOneWidget);
+    await tester.tap(find.text('Local Project'));
+    await tester.pumpAndSettle();
     expect(find.text('Browse Folder…'), findsOneWidget);
     expect(find.text('Project name'), findsOneWidget);
     expect(find.text('Selected folder'), findsOneWidget);
     expect(find.text('Add & Configure'), findsOneWidget);
     expect(find.textContaining('.ditch/hooks'), findsOneWidget);
+  });
+
+  testWidgets('add project modal steps dismiss when the backdrop is clicked', (
+    tester,
+  ) async {
+    await tester.pumpWidget(_testApp());
+
+    await tester.tap(find.text('Add Project'));
+    await tester.pumpAndSettle();
+    await tester.tapAt(const Offset(4, 4));
+    await tester.pumpAndSettle();
+    expect(find.text('Local Project'), findsNothing);
+
+    await tester.tap(find.text('Add Project'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Local Project'));
+    await tester.pumpAndSettle();
+    expect(find.text('Browse Folder…'), findsOneWidget);
+    await tester.tapAt(const Offset(4, 4));
+    await tester.pumpAndSettle();
+    expect(find.text('Browse Folder…'), findsNothing);
   });
 
   testWidgets('folder picker fills the project path and inferred name', (
@@ -1160,6 +2540,8 @@ void main() {
 
     await tester.pumpWidget(_testApp());
     await tester.tap(find.text('Add Project'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Local Project'));
     await tester.pumpAndSettle();
     await tester.tap(find.text('Browse Folder…'));
     await tester.pumpAndSettle();
@@ -1350,6 +2732,40 @@ void main() {
       TerminalPresentation.vertical,
       TerminalPresentation.maximized,
     ]);
+    document.dispose();
+  });
+
+  testWidgets('remote project editor is read-only', (tester) async {
+    final document = ProjectEditorDocument(
+      relativePath: 'README.md',
+      content: 'remote source',
+      revision: 'revision-remote',
+      readOnly: true,
+    );
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: ProjectFileEditorBody(
+            document: document,
+            presentation: TerminalPresentation.docked,
+            onBack: () {},
+            onSave: () {},
+            onReload: () {},
+            onOverwrite: () {},
+            onPresentationChanged: (_) {},
+          ),
+        ),
+      ),
+    );
+
+    final editor = tester.widget<TextField>(
+      find.byKey(const Key('project-file-editor')),
+    );
+    expect(editor.readOnly, isTrue);
+    expect(
+      tester.widget<IconButton>(find.byKey(const Key('editor-save'))).onPressed,
+      isNull,
+    );
     document.dispose();
   });
 
@@ -1871,7 +3287,8 @@ void main() {
     );
 
     await tester.enterText(find.byType(TextField), 'still a button');
-    await tester.tap(find.widgetWithText(FilledButton, 'Send'));
+    await tester.pump();
+    await tester.tap(find.text('Send'));
     await tester.pump();
     expect(submitted, 'still a button');
   });

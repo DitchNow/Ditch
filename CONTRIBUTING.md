@@ -4,7 +4,7 @@ Bug reports, reproducible test cases, documentation corrections, and focused pul
 
 ## Before You Start
 
-1. Search [existing issues](https://github.com/DitchNow/TheDitch/issues) and [Discussions](https://github.com/DitchNow/TheDitch/discussions) for the same problem or proposal.
+1. Search [existing issues](https://github.com/DitchNow/Ditch/issues) and [Discussions](https://github.com/DitchNow/Ditch/discussions) for the same problem or proposal.
 2. Reproduce the problem where applicable and reduce it to the smallest reliable case.
 3. Read the [How It Works](README.md#how-it-works) section and inspect the relevant implementation before changing cross-component behavior.
 4. Start a Discussion before large features, architectural changes, schema or protocol changes, or behavior that affects several components.
@@ -46,7 +46,7 @@ Comparisons can provide context, but “add X because another product has X” i
 
 ## Architecture Changes
 
-Start a [GitHub Discussion](https://github.com/DitchNow/TheDitch/discussions) before implementing a change that affects:
+Start a [GitHub Discussion](https://github.com/DitchNow/Ditch/discussions) before implementing a change that affects:
 
 - `ditchd` process or runtime ownership;
 - Codex launch, resume, interruption, or execution behavior;
@@ -90,8 +90,8 @@ Development requires macOS 11 or later, Git, Flutter with macOS desktop support 
 Clone the repository and fetch Flutter dependencies:
 
 ```sh
-git clone https://github.com/DitchNow/TheDitch.git
-cd TheDitch/apps/macos
+git clone https://github.com/DitchNow/Ditch.git
+cd Ditch/apps/macos
 flutter pub get
 ```
 
@@ -133,14 +133,14 @@ For major changes, open an issue and agree on direction before investing heavily
 
 ## Testing
 
-Run checks relevant to the files and behavior you changed. The repository does not currently define a GitHub Actions workflow, so do not assume CI will catch local failures.
+GitHub Actions runs the standard checks, but contributors should run relevant checks locally before opening a pull request.
 
 From the repository root, validate Rust code with:
 
 ```sh
 cargo fmt --all -- --check
-cargo test --workspace
-cargo clippy --workspace --all-targets
+cargo test --locked --workspace
+cargo clippy --locked --workspace --all-targets -- -D warnings
 ```
 
 From `apps/macos`, validate Flutter code with:
@@ -164,9 +164,13 @@ Do not publish exploit details, credentials, tokens, private prompts, repository
 
 ## Contribution Licensing
 
-Contributions accepted into Ditch Community Edition are expected to be compatible with the project's [GNU Affero General Public License v3.0](LICENSE) (`AGPL-3.0-only`).
+Community Edition remains licensed exclusively as [GNU Affero General Public License v3.0](LICENSE) (`AGPL-3.0-only`). This policy does not relicense the public project. Community functionality accepted into an official Community release remains available in Community Edition; a Commercial subscription does not make that functionality paid-only.
 
-Before submitting a substantial code contribution, please open an issue first. The project may require additional contributor paperwork before such a contribution can be merged. No Contributor License Agreement or Developer Certificate of Origin requirement is currently in place.
+The project does not currently ask contributors to sign a separate Contributor License Agreement. DitchNow has not yet adopted final inbound terms that would permit third-party Community source to be included in the statically composed proprietary Commercial application. Until qualified counsel approves and maintainers publish that workflow, maintainers must not merge external source contributions into release branches. Issues, design discussion, reproducible test cases, and suggested patches remain welcome for evaluation, but this document does not grant DitchNow additional proprietary rights in submitted code.
+
+A Developer Certificate of Origin records a contributor's certification about a contribution; by itself it is not permission for proprietary distribution. If a future no-separate-CLA workflow combines DCO sign-off with published inbound licensing terms, those terms and the exact submission process require legal approval before use.
+
+Do not submit proprietary Commercial implementations—including iPhone Remote Control, Relay connectivity, pairing, mobile command transport, mobile projections, or paid capability enforcement—to the Community repository. Proposals for hosted or proprietary capabilities should be discussed separately with maintainers.
 
 ## What Not to Submit
 
@@ -174,6 +178,7 @@ Before submitting a substantial code contribution, please open an issue first. T
 - Generated code dumps or speculative abstractions without a current use case.
 - Mandatory hosted or external-service dependencies for core local behavior.
 - Embedded credentials, tokens, private source, or user data.
+- Proprietary Commercial implementation or protocol contracts.
 - License changes.
 - Wholesale architecture rewrites without prior discussion.
 

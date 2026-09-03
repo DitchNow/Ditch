@@ -1,0 +1,277 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ditchnow.nl/contracts/commercial-offers-v1.schema.json",
+  "title": "Ditch Commercial Offer Catalog v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "protocol_version",
+    "stale",
+    "offers"
+  ],
+  "properties": {
+    "protocol_version": {
+      "const": 1
+    },
+    "stale": {
+      "type": "boolean"
+    },
+    "refreshed_at": {
+      "oneOf": [
+        {
+          "type": "string",
+          "format": "date-time",
+          "pattern": "Z$"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "offers": {
+      "type": "array",
+      "maxItems": 100,
+      "items": {
+        "$ref": "#/$defs/offer"
+      }
+    }
+  },
+  "$defs": {
+    "minorAmount": {
+      "type": "string",
+      "pattern": "^[0-9]{1,38}$"
+    },
+    "interval": {
+      "type": "string",
+      "enum": [
+        "day",
+        "week",
+        "month",
+        "year"
+      ]
+    },
+    "introductoryPrice": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "amount_minor",
+        "duration_count",
+        "duration_unit"
+      ],
+      "properties": {
+        "amount_minor": {
+          "$ref": "#/$defs/minorAmount"
+        },
+        "duration_count": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        },
+        "duration_unit": {
+          "$ref": "#/$defs/interval"
+        }
+      }
+    },
+    "entitlement": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mac_slots",
+        "iphone_slots",
+        "ssh_hosts_unlimited"
+      ],
+      "properties": {
+        "mac_slots": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 65535
+        },
+        "iphone_slots": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 65535
+        },
+        "ssh_hosts_unlimited": {
+          "const": true
+        }
+      }
+    },
+    "offer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "offer_id",
+        "kind",
+        "title",
+        "description",
+        "currency",
+        "base_amount_minor",
+        "minor_unit_exponent",
+        "billing_type",
+        "recurring_interval",
+        "recurring_interval_count",
+        "introductory_price",
+        "purchase_action",
+        "eligible",
+        "ineligible_reason",
+        "entitlement"
+      ],
+      "properties": {
+        "offer_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "commercial_monthly",
+            "commercial_lifetime",
+            "lifetime_extra_pair"
+          ]
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200,
+          "pattern": "\\S"
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 1000
+        },
+        "currency": {
+          "type": "string",
+          "pattern": "^[A-Z]{3}$"
+        },
+        "base_amount_minor": {
+          "$ref": "#/$defs/minorAmount"
+        },
+        "minor_unit_exponent": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 6
+        },
+        "billing_type": {
+          "type": "string",
+          "enum": [
+            "recurring",
+            "one_time"
+          ]
+        },
+        "recurring_interval": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/interval"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "recurring_interval_count": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1,
+          "maximum": 65535
+        },
+        "introductory_price": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/introductoryPrice"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "purchase_action": {
+          "type": "string",
+          "enum": [
+            "acquire",
+            "add_capacity",
+            "upgrade",
+            "renew"
+          ]
+        },
+        "eligible": {
+          "type": "boolean"
+        },
+        "ineligible_reason": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 200
+        },
+        "entitlement": {
+          "$ref": "#/$defs/entitlement"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "billing_type": {
+                "const": "recurring"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "recurring_interval": {
+                "$ref": "#/$defs/interval"
+              },
+              "recurring_interval_count": {
+                "type": "integer",
+                "minimum": 1
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "recurring_interval": {
+                "type": "null"
+              },
+              "recurring_interval_count": {
+                "type": "null"
+              },
+              "introductory_price": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "eligible": {
+                "const": true
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "ineligible_reason": {
+                "type": "null"
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "ineligible_reason": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}

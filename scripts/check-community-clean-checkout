@@ -1,0 +1,24 @@
+#!/bin/sh
+set -eu
+
+workspace=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
+temporary_root=$(mktemp -d "${TMPDIR:-/tmp}/ditch-community-clean.XXXXXX")
+clean_checkout="$temporary_root/community"
+
+cleanup() {
+  rm -rf -- "$temporary_root"
+}
+trap cleanup EXIT HUP INT TERM
+
+git clone --quiet --no-local --no-tags "$workspace" "$clean_checkout"
+
+if [ -e "$clean_checkout/commercial" ]; then
+  echo "clean-checkout gate: private neighboring repository entered the Community clone" >&2
+  exit 1
+fi
+
+cd "$clean_checkout"
+cargo metadata --locked --format-version 1 --no-deps >/dev/null
+DITCH_LEAKAGE_SOURCE_ONLY=1 scripts/check-community-leakage
+
+echo "Community clean-checkout gate passed."

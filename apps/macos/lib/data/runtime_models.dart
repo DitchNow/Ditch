@@ -14,6 +14,12 @@ class RuntimeStatusDto {
     this.codexHome,
     this.codexBinary,
     this.buildVersion = '',
+    this.edition = '',
+    this.deploymentEnvironment = '',
+    this.buildIdentifier = '',
+    this.buildNumber = '',
+    this.releaseSequence = 0,
+    this.communityRevision,
   });
 
   factory RuntimeStatusDto.fromResponse(Map<String, dynamic> response) {
@@ -51,6 +57,15 @@ class RuntimeStatusDto {
       codexHome: body['codex_home']?.toString(),
       codexBinary: body['codex_binary']?.toString(),
       buildVersion: body['build_version']?.toString() ?? '',
+      edition: body['edition']?.toString() ?? '',
+      deploymentEnvironment:
+          body['deployment_environment']?.toString() ?? '',
+      buildIdentifier: body['build_identifier']?.toString() ?? '',
+      buildNumber: body['build_number']?.toString() ?? '',
+      releaseSequence: body['release_sequence'] is int
+          ? body['release_sequence'] as int
+          : 0,
+      communityRevision: body['community_revision']?.toString(),
       capabilities: rawCapabilities is List
           ? rawCapabilities.map((value) => value.toString()).toSet()
           : const {},
@@ -67,6 +82,12 @@ class RuntimeStatusDto {
   final String? codexHome;
   final String? codexBinary;
   final String buildVersion;
+  final String edition;
+  final String deploymentEnvironment;
+  final String buildIdentifier;
+  final String buildNumber;
+  final int releaseSequence;
+  final String? communityRevision;
   final Set<String> capabilities;
 
   bool get supportsPersistentSessions =>

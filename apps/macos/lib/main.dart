@@ -9,15 +9,127 @@ import 'package:flutter/services.dart';
 import 'package:xterm/xterm.dart';
 
 import 'application/command_center_controller.dart';
+import 'data/commercial_models.dart';
 import 'data/runtime_models.dart';
 import 'data/runtime_transport.dart';
 import 'design_system/ditch_theme.dart';
 
 export 'data/runtime_transport.dart'
     show DitchRuntimeException, parseRuntimeResponseLine;
+export 'data/commercial_models.dart';
+
+const ditchDeploymentEnvironment = String.fromEnvironment(
+  'DITCH_DEPLOYMENT_ENVIRONMENT',
+  defaultValue: 'production',
+);
+const ditchRelayOrigin = String.fromEnvironment(
+  'DITCH_RELAY_ORIGIN',
+  defaultValue: 'https://relay.ditchnow.nl',
+);
+const _ditchApplicationChannel = MethodChannel('the_ditch/application');
+
+Map<String, Object> authorizedCommercialUpdateArguments(
+  Map<String, dynamic> release,
+) {
+  final manifest = (release['manifest'] as Map?)?.cast<String, dynamic>();
+  final releaseId = manifest?['release_id']?.toString();
+  final appcastUrl = manifest?['appcast_url']?.toString();
+  final artifactUrl = manifest?['artifact_url']?.toString();
+  final artifactSize = (manifest?['artifact_size'] as num?)?.toInt();
+  final version = manifest?['version']?.toString();
+  final build = manifest?['build']?.toString();
+  final channel = manifest?['channel']?.toString();
+  if (releaseId == null ||
+      releaseId.isEmpty ||
+      appcastUrl == null ||
+      appcastUrl.isEmpty ||
+      artifactUrl == null ||
+      artifactUrl.isEmpty ||
+      artifactSize == null ||
+      artifactSize <= 0 ||
+      version == null ||
+      version.isEmpty ||
+      build == null ||
+      build.isEmpty ||
+      (channel != 'stable' && channel != 'beta')) {
+    throw const FormatException(
+      'Authorized release metadata is incomplete.',
+    );
+  }
+  final updateSession = (release['update_session'] as Map?)
+      ?.cast<String, dynamic>();
+  final bearer = updateSession?['bearer']?.toString();
+  final expiresAt = updateSession?['expires_at']?.toString();
+  if (bearer == null || bearer.isEmpty || expiresAt == null || expiresAt.isEmpty) {
+    throw const FormatException(
+      'Relay did not authorize an authenticated Commercial update session.',
+    );
+  }
+  return {
+    'release_id': releaseId,
+    'appcast_url': appcastUrl,
+    'artifact_url': artifactUrl,
+    'artifact_size': artifactSize,
+    'version': version,
+    'build': build,
+    'channel': channel!,
+    'authorization_bearer': bearer,
+    'expires_at': expiresAt,
+  };
+}
+
+Future<void> startAuthorizedCommercialUpdate(
+  Map<String, dynamic> release,
+) async {
+  final started = await _ditchApplicationChannel.invokeMethod<bool>(
+    'installCommercialUpdate',
+    authorizedCommercialUpdateArguments(release),
+  );
+  if (started != true) {
+    throw const FormatException('The secure updater could not be started.');
+  }
+}
 
 void main() {
   runApp(const TheDitchApp());
+}
+
+@immutable
+class EditionSettingsSection {
+  const EditionSettingsSection({
+    required this.id,
+    required this.icon,
+    required this.title,
+    required this.subtitle,
+    required this.dialogBuilder,
+  });
+
+  final String id;
+  final IconData icon;
+  final String title;
+  final String subtitle;
+  final Widget Function(DitchRuntimeClient client) dialogBuilder;
+}
+
+abstract interface class EditionSurface {
+  const EditionSurface();
+
+  List<EditionSettingsSection> settingsSections(DitchRuntimeClient client);
+}
+
+class CommunityEditionSurface implements EditionSurface {
+  const CommunityEditionSurface();
+
+  @override
+  List<EditionSettingsSection> settingsSections(DitchRuntimeClient client) => [
+    EditionSettingsSection(
+      id: 'remote-mobile',
+      icon: Icons.phone_iphone,
+      title: 'Remote Control',
+      subtitle: 'Optional Commercial upgrade',
+      dialogBuilder: (client) => CommercialUpgradeDialog(client: client),
+    ),
+  ];
 }
 
 final ditchThemeMode = ValueNotifier<ThemeMode>(ThemeMode.system);
@@ -26,11 +138,13 @@ class TheDitchApp extends StatefulWidget {
   const TheDitchApp({
     this.connectRuntimeOnStart = true,
     this.initialProjects = const [],
+    this.editionSurface = const CommunityEditionSurface(),
     super.key,
   });
 
   final bool connectRuntimeOnStart;
   final List<DitchProject> initialProjects;
+  final EditionSurface editionSurface;
 
   @override
   State<TheDitchApp> createState() => _TheDitchAppState();
@@ -65,7 +179,9 @@ class _TheDitchAppState extends State<TheDitchApp> {
     return ValueListenableBuilder<ThemeMode>(
       valueListenable: ditchThemeMode,
       builder: (context, themeMode, _) => MaterialApp(
-        title: 'Ditch',
+        title: ditchDeploymentEnvironment == 'staging'
+            ? 'Ditch Staging'
+            : 'Ditch',
         debugShowCheckedModeBanner: false,
         theme: DitchTheme.light(),
         darkTheme: DitchTheme.dark(),
@@ -73,6 +189,7 @@ class _TheDitchAppState extends State<TheDitchApp> {
         home: CommandCenterScreen(
           connectRuntimeOnStart: widget.connectRuntimeOnStart,
           initialProjects: widget.initialProjects,
+          editionSurface: widget.editionSurface,
         ),
       ),
     );
@@ -101,12 +218,18 @@ class DitchProject {
     required this.name,
     required this.path,
     this.gitPolicy = ProjectGitPolicy.requireRepository,
+    this.remoteMachineId,
+    this.sshHostAlias,
   });
 
   final String? id;
   final String name;
   final String path;
   final ProjectGitPolicy gitPolicy;
+  final String? remoteMachineId;
+  final String? sshHostAlias;
+
+  bool get isRemote => sshHostAlias != null;
 }
 
 enum ProjectGitPolicy {
@@ -114,6 +237,10 @@ enum ProjectGitPolicy {
   initializeRepository,
   allowOutsideGit,
 }
+
+String _titleCase(String value) => value.isEmpty
+    ? value
+    : '${value.substring(0, 1).toUpperCase()}${value.substring(1)}';
 
 bool isInsideGitWorkTree(String path) {
   var directory = Directory(path).absolute;
@@ -140,11 +267,18 @@ String canonicalProjectPath(String path) {
 }
 
 void upsertProject(List<DitchProject> projects, DitchProject incoming) {
-  final incomingPath = canonicalProjectPath(incoming.path);
+  final incomingPath = incoming.isRemote
+      ? incoming.path
+      : canonicalProjectPath(incoming.path);
   final index = projects.indexWhere(
     (existing) =>
         (incoming.id != null && existing.id == incoming.id) ||
-        canonicalProjectPath(existing.path) == incomingPath,
+        (existing.isRemote == incoming.isRemote &&
+            existing.sshHostAlias == incoming.sshHostAlias &&
+            (existing.isRemote
+                    ? existing.path
+                    : canonicalProjectPath(existing.path)) ==
+                incomingPath),
   );
   if (index >= 0) {
     projects[index] = incoming;
@@ -183,6 +317,7 @@ class ProjectEditorDocument {
     required this.relativePath,
     required String content,
     required this.revision,
+    this.readOnly = false,
   }) : originalContent = content,
        controller = TextEditingController(text: content);
 
@@ -190,6 +325,7 @@ class ProjectEditorDocument {
   final TextEditingController controller;
   String originalContent;
   String revision;
+  final bool readOnly;
   bool saving = false;
   bool conflict = false;
   String? error;
@@ -505,6 +641,8 @@ String agentMessageContentKey(AgentChatMessage message) =>
 
 enum AttentionKind { approvalRequired, blocked, completed, failed, needsInput }
 
+enum AttentionAction { installProductUpdate }
+
 class AgentNotificationTarget {
   const AgentNotificationTarget({
     required this.projectId,
@@ -546,6 +684,7 @@ class AttentionEvent {
     this.projectId,
     this.projectName,
     this.agentName,
+    this.action,
     this.isRead = false,
   });
 
@@ -559,9 +698,10 @@ class AttentionEvent {
   final String? projectId;
   final String? projectName;
   final String? agentName;
+  final AttentionAction? action;
   final bool isRead;
 
-  bool get canOpenSession => sessionLocalId != null;
+  bool get canOpen => sessionLocalId != null || action != null;
 }
 
 enum AgentStatus {
@@ -1012,6 +1152,153 @@ class DitchRuntimeClient {
     });
   }
 
+  Future<List<Map<String, dynamic>>> discoverSshHosts() async {
+    final response = await request('DiscoverSshHosts');
+    final values = response['SshHosts'];
+    return values is List
+        ? values
+              .whereType<Map>()
+              .map((item) => Map<String, dynamic>.from(item))
+              .toList()
+        : const [];
+  }
+
+  Future<String> previewSshHost(Map<String, dynamic> host) async {
+    final response = await request({
+      'PreviewSshHost': {'host': host},
+    });
+    return response['SshConfigPreview']?.toString() ?? '';
+  }
+
+  Future<void> addSshHost(Map<String, dynamic> host) async {
+    await request({
+      'AddSshHost': {'host': host},
+    });
+  }
+
+  Future<Map<String, dynamic>> checkRemoteSetup({
+    required String alias,
+    String? password,
+    bool rememberPassword = false,
+    bool trustUnknownHost = false,
+  }) async {
+    final response = await request({
+      'CheckRemoteSetup': {
+        'alias': alias,
+        'password': password,
+        'remember_password': rememberPassword,
+        'trust_unknown_host': trustUnknownHost,
+      },
+    });
+    return Map<String, dynamic>.from(response['RemoteSetup'] as Map);
+  }
+
+  Future<Map<String, dynamic>> installRemoteRuntime(String alias) async {
+    final response = await request({
+      'InstallRemoteRuntime': {'alias': alias},
+    });
+    return Map<String, dynamic>.from(response['RemoteSetup'] as Map);
+  }
+
+  Future<Map<String, dynamic>> installRemoteCodex(String alias) async {
+    final response = await request({
+      'InstallRemoteCodex': {'alias': alias},
+    });
+    return Map<String, dynamic>.from(response['RemoteSetup'] as Map);
+  }
+
+  Future<Map<String, dynamic>> installRemoteGit(String alias) async {
+    final response = await request({
+      'InstallRemoteGit': {'alias': alias},
+    });
+    return Map<String, dynamic>.from(response['RemoteSetup'] as Map);
+  }
+
+  Future<String> openRemoteCodexAuthentication(String alias) async {
+    final response = await request({
+      'OpenRemoteCodexAuthentication': {
+        'alias': alias,
+        'columns': 90,
+        'rows': 24,
+      },
+    });
+    return (response['SetupTerminal'] as Map)['id'].toString();
+  }
+
+  Future<String> openRemoteCodexSandboxSetup(String alias) async {
+    final response = await request({
+      'OpenRemoteCodexSandboxSetup': {
+        'alias': alias,
+        'columns': 90,
+        'rows': 24,
+      },
+    });
+    return (response['SetupTerminal'] as Map)['id'].toString();
+  }
+
+  Future<void> writeSetupTerminal(String terminalId, List<int> data) async {
+    await request({
+      'WriteSetupTerminal': {'terminal_id': terminalId, 'data': data},
+    });
+  }
+
+  Future<Map<String, dynamic>> takeSetupTerminalOutput(
+    String terminalId,
+  ) async {
+    final response = await request({
+      'TakeSetupTerminalOutput': {'terminal_id': terminalId},
+    });
+    return Map<String, dynamic>.from(response['SetupTerminalOutput'] as Map);
+  }
+
+  Future<void> resizeSetupTerminal(
+    String terminalId,
+    int columns,
+    int rows,
+  ) async {
+    await request({
+      'ResizeSetupTerminal': {
+        'terminal_id': terminalId,
+        'columns': columns,
+        'rows': rows,
+      },
+    });
+  }
+
+  Future<void> closeSetupTerminal(String terminalId) async {
+    await request({
+      'CloseSetupTerminal': {'terminal_id': terminalId},
+    });
+  }
+
+  Future<Map<String, dynamic>> listRemoteDirectory(
+    String alias,
+    String absolutePath,
+  ) async {
+    final response = await request({
+      'ListRemoteDirectory': {'alias': alias, 'absolute_path': absolutePath},
+    });
+    return Map<String, dynamic>.from(response['RemoteDirectory'] as Map);
+  }
+
+  Future<Map<String, dynamic>> createRemoteProject({
+    required String alias,
+    required String name,
+    required String root,
+    required ProjectGitPolicy gitPolicy,
+  }) => request({
+    'CreateRemoteProject': {
+      'ssh_host_alias': alias,
+      'name': name,
+      'remote_root': root,
+      'git_policy': switch (gitPolicy) {
+        ProjectGitPolicy.requireRepository => 'RequireRepository',
+        ProjectGitPolicy.initializeRepository => 'InitializeRepository',
+        ProjectGitPolicy.allowOutsideGit => 'AllowOutsideGit',
+      },
+    },
+  });
+
   Future<Map<String, dynamic>> deleteProject(String projectId) {
     return request({
       'DeleteProject': {'project_id': projectId},
@@ -1025,12 +1312,14 @@ class DitchRuntimeClient {
   }
 
   Future<Map<String, dynamic>> startCodexSession({
+    String? projectId,
     required String projectName,
     required String projectRoot,
     required String prompt,
   }) {
     return request({
       'StartCodexSession': {
+        'project_id': projectId,
         'project_name': projectName,
         'project_root': projectRoot,
         'prompt': prompt,
@@ -1070,9 +1359,9 @@ class DitchRuntimeClient {
     });
   }
 
-  Future<List<AgentModelOption>> listCodexModels() async {
+  Future<List<AgentModelOption>> listCodexModels({String? projectId}) async {
     final response = await request({
-      'ListAgentModels': {'provider': 'Codex'},
+      'ListAgentModels': {'provider': 'Codex', 'project_id': projectId},
     });
     final values = response['AgentModels'];
     if (values is! List) return const [];
@@ -1226,6 +1515,50 @@ class DitchRuntimeClient {
       'MarkAttentionRead': {'attention_ids': attentionIds},
     });
   }
+
+  Future<CommercialOfferCatalog> commercialOffers() async {
+    final response = await request('CommercialOffers');
+    return CommercialOfferCatalog.fromJson(
+      (response['CommercialOffers'] as Map).cast<String, dynamic>(),
+    );
+  }
+
+  Future<Map<String, dynamic>> createCommercialCheckout(String offerId) async {
+    final response = await request({
+      'CreateCommercialCheckout': {'offer_id': offerId},
+    });
+    return (response['CommercialCheckout'] as Map).cast<String, dynamic>();
+  }
+
+  Future<Map<String, dynamic>> commercialEntitlement() async {
+    final response = await request('CommercialEntitlement');
+    return (response['CommercialEntitlement'] as Map).cast<String, dynamic>();
+  }
+
+  Future<Map<String, dynamic>> redeemCommercialLicense(
+    String licenseKey,
+  ) async {
+    final response = await request({
+      'RedeemCommercialLicense': {'license_key': licenseKey},
+    });
+    return (response['CommercialEntitlement'] as Map).cast<String, dynamic>();
+  }
+
+  Future<Map<String, dynamic>> commercialBillingManagement() async {
+    final response = await request('CommercialBillingManagement');
+    return (response['CommercialBillingManagement'] as Map)
+        .cast<String, dynamic>();
+  }
+
+  Future<Map<String, dynamic>> currentCommercialRelease() async {
+    final response = await request('CurrentCommercialRelease');
+    return (response['CommercialRelease'] as Map).cast<String, dynamic>();
+  }
+
+  Future<Map<String, dynamic>> checkCommercialRelease() async {
+    final response = await request('CheckCommercialRelease');
+    return (response['CommercialRelease'] as Map).cast<String, dynamic>();
+  }
 }
 
 DitchProject? parseRuntimeProject(Object? value) {
@@ -1242,11 +1575,15 @@ DitchProject? parseRuntimeProject(Object? value) {
     'InitializeRepository' => ProjectGitPolicy.initializeRepository,
     _ => ProjectGitPolicy.requireRepository,
   };
+  final target = value['execution_target'];
+  final remote = target is Map && target['kind']?.toString() == 'remote';
   return DitchProject(
     id: value['id']?.toString(),
     name: name,
     path: root,
     gitPolicy: gitPolicy,
+    remoteMachineId: remote ? target['remote_machine_id']?.toString() : null,
+    sshHostAlias: remote ? target['ssh_host_alias']?.toString() : null,
   );
 }
 
@@ -1254,11 +1591,13 @@ class CommandCenterScreen extends StatefulWidget {
   const CommandCenterScreen({
     this.connectRuntimeOnStart = true,
     this.initialProjects = const [],
+    this.editionSurface = const CommunityEditionSurface(),
     super.key,
   });
 
   final bool connectRuntimeOnStart;
   final List<DitchProject> initialProjects;
+  final EditionSurface editionSurface;
 
   @override
   State<CommandCenterScreen> createState() => _CommandCenterScreenState();
@@ -1289,8 +1628,12 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
   final _readAttentionIds = <String>{};
   final Map<String, ProjectTerminalSession> _projectTerminals = {};
   final Map<String, ProjectFilesState> _projectFiles = {};
+  final Map<String, String> _remoteHostStatus = {};
 
   StreamSubscription<Map<String, dynamic>>? _runtimeEvents;
+  Timer? _productUpdateTimer;
+  RuntimeStatusDto? _runtimeStatus;
+  bool _productUpdateChecking = false;
   String? _runtimeInstanceId;
   bool _runtimeReconnectScheduled = false;
   bool _runtimeHomeMismatchReported = false;
@@ -1320,6 +1663,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
   String? _expandedAgentLocalId;
   String? _focusedAgentLocalId;
   AgentNotificationTarget? _pendingNotificationTarget;
+  BuildContext? _projectSetupProgressContext;
   bool _runtimeSnapshotHydrated = false;
   final List<AgentSession> _agentSessions = [];
 
@@ -1333,7 +1677,10 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
   }
 
   String _projectKey(DitchProject project) =>
-      project.id ?? canonicalProjectPath(project.path);
+      project.id ??
+      (project.isRemote
+          ? 'remote:${project.sshHostAlias}:${project.path}'
+          : canonicalProjectPath(project.path));
 
   int get _selectedProjectIndex {
     if (_projects.isEmpty) return -1;
@@ -1395,6 +1742,18 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
   }
 
   Future<void> _revealProjectInFinder(DitchProject project) async {
+    if (project.isRemote) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              '${project.path} lives on ${project.sshHostAlias}. Source files remain remote.',
+            ),
+          ),
+        );
+      }
+      return;
+    }
     try {
       final revealed =
           await _applicationChannel.invokeMethod<bool>(
@@ -1427,6 +1786,18 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
   }
 
   Future<void> _revealProjectEntry(ProjectFileEntry entry) async {
+    if (_selectedProject.isRemote) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              '${entry.relativePath} lives on ${_selectedProject.sshHostAlias}.',
+            ),
+          ),
+        );
+      }
+      return;
+    }
     final path = '${_selectedProject.path}/${entry.relativePath}';
     try {
       await _applicationChannel.invokeMethod<bool>('revealInFinder', path);
@@ -1573,6 +1944,76 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
     return null;
   }
 
+  Future<void> _checkForProductUpdate() async {
+    if (_productUpdateChecking || _runtimeStatus?.edition != 'commercial') {
+      return;
+    }
+    _productUpdateChecking = true;
+    try {
+      final release = await _runtimeClient.checkCommercialRelease();
+      final manifest = (release['manifest'] as Map?)?.cast<String, dynamic>();
+      final sequence = (manifest?['release_sequence'] as num?)?.toInt();
+      if (sequence == null ||
+          sequence <= (_runtimeStatus?.releaseSequence ?? 0)) {
+        return;
+      }
+      final version = manifest?['version']?.toString() ?? 'new';
+      final build = manifest?['build']?.toString();
+      final notice = AttentionEvent(
+        id: 'attention-product-update-$sequence',
+        kind: AttentionKind.completed,
+        icon: Icons.system_update_alt,
+        title: 'Ditch $version is available',
+        body:
+            'A verified ${_runtimeStatus?.edition ?? 'Ditch'} update${build == null ? '' : ' (build $build)'} is ready. Click Install to update without changing projects, sessions, or SSH configuration.',
+        createdAt: DateTime.now(),
+        action: AttentionAction.installProductUpdate,
+      );
+      if (!mounted) return;
+      setState(() {
+        _attention.removeWhere(
+          (event) => event.action == AttentionAction.installProductUpdate,
+        );
+        _attention.insert(0, notice);
+      });
+      _scheduleStatusBarUpdate();
+    } on DitchRuntimeException catch (error) {
+      // No compatible newer release, an inactive entitlement, or a temporary
+      // Relay failure is not an agent-facing notification.
+      debugPrint('Product update check did not return an update: $error');
+    } on Object catch (error) {
+      debugPrint('Product update check failed: $error');
+    } finally {
+      _productUpdateChecking = false;
+    }
+  }
+
+  Future<void> _installProductUpdate(AttentionEvent event) async {
+    try {
+      final release = await _runtimeClient.currentCommercialRelease();
+      await startAuthorizedCommercialUpdate(release);
+      _markAttentionIdsRead({event.id});
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text(
+              'Verified update ready. Follow the Sparkle window to install and restart Ditch.',
+            ),
+          ),
+        );
+      }
+    } on Object catch (error) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            'Ditch could not start the verified update. Nothing was replaced. $error',
+          ),
+        ),
+      );
+    }
+  }
+
   AgentSession _createAgentSession({required bool expand}) {
     final session = AgentSession(
       localId: 'agent-${_nextAgentSessionId++}',
@@ -1623,12 +2064,20 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
         onDone: _scheduleRuntimeReconnect,
       );
       final confirmed = await _runtimeClient.runtimeStatus();
+      _runtimeStatus = confirmed;
       final confirmedInstanceId = confirmed.instanceId;
       if (_runtimeInstanceId != confirmedInstanceId) {
         await _runtimeEvents?.cancel();
         _scheduleRuntimeReconnect();
       }
       _presentation.connected();
+      if (confirmed.edition == 'commercial') {
+        unawaited(_checkForProductUpdate());
+        _productUpdateTimer ??= Timer.periodic(
+          const Duration(hours: 6),
+          (_) => unawaited(_checkForProductUpdate()),
+        );
+      }
       unawaited(_ensureSelectedProjectTerminal());
       unawaited(_refreshNotificationReadiness());
       await _refreshCodexReadiness();
@@ -1919,6 +2368,56 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
     }
   }
 
+  Future<void> _openAppSettings() async {
+    final editionSections = widget.editionSurface.settingsSections(
+      _runtimeClient,
+    );
+    final section = await showDialog<String>(
+      context: context,
+      builder: (context) => SimpleDialog(
+        title: const Text('Settings'),
+        children: [
+          SimpleDialogOption(
+            onPressed: () => Navigator.pop(context, 'codex'),
+            child: const ListTile(
+              leading: Icon(Icons.terminal),
+              title: Text('Codex'),
+              subtitle: Text('Installation and runtime setup'),
+            ),
+          ),
+          ...editionSections.map(
+            (entry) => SimpleDialogOption(
+              key: Key('settings-${entry.id}'),
+              onPressed: () => Navigator.pop(context, entry.id),
+              child: ListTile(
+                leading: Icon(entry.icon),
+                title: Text(entry.title),
+                subtitle: Text(entry.subtitle),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+    if (!mounted) return;
+    if (section == 'codex') {
+      await _openCodexSettings();
+    } else {
+      EditionSettingsSection? selected;
+      for (final entry in editionSections) {
+        if (entry.id == section) {
+          selected = entry;
+          break;
+        }
+      }
+      if (selected == null) return;
+      await showDialog<void>(
+        context: context,
+        builder: (context) => selected!.dialogBuilder(_runtimeClient),
+      );
+    }
+  }
+
   void _checkRuntimeCapabilities(RuntimeStatusDto status) {
     _runtimeSupportsPersistence = status.supportsPersistentSessions;
     _runtimeSupportsAlwaysOnWebAccess = status.supportsAlwaysOnWebAccess;
@@ -2004,6 +2503,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
       for (final session in _agentSessions) session.localId: session,
     };
     final sessionsById = <String, AgentSession>{};
+    final refreshLatestAgentIds = <String>{};
     for (final agentJson in agentsJson) {
       final session = _agentSessionFromRuntime(
         agentJson,
@@ -2012,6 +2512,13 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
       if (session != null) {
         final existing = existingSessions[session.localId];
         if (existing != null) {
+          if (session.updatedAt.isAfter(existing.updatedAt) &&
+              _projects.any(
+                (project) =>
+                    project.id == session.projectId && project.isRemote,
+              )) {
+            refreshLatestAgentIds.add(session.localId);
+          }
           session.messages
             ..clear()
             ..addAll(existing.messages);
@@ -2110,6 +2617,12 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
         ? null
         : sessionsById[_expandedAgentLocalId];
     if (expanded != null) unawaited(_loadAgentMessages(expanded));
+    for (final agentId in refreshLatestAgentIds) {
+      final session = sessionsById[agentId];
+      if (session != null) {
+        unawaited(_loadAgentMessages(session, refreshLatest: true));
+      }
+    }
     _scheduleStatusBarUpdate();
     final pendingTarget = _pendingNotificationTarget;
     if (pendingTarget != null) {
@@ -2143,6 +2656,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
     _applicationChannel.setMethodCallHandler(null);
     _presentation.dispose();
     _runtimeEvents?.cancel();
+    _productUpdateTimer?.cancel();
     _idleChatViewport.dispose();
     for (final viewport in _chatViewports.values) {
       viewport.dispose();
@@ -2233,6 +2747,16 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
     if (!mounted) {
       return;
     }
+    final kind = await showDialog<_AddProjectKind>(
+      context: context,
+      builder: (context) => const AddProjectKindDialog(),
+    );
+    if (kind == null) return;
+    if (kind == _AddProjectKind.remote) {
+      await _addRemoteProject();
+      return;
+    }
+    if (!mounted) return;
     final project = await showDialog<DitchProject>(
       context: context,
       builder: (context) => const AddProjectDialog(),
@@ -2264,7 +2788,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
       if (!mounted) {
         return;
       }
-      Navigator.of(context, rootNavigator: true).pop();
+      _dismissProjectSetupProgress();
       final configuredProject =
           _projectFromRuntime(response['ProjectCreated']) ??
           DitchProject(
@@ -2295,7 +2819,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
       if (!mounted) {
         return;
       }
-      Navigator.of(context, rootNavigator: true).pop();
+      _dismissProjectSetupProgress();
       _showProjectSetupResult(
         title: 'Setup incomplete',
         message: '$error',
@@ -2304,12 +2828,43 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
     }
   }
 
+  Future<void> _addRemoteProject() async {
+    await _ensureRuntimeStarted();
+    if (!mounted) return;
+    final created = await showDialog<DitchProject>(
+      context: context,
+      barrierDismissible: true,
+      builder: (context) => AddRemoteProjectDialog(client: _runtimeClient),
+    );
+    if (created == null || !mounted) return;
+    setState(() {
+      upsertProject(_projects, created);
+      _selectedProjectKey = _projectKey(created);
+      _createAgentSession(expand: true);
+    });
+    unawaited(_ensureSelectedProjectTerminal());
+  }
+
   Future<void> _copyProjectPath(DitchProject project) async {
     await Clipboard.setData(ClipboardData(text: project.path));
     if (!mounted) return;
     ScaffoldMessenger.of(
       context,
     ).showSnackBar(const SnackBar(content: Text('Project path copied.')));
+  }
+
+  Future<void> _checkRemoteSetupForProject(DitchProject project) async {
+    final alias = project.sshHostAlias;
+    if (alias == null) return;
+    await showDialog<bool>(
+      context: context,
+      barrierDismissible: true,
+      builder: (context) => AddRemoteProjectDialog(
+        client: _runtimeClient,
+        initialAlias: alias,
+        repairOnly: true,
+      ),
+    );
   }
 
   Future<void> _deleteProject(DitchProject project) async {
@@ -2407,19 +2962,32 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
   }
 
   void _showProjectSetupProgress() {
-    showDialog<void>(
-      context: context,
-      barrierDismissible: false,
-      builder: (context) => const AlertDialog(
-        content: Row(
-          children: [
-            CircularProgressIndicator(),
-            SizedBox(width: 20),
-            Text('Configuring project…'),
-          ],
-        ),
-      ),
+    unawaited(
+      showDialog<void>(
+        context: context,
+        barrierDismissible: true,
+        builder: (dialogContext) {
+          _projectSetupProgressContext = dialogContext;
+          return const AlertDialog(
+            content: Row(
+              children: [
+                CircularProgressIndicator(),
+                SizedBox(width: 20),
+                Text('Configuring project…'),
+              ],
+            ),
+          );
+        },
+      ).whenComplete(() => _projectSetupProgressContext = null),
     );
+  }
+
+  void _dismissProjectSetupProgress() {
+    final dialogContext = _projectSetupProgressContext;
+    _projectSetupProgressContext = null;
+    if (dialogContext != null && dialogContext.mounted) {
+      Navigator.of(dialogContext).pop();
+    }
   }
 
   void _showProjectSetupResult({
@@ -2471,6 +3039,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
     }
     try {
       final response = await _runtimeClient.startCodexSession(
+        projectId: _selectedProject.id,
         projectName: _selectedProject.name,
         projectRoot: _selectedProject.path,
         prompt: prompt,
@@ -2518,6 +3087,75 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
   }
 
   Future<bool> _prepareSelectedProjectForCodex() async {
+    if (_selectedProject.isRemote) {
+      try {
+        final alias = _selectedProject.sshHostAlias;
+        if (alias == null) {
+          throw const FormatException(
+            'Remote project does not have an SSH host alias.',
+          );
+        }
+        var setup = await _runtimeClient.checkRemoteSetup(alias: alias);
+        final checks = setup['checks'];
+        final sandboxReady = remoteSetupCheckHasState(
+          setup,
+          key: 'codex_sandbox',
+          state: 'ready',
+        );
+        final sandboxRequired =
+            agentExecutionSettings.approval != AgentApprovalPreset.fullAccess;
+        final sandboxCanBeConfigured =
+            checks is List &&
+            checks.whereType<Map>().any(
+              (item) =>
+                  item['key'] == 'codex_sandbox' &&
+                  item['state'] == 'install_available',
+            );
+        if (sandboxRequired && !sandboxReady && sandboxCanBeConfigured) {
+          if (!mounted) return false;
+          final configured = await showDialog<bool>(
+            context: context,
+            barrierDismissible: true,
+            builder: (context) => CodexAuthenticationDialog(
+              client: _runtimeClient,
+              alias: alias,
+              sandboxSetup: true,
+            ),
+          );
+          if (configured != true || !mounted) return false;
+          setup = await _runtimeClient.checkRemoteSetup(alias: alias);
+        }
+        if (!remoteSetupReadyForExecution(
+          setup,
+          requireCodexSandbox: sandboxRequired,
+        )) {
+          if (!mounted) return false;
+          final repaired = await showDialog<bool>(
+            context: context,
+            barrierDismissible: true,
+            builder: (context) => AddRemoteProjectDialog(
+              client: _runtimeClient,
+              initialAlias: alias,
+              initialSetup: setup,
+              repairOnly: true,
+              requireCodexSandbox: sandboxRequired,
+            ),
+          );
+          if (repaired != true) return false;
+        }
+        await _runtimeClient.request({
+          'CheckRemoteProject': {'project_id': _selectedProject.id},
+        });
+        return true;
+      } on Object catch (error) {
+        _showProjectSetupResult(
+          title: 'Remote project unavailable',
+          message: '$error',
+          isError: true,
+        );
+        return false;
+      }
+    }
     if (_codexReadiness?.ready != true) {
       await _refreshCodexReadiness();
       if (_codexReadiness?.ready != true) {
@@ -2797,6 +3435,10 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
   }
 
   void _openAttentionSession(AttentionEvent event) {
+    if (event.action == AttentionAction.installProductUpdate) {
+      unawaited(_installProductUpdate(event));
+      return;
+    }
     final sessionLocalId = event.sessionLocalId;
     if (sessionLocalId == null ||
         _agentSessionByLocalId(sessionLocalId) == null) {
@@ -2827,7 +3469,9 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
       _readAttentionIds.remove(event.id);
     });
     _scheduleStatusBarUpdate();
-    unawaited(_runtimeClient.dismissAttention(event.id));
+    if (!event.id.startsWith('attention-')) {
+      unawaited(_runtimeClient.dismissAttention(event.id));
+    }
   }
 
   void _markNotificationsRead() {
@@ -2971,6 +3615,15 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
     }
 
     final projectChanged = eventBody['ProjectChanged'];
+    final remotePresence = eventBody['RemoteHostStatusChanged'];
+    if (remotePresence is Map) {
+      final alias = remotePresence['ssh_host_alias']?.toString();
+      final status = remotePresence['state']?.toString();
+      if (alias != null && status != null) {
+        setState(() => _remoteHostStatus[alias] = status);
+      }
+      return;
+    }
     if (projectChanged != null) {
       final project = _projectFromRuntime(projectChanged);
       if (project == null) {
@@ -3002,6 +3655,13 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
           _expandedAgentLocalId ??= incoming.localId;
         }
       });
+      final updated = _agentSessionByLocalId(incoming.localId);
+      if (updated != null &&
+          _projects.any(
+            (project) => project.id == updated.projectId && project.isRemote,
+          )) {
+        unawaited(_loadAgentMessages(updated, refreshLatest: true));
+      }
       _scheduleStatusBarUpdate();
       return;
     }
@@ -3280,12 +3940,17 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
     _scheduleStatusBarUpdate();
   }
 
-  Future<void> _loadAgentMessages(AgentSession session) async {
+  Future<void> _loadAgentMessages(
+    AgentSession session, {
+    bool refreshLatest = false,
+  }) async {
     if (session.messagesLoading ||
-        (session.messagesLoaded && !session.hasOlderMessages)) {
+        (!refreshLatest &&
+            session.messagesLoaded &&
+            !session.hasOlderMessages)) {
       return;
     }
-    final initial = !session.messagesLoaded;
+    final initial = refreshLatest || !session.messagesLoaded;
     setState(() {
       session.messagesLoading = true;
       session.historyError = null;
@@ -3321,13 +3986,19 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
       if (target == null) return;
       setState(() {
         final additions = uniqueRuntimeMessages(target.messages, pageItems);
-        target.messages.insertAll(0, additions);
+        if (refreshLatest && target.messagesLoaded) {
+          target.messages.addAll(additions);
+        } else {
+          target.messages.insertAll(0, additions);
+        }
         target.messagesLoaded = true;
         target.messagesLoading = false;
-        target.hasOlderMessages = page['has_more'] == true;
-        target.nextBeforeSequence = page['next_before_sequence'] is int
-            ? page['next_before_sequence'] as int
-            : null;
+        if (!refreshLatest || target.nextBeforeSequence == null) {
+          target.hasOlderMessages = page['has_more'] == true;
+          target.nextBeforeSequence = page['next_before_sequence'] is int
+              ? page['next_before_sequence'] as int
+              : null;
+        }
       });
     } on Object catch (error) {
       if (!mounted) return;
@@ -3489,6 +4160,9 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
         relativePath: entry.relativePath,
         content: value['content']?.toString() ?? '',
         revision: value['revision']?.toString() ?? '',
+        readOnly: _projects.any(
+          (project) => project.id == projectId && project.isRemote,
+        ),
       );
       document.controller.addListener(() {
         if (mounted && identical(files.document, document)) setState(() {});
@@ -3515,6 +4189,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
     final projectId = _selectedProject.id;
     final document = files.document;
     if (projectId == null || document == null || document.saving) return false;
+    if (document.readOnly) return false;
     setState(() {
       document.saving = true;
       document.conflict = false;
@@ -3903,6 +4578,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
                       ProjectSidebar(
                         width: projectSidebarWidth,
                         projects: _projects,
+                        remoteHostStatus: _remoteHostStatus,
                         selectedIndex: _selectedProjectIndex,
                         onAddProject: _addProject,
                         onSelectProject: _selectProject,
@@ -3910,6 +4586,8 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
                             unawaited(_revealProjectInFinder(project)),
                         onCopyProjectPath: (project) =>
                             unawaited(_copyProjectPath(project)),
+                        onCheckRemoteSetup: (project) =>
+                            unawaited(_checkRemoteSetupForProject(project)),
                         onDeleteProject: (project) =>
                             unawaited(_deleteProject(project)),
                         summaryForProject: (project) => summarizeProjectAgents(
@@ -3963,7 +4641,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
                       onOpenNotification: _openAttentionSession,
                       onDismissNotification: _dismissAttention,
                       onDismissAllNotifications: _dismissAllNotifications,
-                      onOpenCodexSettings: _openCodexSettings,
+                      onOpenCodexSettings: _openAppSettings,
                       codexAvailable: _codexBinary != null,
                       onToggleSidebar: _presentation.toggleSidebar,
                       onToggleInspector: _presentation.toggleInspector,
@@ -4435,6 +5113,935 @@ class NotificationSetupBanner extends StatelessWidget {
   }
 }
 
+class CommercialUpgradeDialog extends StatefulWidget {
+  const CommercialUpgradeDialog({
+    required this.client,
+    this.deploymentEnvironment = ditchDeploymentEnvironment,
+    this.relayOrigin = ditchRelayOrigin,
+    super.key,
+  });
+
+  final DitchRuntimeClient client;
+  final String deploymentEnvironment;
+  final String relayOrigin;
+
+  @override
+  State<CommercialUpgradeDialog> createState() =>
+      _CommercialUpgradeDialogState();
+}
+
+class _CommercialUpgradeDialogState extends State<CommercialUpgradeDialog> {
+  static const _applicationChannel = MethodChannel('the_ditch/application');
+  static const _deferredInstallRetryInterval = Duration(seconds: 2);
+  final _licenseController = TextEditingController();
+  CommercialOfferCatalog? _catalog;
+  Map<String, dynamic>? _entitlement;
+  bool _loading = true;
+  bool _busy = false;
+  bool _finishing = false;
+  String? _pendingCheckoutOfferId;
+  String? _pendingCheckoutUrl;
+  DateTime? _pendingCheckoutExpiresAt;
+  String? _catalogError;
+  String? _entitlementError;
+  String? _actionError;
+  String? _installationStatus;
+  Timer? _commercialInstallRetryTimer;
+  bool _waitingForAgents = false;
+
+  @override
+  void initState() {
+    super.initState();
+    unawaited(_loadCommercialState());
+  }
+
+  @override
+  void dispose() {
+    _commercialInstallRetryTimer?.cancel();
+    _licenseController.clear();
+    _licenseController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _loadCommercialState() async {
+    if (mounted) {
+      setState(() {
+        _loading = true;
+        _catalogError = null;
+        _entitlementError = null;
+        _actionError = null;
+        _installationStatus = null;
+      });
+    }
+    CommercialOfferCatalog? catalog;
+    Map<String, dynamic>? entitlement;
+    try {
+      catalog = await widget.client.commercialOffers();
+    } on Object catch (error) {
+      debugPrint('Commercial catalog unavailable: $error');
+      _catalogError = 'Pricing is temporarily unavailable.';
+    }
+    try {
+      entitlement = await widget.client.commercialEntitlement();
+    } on Object catch (error) {
+      debugPrint('Commercial entitlement unavailable: $error');
+      _entitlementError = 'Commercial status is temporarily unavailable.';
+    }
+    if (mounted) {
+      setState(() {
+        _catalog = catalog;
+        _entitlement = entitlement;
+        _loading = false;
+      });
+    }
+  }
+
+  Future<void> _checkout(CommercialOffer offer) async {
+    final baseline = Map<String, dynamic>.from(_entitlement ?? const {});
+    setState(() {
+      _busy = true;
+      _actionError = null;
+    });
+    try {
+      final checkout = await widget.client.createCommercialCheckout(
+        offer.offerId,
+      );
+      final hostedUrl = checkout['hosted_url']?.toString();
+      if (hostedUrl == null || hostedUrl.isEmpty) {
+        throw const FormatException('Checkout did not provide a hosted URL.');
+      }
+      final opened = await _applicationChannel.invokeMethod<bool>(
+        'openURL',
+        hostedUrl,
+      );
+      if (opened != true) {
+        throw const FormatException('The hosted checkout could not be opened.');
+      }
+      if (!mounted) return;
+      final expiresAt = DateTime.tryParse(
+        checkout['expires_at']?.toString() ?? '',
+      )?.toUtc();
+      setState(() {
+        _busy = false;
+        _finishing = true;
+        _pendingCheckoutOfferId = offer.offerId;
+        _pendingCheckoutUrl = hostedUrl;
+        _pendingCheckoutExpiresAt =
+            expiresAt ?? DateTime.now().toUtc().add(const Duration(minutes: 5));
+      });
+      await _waitForEntitlement(offer, baseline);
+    } on Object catch (error) {
+      debugPrint('Commercial checkout failed: $error');
+      if (mounted) {
+        setState(() {
+          _busy = false;
+          _finishing = false;
+          _pendingCheckoutOfferId = null;
+          _pendingCheckoutUrl = null;
+          _pendingCheckoutExpiresAt = null;
+          _actionError = 'Checkout could not be started. Please try again.';
+        });
+      }
+    }
+  }
+
+  Future<void> _waitForEntitlement(
+    CommercialOffer offer,
+    Map<String, dynamic> baseline,
+  ) async {
+    var pollIndex = 0;
+    final deadline =
+        _pendingCheckoutExpiresAt ??
+        DateTime.now().toUtc().add(const Duration(minutes: 5));
+    while (mounted && DateTime.now().toUtc().isBefore(deadline)) {
+      try {
+        final entitlement = await widget.client.commercialEntitlement();
+        if (_entitlementCompleted(offer, baseline, entitlement)) {
+          if (!mounted) return;
+          setState(() {
+            _entitlement = entitlement;
+            _finishing = false;
+            _pendingCheckoutOfferId = null;
+            _pendingCheckoutUrl = null;
+            _pendingCheckoutExpiresAt = null;
+            _actionError = null;
+          });
+          if (baseline['active'] != true && entitlement['active'] == true) {
+            await _startCommercialInstallation();
+          } else {
+            await _loadCommercialState();
+          }
+          return;
+        }
+        if (pollIndex.isEven) {
+          final catalog = await widget.client.commercialOffers();
+          final currentOffer = _offerWithId(catalog, offer.offerId);
+          if (!mounted) return;
+          setState(() => _catalog = catalog);
+          if (offer.kind == CommercialOfferKind.commercialMonthly &&
+              currentOffer?.eligible == true) {
+            setState(() {
+              _finishing = false;
+              _pendingCheckoutOfferId = null;
+              _pendingCheckoutUrl = null;
+              _pendingCheckoutExpiresAt = null;
+              _actionError =
+                  'Payment was not completed. The plan is available to try again.';
+            });
+            return;
+          }
+        }
+      } on Object {
+        // Checkout may still be settling. A browser redirect is never treated
+        // as payment proof; only an active backend entitlement completes it.
+      }
+      pollIndex += 1;
+      await Future<void>.delayed(const Duration(seconds: 2));
+    }
+    if (mounted) {
+      setState(() {
+        _finishing = false;
+        _pendingCheckoutUrl = null;
+        _pendingCheckoutExpiresAt = null;
+      });
+      await _loadCommercialState();
+      if (mounted) {
+        setState(() {
+          _actionError =
+              'Checkout expired before payment was confirmed. The plan remains visible and can be checked again.';
+        });
+      }
+    }
+  }
+
+  CommercialOffer? _offerWithId(
+    CommercialOfferCatalog catalog,
+    String offerId,
+  ) {
+    for (final offer in catalog.offers) {
+      if (offer.offerId == offerId) return offer;
+    }
+    return null;
+  }
+
+  Future<void> _reopenPendingCheckout() async {
+    final url = _pendingCheckoutUrl;
+    if (url == null) {
+      await _loadCommercialState();
+      return;
+    }
+    final opened = await _applicationChannel.invokeMethod<bool>('openURL', url);
+    if (opened != true && mounted) {
+      setState(() {
+        _actionError = 'The hosted checkout could not be reopened.';
+      });
+    }
+  }
+
+  bool _entitlementCompleted(
+    CommercialOffer offer,
+    Map<String, dynamic> baseline,
+    Map<String, dynamic> current,
+  ) {
+    switch (offer.purchaseAction) {
+      case CommercialPurchaseAction.acquire:
+      case CommercialPurchaseAction.renew:
+        return current['active'] == true && baseline['active'] != true;
+      case CommercialPurchaseAction.addCapacity:
+        final oldMacs = (baseline['mac_slots'] as num?)?.toInt() ?? 0;
+        final oldPhones = (baseline['iphone_slots'] as num?)?.toInt() ?? 0;
+        final newMacs = (current['mac_slots'] as num?)?.toInt() ?? 0;
+        final newPhones = (current['iphone_slots'] as num?)?.toInt() ?? 0;
+        return current['active'] == true &&
+            (newMacs > oldMacs || newPhones > oldPhones);
+      case CommercialPurchaseAction.upgrade:
+        return current['active'] == true &&
+            (current['plan'] != baseline['plan'] ||
+                current['mac_slots'] != baseline['mac_slots'] ||
+                current['iphone_slots'] != baseline['iphone_slots']);
+    }
+  }
+
+  Future<void> _installAuthorizedRelease() async {
+    final release = await widget.client.currentCommercialRelease();
+    await startAuthorizedCommercialUpdate(release);
+  }
+
+  void _scheduleDeferredInstallRetry() {
+    _commercialInstallRetryTimer ??= Timer.periodic(
+      _deferredInstallRetryInterval,
+      (_) => unawaited(_retryDeferredCommercialInstallation()),
+    );
+  }
+
+  void _stopDeferredInstallRetry() {
+    _commercialInstallRetryTimer?.cancel();
+    _commercialInstallRetryTimer = null;
+    _waitingForAgents = false;
+  }
+
+  Future<void> _retryDeferredCommercialInstallation() async {
+    if (!mounted || !_waitingForAgents || _busy) return;
+    await _startCommercialInstallation(automaticRetry: true);
+  }
+
+  String _commercialInstallationErrorMessage(Object error) {
+    if (error is DitchRuntimeException) {
+      return switch (error.code) {
+        'commercial_release_unavailable' =>
+          'Commercial is active, but no compatible Commercial build has been published for this environment yet. Your purchase is safe. Try again after a release is published.',
+        'commercial_release_verification_not_configured' =>
+          'This Ditch build is not configured to verify official Commercial releases. Install an official staging build and try again.',
+        'commercial_release_network_failed' =>
+          'Ditch could not reach the Relay to authorize the Commercial download. Check your connection and try again.',
+        'commercial_device_not_licensed' =>
+          'This Mac could not be activated for the Commercial license. Check the available Mac slots and try again.',
+        'commercial_release_authorization_expired' =>
+          'The secure download authorization expired before installation started. Try again to request a fresh authorization.',
+        'commercial_release_incompatible' =>
+          'The available Commercial build is not compatible with this Community build. Update Community first, then try again.',
+        'commercial_release_downgrade_refused' =>
+          'Ditch refused to install an older Commercial build over this installation.',
+        'commercial_release_signature_invalid' ||
+        'commercial_release_artifact_invalid' ||
+        'commercial_release_identity_invalid' =>
+          'Ditch could not verify the Commercial release, so nothing was installed. Please report this staging release to DitchNow.',
+        'commercial_release_rejected' =>
+          'The Relay did not authorize this Commercial release for the current installation. Your purchase is unchanged; try again or check the license status.',
+        _ => 'Commercial installation could not start: ${error.message}',
+      };
+    }
+    if (error is PlatformException) {
+      return switch (error.code) {
+        'update_verification_not_configured' =>
+          'This Ditch build is missing its public Sparkle verification key. Install an official staging build and try again.',
+        'invalid_update_feed' =>
+          'The Commercial release returned an invalid secure update feed.',
+        'unauthorized_update_host' =>
+          'Ditch refused the update because its download host is not authorized for this environment.',
+        _ =>
+          error.message?.isNotEmpty == true
+              ? error.message!
+              : 'The secure updater could not be started.',
+      };
+    }
+    if (error is FormatException) return error.message;
+    return 'The secure updater could not be started. Please try again.';
+  }
+
+  Future<void> _startCommercialInstallation({
+    bool automaticRetry = false,
+  }) async {
+    if (!automaticRetry) _stopDeferredInstallRetry();
+    if (mounted) {
+      setState(() {
+        _busy = true;
+        _actionError = null;
+        if (!automaticRetry) _installationStatus = null;
+      });
+    }
+    try {
+      await _installAuthorizedRelease();
+      _stopDeferredInstallRetry();
+      if (mounted) {
+        setState(() {
+          _busy = false;
+          _installationStatus =
+              'The secure Commercial installer is ready. Follow the update window to finish installation.';
+        });
+      }
+    } on Object catch (error) {
+      debugPrint('Commercial installation could not start: $error');
+      final deferred =
+          error is DitchRuntimeException &&
+          error.code == 'commercial_upgrade_deferred';
+      if (deferred) {
+        _waitingForAgents = true;
+        _scheduleDeferredInstallRetry();
+      } else {
+        _stopDeferredInstallRetry();
+      }
+      if (mounted) {
+        setState(() {
+          _busy = false;
+          if (deferred) {
+            _actionError = null;
+            _installationStatus =
+                '${error.message} Installation will retry automatically.';
+          } else {
+            _installationStatus = null;
+            _actionError = _commercialInstallationErrorMessage(error);
+          }
+        });
+      }
+    }
+  }
+
+  Future<void> _activateLicense() async {
+    final rawKey = _licenseController.text.trim();
+    if (rawKey.isEmpty) return;
+    setState(() {
+      _busy = true;
+      _actionError = null;
+    });
+    _licenseController.clear();
+    try {
+      final entitlement = await widget.client.redeemCommercialLicense(rawKey);
+      if (!mounted) return;
+      setState(() {
+        _busy = false;
+        _entitlement = entitlement;
+      });
+      if (entitlement['active'] == true) {
+        await _startCommercialInstallation();
+      } else {
+        setState(
+          () => _actionError =
+              'Ditch did not return an active Commercial license.',
+        );
+      }
+    } on Object catch (error) {
+      debugPrint('Commercial license activation failed: $error');
+      if (mounted) {
+        setState(() {
+          _busy = false;
+          _actionError = 'The Ditch license could not be activated.';
+        });
+      }
+    }
+  }
+
+  Future<void> _manageBilling() async {
+    setState(() {
+      _busy = true;
+      _actionError = null;
+    });
+    try {
+      final session = await widget.client.commercialBillingManagement();
+      final url = session['billing_management_url']?.toString();
+      if (url == null || url.isEmpty) {
+        throw const FormatException(
+          'Billing management did not provide a destination.',
+        );
+      }
+      final opened = await _applicationChannel.invokeMethod<bool>(
+        'openURL',
+        url,
+      );
+      if (opened != true) {
+        throw const FormatException('Billing management could not be opened.');
+      }
+      if (mounted) setState(() => _busy = false);
+    } on Object catch (error) {
+      debugPrint('Commercial billing management failed: $error');
+      if (mounted) {
+        setState(() {
+          _busy = false;
+          _actionError = 'Billing management is temporarily unavailable.';
+        });
+      }
+    }
+  }
+
+  Future<void> _openRelayOrigin() async {
+    try {
+      final opened = await _applicationChannel.invokeMethod<bool>(
+        'openURL',
+        widget.relayOrigin,
+      );
+      if (opened != true) {
+        throw const FormatException('The Relay URL could not be opened.');
+      }
+    } on Object catch (error) {
+      debugPrint('Configured Relay URL could not be opened: $error');
+      if (mounted) {
+        setState(() {
+          _actionError = 'The configured Relay URL could not be opened.';
+        });
+      }
+    }
+  }
+
+  String _billingSuffix(CommercialOffer offer) {
+    if (offer.billingType == CommercialBillingType.oneTime) return ' once';
+    final interval = offer.recurringInterval!;
+    final count = offer.recurringIntervalCount!;
+    return count == 1
+        ? '/${interval.name}'
+        : ' every $count ${interval.label(count)}';
+  }
+
+  String _offerButtonLabel(CommercialOffer offer) =>
+      switch (offer.purchaseAction) {
+        CommercialPurchaseAction.addCapacity => 'Add pair',
+        CommercialPurchaseAction.upgrade => 'Upgrade',
+        CommercialPurchaseAction.renew => 'Renew',
+        CommercialPurchaseAction.acquire =>
+          offer.kind == CommercialOfferKind.commercialLifetime
+              ? 'Buy Lifetime'
+              : 'Upgrade',
+      };
+
+  String _planLabel(Object? value) {
+    final plans = value
+        ?.toString()
+        .split('+')
+        .map(
+          (plan) => switch (plan) {
+            'commercial_monthly' => 'Commercial Monthly',
+            'commercial_lifetime' => 'Commercial Lifetime',
+            'lifetime_extra_pair' => 'Lifetime extra pair',
+            'administrative' => 'Commercial',
+            _ => 'Commercial',
+          },
+        )
+        .toList(growable: false);
+    return plans == null || plans.isEmpty ? 'Commercial' : plans.join(' + ');
+  }
+
+  Widget _offerCard(BuildContext context, CommercialOffer offer) {
+    final locale = Localizations.localeOf(context);
+    final base = offer.basePrice.format(locale);
+    final suffix = _billingSuffix(offer);
+    final introductory = offer.introductoryPrice;
+    final introductoryMoney = offer.introductoryMoney;
+    final slots = offer.entitlement;
+    final description = offer.description;
+    final price = introductoryMoney?.format(locale);
+    final introDuration = introductory == null
+        ? null
+        : '${introductory.durationCount} ${introductory.durationUnit.label(introductory.durationCount)}';
+    final checkoutPending =
+        !offer.eligible && offer.ineligibleReason == 'checkout_in_progress';
+    final canReopenCheckout =
+        checkoutPending &&
+        _pendingCheckoutOfferId == offer.offerId &&
+        _pendingCheckoutUrl != null;
+    final actionLabel = checkoutPending
+        ? (canReopenCheckout ? 'Return to checkout' : 'Check status')
+        : _offerButtonLabel(offer);
+    return Card(
+      key: Key('commercial-offer-${offer.offerId}'),
+      margin: const EdgeInsets.only(bottom: 10),
+      child: Padding(
+        padding: const EdgeInsets.all(14),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    offer.title,
+                    style: Theme.of(context).textTheme.titleMedium,
+                  ),
+                  if (description != null) ...[
+                    const SizedBox(height: 3),
+                    Text(description),
+                  ],
+                  const SizedBox(height: 8),
+                  if (introductory != null &&
+                      introductoryMoney != null &&
+                      price != null &&
+                      introDuration != null)
+                    Semantics(
+                      container: true,
+                      label:
+                          'Introductory price: $price${_billingSuffix(offer)} plus VAT for $introDuration. Then $base${_billingSuffix(offer)} plus VAT.',
+                      child: ExcludeSemantics(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Wrap(
+                              spacing: 8,
+                              crossAxisAlignment: WrapCrossAlignment.center,
+                              children: [
+                                Text(
+                                  '$base$suffix',
+                                  key: Key(
+                                    'commercial-base-price-${offer.offerId}',
+                                  ),
+                                  style: Theme.of(context).textTheme.bodyLarge
+                                      ?.copyWith(
+                                        decoration: TextDecoration.lineThrough,
+                                      ),
+                                ),
+                                Text(
+                                  '$price$suffix',
+                                  key: Key(
+                                    'commercial-intro-price-${offer.offerId}',
+                                  ),
+                                  style: Theme.of(context).textTheme.titleLarge,
+                                ),
+                                const Text('+ VAT'),
+                              ],
+                            ),
+                            Text('for the first $introDuration'),
+                            Text('Then $base$suffix + VAT'),
+                          ],
+                        ),
+                      ),
+                    )
+                  else
+                    Wrap(
+                      spacing: 8,
+                      crossAxisAlignment: WrapCrossAlignment.center,
+                      children: [
+                        Text(
+                          '$base$suffix',
+                          style: Theme.of(context).textTheme.titleLarge,
+                        ),
+                        const Text('+ VAT'),
+                      ],
+                    ),
+                  const Text(
+                    'VAT is calculated at checkout for your billing location.',
+                  ),
+                  const SizedBox(height: 5),
+                  Text(
+                    '${slots.macSlots} Mac${slots.macSlots == 1 ? '' : 's'} + ${slots.iPhoneSlots} iPhone${slots.iPhoneSlots == 1 ? '' : 's'}',
+                  ),
+                  if (checkoutPending) ...[
+                    const SizedBox(height: 9),
+                    Row(
+                      key: Key('commercial-checkout-status-${offer.offerId}'),
+                      children: [
+                        if (_finishing &&
+                            _pendingCheckoutOfferId == offer.offerId) ...[
+                          const SizedBox.square(
+                            dimension: 14,
+                            child: CircularProgressIndicator(strokeWidth: 2),
+                          ),
+                          const SizedBox(width: 8),
+                        ] else ...[
+                          const Icon(Icons.hourglass_top, size: 16),
+                          const SizedBox(width: 6),
+                        ],
+                        const Expanded(
+                          child: Text(
+                            'Checkout in progress — payment has not yet been confirmed.',
+                          ),
+                        ),
+                      ],
+                    ),
+                  ],
+                ],
+              ),
+            ),
+            const SizedBox(width: 12),
+            FilledButton(
+              key: Key('commercial-offer-action-${offer.offerId}'),
+              onPressed: _busy || (!checkoutPending && _finishing)
+                  ? null
+                  : checkoutPending
+                  ? _reopenPendingCheckout
+                  : offer.eligible
+                  ? () => _checkout(offer)
+                  : null,
+              child: Text(actionLabel),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _offerSection(
+    BuildContext context,
+    String title,
+    List<CommercialOffer> offers,
+  ) {
+    if (offers.isEmpty) return const SizedBox.shrink();
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Text(title, style: Theme.of(context).textTheme.titleMedium),
+        const SizedBox(height: 8),
+        ...offers.map((offer) => _offerCard(context, offer)),
+      ],
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final entitlement = _entitlement;
+    final active = entitlement?['active'] == true;
+    final status =
+        entitlement?['status']?.toString() ?? (active ? 'active' : 'inactive');
+    final expired = status == 'expired';
+    final eligible =
+        _catalog?.offers
+            .where((offer) => offer.eligible)
+            .toList(growable: false) ??
+        const <CommercialOffer>[];
+    final acquisitionOffers =
+        _catalog?.offers
+            .where(
+              (offer) =>
+                  offer.purchaseAction == CommercialPurchaseAction.acquire &&
+                  (offer.eligible ||
+                      offer.ineligibleReason == 'checkout_in_progress'),
+            )
+            .toList(growable: false) ??
+        const <CommercialOffer>[];
+    final renewalOffers = eligible
+        .where(
+          (offer) => offer.purchaseAction == CommercialPurchaseAction.renew,
+        )
+        .toList(growable: false);
+    final upgradeOffers = eligible
+        .where(
+          (offer) => offer.purchaseAction == CommercialPurchaseAction.upgrade,
+        )
+        .toList(growable: false);
+    final capacityOffers = eligible
+        .where(
+          (offer) =>
+              offer.purchaseAction == CommercialPurchaseAction.addCapacity,
+        )
+        .toList(growable: false);
+    return AlertDialog(
+      icon: const Icon(Icons.phone_iphone),
+      title: const Text('Remote Control'),
+      content: SizedBox(
+        width: 580,
+        child: SingleChildScrollView(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Text(
+                'Control your agents from your iPhone, receive alerts and keep work moving away from your Mac.',
+              ),
+              const SizedBox(height: 18),
+              Text(
+                'Commercial',
+                style: Theme.of(context).textTheme.titleMedium,
+              ),
+              const SizedBox(height: 8),
+              if (widget.deploymentEnvironment == 'staging') ...[
+                Container(
+                  key: const Key('commercial-staging-environment'),
+                  padding: const EdgeInsets.all(12),
+                  decoration: BoxDecoration(
+                    color: Theme.of(context).colorScheme.tertiaryContainer,
+                    borderRadius: BorderRadius.circular(10),
+                  ),
+                  child: Row(
+                    crossAxisAlignment: CrossAxisAlignment.center,
+                    children: [
+                      Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 9,
+                          vertical: 5,
+                        ),
+                        decoration: BoxDecoration(
+                          color: Theme.of(context).colorScheme.tertiary,
+                          borderRadius: BorderRadius.circular(999),
+                        ),
+                        child: Text(
+                          'TEST MODE',
+                          style: TextStyle(
+                            color: Theme.of(context).colorScheme.onTertiary,
+                            fontWeight: FontWeight.w700,
+                            fontSize: 12,
+                          ),
+                        ),
+                      ),
+                      const SizedBox(width: 12),
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              'Relay',
+                              style: Theme.of(context).textTheme.labelMedium,
+                            ),
+                            Semantics(
+                              link: true,
+                              child: TextButton(
+                                key: const Key('commercial-staging-relay-link'),
+                                onPressed: _openRelayOrigin,
+                                style: TextButton.styleFrom(
+                                  alignment: Alignment.centerLeft,
+                                  padding: EdgeInsets.zero,
+                                  minimumSize: Size.zero,
+                                  tapTargetSize:
+                                      MaterialTapTargetSize.shrinkWrap,
+                                ),
+                                child: Text(
+                                  widget.relayOrigin,
+                                  overflow: TextOverflow.ellipsis,
+                                ),
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                const SizedBox(height: 12),
+              ],
+              if (_loading)
+                const Center(child: CircularProgressIndicator())
+              else if (_entitlementError != null) ...[
+                Text(_entitlementError!),
+                const SizedBox(height: 8),
+                Align(
+                  alignment: Alignment.centerLeft,
+                  child: OutlinedButton(
+                    key: const Key('commercial-retry'),
+                    onPressed: _busy ? null : _loadCommercialState,
+                    child: const Text('Retry'),
+                  ),
+                ),
+              ] else ...[
+                if (active) ...[
+                  Text(
+                    'Commercial active',
+                    key: const Key('commercial-active-status'),
+                    style: Theme.of(context).textTheme.titleLarge,
+                  ),
+                  Text(_planLabel(entitlement?['plan'])),
+                  Text(
+                    '${entitlement?['mac_slots'] ?? 0} Mac slots · ${entitlement?['iphone_slots'] ?? 0} iPhone slots',
+                  ),
+                  const SizedBox(height: 12),
+                  Align(
+                    alignment: Alignment.centerLeft,
+                    child: FilledButton(
+                      key: const Key('install-commercial-build'),
+                      onPressed: _busy ? null : _startCommercialInstallation,
+                      child: Text(
+                        _waitingForAgents
+                            ? 'Check again'
+                            : 'Install Commercial',
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  if (entitlement?['billing_management_available'] == true)
+                    Align(
+                      alignment: Alignment.centerLeft,
+                      child: OutlinedButton(
+                        key: const Key('manage-commercial-billing'),
+                        onPressed: _busy ? null : _manageBilling,
+                        child: const Text('Manage Billing'),
+                      ),
+                    ),
+                  const SizedBox(height: 12),
+                  _offerSection(context, 'Available upgrade', upgradeOffers),
+                  _offerSection(context, 'Add capacity', capacityOffers),
+                ] else if (expired) ...[
+                  Text(
+                    'Commercial subscription expired.',
+                    style: Theme.of(context).textTheme.titleLarge,
+                  ),
+                  const Text('Local and SSH Ditch continue to work.'),
+                  const SizedBox(height: 12),
+                  _offerSection(context, 'Renew', renewalOffers),
+                ] else ...[
+                  _offerSection(
+                    context,
+                    'Choose Commercial',
+                    acquisitionOffers,
+                  ),
+                ],
+                if (_catalog?.stale == true) ...[
+                  const SizedBox(height: 6),
+                  const Text(
+                    'Showing the last verified pricing while Ditch refreshes the catalog.',
+                  ),
+                ],
+                if (_catalogError != null) ...[
+                  Text(_catalogError!),
+                  const SizedBox(height: 8),
+                  Align(
+                    alignment: Alignment.centerLeft,
+                    child: OutlinedButton(
+                      key: const Key('commercial-pricing-retry'),
+                      onPressed: _busy ? null : _loadCommercialState,
+                      child: const Text('Retry'),
+                    ),
+                  ),
+                ] else if (!active && !expired && acquisitionOffers.isEmpty)
+                  const Text('No Commercial offers are currently available.'),
+              ],
+              const Text(
+                'SSH execution hosts are unlimited and do not consume Mac slots.',
+              ),
+              if (_finishing) ...[
+                const SizedBox(height: 16),
+                const LinearProgressIndicator(),
+                const SizedBox(height: 8),
+                const Text('Finishing upgrade…'),
+              ],
+              if (!active) ...[
+                const Divider(height: 28),
+                Text(
+                  'Already purchased?',
+                  style: Theme.of(context).textTheme.titleSmall,
+                ),
+                const SizedBox(height: 8),
+                Row(
+                  children: [
+                    Expanded(
+                      child: TextField(
+                        key: const Key('commercial-license-key'),
+                        controller: _licenseController,
+                        obscureText: true,
+                        autocorrect: false,
+                        enableSuggestions: false,
+                        decoration: const InputDecoration(
+                          labelText: 'Ditch license key',
+                          border: OutlineInputBorder(),
+                        ),
+                        onSubmitted: _busy ? null : (_) => _activateLicense(),
+                      ),
+                    ),
+                    const SizedBox(width: 10),
+                    OutlinedButton(
+                      key: const Key('activate-commercial-license'),
+                      onPressed: _busy ? null : _activateLicense,
+                      child: const Text('Activate'),
+                    ),
+                  ],
+                ),
+              ],
+              if (_actionError != null) ...[
+                const SizedBox(height: 10),
+                SelectableText(
+                  _actionError!,
+                  style: TextStyle(color: Theme.of(context).colorScheme.error),
+                ),
+              ],
+              if (_installationStatus != null) ...[
+                const SizedBox(height: 10),
+                SelectableText(
+                  _installationStatus!,
+                  key: const Key('commercial-installation-status'),
+                ),
+              ],
+              const SizedBox(height: 14),
+              const Text(
+                'Local projects, Codex, sessions and SSH remote projects remain Community features.',
+              ),
+            ],
+          ),
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(context),
+          child: const Text('Close'),
+        ),
+      ],
+    );
+  }
+}
+
 class DitchToolbar extends StatelessWidget {
   const DitchToolbar({
     required this.projectName,
@@ -4849,7 +6456,7 @@ class _NotificationCenterButtonState extends State<NotificationCenterButton> {
                           final event = notifications[index];
                           return _NotificationCenterItem(
                             event: event,
-                            onOpen: event.canOpenSession
+                            onOpen: event.canOpen
                                 ? () {
                                     _controller.close();
                                     widget.onOpen(event);
@@ -4935,8 +6542,17 @@ class _NotificationCenterItem extends StatelessWidget {
                     if (onOpen != null)
                       TextButton.icon(
                         onPressed: onOpen,
-                        icon: const Icon(Icons.open_in_full, size: 15),
-                        label: const Text('Open'),
+                        icon: Icon(
+                          event.action == AttentionAction.installProductUpdate
+                              ? Icons.system_update_alt
+                              : Icons.open_in_full,
+                          size: 15,
+                        ),
+                        label: Text(
+                          event.action == AttentionAction.installProductUpdate
+                              ? 'Install'
+                              : 'Open',
+                        ),
                       ),
                     const Spacer(),
                     IconButton(
@@ -4960,11 +6576,13 @@ class ProjectSidebar extends StatelessWidget {
   const ProjectSidebar({
     required this.width,
     required this.projects,
+    required this.remoteHostStatus,
     required this.selectedIndex,
     required this.onAddProject,
     required this.onSelectProject,
     required this.onRevealProject,
     required this.onCopyProjectPath,
+    required this.onCheckRemoteSetup,
     required this.onDeleteProject,
     required this.summaryForProject,
     super.key,
@@ -4972,11 +6590,13 @@ class ProjectSidebar extends StatelessWidget {
 
   final double width;
   final List<DitchProject> projects;
+  final Map<String, String> remoteHostStatus;
   final int selectedIndex;
   final VoidCallback onAddProject;
   final ValueChanged<int> onSelectProject;
   final ValueChanged<DitchProject> onRevealProject;
   final ValueChanged<DitchProject> onCopyProjectPath;
+  final ValueChanged<DitchProject> onCheckRemoteSetup;
   final ValueChanged<DitchProject> onDeleteProject;
   final ProjectAgentSummary Function(DitchProject) summaryForProject;
 
@@ -5013,10 +6633,19 @@ class ProjectSidebar extends StatelessWidget {
                       return ProjectTile(
                         name: project.name,
                         path: project.path,
+                        isRemote: project.isRemote,
+                        sshHostAlias: project.sshHostAlias,
+                        remoteStatus: project.isRemote
+                            ? remoteHostStatus[project.sshHostAlias] ??
+                                  'connecting'
+                            : null,
                         selected: index == selectedIndex,
                         onTap: () => onSelectProject(index),
                         onReveal: () => onRevealProject(project),
                         onCopyPath: () => onCopyProjectPath(project),
+                        onCheckRemoteSetup: project.isRemote
+                            ? () => onCheckRemoteSetup(project)
+                            : null,
                         onDelete: () => onDeleteProject(project),
                         runningCount: summary.runningCount,
                         stoppedCount: summary.stoppedCount,
@@ -5048,10 +6677,14 @@ class ProjectTile extends StatelessWidget {
     required this.onTap,
     required this.onReveal,
     required this.onCopyPath,
+    this.onCheckRemoteSetup,
     required this.onDelete,
     this.runningCount = 0,
     this.stoppedCount = 0,
     this.hasUnreadResult = false,
+    this.isRemote = false,
+    this.sshHostAlias,
+    this.remoteStatus,
     super.key,
   });
 
@@ -5061,10 +6694,14 @@ class ProjectTile extends StatelessWidget {
   final VoidCallback onTap;
   final VoidCallback onReveal;
   final VoidCallback onCopyPath;
+  final VoidCallback? onCheckRemoteSetup;
   final VoidCallback onDelete;
   final int runningCount;
   final int stoppedCount;
   final bool hasUnreadResult;
+  final bool isRemote;
+  final String? sshHostAlias;
+  final String? remoteStatus;
 
   Future<void> _showContextMenu(
     BuildContext context,
@@ -5082,18 +6719,28 @@ class ProjectTile extends StatelessWidget {
         ),
         Offset.zero & overlay.size,
       ),
-      items: const [
-        PopupMenuItem(
+      items: [
+        const PopupMenuItem(
           value: _ProjectMenuAction.copyPath,
           child: Text('Copy Project Path'),
         ),
-        PopupMenuDivider(),
-        PopupMenuItem(value: _ProjectMenuAction.delete, child: Text('Delete')),
+        if (onCheckRemoteSetup != null)
+          const PopupMenuItem(
+            value: _ProjectMenuAction.checkRemoteSetup,
+            child: Text('Check Remote Setup'),
+          ),
+        const PopupMenuDivider(),
+        const PopupMenuItem(
+          value: _ProjectMenuAction.delete,
+          child: Text('Delete'),
+        ),
       ],
     );
     switch (action) {
       case _ProjectMenuAction.copyPath:
         onCopyPath();
+      case _ProjectMenuAction.checkRemoteSetup:
+        onCheckRemoteSetup?.call();
       case _ProjectMenuAction.delete:
         onDelete();
       case null:
@@ -5150,7 +6797,9 @@ class ProjectTile extends StatelessWidget {
                       ],
                     ),
                     Text(
-                      path,
+                      isRemote
+                          ? 'Remote · $sshHostAlias · ${_titleCase(remoteStatus ?? "connecting")}'
+                          : path,
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,
                       style: Theme.of(context).textTheme.bodySmall,
@@ -5169,8 +6818,10 @@ class ProjectTile extends StatelessWidget {
               const SizedBox(width: 4),
               IconButton(
                 key: ValueKey('reveal-project-$path'),
-                onPressed: onReveal,
-                tooltip: 'Show in Finder',
+                onPressed: isRemote ? null : onReveal,
+                tooltip: isRemote
+                    ? 'Source remains on the remote machine'
+                    : 'Show in Finder',
                 visualDensity: VisualDensity.compact,
                 constraints: const BoxConstraints.tightFor(
                   width: 28,
@@ -5187,7 +6838,7 @@ class ProjectTile extends StatelessWidget {
   }
 }
 
-enum _ProjectMenuAction { copyPath, delete }
+enum _ProjectMenuAction { copyPath, checkRemoteSetup, delete }
 
 class AgentsSurface extends StatelessWidget {
   const AgentsSurface({
@@ -7660,7 +9311,8 @@ class ProjectFileEditorBody extends StatelessWidget {
   Widget build(BuildContext context) {
     return CallbackShortcuts(
       bindings: {
-        const SingleActivator(LogicalKeyboardKey.keyS, meta: true): onSave,
+        if (!document.readOnly)
+          const SingleActivator(LogicalKeyboardKey.keyS, meta: true): onSave,
       },
       child: Column(
         children: [
@@ -7686,8 +9338,11 @@ class ProjectFileEditorBody extends StatelessWidget {
                   ),
                   IconButton(
                     key: const Key('editor-save'),
-                    tooltip: 'Save file (⌘S)',
-                    onPressed: document.dirty && !document.saving
+                    tooltip: document.readOnly
+                        ? 'Remote files are read-only'
+                        : 'Save file (⌘S)',
+                    onPressed:
+                        !document.readOnly && document.dirty && !document.saving
                         ? onSave
                         : null,
                     icon: document.saving
@@ -7756,6 +9411,7 @@ class ProjectFileEditorBody extends StatelessWidget {
               child: TextField(
                 key: const Key('project-file-editor'),
                 controller: document.controller,
+                readOnly: document.readOnly,
                 expands: true,
                 maxLines: null,
                 minLines: null,
@@ -7997,6 +9653,1005 @@ class ProjectTerminalHeader extends StatelessWidget {
       ),
     );
   }
+}
+
+enum _AddProjectKind { local, remote }
+
+class AddProjectKindDialog extends StatelessWidget {
+  const AddProjectKindDialog({super.key});
+
+  @override
+  Widget build(BuildContext context) => AlertDialog(
+    title: const Text('Add Project'),
+    content: SizedBox(
+      width: 480,
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          ListTile(
+            leading: const Icon(Icons.laptop_mac_outlined),
+            title: const Text('Local Project'),
+            subtitle: const Text('Runs on this Mac'),
+            onTap: () => Navigator.pop(context, _AddProjectKind.local),
+          ),
+          const SizedBox(height: 8),
+          ListTile(
+            leading: const Icon(Icons.dns_outlined),
+            title: const Text('Remote Project'),
+            subtitle: const Text('Runs on a machine over SSH'),
+            onTap: () => Navigator.pop(context, _AddProjectKind.remote),
+          ),
+        ],
+      ),
+    ),
+    actions: [
+      TextButton(
+        onPressed: () => Navigator.pop(context),
+        child: const Text('Cancel'),
+      ),
+    ],
+  );
+}
+
+bool remoteSetupCheckHasState(
+  Map<String, dynamic> setup, {
+  required String key,
+  required String state,
+}) {
+  final checks = setup['checks'];
+  return checks is List &&
+      checks.whereType<Map>().any(
+        (item) => item['key'] == key && item['state'] == state,
+      );
+}
+
+bool remoteSetupReadyForExecution(
+  Map<String, dynamic> setup, {
+  required bool requireCodexSandbox,
+}) =>
+    setup['ready'] == true &&
+    (!requireCodexSandbox ||
+        remoteSetupCheckHasState(setup, key: 'codex_sandbox', state: 'ready'));
+
+bool remoteSetupShouldConfigureSandbox(
+  Map<String, dynamic> setup, {
+  required bool repairOnly,
+  required bool requireCodexSandbox,
+  required bool alreadyOffered,
+}) =>
+    !repairOnly &&
+    requireCodexSandbox &&
+    !alreadyOffered &&
+    remoteSetupCheckHasState(setup, key: 'runtime', state: 'ready') &&
+    remoteSetupCheckHasState(
+      setup,
+      key: 'codex_sandbox',
+      state: 'install_available',
+    );
+
+class AddRemoteProjectDialog extends StatefulWidget {
+  const AddRemoteProjectDialog({
+    required this.client,
+    this.initialAlias,
+    this.initialSetup,
+    this.repairOnly = false,
+    this.requireCodexSandbox = true,
+    super.key,
+  });
+  final DitchRuntimeClient client;
+  final String? initialAlias;
+  final Map<String, dynamic>? initialSetup;
+  final bool repairOnly;
+  final bool requireCodexSandbox;
+
+  @override
+  State<AddRemoteProjectDialog> createState() => _AddRemoteProjectDialogState();
+}
+
+class _AddRemoteProjectDialogState extends State<AddRemoteProjectDialog> {
+  final _password = TextEditingController();
+  final _path = TextEditingController();
+  final _name = TextEditingController();
+  List<Map<String, dynamic>> _hosts = const [];
+  List<Map<String, dynamic>> _entries = const [];
+  Map<String, dynamic>? _setup;
+  String? _alias;
+  String? _error;
+  bool _busy = true;
+  bool _selectingDirectory = false;
+  bool _sandboxSetupOffered = false;
+  bool _remember = false;
+  ProjectGitPolicy _gitPolicy = ProjectGitPolicy.requireRepository;
+
+  @override
+  void initState() {
+    super.initState();
+    _alias = widget.initialAlias;
+    _setup = widget.initialSetup;
+    if (widget.initialSetup != null) {
+      _busy = false;
+    } else if (widget.repairOnly && widget.initialAlias != null) {
+      unawaited(_check());
+    } else {
+      unawaited(_loadHosts());
+    }
+  }
+
+  @override
+  void dispose() {
+    _password.dispose();
+    _path.dispose();
+    _name.dispose();
+    super.dispose();
+  }
+
+  Future<void> _loadHosts() async {
+    try {
+      final hosts = await widget.client.discoverSshHosts();
+      if (mounted) {
+        setState(() {
+          _hosts = hosts;
+          _busy = false;
+        });
+      }
+    } on Object catch (error) {
+      if (mounted) {
+        setState(() {
+          _busy = false;
+          _error = '$error';
+        });
+      }
+    }
+  }
+
+  Future<void> _check({bool trust = false}) async {
+    final alias = _alias;
+    if (alias == null) return;
+    setState(() {
+      _busy = true;
+      _error = null;
+    });
+    try {
+      final setup = await widget.client.checkRemoteSetup(
+        alias: alias,
+        password: _password.text.isEmpty ? null : _password.text,
+        rememberPassword: _remember,
+        trustUnknownHost: trust,
+      );
+      if (!mounted) return;
+      await _acceptSetup(setup);
+      if (!mounted) return;
+      if (setup['connection_state'] == 'host_key_confirmation_required') {
+        final fingerprint =
+            setup['host_key_fingerprint']?.toString() ?? 'Unknown fingerprint';
+        final approved = await showDialog<bool>(
+          context: context,
+          builder: (context) => AlertDialog(
+            icon: const Icon(Icons.security),
+            title: const Text('Trust this SSH host?'),
+            content: Text(
+              'The authenticity of $alias has not been established.\n\nFingerprint:\n$fingerprint',
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(context, false),
+                child: const Text('Cancel'),
+              ),
+              FilledButton(
+                onPressed: () => Navigator.pop(context, true),
+                child: const Text('Trust & Connect'),
+              ),
+            ],
+          ),
+        );
+        if (approved == true) await _check(trust: true);
+      }
+    } on Object catch (error) {
+      if (mounted) {
+        setState(() {
+          _busy = false;
+          _error = '$error';
+        });
+      }
+    }
+  }
+
+  Future<void> _acceptSetup(Map<String, dynamic> setup) async {
+    if (!mounted) return;
+    final ready = remoteSetupReadyForExecution(
+      setup,
+      requireCodexSandbox: widget.requireCodexSandbox,
+    );
+    final home = setup['home_directory']?.toString().trim();
+    final offerSandboxSetup = remoteSetupShouldConfigureSandbox(
+      setup,
+      repairOnly: widget.repairOnly,
+      requireCodexSandbox: widget.requireCodexSandbox,
+      alreadyOffered: _sandboxSetupOffered,
+    );
+    setState(() {
+      _setup = setup;
+      _busy = false;
+      if (!widget.repairOnly && ready && home != null && home.isNotEmpty) {
+        _selectingDirectory = true;
+        _path.text = home;
+      }
+    });
+    if (offerSandboxSetup) {
+      _sandboxSetupOffered = true;
+      await _setupCodexSandbox();
+      return;
+    }
+    if (ready && !widget.repairOnly) {
+      if (home == null || home.isEmpty) {
+        setState(() {
+          _error = 'The remote runtime did not report its home directory.';
+        });
+        return;
+      }
+      await _browse(home);
+    }
+  }
+
+  Future<void> _installRuntime() async {
+    final alias = _alias;
+    if (alias == null) return;
+    setState(() {
+      _busy = true;
+      _error = null;
+    });
+    try {
+      final setup = await widget.client.installRemoteRuntime(alias);
+      if (!mounted) return;
+      await _acceptSetup(setup);
+    } on Object catch (error) {
+      if (mounted) {
+        setState(() {
+          _busy = false;
+          _error = '$error';
+        });
+      }
+    }
+  }
+
+  Future<void> _installCodex() async {
+    final alias = _alias;
+    if (alias == null) return;
+    setState(() {
+      _busy = true;
+      _error = null;
+    });
+    try {
+      final setup = await widget.client.installRemoteCodex(alias);
+      if (!mounted) return;
+      await _acceptSetup(setup);
+    } on Object catch (error) {
+      if (mounted) {
+        setState(() {
+          _busy = false;
+          _error = '$error';
+        });
+      }
+    }
+  }
+
+  Future<void> _installGit() async {
+    final alias = _alias;
+    if (alias == null) return;
+    setState(() {
+      _busy = true;
+      _error = null;
+    });
+    try {
+      final setup = await widget.client.installRemoteGit(alias);
+      if (!mounted) return;
+      await _acceptSetup(setup);
+    } on Object catch (error) {
+      if (mounted) {
+        setState(() {
+          _busy = false;
+          _error = '$error';
+        });
+      }
+    }
+  }
+
+  Future<void> _authenticateCodex() async {
+    final alias = _alias;
+    if (alias == null) return;
+    final authenticated = await showDialog<bool>(
+      context: context,
+      barrierDismissible: true,
+      builder: (context) =>
+          CodexAuthenticationDialog(client: widget.client, alias: alias),
+    );
+    if (authenticated == true) await _check();
+  }
+
+  Future<void> _setupCodexSandbox() async {
+    final alias = _alias;
+    if (alias == null) return;
+    final configured = await showDialog<bool>(
+      context: context,
+      barrierDismissible: true,
+      builder: (context) => CodexAuthenticationDialog(
+        client: widget.client,
+        alias: alias,
+        sandboxSetup: true,
+      ),
+    );
+    if (configured == true) await _check();
+  }
+
+  Future<void> _browse(String path) async {
+    final alias = _alias;
+    if (alias == null) return;
+    setState(() {
+      _busy = true;
+      _error = null;
+    });
+    try {
+      final directory = await widget.client.listRemoteDirectory(alias, path);
+      final entries = directory['entries'];
+      if (!mounted) return;
+      setState(() {
+        _path.text = directory['absolute_path']?.toString() ?? path;
+        _entries = entries is List
+            ? entries
+                  .whereType<Map>()
+                  .map((item) => Map<String, dynamic>.from(item))
+                  .toList()
+            : const [];
+        if (_name.text.isEmpty) {
+          _name.text =
+              _path.text.split('/').where((v) => v.isNotEmpty).lastOrNull ??
+              alias;
+        }
+        _busy = false;
+      });
+    } on Object catch (error) {
+      if (mounted) {
+        setState(() {
+          _busy = false;
+          _error = '$error';
+        });
+      }
+    }
+  }
+
+  Future<void> _addHost() async {
+    final host = await showDialog<Map<String, dynamic>>(
+      context: context,
+      builder: (context) => const AddSshHostDialog(),
+    );
+    if (host == null) return;
+    try {
+      final preview = await widget.client.previewSshHost(host);
+      if (!mounted) return;
+      final approved = await showDialog<bool>(
+        context: context,
+        builder: (context) => AlertDialog(
+          title: const Text('Add to ~/.ssh/config?'),
+          content: SelectableText(preview),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context, false),
+              child: const Text('Cancel'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(context, true),
+              child: const Text('Add SSH Host'),
+            ),
+          ],
+        ),
+      );
+      if (approved != true) return;
+      await widget.client.addSshHost(host);
+      await _loadHosts();
+      if (mounted) setState(() => _alias = host['alias']?.toString());
+    } on Object catch (error) {
+      if (mounted) setState(() => _error = '$error');
+    }
+  }
+
+  Future<void> _create() async {
+    final alias = _alias;
+    if (alias == null || _path.text.isEmpty || _name.text.trim().isEmpty) {
+      return;
+    }
+    setState(() {
+      _busy = true;
+      _error = null;
+    });
+    try {
+      final response = await widget.client.createRemoteProject(
+        alias: alias,
+        name: _name.text.trim(),
+        root: _path.text,
+        gitPolicy: _gitPolicy,
+      );
+      final project = parseRuntimeProject(response['ProjectCreated']);
+      if (project == null) {
+        throw const FormatException(
+          'Remote runtime returned an invalid project.',
+        );
+      }
+      if (mounted) Navigator.pop(context, project);
+    } on Object catch (error) {
+      if (mounted) {
+        setState(() {
+          _busy = false;
+          _error = '$error';
+        });
+      }
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final checks = _setup?['checks'];
+    final effectiveReady =
+        _setup != null &&
+        remoteSetupReadyForExecution(
+          _setup!,
+          requireCodexSandbox: widget.requireCodexSandbox,
+        );
+    final selectingDirectory = effectiveReady && _selectingDirectory;
+    final runtimeNeedsInstall =
+        checks is List &&
+        checks.whereType<Map>().any(
+          (item) => item['key'] == 'runtime' && item['state'] != 'ready',
+        );
+    final codexNeedsInstall =
+        checks is List &&
+        checks.whereType<Map>().any(
+          (item) => item['key'] == 'codex' && item['state'] != 'ready',
+        );
+    final gitInstallAvailable =
+        checks is List &&
+        checks.whereType<Map>().any(
+          (item) =>
+              item['key'] == 'git' && item['state'] == 'install_available',
+        );
+    final codexNeedsAuthentication =
+        checks is List &&
+        checks.whereType<Map>().any(
+          (item) =>
+              item['key'] == 'codex_auth' &&
+              item['state'] == 'authentication_required',
+        );
+    final codexSandboxNeedsSetup =
+        !runtimeNeedsInstall &&
+        checks is List &&
+        checks.whereType<Map>().any(
+          (item) =>
+              item['key'] == 'codex_sandbox' &&
+              item['state'] == 'install_available',
+        );
+    final dialogTitle = widget.repairOnly
+        ? 'Remote setup · ${_alias ?? ''}'
+        : _setup == null
+        ? 'Choose a machine'
+        : selectingDirectory
+        ? 'Choose project folder · ${_alias ?? ''}'
+        : 'Remote setup · ${_alias ?? ''}';
+    return AlertDialog(
+      clipBehavior: Clip.antiAlias,
+      titlePadding: EdgeInsets.zero,
+      title: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          SizedBox(
+            height: 3,
+            child: _busy
+                ? const LinearProgressIndicator(
+                    key: Key('remote-setup-progress'),
+                    minHeight: 3,
+                  )
+                : null,
+          ),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(24, 20, 24, 0),
+            child: Text(dialogTitle),
+          ),
+        ],
+      ),
+      content: SizedBox(
+        width: 600,
+        height: 520,
+        child: _busy && _hosts.isEmpty
+            ? const Center(child: CircularProgressIndicator())
+            : ListView(
+                children: [
+                  if (_setup == null) ...[
+                    if (widget.repairOnly)
+                      Padding(
+                        padding: const EdgeInsets.only(bottom: 12),
+                        child: Text(
+                          'Reconnect to ${_alias ?? 'this machine'} to inspect and repair its Ditch setup.',
+                        ),
+                      ),
+                    ..._hosts.map(
+                      (host) => ListTile(
+                        leading: const Icon(Icons.dns_outlined),
+                        title: Text(host['alias']?.toString() ?? ''),
+                        selected: _alias == host['alias'],
+                        onTap: () =>
+                            setState(() => _alias = host['alias']?.toString()),
+                      ),
+                    ),
+                    if (!widget.repairOnly) ...[
+                      TextButton.icon(
+                        onPressed: _addHost,
+                        icon: const Icon(Icons.add),
+                        label: const Text('Add SSH Host'),
+                      ),
+                      const Divider(),
+                    ],
+                    TextField(
+                      controller: _password,
+                      obscureText: true,
+                      decoration: const InputDecoration(
+                        labelText: 'Password (only if required)',
+                      ),
+                    ),
+                    CheckboxListTile(
+                      value: _remember,
+                      onChanged: (value) =>
+                          setState(() => _remember = value ?? false),
+                      title: const Text('Remember in Keychain'),
+                      controlAffinity: ListTileControlAffinity.leading,
+                    ),
+                  ] else if (!selectingDirectory) ...[
+                    if (checks is List)
+                      ...checks.whereType<Map>().map(
+                        (item) => ListTile(
+                          dense: true,
+                          leading: Icon(
+                            item['state'] == 'ready'
+                                ? Icons.check_circle_outline
+                                : Icons.info_outline,
+                          ),
+                          title: Text(item['label']?.toString() ?? ''),
+                          subtitle: Text(
+                            [
+                                  item['detail']?.toString(),
+                                  item['technical_detail']?.toString(),
+                                ]
+                                .whereType<String>()
+                                .where((value) => value.isNotEmpty)
+                                .join('\n'),
+                          ),
+                        ),
+                      ),
+                    if (runtimeNeedsInstall)
+                      FilledButton.tonalIcon(
+                        onPressed: _busy ? null : _installRuntime,
+                        icon: const Icon(Icons.system_update_alt),
+                        label: const Text('Install / Repair Ditch Runtime'),
+                      ),
+                    if (codexNeedsInstall)
+                      FilledButton.tonalIcon(
+                        onPressed: _busy ? null : _installCodex,
+                        icon: const Icon(Icons.download_outlined),
+                        label: const Text('Install Codex'),
+                      ),
+                    if (gitInstallAvailable)
+                      FilledButton.tonalIcon(
+                        onPressed: _busy ? null : _installGit,
+                        icon: const Icon(Icons.download_outlined),
+                        label: const Text('Install Git'),
+                      ),
+                    if (codexNeedsAuthentication)
+                      FilledButton.tonalIcon(
+                        onPressed: _busy ? null : _authenticateCodex,
+                        icon: const Icon(Icons.login),
+                        label: const Text('Authenticate Codex'),
+                      ),
+                    if (codexSandboxNeedsSetup)
+                      FilledButton.tonalIcon(
+                        onPressed: _busy ? null : _setupCodexSandbox,
+                        icon: const Icon(Icons.security_outlined),
+                        label: const Text('Set up Codex sandbox'),
+                      ),
+                    if (!effectiveReady)
+                      Padding(
+                        padding: const EdgeInsets.only(top: 12),
+                        child: Text(
+                          'Complete the indicated Git or Codex setup on this machine, then retry. Credentials are never copied from this Mac.',
+                        ),
+                      ),
+                  ] else ...[
+                    Row(
+                      children: [
+                        IconButton(
+                          tooltip: 'Go up',
+                          onPressed: _busy || _path.text == '/'
+                              ? null
+                              : () {
+                                  final parts = _path.text
+                                      .split('/')
+                                      .where((part) => part.isNotEmpty)
+                                      .toList();
+                                  final parent = parts.length <= 1
+                                      ? '/'
+                                      : '/${parts.take(parts.length - 1).join('/')}';
+                                  _browse(parent);
+                                },
+                          icon: const Icon(Icons.arrow_upward),
+                        ),
+                        Expanded(
+                          child: TextField(
+                            controller: _path,
+                            decoration: const InputDecoration(
+                              labelText: 'Remote directory',
+                            ),
+                            onSubmitted: _busy ? null : _browse,
+                          ),
+                        ),
+                        IconButton(
+                          tooltip: 'Refresh',
+                          onPressed: _busy ? null : () => _browse(_path.text),
+                          icon: const Icon(Icons.refresh),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 8),
+                    ..._entries.map(
+                      (entry) => ListTile(
+                        dense: true,
+                        leading: const Icon(Icons.folder_outlined),
+                        title: Text(entry['name']?.toString() ?? ''),
+                        onTap: entry['is_directory'] == true
+                            ? () => _browse(
+                                entry['absolute_path']?.toString() ?? '',
+                              )
+                            : null,
+                      ),
+                    ),
+                    const Divider(),
+                    TextField(
+                      controller: _name,
+                      decoration: const InputDecoration(
+                        labelText: 'Project name',
+                      ),
+                    ),
+                    DropdownButtonFormField<ProjectGitPolicy>(
+                      initialValue: _gitPolicy,
+                      decoration: const InputDecoration(
+                        labelText: 'Git policy',
+                      ),
+                      items: const [
+                        DropdownMenuItem(
+                          value: ProjectGitPolicy.requireRepository,
+                          child: Text('Require existing Git repository'),
+                        ),
+                        DropdownMenuItem(
+                          value: ProjectGitPolicy.initializeRepository,
+                          child: Text('Initialize Git repository'),
+                        ),
+                        DropdownMenuItem(
+                          value: ProjectGitPolicy.allowOutsideGit,
+                          child: Text('Allow outside Git'),
+                        ),
+                      ],
+                      onChanged: (value) =>
+                          setState(() => _gitPolicy = value ?? _gitPolicy),
+                    ),
+                    const SizedBox(height: 8),
+                    const Text(
+                      'Ditch will validate this directory remotely and create its .ditch project metadata on the remote machine.',
+                    ),
+                  ],
+                  if (_error != null)
+                    Padding(
+                      padding: const EdgeInsets.only(top: 12),
+                      child: Text(
+                        _error!,
+                        style: TextStyle(
+                          color: Theme.of(context).colorScheme.error,
+                        ),
+                      ),
+                    ),
+                ],
+              ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: _busy ? null : () => Navigator.pop(context),
+          child: Text(widget.repairOnly ? 'Close' : 'Cancel'),
+        ),
+        if (widget.repairOnly && effectiveReady)
+          FilledButton(
+            onPressed: _busy ? null : () => Navigator.pop(context, true),
+            child: const Text('Done'),
+          )
+        else if (_setup == null)
+          FilledButton(
+            onPressed: _alias == null || _busy ? null : _check,
+            child: Text(widget.repairOnly ? 'Retry Connection' : 'Connect'),
+          )
+        else if (!selectingDirectory)
+          OutlinedButton(
+            onPressed: _busy ? null : _check,
+            child: const Text('Check Again'),
+          )
+        else
+          FilledButton(
+            onPressed: _busy ? null : _create,
+            child: const Text('Add Project'),
+          ),
+      ],
+    );
+  }
+}
+
+class CodexAuthenticationDialog extends StatefulWidget {
+  const CodexAuthenticationDialog({
+    required this.client,
+    required this.alias,
+    this.sandboxSetup = false,
+    super.key,
+  });
+  final DitchRuntimeClient client;
+  final String alias;
+  final bool sandboxSetup;
+
+  @override
+  State<CodexAuthenticationDialog> createState() =>
+      _CodexAuthenticationDialogState();
+}
+
+class _CodexAuthenticationDialogState extends State<CodexAuthenticationDialog> {
+  final terminal = Terminal(
+    maxLines: 5000,
+    platform: TerminalTargetPlatform.macos,
+  );
+  String? terminalId;
+  Timer? timer;
+  bool polling = false;
+  bool closing = false;
+  String? error;
+
+  @override
+  void initState() {
+    super.initState();
+    unawaited(_open());
+  }
+
+  Future<void> _open() async {
+    try {
+      final id = widget.sandboxSetup
+          ? await widget.client.openRemoteCodexSandboxSetup(widget.alias)
+          : await widget.client.openRemoteCodexAuthentication(widget.alias);
+      if (!mounted) {
+        await widget.client.closeSetupTerminal(id);
+        return;
+      }
+      terminalId = id;
+      terminal.onOutput = (data) {
+        unawaited(widget.client.writeSetupTerminal(id, utf8.encode(data)));
+      };
+      terminal.onResize = (columns, rows, _, _) {
+        unawaited(widget.client.resizeSetupTerminal(id, columns, rows));
+      };
+      timer = Timer.periodic(
+        const Duration(milliseconds: 150),
+        (_) => unawaited(_poll()),
+      );
+      await _poll();
+    } on Object catch (caught) {
+      if (mounted) setState(() => error = '$caught');
+    }
+  }
+
+  Future<void> _poll() async {
+    final id = terminalId;
+    if (id == null || polling) return;
+    polling = true;
+    try {
+      final chunk = await widget.client.takeSetupTerminalOutput(id);
+      final raw = chunk['data'];
+      if (raw is List && raw.isNotEmpty) {
+        terminal.write(
+          utf8.decode(
+            raw.whereType<num>().map((byte) => byte.toInt()).toList(),
+            allowMalformed: true,
+          ),
+        );
+      }
+      if (chunk['exited'] == true) {
+        timer?.cancel();
+        final status = await widget.client.checkRemoteSetup(
+          alias: widget.alias,
+        );
+        final checks = status['checks'];
+        final completed =
+            checks is List &&
+            checks.whereType<Map>().any(
+              (item) =>
+                  item['key'] ==
+                      (widget.sandboxSetup ? 'codex_sandbox' : 'codex_auth') &&
+                  item['state'] == 'ready',
+            );
+        if (completed) {
+          await _closeTerminal();
+          if (mounted) Navigator.pop(context, true);
+        }
+        if (!completed && mounted) {
+          setState(
+            () => error = widget.sandboxSetup
+                ? 'Codex sandbox setup did not complete.'
+                : 'Codex authentication did not complete.',
+          );
+        }
+      }
+    } on Object catch (caught) {
+      if (mounted) setState(() => error = '$caught');
+    } finally {
+      polling = false;
+    }
+  }
+
+  Future<void> _cancel() async {
+    await _closeTerminal();
+    if (mounted) Navigator.pop(context, false);
+  }
+
+  Future<void> _closeTerminal() async {
+    if (closing) return;
+    closing = true;
+    timer?.cancel();
+    final id = terminalId;
+    terminalId = null;
+    if (id != null) {
+      try {
+        await widget.client.closeSetupTerminal(id);
+      } on Object catch (_) {}
+    }
+  }
+
+  @override
+  void dispose() {
+    timer?.cancel();
+    unawaited(_closeTerminal());
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) => AlertDialog(
+    title: Text(
+      '${widget.sandboxSetup ? 'Set up Codex sandbox' : 'Authenticate Codex'} · ${widget.alias}',
+    ),
+    content: SizedBox(
+      width: 720,
+      height: 430,
+      child: Column(
+        children: [
+          Align(
+            alignment: Alignment.centerLeft,
+            child: Text(
+              widget.sandboxSetup
+                  ? 'Ditch will install the official Linux bubblewrap package and the Ubuntu AppArmor profile when required. Sudo credentials stay inside this temporary remote terminal and are never stored.'
+                  : 'This terminal is owned by the remote Ditch runtime and can only run the Codex sign-in flow.',
+            ),
+          ),
+          const SizedBox(height: 10),
+          Expanded(
+            child: DecoratedBox(
+              decoration: BoxDecoration(
+                color: Colors.black,
+                borderRadius: BorderRadius.circular(6),
+              ),
+              child: TerminalView(
+                terminal,
+                autofocus: true,
+                theme: ditchTerminalTheme(context),
+                padding: const EdgeInsets.all(8),
+              ),
+            ),
+          ),
+          if (terminalId == null && error == null)
+            const LinearProgressIndicator(),
+          if (error != null)
+            Align(
+              alignment: Alignment.centerLeft,
+              child: Text(
+                error!,
+                style: TextStyle(color: Theme.of(context).colorScheme.error),
+              ),
+            ),
+        ],
+      ),
+    ),
+    actions: [TextButton(onPressed: _cancel, child: const Text('Cancel'))],
+  );
+}
+
+class AddSshHostDialog extends StatefulWidget {
+  const AddSshHostDialog({super.key});
+  @override
+  State<AddSshHostDialog> createState() => _AddSshHostDialogState();
+}
+
+class _AddSshHostDialogState extends State<AddSshHostDialog> {
+  final alias = TextEditingController();
+  final hostname = TextEditingController();
+  final user = TextEditingController();
+  final port = TextEditingController(text: '22');
+  final identity = TextEditingController();
+  @override
+  void dispose() {
+    alias.dispose();
+    hostname.dispose();
+    user.dispose();
+    port.dispose();
+    identity.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) => AlertDialog(
+    title: const Text('Add SSH Host'),
+    content: SizedBox(
+      width: 460,
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          TextField(
+            controller: alias,
+            decoration: const InputDecoration(labelText: 'Name / SSH alias'),
+          ),
+          TextField(
+            controller: hostname,
+            decoration: const InputDecoration(labelText: 'Hostname / IP'),
+          ),
+          TextField(
+            controller: user,
+            decoration: const InputDecoration(labelText: 'User'),
+          ),
+          TextField(
+            controller: port,
+            keyboardType: TextInputType.number,
+            decoration: const InputDecoration(labelText: 'Port'),
+          ),
+          TextField(
+            controller: identity,
+            decoration: const InputDecoration(
+              labelText: 'Identity file (optional)',
+            ),
+          ),
+        ],
+      ),
+    ),
+    actions: [
+      TextButton(
+        onPressed: () => Navigator.pop(context),
+        child: const Text('Cancel'),
+      ),
+      FilledButton(
+        onPressed: () {
+          final parsedPort = int.tryParse(port.text);
+          if (alias.text.trim().isEmpty ||
+              hostname.text.trim().isEmpty ||
+              user.text.trim().isEmpty ||
+              parsedPort == null) {
+            return;
+          }
+          Navigator.pop(context, <String, dynamic>{
+            'alias': alias.text.trim(),
+            'hostname': hostname.text.trim(),
+            'user': user.text.trim(),
+            'port': parsedPort,
+            'identity_file': identity.text.trim().isEmpty
+                ? null
+                : identity.text.trim(),
+          });
+        },
+        child: const Text('Preview'),
+      ),
+    ],
+  );
 }
 
 class AddProjectDialog extends StatefulWidget {

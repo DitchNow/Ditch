@@ -1,0 +1,37 @@
+name: Community CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  community:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - run: cargo fmt --all -- --check
+      - run: scripts/check-commercial-offer-contract
+      - run: scripts/check-community-clean-checkout
+      - run: cargo build --locked -p ditchd -p ditch_cli
+      - run: cargo test --locked --workspace
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - working-directory: apps/macos
+        run: flutter pub get
+      - working-directory: apps/macos
+        run: flutter analyze
+      - working-directory: apps/macos
+        run: flutter test
+      - working-directory: apps/macos
+        run: flutter build macos --release
+      - run: scripts/check-community-leakage

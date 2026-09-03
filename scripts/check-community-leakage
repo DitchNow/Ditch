@@ -1,0 +1,117 @@
+#!/bin/sh
+set -eu
+
+workspace=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
+cd "$workspace"
+
+fail() {
+  echo "community leakage gate: $*" >&2
+  exit 1
+}
+
+tracked_environment_files=$(git ls-files | awk -F/ '$NF == ".env" || $NF ~ /^\.env\./ { print }')
+[ -z "$tracked_environment_files" ] || {
+  printf '%s\n' "$tracked_environment_files" >&2
+  fail "tracked .env files are forbidden"
+}
+
+private_crate="ditch_""remote"
+private_module="remote_""control.rs"
+service_daemon="ditch-""servicesd"
+
+for path in $(git ls-files -co --exclude-standard); do
+  [ -e "$path" ] || continue
+  case "$path" in
+    crates/ditch_remote/*|*/remote_control.rs|private/*|commercial-only/*)
+      fail "proprietary path is present in Community source: $path"
+      ;;
+  esac
+done
+
+metadata=$(cargo metadata --format-version 1 --no-deps)
+case "$metadata" in
+  *"\"name\":\"$private_crate\""*) fail "proprietary crate is in Cargo metadata" ;;
+esac
+
+for symbol in \
+  CreateRemotePairing \
+  RemotePairing \
+  RemoteControlStatus \
+  REMOTE_PROTOCOL_V1 \
+  REMOTE_PROTOCOL_V2 \
+  DITCH_REMOTE_RELAY_ORIGIN \
+  RelaySocketClient \
+  connect_relay_socket \
+  remote_control_v1 \
+  QrImageView
+do
+  if rg -n --hidden \
+    --glob '!commercial/**' \
+    --glob '!target/**' \
+    --glob '!dist/**' \
+    --glob '!scripts/check-community-leakage' \
+    "$symbol" . >/dev/null
+  then
+    fail "forbidden proprietary symbol is present: $symbol"
+  fi
+done
+
+if rg -n --hidden --glob '!commercial/**' --glob '!target/**' --glob '!dist/**' \
+  "$service_daemon" . >/dev/null
+then
+  fail "a second runtime daemon is present"
+fi
+
+if [ "${DITCH_LEAKAGE_SOURCE_ONLY:-0}" != 1 ]; then
+  cargo build --locked --release -p ditchd -p ditch_cli
+  for binary in target/release/ditchd target/release/ditch_cli; do
+    [ -f "$binary" ] || fail "expected Community binary is missing: $binary"
+    if strings "$binary" | rg "DITCH_REMOTE_RELAY_ORIGIN|RelaySocketClient|connect_relay_socket|CreateRemotePairing|RemoteControlStatus|remote_control_v1|$service_daemon" >/dev/null
+    then
+      fail "proprietary symbol found in Community binary: $binary"
+    fi
+  done
+fi
+
+scan_app() {
+  app=$1
+  [ -d "$app" ] || return 0
+  if find "$app" -type f -perm -111 -print0 | xargs -0 strings 2>/dev/null | \
+    rg "DITCH_REMOTE_RELAY_ORIGIN|RelaySocketClient|connect_relay_socket|CreateRemotePairing|RemoteControlStatus|remote_control_v1|$service_daemon" >/dev/null
+  then
+    fail "proprietary symbol found in Community app: $app"
+  fi
+  if find "$app" -type f -perm -111 -print0 | xargs -0 otool -L 2>/dev/null | \
+    rg "$private_crate|$service_daemon" >/dev/null
+  then
+    fail "proprietary binary dependency found in Community app: $app"
+  fi
+  runtime_count=$(find "$app" -type f -name ditchd | wc -l | tr -d ' ')
+  [ "$runtime_count" = 1 ] || fail "Community app must contain exactly one local ditchd runtime"
+}
+
+for app in apps/macos/build/macos/Build/Products/Release/*.app build/macos/Build/Products/Release/*.app; do
+  [ -d "$app" ] || continue
+  scan_app "$app"
+done
+
+for dmg in dist/community/*.dmg; do
+  [ -f "$dmg" ] || continue
+  mountpoint=$(mktemp -d "${TMPDIR:-/tmp}/ditch-community-leakage.XXXXXX")
+  cleanup_mount() {
+    hdiutil detach -quiet "$mountpoint" >/dev/null 2>&1 || true
+    rmdir "$mountpoint" >/dev/null 2>&1 || true
+  }
+  trap cleanup_mount EXIT HUP INT TERM
+  hdiutil attach -quiet -readonly -nobrowse -mountpoint "$mountpoint" "$dmg"
+  packaged_app=$(find "$mountpoint" -maxdepth 1 -type d -name '*.app' -print -quit)
+  if [ -z "$packaged_app" ]; then
+    cleanup_mount
+    fail "Community DMG contains no application"
+  fi
+  scan_app "$packaged_app"
+  cleanup_mount
+  trap - EXIT HUP INT TERM
+done
+
+echo "Community leakage gate passed."
