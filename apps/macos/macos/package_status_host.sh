@@ -252,11 +252,23 @@ SIGNING_IDENTITY="${EXPANDED_CODE_SIGN_IDENTITY:--}"
 if [ -z "$SIGNING_IDENTITY" ]; then
   SIGNING_IDENTITY="-"
 fi
-/usr/bin/codesign --force --sign "$SIGNING_IDENTITY" --options runtime "$MAIN_MACOS/ditch_cli"
-/usr/bin/codesign --force --sign "$SIGNING_IDENTITY" --options runtime "$MAIN_MACOS/ditchd-remote-$HOST_REMOTE_TARGET"
-/usr/bin/codesign --force --sign "$SIGNING_IDENTITY" --options runtime "$HELPER_MACOS/ditchd-remote-$HOST_REMOTE_TARGET"
-/usr/bin/codesign --force --sign "$SIGNING_IDENTITY" --options runtime "$HELPER_MACOS/ditch_cli"
-/usr/bin/codesign --force --sign "$SIGNING_IDENTITY" --options runtime "$HELPER_APP"
+sign_code() {
+  if [ "$SIGNING_IDENTITY" = "-" ]; then
+    /usr/bin/codesign --force --sign - --options runtime "$1"
+  else
+    /usr/bin/codesign --force --timestamp --sign "$SIGNING_IDENTITY" --options runtime "$1"
+  fi
+}
+
+sign_code "$MAIN_MACOS/ditch_cli"
+sign_code "$MAIN_MACOS/ditchd-remote-$HOST_REMOTE_TARGET"
+sign_code "$HELPER_MACOS/ditchd-remote-$HOST_REMOTE_TARGET"
+sign_code "$HELPER_MACOS/ditch_cli"
+for REMOTE_RUNTIME in "$HELPER_RESOURCES"/ditchd-*-apple-darwin; do
+  [ -f "$REMOTE_RUNTIME" ] || continue
+  sign_code "$REMOTE_RUNTIME"
+done
+sign_code "$HELPER_APP"
 
 rm -rf "$TARGET_BUILD_DIR/$CONTENTS_FOLDER_PATH/Library/LoginItems/The Ditch Status.app"
 rm -f "$TARGET_BUILD_DIR/$CONTENTS_FOLDER_PATH/MacOS/ditch-status-host"

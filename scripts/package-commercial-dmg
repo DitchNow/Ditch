@@ -27,8 +27,42 @@ expected_bundle_id=${DITCH_BUNDLE_ID:-ai.theditch.app}
 }
 
 if [ -n "${DITCH_CODESIGN_IDENTITY:-}" ]; then
-  # The Xcode archive signs nested code inside-out. Never use --deep to sign;
-  # it is used here only to verify every bundled executable and framework.
+  sign_release_code() {
+    codesign --force --timestamp --options runtime \
+      --sign "$DITCH_CODESIGN_IDENTITY" "$1"
+  }
+
+  # Normalize all nested signatures inside-out. Swift Package Manager may
+  # supply Sparkle with ad-hoc signatures, and the Xcode build phase adds the
+  # cross-built macOS runtimes after Xcode's normal signing traversal.
+  sparkle="$app/Contents/Frameworks/Sparkle.framework/Versions/B"
+  helper="$app/Contents/Library/LoginItems/The Ditch Runtime.app"
+  for nested in \
+    "$sparkle/Autoupdate" \
+    "$sparkle/Updater.app" \
+    "$sparkle/XPCServices/Downloader.xpc" \
+    "$sparkle/XPCServices/Installer.xpc" \
+    "$app/Contents/MacOS/ditch_cli" \
+    "$app/Contents/MacOS/ditchd-remote-aarch64-apple-darwin" \
+    "$helper/Contents/MacOS/ditchd" \
+    "$helper/Contents/MacOS/ditch_cli" \
+    "$helper/Contents/MacOS/ditchd-remote-aarch64-apple-darwin" \
+    "$helper/Contents/Resources/RemoteRuntimes/ditchd-aarch64-apple-darwin" \
+    "$helper/Contents/Resources/RemoteRuntimes/ditchd-x86_64-apple-darwin"
+  do
+    [ -e "$nested" ] || { echo "error: missing nested release code: $nested" >&2; exit 1; }
+    sign_release_code "$nested"
+  done
+  sign_release_code "$app/Contents/Frameworks/Sparkle.framework"
+  sign_release_code "$app/Contents/Frameworks/App.framework"
+  sign_release_code "$app/Contents/Frameworks/FlutterMacOS.framework"
+  sign_release_code "$helper"
+  codesign --force --timestamp --options runtime \
+    --entitlements "$workspace/apps/macos/macos/Runner/Release.entitlements" \
+    --sign "$DITCH_CODESIGN_IDENTITY" "$app"
+
+  # --deep is intentionally verification-only. Signing recursively would hide
+  # omissions and may apply the app's entitlements to unrelated nested code.
   codesign --verify --deep --strict --verbose=2 "$app"
   actual_team_id=$(codesign -dv --verbose=4 "$app" 2>&1 | sed -n 's/^TeamIdentifier=//p' | tail -n 1)
   [ -n "$actual_team_id" ] || { echo "error: signed app has no Apple Team ID" >&2; exit 1; }
@@ -44,6 +78,30 @@ if [ -n "${DITCH_CODESIGN_IDENTITY:-}" ]; then
     echo "error: app is not signed by the configured Developer ID Application identity" >&2
     exit 1
   }
+  for signed_code in \
+    "$app" \
+    "$helper" \
+    "$helper/Contents/Resources/RemoteRuntimes/ditchd-aarch64-apple-darwin" \
+    "$helper/Contents/Resources/RemoteRuntimes/ditchd-x86_64-apple-darwin" \
+    "$app/Contents/Frameworks/Sparkle.framework" \
+    "$sparkle/Updater.app" \
+    "$sparkle/XPCServices/Downloader.xpc" \
+    "$sparkle/XPCServices/Installer.xpc"
+  do
+    signature=$(codesign -dv --verbose=4 "$signed_code" 2>&1)
+    printf '%s\n' "$signature" | grep -Fq "Authority=$DITCH_CODESIGN_IDENTITY" || {
+      echo "error: nested code is not signed by the configured identity: $signed_code" >&2
+      exit 1
+    }
+    printf '%s\n' "$signature" | grep -Eq '^(Timestamp|Signed Time)=' || {
+      echo "error: nested code has no secure timestamp: $signed_code" >&2
+      exit 1
+    }
+    printf '%s\n' "$signature" | grep -Eq '^CodeDirectory .*flags=.*runtime' || {
+      echo "error: nested code has no hardened runtime: $signed_code" >&2
+      exit 1
+    }
+  done
 fi
 
 staging=$(mktemp -d "${TMPDIR:-/tmp}/ditch-commercial-dmg.XXXXXX")
