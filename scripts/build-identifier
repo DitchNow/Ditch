@@ -1,0 +1,28 @@
+#!/bin/sh
+set -eu
+
+workspace=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
+version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' "$workspace/Cargo.toml" | head -n 1)
+
+if command -v shasum >/dev/null 2>&1; then
+  hash_file() { shasum -a 256 "$1" | awk '{print $1}'; }
+  hash_stream() { shasum -a 256 | awk '{print $1}'; }
+elif command -v sha256sum >/dev/null 2>&1; then
+  hash_file() { sha256sum "$1" | awk '{print $1}'; }
+  hash_stream() { sha256sum | awk '{print $1}'; }
+else
+  echo 'error: no SHA-256 utility is available' >&2
+  exit 1
+fi
+
+fingerprint=$(
+  cd "$workspace"
+  find Cargo.toml Cargo.lock crates COMMUNITY_REVISION -type f -print |
+    LC_ALL=C sort |
+    while IFS= read -r file; do
+      printf '%s\t%s\n' "$file" "$(hash_file "$file")"
+    done |
+    hash_stream
+)
+
+printf '%s-%s\n' "$version" "$(printf '%s' "$fingerprint" | cut -c1-16)"

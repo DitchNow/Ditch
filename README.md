@@ -1,3 +1,6 @@
+<!-- sparkle-sign-warning:
+IMPORTANT: This file was signed by Sparkle. Any modifications to this file requires updating signatures in appcasts that reference this file! This will involve re-running generate_appcast or sign_update.
+-->
 # Ditch
 
 **Ditch Community Edition** is a local macOS workspace for running, following, and returning to Codex sessions across multiple projects.
@@ -100,7 +103,9 @@ Projects, session metadata, transcripts, attention state, and selected runtime s
 
 ## Local-First & Privacy
 
-The application, runtime, socket, database, project access, and notification processing run on the Mac. The repository contains no Ditch-hosted prompt proxy, analytics SDK, or crash-reporting integration.
+The application, runtime, socket, primary database, project access, and agent execution run on the Mac. Optional Remote Control is an explicit opt-in connectivity feature: it sends anonymous machine/device identity, sanitized project/session/attention status, push tokens, and privacy-safe audit metadata to a Ditch-managed relay. Sensitive prompts and transcript pages are relayed end-to-end encrypted and full transcript bodies are not stored by that service. The relay is built and deployed independently from the `TheDitchRelay` repository; this Mac repository contains only the daemon client, desktop UI, and shared Remote Protocol contract. The repository contains no analytics SDK or crash-reporting integration.
+
+Release builds use `https://relay.ditchnow.nl` as the built-in Remote Control origin; users do not configure Cloudflare or a relay address. Developers may override it at process startup with `DITCH_REMOTE_RELAY_ORIGIN`. Overrides must be an HTTPS origin without credentials, path, query, or fragment. Plain HTTP is accepted only for loopback development (`localhost`, `127.0.0.1`, or `::1`).
 
 The download website is a separate boundary: its beta form collects an email address to send access and states that it records whether the download link is opened.
 

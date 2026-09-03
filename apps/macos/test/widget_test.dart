@@ -3,7 +3,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/gestures.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
-import 'package:the_ditch/main.dart';
+import 'package:the_ditch_commercial/main.dart';
 import 'package:the_ditch/application/command_center_controller.dart';
 import 'package:the_ditch/data/runtime_models.dart';
 import 'package:the_ditch/design_system/ditch_theme.dart';
@@ -18,12 +18,147 @@ const _testProject = DitchProject(
   path: '/tmp/the-ditch-test-project',
 );
 
+class _ExpiredCommercialClient extends DitchRuntimeClient {
+  _ExpiredCommercialClient()
+    : super(socketPath: '/tmp/ditch-expired-commercial.sock');
+
+  @override
+  Future<Map<String, dynamic>> request(Object body) {
+    if (body == 'CommercialBillingManagement') {
+      return Future.value({
+        'CommercialBillingManagement': {
+          'billing_management_url':
+              'https://payments.example.test/ditch/renewal',
+        },
+      });
+    }
+    throw StateError(
+      'Commercial subscription expired. Local and SSH Ditch continue to work.',
+    );
+  }
+}
+
+class _ActiveCommercialClient extends DitchRuntimeClient {
+  _ActiveCommercialClient()
+    : super(socketPath: '/tmp/ditch-active-commercial.sock');
+
+  @override
+  Future<Map<String, dynamic>> request(Object body) async {
+    if (body == 'CommercialBillingManagement') {
+      return {
+        'CommercialBillingManagement': {
+          'billing_management_url':
+              'https://payments.example.test/ditch/management',
+        },
+      };
+    }
+    if (body == 'RemoteControlStatus') {
+      return {
+        'RemoteControlStatus': {
+          'configured': true,
+          'online': true,
+          'machine_name': 'Test Mac',
+          'devices': <Object>[],
+        },
+      };
+    }
+    throw StateError('Unexpected request: $body');
+  }
+}
+
 Widget _testApp() => const TheDitchApp(
   connectRuntimeOnStart: false,
   initialProjects: [_testProject],
 );
 
 void main() {
+  testWidgets('expired Commercial keeps local and SSH reassurance visible', (
+    tester,
+  ) async {
+    await tester.pumpWidget(
+      MaterialApp(
+        home: RemoteSettingsDialog(client: _ExpiredCommercialClient()),
+      ),
+    );
+    await tester.pump();
+
+    expect(find.text('Commercial subscription expired.'), findsOneWidget);
+    expect(find.text('Local and SSH Ditch continue to work.'), findsOneWidget);
+    expect(find.text('Renew'), findsOneWidget);
+  });
+
+  testWidgets('renewal opens only the Relay-provided billing URL', (
+    tester,
+  ) async {
+    final opened = <MethodCall>[];
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(
+          const MethodChannel('the_ditch/application'),
+          (call) async {
+            opened.add(call);
+            return true;
+          },
+        );
+    addTearDown(
+      () => TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(
+            const MethodChannel('the_ditch/application'),
+            null,
+          ),
+    );
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: RemoteSettingsDialog(client: _ExpiredCommercialClient()),
+      ),
+    );
+    await tester.pump();
+    await tester.tap(find.byKey(const Key('renew-commercial')));
+    await tester.pump();
+
+    expect(opened, hasLength(1));
+    expect(opened.single.method, 'openURL');
+    expect(
+      opened.single.arguments,
+      'https://payments.example.test/ditch/renewal',
+    );
+    expect(find.text('Local and SSH Ditch continue to work.'), findsOneWidget);
+  });
+
+  testWidgets('Manage Billing is provider-neutral and Relay-controlled', (
+    tester,
+  ) async {
+    final openedUrls = <String>[];
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(
+          const MethodChannel('the_ditch/application'),
+          (call) async {
+            if (call.method == 'openURL') {
+              openedUrls.add(call.arguments as String);
+            }
+            return true;
+          },
+        );
+    addTearDown(
+      () => TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(
+            const MethodChannel('the_ditch/application'),
+            null,
+          ),
+    );
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: RemoteSettingsDialog(client: _ActiveCommercialClient()),
+      ),
+    );
+    await tester.pump();
+    await tester.tap(find.byKey(const Key('manage-commercial-billing')));
+    await tester.pump();
+
+    expect(openedUrls, ['https://payments.example.test/ditch/management']);
+  });
+
   test('agent execution settings expose model and approval controls', () {
     final settings = AgentExecutionSettings();
 
@@ -82,10 +217,7 @@ void main() {
         'codex_home': '/tmp/codex',
         'codex_binary': '/opt/homebrew/bin/codex',
         'build_version': '1.0.0',
-        'capabilities': [
-          'persistent_sessions_v1',
-          'always_on_web_access_v1',
-        ],
+        'capabilities': ['persistent_sessions_v1', 'always_on_web_access_v1'],
       },
     });
 
@@ -127,6 +259,25 @@ void main() {
     expect(project!.name, 'Recovered');
     expect(project.path, '/tmp/recovered');
     expect(project.gitPolicy, ProjectGitPolicy.allowOutsideGit);
+  });
+
+  test('runtime project parser preserves remote execution identity', () {
+    final project = parseRuntimeProject({
+      'id': 'remote-project',
+      'name': 'FieldOps',
+      'root': '/home/mtn/fieldops',
+      'git_policy': 'RequireRepository',
+      'execution_target': {
+        'kind': 'remote',
+        'remote_machine_id': '11111111-1111-4111-8111-111111111111',
+        'ssh_host_alias': 'dev-box',
+      },
+    });
+
+    expect(project, isNotNull);
+    expect(project!.isRemote, isTrue);
+    expect(project.sshHostAlias, 'dev-box');
+    expect(project.path, '/home/mtn/fieldops');
   });
 
   test('project reconciliation replaces duplicate ids and paths', () {
@@ -522,10 +673,7 @@ void main() {
     expect(find.byKey(const Key('onboarding-continue')), findsOneWidget);
     expect(find.byKey(const Key('first-project-add')), findsNothing);
     expect(find.widgetWithText(AlertDialog, 'Add Project'), findsNothing);
-    expect(
-      find.text('/Users/tester/Projects/example'),
-      findsNothing,
-    );
+    expect(find.text('/Users/tester/Projects/example'), findsNothing);
     expect(find.text('PROJECTS'), findsNothing);
   });
 
@@ -1136,11 +1284,36 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(find.widgetWithText(AlertDialog, 'Add Project'), findsOneWidget);
+    expect(find.text('Local Project'), findsOneWidget);
+    expect(find.text('Remote Project'), findsOneWidget);
+    await tester.tap(find.text('Local Project'));
+    await tester.pumpAndSettle();
     expect(find.text('Browse Folder…'), findsOneWidget);
     expect(find.text('Project name'), findsOneWidget);
     expect(find.text('Selected folder'), findsOneWidget);
     expect(find.text('Add & Configure'), findsOneWidget);
     expect(find.textContaining('.ditch/hooks'), findsOneWidget);
+  });
+
+  testWidgets('add project modal steps dismiss when the backdrop is clicked', (
+    tester,
+  ) async {
+    await tester.pumpWidget(_testApp());
+
+    await tester.tap(find.text('Add Project'));
+    await tester.pumpAndSettle();
+    await tester.tapAt(const Offset(4, 4));
+    await tester.pumpAndSettle();
+    expect(find.text('Local Project'), findsNothing);
+
+    await tester.tap(find.text('Add Project'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Local Project'));
+    await tester.pumpAndSettle();
+    expect(find.text('Browse Folder…'), findsOneWidget);
+    await tester.tapAt(const Offset(4, 4));
+    await tester.pumpAndSettle();
+    expect(find.text('Browse Folder…'), findsNothing);
   });
 
   testWidgets('folder picker fills the project path and inferred name', (
@@ -1160,6 +1333,8 @@ void main() {
 
     await tester.pumpWidget(_testApp());
     await tester.tap(find.text('Add Project'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Local Project'));
     await tester.pumpAndSettle();
     await tester.tap(find.text('Browse Folder…'));
     await tester.pumpAndSettle();
@@ -1871,7 +2046,8 @@ void main() {
     );
 
     await tester.enterText(find.byType(TextField), 'still a button');
-    await tester.tap(find.widgetWithText(FilledButton, 'Send'));
+    await tester.pump();
+    await tester.tap(find.text('Send'));
     await tester.pump();
     expect(submitted, 'still a button');
   });

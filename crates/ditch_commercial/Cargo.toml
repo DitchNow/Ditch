@@ -1,0 +1,21 @@
+[package]
+name = "ditch_commercial"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+base64.workspace = true
+chrono.workspace = true
+ditch_identity.workspace = true
+ditch_remote.workspace = true
+p256.workspace = true
+rand_core.workspace = true
+semver.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+ureq = { version = "2.12.1", features = ["json"] }
+url.workspace = true
+uuid.workspace = true

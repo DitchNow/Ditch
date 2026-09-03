@@ -1,0 +1,186 @@
+{
+  "fixture_version": 1,
+  "notes": "Non-production identifiers and secrets. Crypto outputs are generated and checked by scripts/generate-remote-fixtures.",
+  "signed_request": {
+    "method": "POST",
+    "path_and_query": "/v1/auth/socket-ticket",
+    "body": "{\"machine_id\":\"22222222-2222-4222-8222-222222222222\"}",
+    "timestamp_ms": 1787596800000,
+    "nonce": "AAECAwQFBgcICQoLDA0ODw",
+    "principal_id": "11111111-1111-4111-8111-111111111111",
+    "canonical": "DITCH1\nPOST\n/v1/auth/socket-ticket\nacd1e31f7f0cfe00afdf5ac287050fec8f5af7f4af3afe5512a92607e77f1a11\n1787596800000\nAAECAwQFBgcICQoLDA0ODw\n11111111-1111-4111-8111-111111111111"
+  },
+  "pairing_qr": {
+    "v": 1,
+    "relay": "https://relay.example.test",
+    "pairing_id": "33333333-3333-4333-8333-333333333333",
+    "machine_id": "22222222-2222-4222-8222-222222222222",
+    "secret": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+    "expires_at": 1787596980000
+  },
+  "machine_device_roster": {
+    "protocol_version": 1,
+    "devices": [
+      {
+        "id": "11111111-1111-4111-8111-111111111111",
+        "name": "Fixture iPhone",
+        "platform": "ios",
+        "state": "active",
+        "signing_public_key": "BEpzUDasQTezvS3DbSVeuAqDbQ7lL27drGz6T2wFxigZ7q0Cq5KV0ZgV3gGsCWAQq6d1GgTTArxB7r-tF3UsNeY",
+        "agreement_public_key": "BKLLvBAvoHGRc8aMEJgGlYX6M_FcwKQqu8B5czZ-XzsEoEvQgqAK7cDxfc1NpOQVmXFm6pfcyXSoSm5bfEoo05E",
+        "key_version": 1,
+        "authorized_at": 1787596790000,
+        "last_seen_at": 1787596800000
+      }
+    ]
+  },
+  "valid_command": {
+    "protocol_version": 1,
+    "command_id": "44444444-4444-4444-8444-444444444444",
+    "idempotency_key": "fixture-idempotency-0001",
+    "owner_id": "55555555-5555-4555-8555-555555555555",
+    "machine_id": "22222222-2222-4222-8222-222222222222",
+    "device_id": "11111111-1111-4111-8111-111111111111",
+    "type": "session.prompt",
+    "created_at": 1787596800000,
+    "expires_at": 1787596860000,
+    "confirmation_class": "none",
+    "payload": {"key_version": 1, "nonce": "AAECAwQFBgcICQoL", "ciphertext": "fixtureCiphertextAndTag"}
+  },
+  "projection_sequences": [
+    {"epoch":"66666666-6666-4666-8666-666666666666","sequence":1,"expected":"apply"},
+    {"epoch":"66666666-6666-4666-8666-666666666666","sequence":1,"expected":"duplicate"},
+    {"epoch":"66666666-6666-4666-8666-666666666666","sequence":3,"expected":"gap"}
+  ],
+  "projection_envelopes": {
+    "snapshot_begin": {
+      "protocol_version": 1,
+      "message_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1",
+      "type": "projection_snapshot_begin",
+      "created_at": 1787596800000,
+      "payload": {
+        "owner_id": "55555555-5555-4555-8555-555555555555",
+        "machine_id": "22222222-2222-4222-8222-222222222222",
+        "epoch": "66666666-6666-4666-8666-666666666666",
+        "sequence": 1,
+        "counts": {"projects": 1, "sessions": 1, "attention": 0}
+      }
+    },
+    "snapshot_record": {
+      "protocol_version": 1,
+      "message_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa5",
+      "type": "projection_snapshot_record",
+      "created_at": 1787596800100,
+      "payload": {
+        "owner_id": "55555555-5555-4555-8555-555555555555",
+        "machine_id": "22222222-2222-4222-8222-222222222222",
+        "epoch": "66666666-6666-4666-8666-666666666666",
+        "sequence": 2,
+        "kind": "project",
+        "record": {
+          "project_id": "88888888-8888-4888-8888-888888888888",
+          "name": "Fixture project",
+          "status": "running",
+          "running_count": 1,
+          "waiting_count": 0,
+          "ready_count": 0,
+          "failed_count": 0,
+          "attention_count": 1,
+          "last_activity_at": 1787596800000,
+          "projection_version": 2
+        }
+      }
+    },
+    "snapshot_commit": {
+      "protocol_version": 1,
+      "message_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa2",
+      "type": "projection_snapshot_commit",
+      "created_at": 1787596800200,
+      "payload": {
+        "owner_id": "55555555-5555-4555-8555-555555555555",
+        "machine_id": "22222222-2222-4222-8222-222222222222",
+        "epoch": "66666666-6666-4666-8666-666666666666",
+        "sequence": 4,
+        "counts": {"projects": 1, "sessions": 1, "attention": 0}
+      }
+    },
+    "ack": {
+      "protocol_version": 1,
+      "message_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa3",
+      "type": "projection_ack",
+      "created_at": 1787596800201,
+      "payload": {
+        "epoch": "66666666-6666-4666-8666-666666666666",
+        "accepted_sequence": 4,
+        "status": "applied"
+      }
+    },
+    "incremental_update": {
+      "protocol_version": 1,
+      "message_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa6",
+      "type": "projection_update",
+      "created_at": 1787596800300,
+      "payload": {
+        "owner_id": "55555555-5555-4555-8555-555555555555",
+        "machine_id": "22222222-2222-4222-8222-222222222222",
+        "epoch": "66666666-6666-4666-8666-666666666666",
+        "sequence": 5,
+        "kind": "project",
+        "record": {
+          "project_id": "88888888-8888-4888-8888-888888888888",
+          "name": "Fixture project",
+          "status": "idle",
+          "running_count": 0,
+          "waiting_count": 0,
+          "ready_count": 0,
+          "failed_count": 0,
+          "attention_count": 0,
+          "last_activity_at": 1787596800300,
+          "projection_version": 5
+        }
+      }
+    },
+    "gap": {
+      "protocol_version": 1,
+      "message_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa4",
+      "type": "projection_gap",
+      "created_at": 1787596800202,
+      "payload": {
+        "epoch": "66666666-6666-4666-8666-666666666666",
+        "expected_sequence": 5,
+        "received_sequence": 7,
+        "full_snapshot_required": true
+      }
+    }
+  },
+  "projection_records": {
+    "project": {
+      "project_id": "88888888-8888-4888-8888-888888888888",
+      "name": "Fixture project",
+      "status": "running",
+      "running_count": 1,
+      "waiting_count": 0,
+      "ready_count": 0,
+      "failed_count": 0,
+      "attention_count": 1,
+      "last_activity_at": 1787596800000,
+      "projection_version": 1
+    },
+    "session": {
+      "session_id": "99999999-9999-4999-8999-999999999999",
+      "project_id": "88888888-8888-4888-8888-888888888888",
+      "title": "Fixture session",
+      "provider_name": "Codex",
+      "status": "working",
+      "semantic_phase": "Implementing",
+      "needs_user": false,
+      "attention_count": 0,
+      "changed_file_count": 2,
+      "validation_summary": null,
+      "integration_readiness": null,
+      "last_activity_at": 1787596800123,
+      "projection_version": 1
+    }
+  },
+  "error": {"error":{"code":"machine_offline","message":"The Mac is offline.","request_id":"77777777-7777-4777-8777-777777777777","retryable":false}}
+}

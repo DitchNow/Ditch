@@ -1,0 +1,40 @@
+name = "ditch-remote-relay-production"
+main = "../src/worker.ts"
+compatibility_date = "2026-08-14"
+
+[[durable_objects.bindings]]
+name = "MACHINE_HUB"
+class_name = "MachineHub"
+
+[exports.MachineHub]
+type = "durable-object"
+storage = "sqlite"
+
+[[queues.producers]]
+binding = "PUSH_NOTIFICATIONS"
+queue = "ditch-remote-push-production"
+
+[[queues.consumers]]
+queue = "ditch-remote-push-production"
+max_batch_size = 10
+max_batch_timeout = 5
+max_retries = 5
+dead_letter_queue = "ditch-remote-push-dead-production"
+
+[vars]
+ENVIRONMENT = "production"
+APNS_ENVIRONMENT = "production"
+APNS_GENERIC_CONTENT = "true"
+
+[triggers]
+crons = ["17 3 * * *"]
+
+[[routes]]
+pattern = "relay.ditchnow.nl"
+custom_domain = true
+
+[[d1_databases]]
+binding = "DB"
+database_name = "ditch-remote-relay-production"
+database_id = "9a7b307d-b7a0-401c-bac0-d6d617788eee"
+migrations_dir = "../migrations"

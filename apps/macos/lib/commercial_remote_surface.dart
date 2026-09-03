@@ -1,0 +1,387 @@
+import 'dart:async';
+
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:qr_flutter/qr_flutter.dart';
+import 'package:the_ditch/main.dart';
+
+class CommercialEditionSurface implements EditionSurface {
+  const CommercialEditionSurface();
+
+  @override
+  List<EditionSettingsSection> settingsSections(DitchRuntimeClient client) => [
+    EditionSettingsSection(
+      id: 'remote-mobile',
+      icon: Icons.phone_iphone,
+      title: 'Remote Control',
+      subtitle: 'iPhone pairing and device access',
+      dialogBuilder: (client) => RemoteSettingsDialog(client: client),
+    ),
+  ];
+}
+
+class RemoteSettingsDialog extends StatefulWidget {
+  const RemoteSettingsDialog({required this.client, this.sshAlias, super.key});
+
+  final DitchRuntimeClient client;
+  final String? sshAlias;
+
+  @override
+  State<RemoteSettingsDialog> createState() => _RemoteSettingsDialogState();
+}
+
+class _RemoteSettingsDialogState extends State<RemoteSettingsDialog> {
+  static const _applicationChannel = MethodChannel('the_ditch/application');
+  Map<String, dynamic>? _status;
+  Map<String, dynamic>? _pairing;
+  Timer? _timer;
+  bool _busy = false;
+  bool _billingBusy = false;
+  String? _error;
+  String? _billingError;
+
+  @override
+  void initState() {
+    super.initState();
+    unawaited(_refresh());
+    _timer = Timer.periodic(const Duration(seconds: 1), (_) {
+      final state = _pairing?['state'];
+      if (state == 'pending' || state == 'claimed') unawaited(_pollPairing());
+    });
+  }
+
+  @override
+  void dispose() {
+    _timer?.cancel();
+    super.dispose();
+  }
+
+  Future<Map<String, dynamic>> _requestLocalOrRemote(
+    Object local,
+    String remoteName,
+    Map<String, dynamic> remoteBody,
+  ) {
+    final alias = widget.sshAlias;
+    return widget.client.request(
+      alias == null
+          ? local
+          : {
+              remoteName: {'alias': alias, ...remoteBody},
+            },
+    );
+  }
+
+  Future<void> _refresh() async {
+    try {
+      final response = await _requestLocalOrRemote(
+        'RemoteControlStatus',
+        'RemoteMachineControlStatus',
+        const {},
+      );
+      if (!mounted) return;
+      setState(() {
+        _status = (response['RemoteControlStatus'] as Map?)
+            ?.cast<String, dynamic>();
+        _error = null;
+      });
+    } on Object catch (error) {
+      if (mounted) setState(() => _error = '$error');
+    }
+  }
+
+  Future<void> _connect() async {
+    setState(() => _busy = true);
+    try {
+      final response = await _requestLocalOrRemote(
+        'CreateRemotePairing',
+        'CreateRemoteMachinePairing',
+        const {},
+      );
+      if (!mounted) return;
+      setState(() {
+        _pairing = (response['RemotePairing'] as Map?)?.cast<String, dynamic>();
+        _busy = false;
+        _error = null;
+      });
+    } on Object catch (error) {
+      if (mounted) {
+        setState(() {
+          _busy = false;
+          _error = '$error';
+        });
+      }
+    }
+  }
+
+  Future<void> _pollPairing() async {
+    final id = _pairing?['pairing_id']?.toString();
+    if (id == null || _busy) return;
+    try {
+      final response = await _requestLocalOrRemote(
+        {
+          'GetRemotePairing': {'pairing_id': id},
+        },
+        'GetRemoteMachinePairing',
+        {'pairing_id': id},
+      );
+      if (!mounted) return;
+      final next = (response['RemotePairing'] as Map?)?.cast<String, dynamic>();
+      if (next != null) {
+        next['qr_payload'] ??= _pairing?['qr_payload'];
+        setState(() => _pairing = next);
+      }
+    } on Object catch (error) {
+      if (mounted) setState(() => _error = '$error');
+    }
+  }
+
+  Future<void> _confirm() async {
+    final id = _pairing?['pairing_id']?.toString();
+    if (id == null) return;
+    setState(() => _busy = true);
+    try {
+      await _requestLocalOrRemote(
+        {
+          'ConfirmRemotePairing': {'pairing_id': id},
+        },
+        'ConfirmRemoteMachinePairing',
+        {'pairing_id': id},
+      );
+      if (mounted) {
+        setState(() {
+          _pairing = null;
+          _busy = false;
+        });
+      }
+      await _refresh();
+    } on Object catch (error) {
+      if (mounted) {
+        setState(() {
+          _busy = false;
+          _error = '$error';
+        });
+      }
+    }
+  }
+
+  Future<void> _cancel() async {
+    final id = _pairing?['pairing_id']?.toString();
+    if (id != null) {
+      await _requestLocalOrRemote(
+        {
+          'CancelRemotePairing': {'pairing_id': id},
+        },
+        'CancelRemoteMachinePairing',
+        {'pairing_id': id},
+      );
+    }
+    if (mounted) setState(() => _pairing = null);
+  }
+
+  Future<void> _revoke(String id) async {
+    await widget.client.request({
+      'RevokeRemoteDevice': {'device_id': id},
+    });
+    await _refresh();
+  }
+
+  Future<void> _openBillingManagement() async {
+    setState(() {
+      _billingBusy = true;
+      _billingError = null;
+    });
+    try {
+      final response = await widget.client.request(
+        'CommercialBillingManagement',
+      );
+      final session = (response['CommercialBillingManagement'] as Map?)
+          ?.cast<String, dynamic>();
+      final url = session?['billing_management_url']?.toString();
+      if (url == null || url.isEmpty) {
+        throw const FormatException(
+          'Ditch did not provide a billing-management URL.',
+        );
+      }
+      final opened = await _applicationChannel.invokeMethod<bool>(
+        'openURL',
+        url,
+      );
+      if (opened != true) {
+        throw const FormatException(
+          'The billing-management page could not be opened.',
+        );
+      }
+      if (mounted) setState(() => _billingBusy = false);
+    } on Object catch (error) {
+      if (mounted) {
+        setState(() {
+          _billingBusy = false;
+          _billingError = '$error';
+        });
+      }
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final expired = _error?.contains('Commercial subscription expired') == true;
+    final devices =
+        (_status?['devices'] as List?)?.whereType<Map>().toList() ?? const [];
+    return AlertDialog(
+      icon: const Icon(Icons.phone_iphone),
+      title: Text(
+        widget.sshAlias == null
+            ? 'Remote Control'
+            : 'Enroll ${widget.sshAlias}',
+      ),
+      content: SizedBox(
+        width: 580,
+        child: expired
+            ? Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text(
+                    'Commercial subscription expired.',
+                    style: Theme.of(context).textTheme.titleSmall,
+                  ),
+                  const SizedBox(height: 8),
+                  const Text('Local and SSH Ditch continue to work.'),
+                  const SizedBox(height: 12),
+                  FilledButton(
+                    key: const Key('renew-commercial'),
+                    onPressed: _billingBusy ? null : _openBillingManagement,
+                    child: const Text('Renew'),
+                  ),
+                  if (_billingError != null) ...[
+                    const SizedBox(height: 10),
+                    SelectableText(
+                      _billingError!,
+                      style: TextStyle(
+                        color: Theme.of(context).colorScheme.error,
+                      ),
+                    ),
+                  ],
+                ],
+              )
+            : _status == null
+            ? _error == null
+                  ? const Center(child: CircularProgressIndicator())
+                  : SelectableText(_error!)
+            : SingleChildScrollView(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    ListTile(
+                      contentPadding: EdgeInsets.zero,
+                      leading: Icon(
+                        _status?['online'] == true
+                            ? Icons.cloud_done_outlined
+                            : Icons.cloud_off_outlined,
+                      ),
+                      title: Text(
+                        _status?['machine_name']?.toString() ??
+                            widget.sshAlias ??
+                            'This Mac',
+                      ),
+                      subtitle: Text(
+                        _status?['online'] == true ? 'Online' : 'Offline',
+                      ),
+                    ),
+                    const Divider(),
+                    Text(
+                      'iPhones with access',
+                      style: Theme.of(context).textTheme.titleSmall,
+                    ),
+                    if (devices.isEmpty)
+                      const Padding(
+                        padding: EdgeInsets.symmetric(vertical: 12),
+                        child: Text('No iPhones have access to this Mac.'),
+                      ),
+                    ...devices.map((raw) {
+                      final device = raw.cast<Object?, Object?>();
+                      return ListTile(
+                        leading: const Icon(Icons.phone_iphone),
+                        title: Text(device['name']?.toString() ?? 'iPhone'),
+                        subtitle: Text(
+                          device['state']?.toString() ?? 'unknown',
+                        ),
+                        trailing:
+                            widget.sshAlias == null &&
+                                device['state'] == 'active'
+                            ? TextButton(
+                                onPressed: _busy
+                                    ? null
+                                    : () => _revoke(
+                                        device['device_id'].toString(),
+                                      ),
+                                child: const Text('Revoke'),
+                              )
+                            : null,
+                      );
+                    }),
+                    if (_pairing != null) _pairingView(),
+                    const SizedBox(height: 12),
+                    const Text(
+                      'Remote payloads are end-to-end encrypted; local source, secrets, and full transcripts are not projected.',
+                    ),
+                  ],
+                ),
+              ),
+      ),
+      actions: [
+        if (!expired)
+          TextButton(
+            key: const Key('manage-commercial-billing'),
+            onPressed: _billingBusy ? null : _openBillingManagement,
+            child: const Text('Manage Billing'),
+          ),
+        if (_pairing == null && !expired)
+          FilledButton.icon(
+            key: const Key('connect-iphone'),
+            onPressed: _busy || _status?['configured'] != true
+                ? null
+                : _connect,
+            icon: const Icon(Icons.qr_code),
+            label: const Text('Connect iPhone'),
+          ),
+        TextButton(
+          onPressed: () => Navigator.pop(context),
+          child: const Text('Close'),
+        ),
+      ],
+    );
+  }
+
+  Widget _pairingView() {
+    final state = _pairing?['state']?.toString();
+    final qr = _pairing?['qr_payload']?.toString();
+    if (state == 'claimed') {
+      return Column(
+        children: [
+          const Text('Confirm the matching code shown on both devices.'),
+          const SizedBox(height: 8),
+          FilledButton(
+            onPressed: _busy ? null : _confirm,
+            child: const Text('Confirm iPhone'),
+          ),
+          TextButton(
+            onPressed: _busy ? null : _cancel,
+            child: const Text('Cancel'),
+          ),
+        ],
+      );
+    }
+    return Column(
+      children: [
+        const Divider(),
+        if (qr != null) QrImageView(data: qr, size: 220),
+        const Text('Scan with the proprietary Ditch iPhone app.'),
+        TextButton(
+          onPressed: _busy ? null : _cancel,
+          child: const Text('Cancel'),
+        ),
+      ],
+    );
+  }
+}

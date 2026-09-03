@@ -1,0 +1,296 @@
+#!/bin/sh
+set -eu
+
+workspace=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
+
+usage() {
+  cat >&2 <<'EOF'
+usage: scripts/macos-app staging|production run|build|show [flutter arguments]
+
+Examples:
+  scripts/macos-app staging run
+  scripts/macos-app production run
+  scripts/macos-app staging build
+  scripts/macos-app production build --build-name 1.2.0 --build-number 42
+  scripts/macos-app staging show
+EOF
+  exit 2
+}
+
+environment=${1:-}
+action=${2:-}
+[ "$#" -ge 2 ] || usage
+shift 2
+
+case "$environment" in
+  staging|production) ;;
+  *) usage ;;
+esac
+case "$action" in
+  run|build|show) ;;
+  *) usage ;;
+esac
+
+environment_file="$workspace/apps/macos/config/.env.$environment"
+[ -f "$environment_file" ] || {
+  echo "error: missing macOS environment file: $environment_file" >&2
+  exit 1
+}
+
+while IFS= read -r line || [ -n "$line" ]; do
+  line=$(printf '%s' "$line" | tr -d '\r')
+  case "$line" in
+    ''|'#'*) continue ;;
+    *=*) ;;
+    *) echo "error: invalid line in $environment_file" >&2; exit 1 ;;
+  esac
+  key=${line%%=*}
+  value=${line#*=}
+  case "$key" in
+    DITCH_DEPLOYMENT_ENVIRONMENT|DITCH_RELAY_ORIGIN|DITCH_UPDATE_ALLOWED_HOSTS) ;;
+    *) echo "error: unsupported variable $key in $environment_file" >&2; exit 1 ;;
+  esac
+  [ -n "$value" ] || { echo "error: $key is empty in $environment_file" >&2; exit 1; }
+  export "$key=$value"
+done < "$environment_file"
+
+# Optional local/CI release trust configuration. These values are public and
+# are intentionally versioned so a checkout has an auditable trust policy.
+release_environment_file="$workspace/apps/macos/config/.env.release.$environment"
+if [ -f "$release_environment_file" ]; then
+  while IFS= read -r line || [ -n "$line" ]; do
+    line=$(printf '%s' "$line" | tr -d '\r')
+    case "$line" in
+      ''|'#'*) continue ;;
+      *=*) ;;
+      *) echo "error: invalid line in $release_environment_file" >&2; exit 1 ;;
+    esac
+    key=${line%%=*}
+    value=${line#*=}
+    case "$key" in
+      DITCH_SPARKLE_PUBLIC_ED_KEY|DITCH_RELEASE_MANIFEST_PUBLIC_KEY_SEC1_B64|DITCH_APPLE_TEAM_ID|DITCH_COMMUNITY_BUILD_SEQUENCE) ;;
+      *) echo "error: unsupported variable $key in $release_environment_file" >&2; exit 1 ;;
+    esac
+    [ -n "$value" ] || { echo "error: $key is empty in $release_environment_file" >&2; exit 1; }
+    export "$key=$value"
+  done < "$release_environment_file"
+fi
+
+[ "${DITCH_DEPLOYMENT_ENVIRONMENT:-}" = "$environment" ] || {
+  echo "error: $environment_file declares the wrong deployment environment" >&2
+  exit 1
+}
+
+case "$DITCH_RELAY_ORIGIN" in
+  https://*) ;;
+  *) echo "error: DITCH_RELAY_ORIGIN must be an HTTPS origin" >&2; exit 1 ;;
+esac
+case "${DITCH_RELAY_ORIGIN#https://}" in
+  ''|*/*|*'?'*|*'#'*|*'@'*|*:*)
+    echo "error: DITCH_RELAY_ORIGIN must contain only an HTTPS scheme and hostname" >&2
+    exit 1
+    ;;
+esac
+
+production_origin=https://relay.ditchnow.nl
+if [ "$environment" = production ] && [ "$DITCH_RELAY_ORIGIN" != "$production_origin" ]; then
+  echo "error: production must use $production_origin" >&2
+  exit 1
+fi
+if [ "$environment" = staging ] && [ "$DITCH_RELAY_ORIGIN" = "$production_origin" ]; then
+  echo "error: staging must not use the production Relay" >&2
+  exit 1
+fi
+
+relay_host=${DITCH_RELAY_ORIGIN#https://}
+case ",${DITCH_UPDATE_ALLOWED_HOSTS}," in
+  *,"$relay_host",*) ;;
+  *) echo "error: DITCH_UPDATE_ALLOWED_HOSTS must include $relay_host" >&2; exit 1 ;;
+esac
+case "$DITCH_UPDATE_ALLOWED_HOSTS" in
+  *[!A-Za-z0-9.,-]*)
+    echo "error: DITCH_UPDATE_ALLOWED_HOSTS contains an invalid character" >&2
+    exit 1
+    ;;
+esac
+
+if [ "$action" = show ]; then
+  printf '%s\n' \
+    "DITCH_DEPLOYMENT_ENVIRONMENT=$DITCH_DEPLOYMENT_ENVIRONMENT" \
+    "DITCH_RELAY_ORIGIN=$DITCH_RELAY_ORIGIN" \
+    "DITCH_UPDATE_ALLOWED_HOSTS=$DITCH_UPDATE_ALLOWED_HOSTS"
+  exit 0
+fi
+
+release_verification_config="$workspace/apps/macos/macos/Runner/Configs/ReleaseVerification.xcconfig"
+
+configure_release_verification() {
+  configured=0
+  for key in \
+    DITCH_SPARKLE_PUBLIC_ED_KEY \
+    DITCH_RELEASE_MANIFEST_PUBLIC_KEY_SEC1_B64 \
+    DITCH_APPLE_TEAM_ID \
+    DITCH_COMMUNITY_BUILD_SEQUENCE
+  do
+    eval "value=\${$key:-}"
+    [ -n "$value" ] && configured=$((configured + 1))
+  done
+  if [ "$configured" -ne 0 ] && [ "$configured" -ne 4 ]; then
+    echo "error: release verification configuration is incomplete" >&2
+    echo "Set all four public DITCH release verification values in $release_environment_file." >&2
+    exit 1
+  fi
+  if [ "$configured" -eq 4 ]; then
+    umask 022
+    printf '%s\n' \
+      "DITCH_SPARKLE_PUBLIC_ED_KEY = $DITCH_SPARKLE_PUBLIC_ED_KEY" \
+      "DITCH_RELEASE_MANIFEST_PUBLIC_KEY_SEC1_B64 = $DITCH_RELEASE_MANIFEST_PUBLIC_KEY_SEC1_B64" \
+      "DITCH_APPLE_TEAM_ID = $DITCH_APPLE_TEAM_ID" \
+      "DITCH_COMMUNITY_BUILD_SEQUENCE = $DITCH_COMMUNITY_BUILD_SEQUENCE" \
+      > "$release_verification_config"
+  fi
+}
+
+release_value() {
+  key=$1
+  sed -n "s/^[[:space:]]*$key[[:space:]]*=[[:space:]]*//p" "$release_verification_config" | tail -n 1
+}
+
+public_release_value() {
+  file=$1
+  key=$2
+  sed -n "s/^[[:space:]]*$key[[:space:]]*=[[:space:]]*//p" "$file" | tail -n 1
+}
+
+validate_release_environment_isolation() {
+  other_environment=staging
+  [ "$environment" = staging ] && other_environment=production
+  other_file="$workspace/apps/macos/config/.env.release.$other_environment"
+  [ -f "$other_file" ] || {
+    echo "error: missing public release trust configuration: $other_file" >&2
+    exit 1
+  }
+  other_sparkle_key=$(public_release_value "$other_file" DITCH_SPARKLE_PUBLIC_ED_KEY)
+  other_manifest_key=$(public_release_value "$other_file" DITCH_RELEASE_MANIFEST_PUBLIC_KEY_SEC1_B64)
+  [ "$DITCH_SPARKLE_PUBLIC_ED_KEY" != "$other_sparkle_key" ] || {
+    echo "error: staging and production must use different Sparkle signing keys" >&2
+    exit 1
+  }
+  [ "$DITCH_RELEASE_MANIFEST_PUBLIC_KEY_SEC1_B64" != "$other_manifest_key" ] || {
+    echo "error: staging and production must use different release-manifest signing keys" >&2
+    exit 1
+  }
+}
+
+validate_release_verification() {
+  [ -f "$release_verification_config" ] || {
+    echo "error: a distributable $environment build requires public release verification values" >&2
+    echo "Create $release_environment_file from apps/macos/config/release.example and run this command again." >&2
+    exit 1
+  }
+  sparkle_key=$(release_value DITCH_SPARKLE_PUBLIC_ED_KEY)
+  manifest_key=$(release_value DITCH_RELEASE_MANIFEST_PUBLIC_KEY_SEC1_B64)
+  team_id=$(release_value DITCH_APPLE_TEAM_ID)
+  build_sequence=$(release_value DITCH_COMMUNITY_BUILD_SEQUENCE)
+  for value in "$sparkle_key" "$manifest_key" "$team_id" "$build_sequence"; do
+    [ -n "$value" ] || {
+      echo "error: $release_verification_config contains an empty release verification value" >&2
+      exit 1
+    }
+  done
+  case "$sparkle_key:$manifest_key:$team_id:$build_sequence" in
+    *BASE64_*|*APPLE_TEAM_ID*|*BUILD_SEQUENCE*)
+      echo "error: $release_verification_config contains missing or placeholder values" >&2
+      exit 1
+      ;;
+  esac
+  case "$team_id" in
+    *[!A-Z0-9]*|'') echo "error: DITCH_APPLE_TEAM_ID must contain only uppercase letters and digits" >&2; exit 1 ;;
+  esac
+  [ "${#team_id}" -eq 10 ] || { echo "error: DITCH_APPLE_TEAM_ID must be 10 characters" >&2; exit 1; }
+  case "$build_sequence" in
+    *[!0-9]*|''|0) echo "error: DITCH_COMMUNITY_BUILD_SEQUENCE must be a positive integer" >&2; exit 1 ;;
+  esac
+  sparkle_bytes=$(printf '%s' "$sparkle_key" | openssl base64 -d -A 2>/dev/null | wc -c | tr -d ' ')
+  [ "$sparkle_bytes" -eq 32 ] || { echo "error: DITCH_SPARKLE_PUBLIC_ED_KEY must decode to 32 bytes" >&2; exit 1; }
+  manifest_bytes=$(printf '%s' "$manifest_key" | openssl base64 -d -A 2>/dev/null | wc -c | tr -d ' ')
+  [ "$manifest_bytes" -eq 33 ] || [ "$manifest_bytes" -eq 65 ] || {
+    echo "error: DITCH_RELEASE_MANIFEST_PUBLIC_KEY_SEC1_B64 must be a compressed or uncompressed P-256 public key" >&2
+    exit 1
+  }
+  validate_release_environment_isolation
+}
+
+configure_release_verification
+if [ "$action" = build ]; then
+  distribution_build=1
+  for argument in "$@"; do
+    [ "$argument" = "--debug" ] && distribution_build=0
+  done
+  [ "$distribution_build" -eq 0 ] || validate_release_verification
+elif [ ! -f "$release_verification_config" ]; then
+  echo "warning: Commercial installation is unavailable in this local run because release verification is not configured." >&2
+  echo "Configure $release_environment_file to test the secure staging installer." >&2
+fi
+
+resolve_flutter() {
+  for candidate in "${DITCH_FLUTTER:-}" "${FLUTTER_BIN:-}"; do
+    [ -n "$candidate" ] || continue
+    if [ -d "$candidate" ]; then
+      candidate="$candidate/bin/flutter"
+    fi
+    if [ -x "$candidate" ]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+
+  if [ -n "${FLUTTER_ROOT:-}" ] && [ -x "$FLUTTER_ROOT/bin/flutter" ]; then
+    printf '%s\n' "$FLUTTER_ROOT/bin/flutter"
+    return 0
+  fi
+
+  path_flutter=$(command -v flutter 2>/dev/null || true)
+  if [ -n "$path_flutter" ] && [ -x "$path_flutter" ]; then
+    printf '%s\n' "$path_flutter"
+    return 0
+  fi
+
+  generated_config="$workspace/apps/macos/macos/Flutter/ephemeral/Flutter-Generated.xcconfig"
+  if [ -f "$generated_config" ]; then
+    generated_flutter_root=$(sed -n 's/^FLUTTER_ROOT=//p' "$generated_config" | tail -n 1)
+    if [ -n "$generated_flutter_root" ] && [ -x "$generated_flutter_root/bin/flutter" ]; then
+      printf '%s\n' "$generated_flutter_root/bin/flutter"
+      return 0
+    fi
+  fi
+
+  echo "error: Flutter was not found." >&2
+  echo "Install Flutter or set DITCH_FLUTTER to the flutter executable (or SDK directory)." >&2
+  return 1
+}
+
+flutter_command=$(resolve_flutter)
+
+cd "$workspace/apps/macos"
+
+# Flutter can reuse an otherwise valid package_config.json even when its
+# recorded SDK came from a temporary validation checkout that no longer
+# exists. Resolve packages explicitly so package:flutter always points at the
+# SDK selected above before either the CLI build or a later Xcode archive.
+"$flutter_command" --suppress-analytics pub get
+
+case "$action" in
+  run)
+    exec "$flutter_command" --suppress-analytics run -d macos \
+      "--dart-define=DITCH_DEPLOYMENT_ENVIRONMENT=$DITCH_DEPLOYMENT_ENVIRONMENT" \
+      "--dart-define=DITCH_RELAY_ORIGIN=$DITCH_RELAY_ORIGIN" \
+      "$@"
+    ;;
+  build)
+    exec "$flutter_command" --suppress-analytics build macos \
+      "--dart-define=DITCH_DEPLOYMENT_ENVIRONMENT=$DITCH_DEPLOYMENT_ENVIRONMENT" \
+      "--dart-define=DITCH_RELAY_ORIGIN=$DITCH_RELAY_ORIGIN" \
+      "$@"
+    ;;
+esac

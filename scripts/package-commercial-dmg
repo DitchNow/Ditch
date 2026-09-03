@@ -1,0 +1,133 @@
+#!/bin/sh
+set -eu
+
+workspace=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
+app=${DITCH_APP_PATH:-"$workspace/apps/macos/build/macos/Build/Products/Release/Ditch.app"}
+output=${DITCH_DMG_OUTPUT:-"$workspace/dist/commercial/The-Ditch.dmg"}
+
+[ -d "$app" ] || { echo "error: Commercial app not found at $app" >&2; exit 1; }
+[ "$(find "$app" -type f -name ditchd | wc -l | tr -d ' ')" = 1 ] || {
+  echo "error: Commercial app must contain exactly one local ditchd" >&2
+  exit 1
+}
+test -z "$(find "$app" -type f -name 'ditch-servicesd' -print -quit)" || {
+  echo "error: second daemon is forbidden" >&2
+  exit 1
+}
+case "$output" in
+  "$workspace"/dist/commercial/*.dmg|"$workspace"/dist/commercial/*/*.dmg) ;;
+  *) echo "error: DMG output must be inside dist/commercial" >&2; exit 2 ;;
+esac
+
+actual_bundle_id=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist")
+expected_bundle_id=${DITCH_BUNDLE_ID:-ai.theditch.app}
+[ "$actual_bundle_id" = "$expected_bundle_id" ] || {
+  echo "error: app bundle ID $actual_bundle_id does not match $expected_bundle_id" >&2
+  exit 1
+}
+
+if [ -n "${DITCH_CODESIGN_IDENTITY:-}" ]; then
+  sign_release_code() {
+    codesign --force --timestamp --options runtime \
+      --sign "$DITCH_CODESIGN_IDENTITY" "$1"
+  }
+
+  # Normalize all nested signatures inside-out. Swift Package Manager may
+  # supply Sparkle with ad-hoc signatures, and the Xcode build phase adds the
+  # cross-built macOS runtimes after Xcode's normal signing traversal.
+  sparkle="$app/Contents/Frameworks/Sparkle.framework/Versions/B"
+  helper="$app/Contents/Library/LoginItems/The Ditch Runtime.app"
+  for nested in \
+    "$sparkle/Autoupdate" \
+    "$sparkle/Updater.app" \
+    "$sparkle/XPCServices/Downloader.xpc" \
+    "$sparkle/XPCServices/Installer.xpc" \
+    "$app/Contents/MacOS/ditch_cli" \
+    "$app/Contents/MacOS/ditchd-remote-aarch64-apple-darwin" \
+    "$helper/Contents/MacOS/ditchd" \
+    "$helper/Contents/MacOS/ditch_cli" \
+    "$helper/Contents/MacOS/ditchd-remote-aarch64-apple-darwin" \
+    "$helper/Contents/Resources/RemoteRuntimes/ditchd-aarch64-apple-darwin" \
+    "$helper/Contents/Resources/RemoteRuntimes/ditchd-x86_64-apple-darwin"
+  do
+    [ -e "$nested" ] || { echo "error: missing nested release code: $nested" >&2; exit 1; }
+    sign_release_code "$nested"
+  done
+  sign_release_code "$app/Contents/Frameworks/Sparkle.framework"
+  sign_release_code "$app/Contents/Frameworks/App.framework"
+  sign_release_code "$app/Contents/Frameworks/FlutterMacOS.framework"
+  sign_release_code "$helper"
+  codesign --force --timestamp --options runtime \
+    --entitlements "$workspace/apps/macos/macos/Runner/Release.entitlements" \
+    --sign "$DITCH_CODESIGN_IDENTITY" "$app"
+
+  # --deep is intentionally verification-only. Signing recursively would hide
+  # omissions and may apply the app's entitlements to unrelated nested code.
+  codesign --verify --deep --strict --verbose=2 "$app"
+  actual_team_id=$(codesign -dv --verbose=4 "$app" 2>&1 | sed -n 's/^TeamIdentifier=//p' | tail -n 1)
+  [ -n "$actual_team_id" ] || { echo "error: signed app has no Apple Team ID" >&2; exit 1; }
+  if [ -n "${DITCH_APPLE_TEAM_ID:-}" ] && [ "$actual_team_id" != "$DITCH_APPLE_TEAM_ID" ]; then
+    echo "error: app Team ID $actual_team_id does not match expected Team ID $DITCH_APPLE_TEAM_ID" >&2
+    exit 1
+  fi
+  codesign -d --verbose=4 "$app" 2>&1 | rg -q 'flags=.*runtime' || {
+    echo "error: app is not signed with hardened runtime" >&2
+    exit 1
+  }
+  codesign -dv --verbose=4 "$app" 2>&1 | grep -Fq "Authority=$DITCH_CODESIGN_IDENTITY" || {
+    echo "error: app is not signed by the configured Developer ID Application identity" >&2
+    exit 1
+  }
+  for signed_code in \
+    "$app" \
+    "$helper" \
+    "$helper/Contents/Resources/RemoteRuntimes/ditchd-aarch64-apple-darwin" \
+    "$helper/Contents/Resources/RemoteRuntimes/ditchd-x86_64-apple-darwin" \
+    "$app/Contents/Frameworks/Sparkle.framework" \
+    "$sparkle/Updater.app" \
+    "$sparkle/XPCServices/Downloader.xpc" \
+    "$sparkle/XPCServices/Installer.xpc"
+  do
+    signature=$(codesign -dv --verbose=4 "$signed_code" 2>&1)
+    printf '%s\n' "$signature" | grep -Fq "Authority=$DITCH_CODESIGN_IDENTITY" || {
+      echo "error: nested code is not signed by the configured identity: $signed_code" >&2
+      exit 1
+    }
+    printf '%s\n' "$signature" | grep -Eq '^(Timestamp|Signed Time)=' || {
+      echo "error: nested code has no secure timestamp: $signed_code" >&2
+      exit 1
+    }
+    printf '%s\n' "$signature" | grep -Eq '^CodeDirectory .*flags=.*runtime' || {
+      echo "error: nested code has no hardened runtime: $signed_code" >&2
+      exit 1
+    }
+  done
+fi
+
+staging=$(mktemp -d "${TMPDIR:-/tmp}/ditch-commercial-dmg.XXXXXX")
+cleanup() { rm -rf "$staging"; }
+trap cleanup EXIT HUP INT TERM
+mkdir -p "$(dirname "$output")"
+ditto "$app" "$staging/The Ditch.app"
+ln -s /Applications "$staging/Applications"
+hdiutil create -quiet -volname "The Ditch" -srcfolder "$staging" -format UDZO -ov "$output"
+hdiutil verify "$output" >/dev/null
+
+if [ -n "${DITCH_CODESIGN_IDENTITY:-}" ]; then
+  codesign --force --timestamp --sign "$DITCH_CODESIGN_IDENTITY" "$output"
+  codesign --verify --strict --verbose=2 "$output"
+fi
+if [ -n "${DITCH_NOTARY_PROFILE:-}" ]; then
+  if [ -n "${DITCH_NOTARY_KEYCHAIN:-}" ]; then
+    xcrun notarytool submit "$output" \
+      --keychain-profile "$DITCH_NOTARY_PROFILE" \
+      --keychain "$DITCH_NOTARY_KEYCHAIN" \
+      --wait
+  else
+    xcrun notarytool submit "$output" --keychain-profile "$DITCH_NOTARY_PROFILE" --wait
+  fi
+  xcrun stapler staple "$output"
+  xcrun stapler validate "$output"
+  spctl --assess --type open --context context:primary-signature --verbose=2 "$output"
+fi
+echo "Commercial DMG written to $output"

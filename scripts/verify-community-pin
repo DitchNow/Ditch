@@ -1,0 +1,80 @@
+#!/bin/sh
+set -eu
+
+workspace=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
+expected=$(tr -d '\r\n' < "$workspace/COMMUNITY_REVISION")
+actual=$(git -C "$workspace/community" rev-parse HEAD)
+index_entry=$(git -C "$workspace" ls-files -s -- community)
+index_mode=$(printf '%s\n' "$index_entry" | awk '{print $1}')
+index_revision=$(printf '%s\n' "$index_entry" | awk '{print $2}')
+
+tracked_environment_files=$(git -C "$workspace" ls-files | awk -F/ '$NF == ".env" || $NF ~ /^\.env\./ { print }')
+[ -z "$tracked_environment_files" ] || {
+  printf '%s\n' "$tracked_environment_files" >&2
+  echo "error: tracked .env files are forbidden in the Commercial repository" >&2
+  exit 1
+}
+tracked_community_environment_files=$(git -C "$workspace/community" ls-files | awk -F/ '$NF == ".env" || $NF ~ /^\.env\./ { print }')
+[ -z "$tracked_community_environment_files" ] || {
+  printf '%s\n' "$tracked_community_environment_files" >&2
+  echo "error: tracked .env files are forbidden in the Community repository" >&2
+  exit 1
+}
+
+case "$expected" in
+  *[!0-9a-f]*|'')
+    echo "error: COMMUNITY_REVISION must contain one lowercase 40-character Git commit" >&2
+    exit 1
+    ;;
+esac
+[ "${#expected}" -eq 40 ] || {
+  echo "error: COMMUNITY_REVISION must contain one lowercase 40-character Git commit" >&2
+  exit 1
+}
+[ "$(git -C "$workspace/community" cat-file -t "$expected" 2>/dev/null || true)" = commit ] || {
+  echo "error: COMMUNITY_REVISION does not resolve to a commit in the Community repository" >&2
+  exit 1
+}
+
+[ "$actual" = "$expected" ] || {
+  echo "error: Community submodule is $actual, expected $expected" >&2
+  exit 1
+}
+[ "$index_mode" = 160000 ] && [ "$index_revision" = "$expected" ] || {
+  echo "error: Commercial index gitlink is ${index_revision:-missing}, expected $expected" >&2
+  exit 1
+}
+
+git -C "$workspace/community" diff --quiet || {
+  echo "error: Community submodule contains uncommitted tracked changes" >&2
+  git -C "$workspace/community" status --short >&2
+  exit 1
+}
+git -C "$workspace/community" diff --cached --quiet || {
+  echo "error: Community submodule contains staged but uncommitted changes" >&2
+  git -C "$workspace/community" status --short >&2
+  exit 1
+}
+test -z "$(git -C "$workspace/community" status --porcelain)" || {
+  echo "error: Community submodule must be clean" >&2
+  git -C "$workspace/community" status --short >&2
+  exit 1
+}
+
+if [ "${1:-}" = "--release" ]; then
+  head_revision=$(git -C "$workspace" ls-tree HEAD -- community | awk '{print $3}')
+  [ "$head_revision" = "$expected" ] || {
+    echo "error: committed Commercial gitlink is ${head_revision:-missing}, expected $expected" >&2
+    exit 1
+  }
+  test -z "$(git -C "$workspace" status --porcelain)" || {
+    echo "error: Commercial release verification requires a clean worktree" >&2
+    git -C "$workspace" status --short >&2
+    exit 1
+  }
+elif [ "$#" -ne 0 ]; then
+  echo "usage: scripts/verify-community-pin [--release]" >&2
+  exit 2
+fi
+
+echo "Commercial source, index gitlink, and clean submodule pin Community revision $actual"

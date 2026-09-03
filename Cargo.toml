@@ -1,28 +1,31 @@
 [workspace]
 members = [
-  "crates/ditch_agents",
   "crates/ditch_cli",
-  "crates/ditch_core",
-  "crates/ditch_orchestrator",
+  "crates/ditch_commercial",
   "crates/ditch_protocol",
-  "crates/ditch_runtime",
+  "crates/ditch_remote",
   "crates/ditch_store",
   "crates/ditchd",
 ]
+exclude = ["community"]
 resolver = "3"
 
 [workspace.package]
 edition = "2024"
-license = "AGPL-3.0-only"
-version = "0.1.0"
+license = "LicenseRef-Ditch-Commercial"
+version = "0.1.1"
 
 [workspace.dependencies]
-ditch_agents = { path = "crates/ditch_agents" }
-ditch_core = { path = "crates/ditch_core" }
-ditch_orchestrator = { path = "crates/ditch_orchestrator" }
-ditch_protocol = { path = "crates/ditch_protocol" }
-ditch_runtime = { path = "crates/ditch_runtime" }
-ditch_store = { path = "crates/ditch_store" }
+ditch_core = { path = "community/crates/ditch_core" }
+ditch_identity = { path = "community/crates/ditch_identity" }
+ditch_product = { path = "community/crates/ditch_product" }
+ditch_commercial = { path = "crates/ditch_commercial" }
+ditch_protocol = { package = "ditch_commercial_protocol", path = "crates/ditch_protocol" }
+ditch_remote = { package = "ditch_commercial_remote", path = "crates/ditch_remote" }
+ditch_commercial_store = { path = "crates/ditch_store" }
+ditch_ssh = { path = "community/crates/ditch_ssh" }
+ditch_store = { path = "community/crates/ditch_store" }
+ditch_upgrade = { path = "community/crates/ditch_upgrade" }
 
 chrono = { version = "0.4.42", features = ["serde"] }
 serde = { version = "1.0.228", features = ["derive"] }
@@ -31,3 +34,11 @@ thiserror = "2.0.17"
 uuid = { version = "1.19.0", features = ["serde", "v4"] }
 rusqlite = { version = "0.38.0", features = ["bundled"] }
 libc = "0.2.189"
+aes-gcm = "0.10.3"
+base64 = "0.22.1"
+hkdf = "0.12.4"
+p256 = { version = "0.13.2", features = ["ecdh", "ecdsa", "pkcs8"] }
+rand_core = { version = "0.6.4", features = ["getrandom"] }
+sha2 = "0.10.9"
+semver = "1.0.28"
+url = "2.5.7"

@@ -1,0 +1,23 @@
+[package]
+name = "ditch_commercial_remote"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+aes-gcm.workspace = true
+base64.workspace = true
+chrono.workspace = true
+ditch_core.workspace = true
+ditch_protocol.workspace = true
+hkdf.workspace = true
+p256.workspace = true
+rand_core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "3.5.1"
