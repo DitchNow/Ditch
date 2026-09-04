@@ -12,7 +12,7 @@ pub use ditch_community_protocol::{
 };
 
 pub const PROTOCOL_VERSION: u16 = 1;
-pub const REMOTE_RUNTIME_PROTOCOL_VERSION: u16 = 2;
+pub const REMOTE_RUNTIME_PROTOCOL_VERSION: u16 = 3;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Envelope<T> {
@@ -162,6 +162,31 @@ pub enum ClientRequest {
         #[serde(default)]
         execution_profile: AgentExecutionProfile,
     },
+    /// Internal SSH-daemon command used only after the desktop runtime has
+    /// resolved a project to an SSH execution target.
+    StartRemoteCodexAppServerSession {
+        project_id: ProjectId,
+        project_name: String,
+        project_root: String,
+        prompt: String,
+        #[serde(default)]
+        execution_profile: AgentExecutionProfile,
+    },
+    ResumeRemoteCodexAppServerSession {
+        project_id: ProjectId,
+        project_name: String,
+        project_root: String,
+        thread_id: String,
+        prompt: String,
+        #[serde(default)]
+        execution_profile: AgentExecutionProfile,
+    },
+    PromptRemoteCodexAppServerAgent {
+        agent_id: AgentId,
+        prompt: String,
+        #[serde(default)]
+        execution_profile: AgentExecutionProfile,
+    },
     StartCodex {
         project_id: ProjectId,
         prompt: String,
@@ -282,6 +307,9 @@ pub enum ClientRequest {
     },
     DisableRemoteControl,
     ApprovePermission {
+        request_id: Uuid,
+    },
+    ApprovePermissionForSession {
         request_id: Uuid,
     },
     DenyPermission {
@@ -499,6 +527,8 @@ pub struct Snapshot {
     pub agents: Vec<AgentRun>,
     pub attention: Vec<RuntimeAttention>,
     pub messages: Vec<AgentChatMessage>,
+    #[serde(default)]
+    pub permissions: Vec<PermissionRequest>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
