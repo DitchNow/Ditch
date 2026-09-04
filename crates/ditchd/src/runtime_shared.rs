@@ -53,9 +53,11 @@ static LOGIN_SHELL_PATH: OnceLock<Option<OsString>> = OnceLock::new();
 #[allow(dead_code)]
 fn main() {
     let result = match std::env::args().skip(1).collect::<Vec<_>>().as_slice() {
-        [command] if command == "daemon" => run_runtime_with_paths(AppPaths::for_remote_user()),
+        [command] if command == "daemon" => {
+            run_runtime_with_paths(AppPaths::for_remote_user(), true)
+        }
         [command, flag] if command == "daemon" && flag == "--remote" => {
-            run_runtime_with_paths(AppPaths::for_remote_user())
+            run_runtime_with_paths(AppPaths::for_remote_user(), true)
         }
         [command, flag] if command == "bridge" && flag == "--stdio" => {
             bridge_stdio(AppPaths::for_remote_user())
@@ -89,13 +91,13 @@ fn main() {
 
 fn run_runtime() -> io::Result<()> {
     let paths = AppPaths::for_current_user();
-    run_runtime_with_paths(paths)
+    run_runtime_with_paths(paths, false)
 }
 
-fn run_runtime_with_paths(paths: AppPaths) -> io::Result<()> {
+fn run_runtime_with_paths(paths: AppPaths, remote_runtime: bool) -> io::Result<()> {
     validate_codex_home()
         .and_then(|_| ensure_app_dirs(&paths).map_err(io::Error::other))
-        .and_then(|_| serve(paths))
+        .and_then(|_| serve(paths, remote_runtime))
 }
 
 /// Stdio transport used by OpenSSH. It is intentionally only a byte bridge to
@@ -181,6 +183,11 @@ struct RuntimeState {
     remote_event_subscriptions: HashSet<String>,
     remote_epochs: HashMap<String, uuid::Uuid>,
     remote_connection_states: HashMap<String, String>,
+    remote_permission_hosts: HashMap<uuid::Uuid, String>,
+    pending_permissions: HashMap<uuid::Uuid, ditch_core::PermissionRequest>,
+    app_server_turns: HashMap<AgentId, codex_app_server::ActiveTurn>,
+    app_server_permission_agents: HashMap<uuid::Uuid, AgentId>,
+    remote_runtime: bool,
 }
 
 struct ProjectTerminalRecord {
@@ -213,10 +220,11 @@ struct ActiveAgentChild {
     run_id: uuid::Uuid,
     process_group_id: i32,
     child: Arc<Mutex<Child>>,
+    app_server: bool,
 }
 
 impl RuntimeState {
-    fn new(paths: AppPaths) -> Result<Self, io::Error> {
+    fn new(paths: AppPaths, remote_runtime: bool) -> Result<Self, io::Error> {
         let mut store = DitchStore::open(&paths).map_err(io::Error::other)?;
         edition::initialize_store(&mut store)?;
         store.reconcile_active_agents().map_err(io::Error::other)?;
@@ -298,6 +306,11 @@ impl RuntimeState {
             remote_event_subscriptions: HashSet::new(),
             remote_epochs: HashMap::new(),
             remote_connection_states: HashMap::new(),
+            remote_permission_hosts: HashMap::new(),
+            pending_permissions: HashMap::new(),
+            app_server_turns: HashMap::new(),
+            app_server_permission_agents: HashMap::new(),
+            remote_runtime,
         })
     }
 
@@ -380,6 +393,7 @@ impl RuntimeState {
                 .collect(),
             attention: self.attention.clone(),
             messages: Vec::new(),
+            permissions: self.pending_permissions.values().cloned().collect(),
         }
     }
 
@@ -449,11 +463,11 @@ struct SequencedEvent {
     event: ServerEvent,
 }
 
-fn serve(paths: AppPaths) -> io::Result<()> {
+fn serve(paths: AppPaths, remote_runtime: bool) -> io::Result<()> {
     remove_stale_socket(&paths.socket_path)?;
     let listener = UnixListener::bind(&paths.socket_path)?;
     fs::set_permissions(&paths.socket_path, fs::Permissions::from_mode(0o600))?;
-    let state = Arc::new(Mutex::new(RuntimeState::new(paths)?));
+    let state = Arc::new(Mutex::new(RuntimeState::new(paths, remote_runtime)?));
     write_runtime_metadata(&state)?;
     edition::start(Arc::clone(&state));
     start_remote_reconciler(Arc::clone(&state));
@@ -599,6 +613,23 @@ fn forward_remote_event(state: &Arc<Mutex<RuntimeState>>, alias: &str, event: Se
             }
             state.broadcast(ServerEvent::AgentMessageAppended(message));
         }
+        ServerEvent::PermissionRequested(request) => {
+            let owned = state.projects.values().any(|project| {
+                project.id == request.project_id
+                    && ssh_remote::remote_alias(project).is_some_and(|host| host == alias)
+            });
+            if !owned {
+                return;
+            }
+            if let Some(agent_id) = request.agent_id {
+                state.remote_agent_hosts.insert(agent_id, alias.to_owned());
+            }
+            state
+                .remote_permission_hosts
+                .insert(request.id, alias.to_owned());
+            state.pending_permissions.insert(request.id, request.clone());
+            state.broadcast(ServerEvent::PermissionRequested(request));
+        }
         ServerEvent::ProjectTerminalOutput { terminal_id, data } => {
             if state
                 .remote_terminal_hosts
@@ -618,8 +649,8 @@ fn forward_remote_event(state: &Arc<Mutex<RuntimeState>>, alias: &str, event: Se
             state.broadcast(ServerEvent::ProjectTerminalExited { terminal_id });
         }
         // Snapshots and attention are reconciled authoritatively by the
-        // bounded poller. Project/agent terminal events need low latency and
-        // are the only event classes forwarded here.
+        // bounded poller. Agent, permission, and terminal events need low
+        // latency and are forwarded directly.
         _ => {}
     }
 }
@@ -713,6 +744,33 @@ fn reconcile_remote_snapshot(
                 terminal_failure: None,
             },
         );
+    }
+
+    let authoritative_permission_ids = snapshot
+        .permissions
+        .iter()
+        .filter(|request| project_ids.contains(&request.project_id))
+        .map(|request| request.id)
+        .collect::<HashSet<_>>();
+    let stale_permissions = state
+        .remote_permission_hosts
+        .iter()
+        .filter(|(_, host)| host.as_str() == alias)
+        .filter_map(|(id, _)| (!authoritative_permission_ids.contains(id)).then_some(*id))
+        .collect::<Vec<_>>();
+    for id in stale_permissions {
+        state.remote_permission_hosts.remove(&id);
+        state.pending_permissions.remove(&id);
+    }
+    for request in snapshot
+        .permissions
+        .into_iter()
+        .filter(|request| project_ids.contains(&request.project_id))
+    {
+        state
+            .remote_permission_hosts
+            .insert(request.id, alias.to_owned());
+        state.pending_permissions.insert(request.id, request);
     }
 
     let replaced_attention_ids = state
@@ -1334,6 +1392,42 @@ fn handle_request(request: ClientRequest, state: Arc<Mutex<RuntimeState>>) -> Se
                 )
             }
         }
+        ClientRequest::StartRemoteCodexAppServerSession {
+            project_id,
+            project_name,
+            project_root,
+            prompt,
+            execution_profile,
+        } => start_remote_app_server_session(
+            state,
+            project_id,
+            project_name,
+            project_root,
+            None,
+            prompt,
+            execution_profile,
+        ),
+        ClientRequest::ResumeRemoteCodexAppServerSession {
+            project_id,
+            project_name,
+            project_root,
+            thread_id,
+            prompt,
+            execution_profile,
+        } => start_remote_app_server_session(
+            state,
+            project_id,
+            project_name,
+            project_root,
+            Some(thread_id),
+            prompt,
+            execution_profile,
+        ),
+        ClientRequest::PromptRemoteCodexAppServerAgent {
+            agent_id,
+            prompt,
+            execution_profile,
+        } => prompt_remote_app_server_agent(state, agent_id, prompt, execution_profile),
         ClientRequest::PromptAgent {
             agent_id,
             prompt,
@@ -1539,9 +1633,24 @@ fn handle_request(request: ClientRequest, state: Arc<Mutex<RuntimeState>>) -> Se
         ClientRequest::CheckCommercialRelease => current_commercial_release(state, false),
         ClientRequest::CurrentCommercialRelease => current_commercial_release(state, true),
         ClientRequest::CheckRemoteProject { project_id } => check_remote_project(state, project_id),
+        ClientRequest::ApprovePermission { request_id } => respond_permission_for_target(
+            state,
+            request_id,
+            codex_app_server::PermissionDecision::ApproveOnce,
+        ),
+        ClientRequest::ApprovePermissionForSession { request_id } => {
+            respond_permission_for_target(
+                state,
+                request_id,
+                codex_app_server::PermissionDecision::ApproveForSession,
+            )
+        }
+        ClientRequest::DenyPermission { request_id, .. } => respond_permission_for_target(
+            state,
+            request_id,
+            codex_app_server::PermissionDecision::Deny,
+        ),
         ClientRequest::StartCodex { .. }
-        | ClientRequest::ApprovePermission { .. }
-        | ClientRequest::DenyPermission { .. }
         | ClientRequest::SubscribeEvents { .. }
         | ClientRequest::SubscribeAttention => protocol_error(
             "unsupported_request",
@@ -2254,7 +2363,7 @@ fn forward_remote_start(
     _project_name: String,
     _project_root: String,
     prompt: String,
-    mode: CodexLaunchMode,
+    _mode: CodexLaunchMode,
     execution_profile: AgentExecutionProfile,
 ) -> ServerResponse {
     let Some(alias) = ssh_remote::remote_alias(&project).map(str::to_owned) else {
@@ -2265,12 +2374,12 @@ fn forward_remote_start(
         .expect("runtime state lock should not be poisoned")
         .remote_connections
         .clone();
-    let request = ClientRequest::StartCodexSession {
-        project_id: Some(project.id),
+    ensure_remote_event_subscription(&state, &alias);
+    let request = ClientRequest::StartRemoteCodexAppServerSession {
+        project_id: project.id,
         project_name: project.name.clone(),
         project_root: project.root.to_string_lossy().into_owned(),
         prompt,
-        mode,
         execution_profile,
     };
     match connections.request(&alias, request) {
@@ -2300,8 +2409,9 @@ fn forward_remote_resume(
         .expect("runtime state lock should not be poisoned")
         .remote_connections
         .clone();
-    let request = ClientRequest::ResumeCodexSession {
-        project_id: Some(project.id),
+    ensure_remote_event_subscription(&state, &alias);
+    let request = ClientRequest::ResumeRemoteCodexAppServerSession {
+        project_id: project.id,
         project_name: project.name.clone(),
         project_root: project.root.to_string_lossy().into_owned(),
         thread_id,
@@ -2337,9 +2447,10 @@ fn forward_or_prompt_agent(
     let Some((alias, connections)) = remote else {
         return prompt_agent(state, agent_id, prompt, execution_profile);
     };
+    ensure_remote_event_subscription(&state, &alias);
     match connections.request(
         &alias,
-        ClientRequest::PromptAgent {
+        ClientRequest::PromptRemoteCodexAppServerAgent {
             agent_id,
             prompt,
             execution_profile,
@@ -2892,6 +3003,8 @@ fn discover_codex_models(binary: &str) -> io::Result<Vec<AgentModel>> {
     Ok(models)
 }
 
+include!("remote_app_server_runtime.rs");
+
 fn start_codex_session(
     state: Arc<Mutex<RuntimeState>>,
     project_name: String,
@@ -3026,6 +3139,7 @@ fn start_codex_session(
                 run_id,
                 process_group_id,
                 child: Arc::clone(&child),
+                app_server: false,
             },
         );
         state.broadcast(ServerEvent::ProjectChanged(project));
@@ -3286,6 +3400,7 @@ fn resume_codex_session(
                 run_id,
                 process_group_id,
                 child: Arc::clone(&child),
+                app_server: false,
             },
         );
         state.broadcast(ServerEvent::ProjectChanged(project));
@@ -3436,6 +3551,7 @@ fn prompt_agent(
                 run_id,
                 process_group_id,
                 child: Arc::clone(&child),
+                app_server: false,
             },
         );
         state.broadcast(ServerEvent::AgentChanged(run));
@@ -3452,6 +3568,15 @@ fn stop_agent(state: Arc<Mutex<RuntimeState>>, agent_id: AgentId) -> ServerRespo
             .lock()
             .expect("runtime state lock should not be poisoned");
         let active = state.children.get(&agent_id).cloned();
+        if active.as_ref().is_some_and(|child| child.app_server) {
+            state.app_server_turns.remove(&agent_id);
+            state
+                .app_server_permission_agents
+                .retain(|_, owner| *owner != agent_id);
+            state
+                .pending_permissions
+                .retain(|_, request| request.agent_id != Some(agent_id));
+        }
         let Some(record) = state.agents.get_mut(&agent_id) else {
             return protocol_error("agent_not_found", "agent session was not found");
         };
@@ -4347,7 +4472,20 @@ fn finish_agent(
     {
         return;
     }
+    let app_server = state
+        .children
+        .get(&agent_id)
+        .is_some_and(|active| active.app_server);
     state.children.remove(&agent_id);
+    if app_server {
+        state.app_server_turns.remove(&agent_id);
+        state
+            .app_server_permission_agents
+            .retain(|_, owner| *owner != agent_id);
+        state
+            .pending_permissions
+            .retain(|_, request| request.agent_id != Some(agent_id));
+    }
     let (run, attention) = {
         let has_blocked_attention = state.attention.iter().any(|attention| {
             attention.agent_id == Some(agent_id)
@@ -4369,11 +4507,16 @@ fn finish_agent(
         };
         let stopping = record.run.state == AgentState::Stopping;
         let interrupted = record.run.state == AgentState::Interrupted;
+        let app_server_finished = app_server
+            && matches!(
+                record.run.state,
+                AgentState::Completed | AgentState::Failed | AgentState::Interrupted
+            );
         record.run.can_stop = false;
         if stopping {
             record.run.state = AgentState::Interrupted;
             record.run.last_visible_action = Some("Stopped by user".to_owned());
-        } else if !interrupted {
+        } else if !interrupted && !app_server_finished {
             record.run.state = if record.terminal_failure.is_some() {
                 AgentState::Failed
             } else {
@@ -4389,7 +4532,9 @@ fn finish_agent(
         }
         record.run.updated_at = Utc::now();
         record.run.finished_at = Some(record.run.updated_at);
-        record.run.exit_code = code;
+        if !app_server_finished {
+            record.run.exit_code = code;
+        }
         record.run.resume_block_reason = record
             .run
             .native_session_id
@@ -5515,7 +5660,26 @@ esac
             scrollback_dir: root.join("scrollback"),
         };
         ensure_app_dirs(&paths).expect("test app directories should be created");
-        RuntimeState::new(paths).expect("test runtime should initialize")
+        RuntimeState::new(paths, false).expect("test runtime should initialize")
+    }
+
+    #[test]
+    fn local_runtime_rejects_the_internal_ssh_app_server_launch() {
+        let state = Arc::new(Mutex::new(test_runtime()));
+        let response = handle_request(
+            ClientRequest::StartRemoteCodexAppServerSession {
+                project_id: ProjectId::new(),
+                project_name: "Remote".to_owned(),
+                project_root: "/srv/remote".to_owned(),
+                prompt: "test".to_owned(),
+                execution_profile: AgentExecutionProfile::default(),
+            },
+            state,
+        );
+        let ServerResponse::Error(error) = response else {
+            panic!("local runtime must reject the SSH-only launch");
+        };
+        assert_eq!(error.code, "ssh_app_server_only");
     }
 
     #[test]
@@ -5935,6 +6099,7 @@ esac
                 run_id,
                 process_group_id,
                 child: Arc::clone(&child),
+                app_server: false,
             },
         );
         let state = Arc::new(Mutex::new(runtime));
@@ -6019,6 +6184,7 @@ esac
                 run_id,
                 process_group_id,
                 child: Arc::clone(&child),
+                app_server: false,
             },
         );
         let state = Arc::new(Mutex::new(runtime));

@@ -448,12 +448,12 @@ pub fn check_setup(
         if codex_sandbox == "ready" {
             "Ready"
         } else if sandbox_install_available {
-            "Ditch can configure the required Linux command sandbox"
+            "Optional sandboxed mode can be configured on this host"
         } else {
-            "This host cannot currently provide the Codex command sandbox"
+            "Interactive App Server approvals remain available without it"
         },
         (codex_sandbox != "ready").then(|| {
-            "Approve for me keeps Codex inside the remote project with workspace-write and disables approval prompts. Linux requires a working distribution Bubblewrap installation to enforce that boundary; Ditch never falls back to unrestricted execution.".to_owned()
+            "Bubblewrap is optional for SSH projects. Without it, Ditch uses Codex App Server's interactive approval flow and commands run with the SSH user's permissions.".to_owned()
         }),
     ));
     let persistence = values
@@ -1117,7 +1117,6 @@ Restart=on-failure
 RestartSec=2
 StandardOutput=append:%h/.ditch/logs/runtime.log
 StandardError=append:%h/.ditch/logs/runtime.log
-NoNewPrivileges=true
 [Install]
 WantedBy=default.target
 UNIT
