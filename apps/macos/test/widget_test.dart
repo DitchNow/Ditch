@@ -397,9 +397,14 @@ class _RelayContractClient extends DitchRuntimeClient {
   }
 }
 
-Widget _testApp() => const TheDitchApp(
+Widget _testApp({
+  String deploymentEnvironment = 'production',
+  String relayOrigin = 'https://relay.ditchnow.nl',
+}) => TheDitchApp(
   connectRuntimeOnStart: false,
-  initialProjects: [_testProject],
+  initialProjects: const [_testProject],
+  deploymentEnvironment: deploymentEnvironment,
+  relayOrigin: relayOrigin,
 );
 
 Widget _testToolbar(RuntimeConnectionPhase connection) => MaterialApp(
@@ -466,6 +471,40 @@ void main() {
     expect(find.byKey(const Key('settings-upgrade-ditch')), findsOneWidget);
     expect(find.text('Upgrade Ditch'), findsOneWidget);
     expect(calls.where((call) => call.method == 'appVersion'), hasLength(1));
+  });
+
+  testWidgets('staging settings keeps test mode visible', (tester) async {
+    const relayOrigin =
+        'https://ditch-remote-relay-staging.matin-1a7.workers.dev';
+    tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+      const MethodChannel('the_ditch/application'),
+      (call) async => switch (call.method) {
+        'appVersion' => {'version': '0.1.0', 'build': '108'},
+        'getThemeMode' => 'system',
+        'getPaneWidths' => <String, double>{},
+        _ => null,
+      },
+    );
+    addTearDown(
+      () => tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+        const MethodChannel('the_ditch/application'),
+        null,
+      ),
+    );
+
+    await tester.pumpWidget(
+      _testApp(deploymentEnvironment: 'staging', relayOrigin: relayOrigin),
+    );
+    await tester.tap(find.byKey(const Key('app-settings-button')));
+    await tester.pumpAndSettle();
+
+    expect(
+      find.byKey(const Key('settings-staging-environment')),
+      findsOneWidget,
+    );
+    expect(find.text('TEST MODE'), findsOneWidget);
+    expect(find.text('Relay'), findsOneWidget);
+    expect(find.text(relayOrigin), findsOneWidget);
   });
 
   testWidgets('Upgrade Ditch displays the Relay-provided license name', (

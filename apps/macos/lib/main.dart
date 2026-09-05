@@ -28,6 +28,85 @@ const ditchRelayOrigin = String.fromEnvironment(
 );
 const _ditchApplicationChannel = MethodChannel('the_ditch/application');
 
+class StagingEnvironmentBanner extends StatelessWidget {
+  const StagingEnvironmentBanner({
+    required this.relayOrigin,
+    this.onOpenRelay,
+    this.relayLinkKey,
+    super.key,
+  });
+
+  final String relayOrigin;
+  final VoidCallback? onOpenRelay;
+  final Key? relayLinkKey;
+
+  @override
+  Widget build(BuildContext context) {
+    final relay = Text(relayOrigin, overflow: TextOverflow.ellipsis);
+    return Container(
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: Theme.of(context).colorScheme.tertiaryContainer,
+        borderRadius: BorderRadius.circular(10),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.center,
+        children: [
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 5),
+            decoration: BoxDecoration(
+              color: Theme.of(context).colorScheme.tertiary,
+              borderRadius: BorderRadius.circular(999),
+            ),
+            child: Text(
+              'TEST MODE',
+              style: TextStyle(
+                color: Theme.of(context).colorScheme.onTertiary,
+                fontWeight: FontWeight.w700,
+                fontSize: 12,
+              ),
+            ),
+          ),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text(
+                  'Relay',
+                  style: TextStyle(fontWeight: FontWeight.w600),
+                ),
+                const SizedBox(height: 2),
+                const Text(
+                  'Purchases, licenses, pairing, and updates do not affect production.',
+                ),
+                const SizedBox(height: 4),
+                if (onOpenRelay == null)
+                  relay
+                else
+                  Semantics(
+                    link: true,
+                    child: TextButton(
+                      key: relayLinkKey,
+                      onPressed: onOpenRelay,
+                      style: TextButton.styleFrom(
+                        alignment: Alignment.centerLeft,
+                        padding: EdgeInsets.zero,
+                        minimumSize: Size.zero,
+                        tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                      ),
+                      child: relay,
+                    ),
+                  ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
 Map<String, Object> authorizedCommercialUpdateArguments(
   Map<String, dynamic> release,
 ) {
@@ -140,12 +219,16 @@ class TheDitchApp extends StatefulWidget {
     this.connectRuntimeOnStart = true,
     this.initialProjects = const [],
     this.editionSurface = const CommunityEditionSurface(),
+    this.deploymentEnvironment = ditchDeploymentEnvironment,
+    this.relayOrigin = ditchRelayOrigin,
     super.key,
   });
 
   final bool connectRuntimeOnStart;
   final List<DitchProject> initialProjects;
   final EditionSurface editionSurface;
+  final String deploymentEnvironment;
+  final String relayOrigin;
 
   @override
   State<TheDitchApp> createState() => _TheDitchAppState();
@@ -180,7 +263,7 @@ class _TheDitchAppState extends State<TheDitchApp> {
     return ValueListenableBuilder<ThemeMode>(
       valueListenable: ditchThemeMode,
       builder: (context, themeMode, _) => MaterialApp(
-        title: ditchDeploymentEnvironment == 'staging'
+        title: widget.deploymentEnvironment == 'staging'
             ? 'Ditch Staging'
             : 'Ditch',
         debugShowCheckedModeBanner: false,
@@ -191,6 +274,8 @@ class _TheDitchAppState extends State<TheDitchApp> {
           connectRuntimeOnStart: widget.connectRuntimeOnStart,
           initialProjects: widget.initialProjects,
           editionSurface: widget.editionSurface,
+          deploymentEnvironment: widget.deploymentEnvironment,
+          relayOrigin: widget.relayOrigin,
         ),
       ),
     );
@@ -1612,12 +1697,16 @@ class CommandCenterScreen extends StatefulWidget {
     this.connectRuntimeOnStart = true,
     this.initialProjects = const [],
     this.editionSurface = const CommunityEditionSurface(),
+    this.deploymentEnvironment = ditchDeploymentEnvironment,
+    this.relayOrigin = ditchRelayOrigin,
     super.key,
   });
 
   final bool connectRuntimeOnStart;
   final List<DitchProject> initialProjects;
   final EditionSurface editionSurface;
+  final String deploymentEnvironment;
+  final String relayOrigin;
 
   @override
   State<CommandCenterScreen> createState() => _CommandCenterScreenState();
@@ -2404,7 +2493,11 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
         icon: Icons.system_update_alt,
         title: 'Upgrade Ditch',
         subtitle: 'Check for updates for your current license',
-        dialogBuilder: (client) => DitchUpdateDialog(client: client),
+        dialogBuilder: (client) => DitchUpdateDialog(
+          client: client,
+          deploymentEnvironment: widget.deploymentEnvironment,
+          relayOrigin: widget.relayOrigin,
+        ),
       ),
     ];
     final section = await showDialog<String>(
@@ -2412,6 +2505,14 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
       builder: (context) => SimpleDialog(
         title: const Text('Settings'),
         children: [
+          if (widget.deploymentEnvironment == 'staging')
+            Padding(
+              padding: const EdgeInsets.fromLTRB(24, 0, 24, 12),
+              child: StagingEnvironmentBanner(
+                key: const Key('settings-staging-environment'),
+                relayOrigin: widget.relayOrigin,
+              ),
+            ),
           SimpleDialogOption(
             onPressed: () => Navigator.pop(context, 'codex'),
             child: const ListTile(
@@ -5289,9 +5390,16 @@ class NotificationSetupBanner extends StatelessWidget {
 }
 
 class DitchUpdateDialog extends StatefulWidget {
-  const DitchUpdateDialog({required this.client, super.key});
+  const DitchUpdateDialog({
+    required this.client,
+    this.deploymentEnvironment = ditchDeploymentEnvironment,
+    this.relayOrigin = ditchRelayOrigin,
+    super.key,
+  });
 
   final DitchRuntimeClient client;
+  final String deploymentEnvironment;
+  final String relayOrigin;
 
   @override
   State<DitchUpdateDialog> createState() => _DitchUpdateDialogState();
@@ -5458,9 +5566,21 @@ class _DitchUpdateDialogState extends State<DitchUpdateDialog> {
       title: const Text('Upgrade Ditch'),
       content: SizedBox(
         width: 520,
-        child: _loading
-            ? const Center(child: CircularProgressIndicator())
-            : Column(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            if (widget.deploymentEnvironment == 'staging') ...[
+              StagingEnvironmentBanner(
+                key: const Key('update-staging-environment'),
+                relayOrigin: widget.relayOrigin,
+              ),
+              const SizedBox(height: 12),
+            ],
+            if (_loading)
+              const Center(child: CircularProgressIndicator())
+            else
+              Column(
                 mainAxisSize: MainAxisSize.min,
                 crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
@@ -5511,6 +5631,8 @@ class _DitchUpdateDialogState extends State<DitchUpdateDialog> {
                   ],
                 ],
               ),
+          ],
+        ),
       ),
       actions: [
         TextButton(
@@ -6228,66 +6350,11 @@ class _CommercialUpgradeDialogState extends State<CommercialUpgradeDialog> {
               ),
               const SizedBox(height: 8),
               if (widget.deploymentEnvironment == 'staging') ...[
-                Container(
+                StagingEnvironmentBanner(
                   key: const Key('commercial-staging-environment'),
-                  padding: const EdgeInsets.all(12),
-                  decoration: BoxDecoration(
-                    color: Theme.of(context).colorScheme.tertiaryContainer,
-                    borderRadius: BorderRadius.circular(10),
-                  ),
-                  child: Row(
-                    crossAxisAlignment: CrossAxisAlignment.center,
-                    children: [
-                      Container(
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 9,
-                          vertical: 5,
-                        ),
-                        decoration: BoxDecoration(
-                          color: Theme.of(context).colorScheme.tertiary,
-                          borderRadius: BorderRadius.circular(999),
-                        ),
-                        child: Text(
-                          'TEST MODE',
-                          style: TextStyle(
-                            color: Theme.of(context).colorScheme.onTertiary,
-                            fontWeight: FontWeight.w700,
-                            fontSize: 12,
-                          ),
-                        ),
-                      ),
-                      const SizedBox(width: 12),
-                      Expanded(
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Text(
-                              'Relay',
-                              style: Theme.of(context).textTheme.labelMedium,
-                            ),
-                            Semantics(
-                              link: true,
-                              child: TextButton(
-                                key: const Key('commercial-staging-relay-link'),
-                                onPressed: _openRelayOrigin,
-                                style: TextButton.styleFrom(
-                                  alignment: Alignment.centerLeft,
-                                  padding: EdgeInsets.zero,
-                                  minimumSize: Size.zero,
-                                  tapTargetSize:
-                                      MaterialTapTargetSize.shrinkWrap,
-                                ),
-                                child: Text(
-                                  widget.relayOrigin,
-                                  overflow: TextOverflow.ellipsis,
-                                ),
-                              ),
-                            ),
-                          ],
-                        ),
-                      ),
-                    ],
-                  ),
+                  relayOrigin: widget.relayOrigin,
+                  relayLinkKey: const Key('commercial-staging-relay-link'),
+                  onOpenRelay: _openRelayOrigin,
                 ),
                 const SizedBox(height: 12),
               ],
