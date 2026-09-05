@@ -44,6 +44,27 @@ struct CachedOfficialBuildSession {
 
 static OFFICIAL_BUILD_SESSION: OnceLock<Mutex<Option<CachedOfficialBuildSession>>> =
     OnceLock::new();
+static OFFICIAL_BUILD_CREDENTIAL: OnceLock<Zeroizing<String>> = OnceLock::new();
+
+/// Configures the release credential inside the signed local macOS runtime.
+/// Standalone daemons and CLI binaries never call this function and therefore
+/// remain unable to establish an official-build session.
+pub fn configure_official_build_credential(credential: &[u8]) -> bool {
+    let Ok(credential) = std::str::from_utf8(credential) else {
+        return false;
+    };
+    if credential.len() < 43
+        || credential.len() > 128
+        || !credential
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return false;
+    }
+    OFFICIAL_BUILD_CREDENTIAL
+        .set(Zeroizing::new(credential.to_owned()))
+        .is_ok()
+}
 
 /// Returns the current short-lived official-build bearer for Commercial
 /// transports that share this process. The bearer never crosses IPC.
@@ -684,21 +705,11 @@ impl HttpUpgradeBackend {
             return Ok(Some(session.bearer));
         }
 
-        let Some(credential) = option_env!("DITCH_OFFICIAL_BUILD_CREDENTIAL") else {
+        let Some(credential) = OFFICIAL_BUILD_CREDENTIAL.get() else {
             return Ok(None);
         };
-        if credential.len() < 43
-            || credential.len() > 128
-            || !credential
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-        {
-            return Err(UpgradeError::InvalidResponse(
-                "official build credential is invalid".to_owned(),
-            ));
-        }
         self.register(identity)?;
-        let session = self.create_official_build_session(identity, credential)?;
+        let session = self.create_official_build_session(identity, credential.as_str())?;
         let bearer = session.bearer.clone();
         *cache.lock().map_err(|_| UpgradeError::Rejected)? = Some(session);
         Ok(Some(bearer))

@@ -80,8 +80,30 @@ if [ -n "${DITCH_OFFICIAL_BUILD_CREDENTIAL:-}" ]; then
     echo "error: official build credential must contain 32-96 random bytes" >&2
     exit 1
   }
-  export DITCH_OFFICIAL_BUILD_CREDENTIAL
 fi
+
+# Keep the raw credential out of Cargo's compile environment so it cannot
+# enter ditch_cli or any SSH runtime. Only a temporary Swift source linked into
+# the signed, in-process macOS runtime host carries it.
+OFFICIAL_BUILD_SWIFT="${TARGET_TEMP_DIR:-${TMPDIR:-/tmp}}/DitchOfficialBuildCredential.swift"
+trap 'rm -f "$OFFICIAL_BUILD_SWIFT"' EXIT HUP INT TERM
+if [ -n "${DITCH_OFFICIAL_BUILD_CREDENTIAL:-}" ]; then
+  {
+    printf '%s\n' 'import Foundation'
+    printf '%s\n' '@_silgen_name("ditch_set_official_build_credential")'
+    printf '%s\n' 'private func ditchSetOfficialBuildCredential(_ bytes: UnsafePointer<UInt8>?, _ length: Int) -> Int32'
+    printf 'private let ditchOfficialBuildCredential = "%s"\n' "$DITCH_OFFICIAL_BUILD_CREDENTIAL"
+    printf '%s\n' 'func configureOfficialBuildCredential() -> Bool {'
+    printf '%s\n' '  let bytes = Array(ditchOfficialBuildCredential.utf8)'
+    printf '%s\n' '  return bytes.withUnsafeBufferPointer {'
+    printf '%s\n' '    ditchSetOfficialBuildCredential($0.baseAddress, $0.count) == 0'
+    printf '%s\n' '  }'
+    printf '%s\n' '}'
+  } > "$OFFICIAL_BUILD_SWIFT"
+else
+  printf '%s\n' 'func configureOfficialBuildCredential() -> Bool { true }' > "$OFFICIAL_BUILD_SWIFT"
+fi
+unset DITCH_OFFICIAL_BUILD_CREDENTIAL
 
 # Keep every object linked into the nested helper on the same explicit minimum
 # OS version. Without this, a newer Xcode stamps its own host OS as the Swift
@@ -197,10 +219,13 @@ export CLANG_MODULE_CACHE_PATH="$SWIFT_CACHE"
 /usr/bin/swiftc -parse-as-library \
   -target "$BUILD_ARCH-apple-macos$DEPLOYMENT_TARGET" \
   "$PROJECT_DIR/StatusHost/StatusHost.swift" \
+  "$OFFICIAL_BUILD_SWIFT" \
   "$DITCHD_LIBRARY" \
   -framework Cocoa \
   -framework UserNotifications \
   -o "$HELPER_MACOS/ditchd"
+rm -f "$OFFICIAL_BUILD_SWIFT"
+trap - EXIT HUP INT TERM
 
 cat > "$HELPER_CONTENTS/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>

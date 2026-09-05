@@ -476,7 +476,7 @@ fn queue_approval(
         .and_then(Value::as_str)
         .or_else(|| params.get("grantRoot").and_then(Value::as_str))
         .or_else(|| params.get("cwd").and_then(Value::as_str))
-        .or_else(|| command.as_deref())
+        .or(command.as_deref())
         .unwrap_or("Remote project")
         .to_owned();
     let summary = params

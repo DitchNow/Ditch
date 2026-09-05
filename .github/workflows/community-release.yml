@@ -128,6 +128,33 @@ jobs:
           printf '%s' "$SPARKLE_PRIVATE_KEY" > "$key_file"
           "$tool" --ed-key-file "$key_file" dist/community
           test -f dist/community/appcast.xml
+      - name: Register official Community build
+        env:
+          BUILD_CREDENTIAL: ${{ secrets.DITCH_OFFICIAL_BUILD_CREDENTIAL_PRODUCTION }}
+          PUBLISHER_TOKEN: ${{ secrets.DITCH_OFFICIAL_BUILD_REGISTER_TOKEN_PRODUCTION }}
+          VERSION: ${{ inputs.version }}
+          BUILD_SEQUENCE: ${{ inputs.build_sequence }}
+        run: |
+          test -n "$BUILD_CREDENTIAL"
+          test -n "$PUBLISHER_TOKEN"
+          credential_hash=$(printf '%s' "$BUILD_CREDENTIAL" | shasum -a 256 | awk '{print $1}')
+          jq -n \
+            --arg environment production \
+            --arg edition community \
+            --arg version "$VERSION" \
+            --argjson build "$BUILD_SEQUENCE" \
+            --arg channel stable \
+            --arg community_revision "$GITHUB_SHA" \
+            --arg official_build_credential_sha256 "$credential_hash" \
+            '{protocol_version:1,environment:$environment,edition:$edition,version:$version,
+              build:$build,channel:$channel,community_revision:$community_revision,
+              official_build_credential_sha256:$official_build_credential_sha256}' \
+            > "$RUNNER_TEMP/official-community-build.json"
+          curl --fail-with-body --proto '=https' --tlsv1.2 \
+            --header "authorization: Bearer $PUBLISHER_TOKEN" \
+            --header 'content-type: application/json' \
+            --data-binary "@$RUNNER_TEMP/official-community-build.json" \
+            https://relay.ditchnow.nl/v1/internal/official-builds
       - name: Publish Community update feed
         env:
           DMG_UPLOAD_URL: ${{ secrets.DITCH_COMMUNITY_DMG_UPLOAD_URL }}
