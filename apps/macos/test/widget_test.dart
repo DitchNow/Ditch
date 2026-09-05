@@ -368,7 +368,70 @@ Widget _testApp() => const TheDitchApp(
   initialProjects: [_testProject],
 );
 
+Widget _testToolbar(RuntimeConnectionPhase connection) => MaterialApp(
+  home: Scaffold(
+    body: DitchToolbar(
+      projectName: 'Ditch',
+      connection: connection,
+      notifications: const [],
+      unreadNotificationCount: 0,
+      sidebarVisible: true,
+      inspectorVisible: true,
+      onToggleSidebar: () {},
+      onToggleInspector: () {},
+      onNotificationsViewed: () {},
+      onOpenNotification: (_) {},
+      onDismissNotification: (_) {},
+      onDismissAllNotifications: () {},
+      onOpenCodexSettings: () {},
+      codexAvailable: true,
+    ),
+  ),
+);
+
 void main() {
+  testWidgets('toolbar omits healthy connection status', (tester) async {
+    await tester.pumpWidget(_testToolbar(RuntimeConnectionPhase.connected));
+
+    expect(find.text('Connected'), findsNothing);
+
+    await tester.pumpWidget(_testToolbar(RuntimeConnectionPhase.reconnecting));
+
+    expect(find.text('Reconnecting'), findsOneWidget);
+  });
+
+  testWidgets('settings shows the installed app version at the bottom', (
+    tester,
+  ) async {
+    final calls = <MethodCall>[];
+    tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+      const MethodChannel('the_ditch/application'),
+      (call) async {
+        calls.add(call);
+        return switch (call.method) {
+          'appVersion' => {'version': '0.1.0', 'build': '106'},
+          'getThemeMode' => 'system',
+          'getPaneWidths' => <String, double>{},
+          _ => null,
+        };
+      },
+    );
+    addTearDown(
+      () => tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+        const MethodChannel('the_ditch/application'),
+        null,
+      ),
+    );
+
+    await tester.pumpWidget(_testApp());
+    await tester.tap(find.byKey(const Key('app-settings-button')));
+    await tester.pumpAndSettle();
+
+    expect(find.byKey(const Key('settings-version')), findsOneWidget);
+    expect(find.text('v0.1.0.106'), findsOneWidget);
+    expect(calls.where((call) => call.method == 'appVersion'), hasLength(1));
+  });
+
   test('authorized update binds every signed release field to native code', () {
     final expiresAt = DateTime.utc(2026, 1, 1).toIso8601String();
     final arguments = authorizedCommercialUpdateArguments({
@@ -381,10 +444,7 @@ void main() {
         'build': '123',
         'channel': 'stable',
       },
-      'update_session': {
-        'bearer': 'test-bearer',
-        'expires_at': expiresAt,
-      },
+      'update_session': {'bearer': 'test-bearer', 'expires_at': expiresAt},
     });
 
     expect(arguments, {
@@ -2858,6 +2918,42 @@ void main() {
     expect(selected, isFalse);
   });
 
+  testWidgets('remote project uses its trailing icon to reconnect', (
+    tester,
+  ) async {
+    var selected = false;
+    var reconnected = false;
+    const path = '/srv/remote-project';
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: ProjectTile(
+            name: 'Remote Project',
+            path: path,
+            selected: false,
+            isRemote: true,
+            sshHostAlias: 'dev-box',
+            remoteStatus: 'offline',
+            onTap: () => selected = true,
+            onReveal: () {},
+            onCopyPath: () {},
+            onReconnect: () => reconnected = true,
+            onDelete: () {},
+          ),
+        ),
+      ),
+    );
+
+    expect(find.byKey(const ValueKey('reveal-project-$path')), findsNothing);
+    expect(find.byIcon(Icons.sync), findsOneWidget);
+    await tester.tap(find.byKey(const ValueKey('reconnect-project-$path')));
+    await tester.pump();
+
+    expect(reconnected, isTrue);
+    expect(selected, isFalse);
+  });
+
   testWidgets('project tile renders agent counts and an unread result dot', (
     tester,
   ) async {
@@ -3195,6 +3291,42 @@ void main() {
     await tester.tap(find.text('Delete'));
     await tester.pumpAndSettle();
     expect(deleted, isTrue);
+  });
+
+  testWidgets('remote project right click exposes reconnect', (tester) async {
+    var reconnected = false;
+    const path = '/srv/context-project';
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: ProjectTile(
+            name: 'Remote Context Project',
+            path: path,
+            selected: false,
+            isRemote: true,
+            sshHostAlias: 'dev-box',
+            remoteStatus: 'offline',
+            onTap: () {},
+            onReveal: () {},
+            onCopyPath: () {},
+            onReconnect: () => reconnected = true,
+            onDelete: () {},
+          ),
+        ),
+      ),
+    );
+
+    await tester.tap(
+      find.byKey(const ValueKey('project-tile-$path')),
+      buttons: kSecondaryMouseButton,
+    );
+    await tester.pumpAndSettle();
+    expect(find.text('Reconnect'), findsOneWidget);
+
+    await tester.tap(find.text('Reconnect'));
+    await tester.pumpAndSettle();
+    expect(reconnected, isTrue);
   });
 
   testWidgets('expanded agent has persistent prompt composer', (tester) async {

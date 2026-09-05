@@ -511,6 +511,14 @@ class AppDelegate: FlutterAppDelegate, SPUUpdaterDelegate {
         result(pending)
       case "runtimeAvailable":
         self.runtimeAvailable { result($0) }
+      case "appVersion":
+        let version =
+          Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? ""
+        let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? ""
+        result([
+          "version": version,
+          "build": build,
+        ])
       case "getThemeMode":
         result(UserDefaults.standard.string(forKey: "themeMode") ?? "system")
       case "setThemeMode":

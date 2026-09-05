@@ -2392,6 +2392,8 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
   }
 
   Future<void> _openAppSettings() async {
+    final appVersion = await _installedAppVersionLabel();
+    if (!mounted) return;
     final editionSections = widget.editionSurface.settingsSections(
       _runtimeClient,
     );
@@ -2419,6 +2421,20 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
               ),
             ),
           ),
+          if (appVersion != null) ...[
+            const Divider(height: 1),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(24, 12, 24, 4),
+              child: Text(
+                appVersion,
+                key: const Key('settings-version'),
+                textAlign: TextAlign.center,
+                style: Theme.of(context).textTheme.labelSmall?.copyWith(
+                  color: context.ditch.mutedText,
+                ),
+              ),
+            ),
+          ],
         ],
       ),
     );
@@ -2438,6 +2454,19 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
         context: context,
         builder: (context) => selected!.dialogBuilder(_runtimeClient),
       );
+    }
+  }
+
+  Future<String?> _installedAppVersionLabel() async {
+    try {
+      final metadata = await _applicationChannel
+          .invokeMapMethod<String, dynamic>('appVersion');
+      final version = metadata?['version']?.trim();
+      final build = metadata?['build']?.trim();
+      if (version == null || version.isEmpty) return null;
+      return build == null || build.isEmpty ? 'v$version' : 'v$version.$build';
+    } on MissingPluginException {
+      return null;
     }
   }
 
@@ -2882,7 +2911,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
     ).showSnackBar(const SnackBar(content: Text('Project path copied.')));
   }
 
-  Future<void> _checkRemoteSetupForProject(DitchProject project) async {
+  Future<void> _reconnectRemoteProject(DitchProject project) async {
     final alias = project.sshHostAlias;
     if (alias == null) return;
     await showDialog<bool>(
@@ -4722,8 +4751,8 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
                             unawaited(_revealProjectInFinder(project)),
                         onCopyProjectPath: (project) =>
                             unawaited(_copyProjectPath(project)),
-                        onCheckRemoteSetup: (project) =>
-                            unawaited(_checkRemoteSetupForProject(project)),
+                        onReconnectRemoteProject: (project) =>
+                            unawaited(_reconnectRemoteProject(project)),
                         onDeleteProject: (project) =>
                             unawaited(_deleteProject(project)),
                         summaryForProject: (project) => summarizeProjectAgents(
@@ -6215,8 +6244,8 @@ class DitchToolbar extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final tokens = context.ditch;
-    final (label, color) = switch (connection) {
-      RuntimeConnectionPhase.connected => ('Connected', tokens.success),
+    final connectionStatus = switch (connection) {
+      RuntimeConnectionPhase.connected => null,
       RuntimeConnectionPhase.connecting => ('Connecting', tokens.waiting),
       RuntimeConnectionPhase.reconnecting => ('Reconnecting', tokens.waiting),
       RuntimeConnectionPhase.unavailable => (
@@ -6248,14 +6277,22 @@ class DitchToolbar extends StatelessWidget {
                 style: Theme.of(context).textTheme.titleMedium,
               ),
             ),
-            Container(
-              width: 7,
-              height: 7,
-              decoration: BoxDecoration(color: color, shape: BoxShape.circle),
-            ),
-            const SizedBox(width: 7),
-            Text(label, style: Theme.of(context).textTheme.bodySmall),
-            const SizedBox(width: 6),
+            if (connectionStatus != null) ...[
+              Container(
+                width: 7,
+                height: 7,
+                decoration: BoxDecoration(
+                  color: connectionStatus.$2,
+                  shape: BoxShape.circle,
+                ),
+              ),
+              const SizedBox(width: 7),
+              Text(
+                connectionStatus.$1,
+                style: Theme.of(context).textTheme.bodySmall,
+              ),
+              const SizedBox(width: 6),
+            ],
             PopupMenuButton<ThemeMode>(
               key: const Key('theme-mode-menu'),
               tooltip: 'Appearance',
@@ -6276,6 +6313,7 @@ class DitchToolbar extends StatelessWidget {
               ],
             ),
             IconButton(
+              key: const Key('app-settings-button'),
               tooltip: codexAvailable
                   ? 'Codex installation'
                   : 'Codex not found — choose an installation',
@@ -6718,7 +6756,7 @@ class ProjectSidebar extends StatelessWidget {
     required this.onSelectProject,
     required this.onRevealProject,
     required this.onCopyProjectPath,
-    required this.onCheckRemoteSetup,
+    required this.onReconnectRemoteProject,
     required this.onDeleteProject,
     required this.summaryForProject,
     super.key,
@@ -6732,7 +6770,7 @@ class ProjectSidebar extends StatelessWidget {
   final ValueChanged<int> onSelectProject;
   final ValueChanged<DitchProject> onRevealProject;
   final ValueChanged<DitchProject> onCopyProjectPath;
-  final ValueChanged<DitchProject> onCheckRemoteSetup;
+  final ValueChanged<DitchProject> onReconnectRemoteProject;
   final ValueChanged<DitchProject> onDeleteProject;
   final ProjectAgentSummary Function(DitchProject) summaryForProject;
 
@@ -6779,8 +6817,8 @@ class ProjectSidebar extends StatelessWidget {
                         onTap: () => onSelectProject(index),
                         onReveal: () => onRevealProject(project),
                         onCopyPath: () => onCopyProjectPath(project),
-                        onCheckRemoteSetup: project.isRemote
-                            ? () => onCheckRemoteSetup(project)
+                        onReconnect: project.isRemote
+                            ? () => onReconnectRemoteProject(project)
                             : null,
                         onDelete: () => onDeleteProject(project),
                         runningCount: summary.runningCount,
@@ -6813,7 +6851,7 @@ class ProjectTile extends StatelessWidget {
     required this.onTap,
     required this.onReveal,
     required this.onCopyPath,
-    this.onCheckRemoteSetup,
+    this.onReconnect,
     required this.onDelete,
     this.runningCount = 0,
     this.stoppedCount = 0,
@@ -6830,7 +6868,7 @@ class ProjectTile extends StatelessWidget {
   final VoidCallback onTap;
   final VoidCallback onReveal;
   final VoidCallback onCopyPath;
-  final VoidCallback? onCheckRemoteSetup;
+  final VoidCallback? onReconnect;
   final VoidCallback onDelete;
   final int runningCount;
   final int stoppedCount;
@@ -6860,10 +6898,10 @@ class ProjectTile extends StatelessWidget {
           value: _ProjectMenuAction.copyPath,
           child: Text('Copy Project Path'),
         ),
-        if (onCheckRemoteSetup != null)
+        if (onReconnect != null)
           const PopupMenuItem(
-            value: _ProjectMenuAction.checkRemoteSetup,
-            child: Text('Check Remote Setup'),
+            value: _ProjectMenuAction.reconnect,
+            child: Text('Reconnect'),
           ),
         const PopupMenuDivider(),
         const PopupMenuItem(
@@ -6875,8 +6913,8 @@ class ProjectTile extends StatelessWidget {
     switch (action) {
       case _ProjectMenuAction.copyPath:
         onCopyPath();
-      case _ProjectMenuAction.checkRemoteSetup:
-        onCheckRemoteSetup?.call();
+      case _ProjectMenuAction.reconnect:
+        onReconnect?.call();
       case _ProjectMenuAction.delete:
         onDelete();
       case null:
@@ -6952,20 +6990,32 @@ class ProjectTile extends StatelessWidget {
                 ),
               ),
               const SizedBox(width: 4),
-              IconButton(
-                key: ValueKey('reveal-project-$path'),
-                onPressed: isRemote ? null : onReveal,
-                tooltip: isRemote
-                    ? 'Source remains on the remote machine'
-                    : 'Show in Finder',
-                visualDensity: VisualDensity.compact,
-                constraints: const BoxConstraints.tightFor(
-                  width: 28,
-                  height: 28,
+              if (isRemote)
+                IconButton(
+                  key: ValueKey('reconnect-project-$path'),
+                  onPressed: onReconnect,
+                  tooltip: 'Reconnect',
+                  visualDensity: VisualDensity.compact,
+                  constraints: const BoxConstraints.tightFor(
+                    width: 28,
+                    height: 28,
+                  ),
+                  padding: EdgeInsets.zero,
+                  icon: const Icon(Icons.sync, size: 16),
+                )
+              else
+                IconButton(
+                  key: ValueKey('reveal-project-$path'),
+                  onPressed: onReveal,
+                  tooltip: 'Show in Finder',
+                  visualDensity: VisualDensity.compact,
+                  constraints: const BoxConstraints.tightFor(
+                    width: 28,
+                    height: 28,
+                  ),
+                  padding: EdgeInsets.zero,
+                  icon: const Icon(Icons.folder_open_outlined, size: 16),
                 ),
-                padding: EdgeInsets.zero,
-                icon: const Icon(Icons.folder_open_outlined, size: 16),
-              ),
             ],
           ),
         ),
@@ -6974,7 +7024,7 @@ class ProjectTile extends StatelessWidget {
   }
 }
 
-enum _ProjectMenuAction { copyPath, checkRemoteSetup, delete }
+enum _ProjectMenuAction { copyPath, reconnect, delete }
 
 class AgentsSurface extends StatelessWidget {
   const AgentsSurface({
