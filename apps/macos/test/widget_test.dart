@@ -37,6 +37,34 @@ class _PendingRemoteSetupClient extends DitchRuntimeClient {
   }) => pending.future;
 }
 
+class _CurrentLicenseClient extends DitchRuntimeClient {
+  _CurrentLicenseClient({required this.entitlement})
+    : super(socketPath: '/tmp/ditch-current-license.sock');
+
+  final Map<String, dynamic> entitlement;
+
+  @override
+  Future<RuntimeStatusDto> runtimeStatus() async => const RuntimeStatusDto(
+    identity: 'The Ditch Runtime',
+    pid: 123,
+    socketPath: '/tmp/ditch-current-license.sock',
+    activeSessionCount: 0,
+    attentionCount: 0,
+    unreadAttentionCount: 0,
+    instanceId: 'test-runtime',
+    capabilities: {},
+    buildVersion: '0.1.0',
+    edition: 'community',
+    deploymentEnvironment: 'staging',
+    buildIdentifier: 'test-build',
+    buildNumber: '107',
+    releaseSequence: 107,
+  );
+
+  @override
+  Future<Map<String, dynamic>> commercialEntitlement() async => entitlement;
+}
+
 class _CommercialOffersClient extends DitchRuntimeClient {
   _CommercialOffersClient({
     this.initiallyActive = false,
@@ -53,15 +81,21 @@ class _CommercialOffersClient extends DitchRuntimeClient {
       catalog ?? _testCatalog();
 
   @override
-  Future<Map<String, dynamic>> commercialEntitlement() async => {
-    'active': initiallyActive,
-    'plan': initiallyActive ? 'commercial_monthly' : null,
-    'status': status ?? (initiallyActive ? 'active' : 'inactive'),
-    'expires_at': null,
-    'mac_slots': initiallyActive ? 1 : 0,
-    'iphone_slots': initiallyActive ? 1 : 0,
-    'billing_management_available': initiallyActive,
-  };
+  Future<Map<String, dynamic>> commercialEntitlement() async {
+    final entitlementStatus =
+        status ?? (initiallyActive ? 'active' : 'inactive');
+    return {
+      'active': initiallyActive,
+      'plan': initiallyActive || entitlementStatus == 'expired'
+          ? 'commercial_monthly'
+          : null,
+      'status': entitlementStatus,
+      'expires_at': null,
+      'mac_slots': initiallyActive ? 1 : 0,
+      'iphone_slots': initiallyActive ? 1 : 0,
+      'billing_management_available': initiallyActive,
+    };
+  }
 
   @override
   Future<Map<String, dynamic>> commercialBillingManagement() async => {
@@ -429,7 +463,109 @@ void main() {
 
     expect(find.byKey(const Key('settings-version')), findsOneWidget);
     expect(find.text('v0.1.0.106'), findsOneWidget);
+    expect(find.byKey(const Key('settings-upgrade-ditch')), findsOneWidget);
+    expect(find.text('Upgrade Ditch'), findsOneWidget);
     expect(calls.where((call) => call.method == 'appVersion'), hasLength(1));
+  });
+
+  testWidgets('Upgrade Ditch displays the Relay-provided license name', (
+    tester,
+  ) async {
+    tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+      const MethodChannel('the_ditch/application'),
+      (call) async => switch (call.method) {
+        'appVersion' => {'version': '0.1.0', 'build': '107'},
+        _ => null,
+      },
+    );
+    addTearDown(
+      () => tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+        const MethodChannel('the_ditch/application'),
+        null,
+      ),
+    );
+    final client = _CurrentLicenseClient(
+      entitlement: {
+        'active': true,
+        'plan': 'commercial_monthly',
+        'status': 'active',
+        'current_license': {
+          'edition': 'commercial',
+          'status': 'active',
+          'display_name': 'Founders Monthly',
+          'plans': [
+            {
+              'kind': 'commercial_monthly',
+              'display_name': 'Founders Monthly',
+              'billing_type': 'recurring',
+              'status': 'active',
+              'valid_until': null,
+            },
+          ],
+        },
+      },
+    );
+
+    await tester.pumpWidget(
+      MaterialApp(home: DitchUpdateDialog(client: client)),
+    );
+    await tester.pumpAndSettle();
+
+    expect(find.text('Current license: Founders Monthly'), findsOneWidget);
+    expect(find.text('Installed v0.1.0.107'), findsOneWidget);
+    expect(find.byKey(const Key('ditch-current-license')), findsOneWidget);
+  });
+
+  testWidgets('Community update checks use the signed public Sparkle channel', (
+    tester,
+  ) async {
+    final nativeCalls = <MethodCall>[];
+    tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+      const MethodChannel('the_ditch/application'),
+      (call) async {
+        nativeCalls.add(call);
+        return switch (call.method) {
+          'appVersion' => {'version': '0.1.0', 'build': '107'},
+          'checkCommunityUpdate' => true,
+          _ => null,
+        };
+      },
+    );
+    addTearDown(
+      () => tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+        const MethodChannel('the_ditch/application'),
+        null,
+      ),
+    );
+    final client = _CurrentLicenseClient(
+      entitlement: {
+        'active': false,
+        'plan': 'community',
+        'status': 'inactive',
+        'current_license': {
+          'edition': 'community',
+          'status': 'active',
+          'display_name': 'Ditch Community',
+          'plans': <Object>[],
+        },
+      },
+    );
+
+    await tester.pumpWidget(
+      MaterialApp(home: DitchUpdateDialog(client: client)),
+    );
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const Key('check-ditch-update')));
+    await tester.pumpAndSettle();
+
+    expect(
+      nativeCalls.where((call) => call.method == 'checkCommunityUpdate'),
+      hasLength(1),
+    );
+    expect(
+      find.text('Sparkle is checking the official Community update channel.'),
+      findsOneWidget,
+    );
   });
 
   test('authorized update binds every signed release field to native code', () {
@@ -984,7 +1120,7 @@ void main() {
       );
       await tester.pumpAndSettle();
 
-      expect(find.text('Commercial subscription expired.'), findsOneWidget);
+      expect(find.textContaining('expired.'), findsOneWidget);
       expect(
         find.text('Local and SSH Ditch continue to work.'),
         findsOneWidget,

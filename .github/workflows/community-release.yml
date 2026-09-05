@@ -95,7 +95,10 @@ jobs:
       - name: Build signed production application
         env:
           DITCH_FLUTTER: ${{ env.FLUTTER_ROOT }}
-        run: scripts/macos-app production build --release --build-name '${{ inputs.version }}' --build-number '${{ inputs.build_sequence }}'
+          DITCH_OFFICIAL_BUILD_CREDENTIAL: ${{ secrets.DITCH_OFFICIAL_BUILD_CREDENTIAL_PRODUCTION }}
+        run: |
+          test -n "$DITCH_OFFICIAL_BUILD_CREDENTIAL"
+          scripts/macos-app production build --release --build-name '${{ inputs.version }}' --build-number '${{ inputs.build_sequence }}'
       - run: scripts/check-community-leakage
       - name: Verify application signature and release metadata
         env:

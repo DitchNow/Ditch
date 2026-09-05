@@ -138,6 +138,9 @@ class AppDelegate: FlutterAppDelegate, SPUUpdaterDelegate {
 
   private var applicationChannel: FlutterMethodChannel?
   private var authorizedUpdateContext: AuthorizedUpdateContext?
+  private var communityUpdateRequested = false
+  private static let communityUpdateFeedURL = URL(
+    string: "https://updates.ditchnow.nl/community/appcast.xml")!
   private lazy var deploymentConfiguration = DeploymentConfiguration.load()
   private lazy var updaterController = SPUStandardUpdaterController(
     startingUpdater: hasUpdateVerificationKey,
@@ -574,7 +577,8 @@ class AppDelegate: FlutterAppDelegate, SPUUpdaterDelegate {
           return
         }
         guard self.updaterController.updater.canCheckForUpdates,
-          self.authorizedUpdateContext == nil
+          self.authorizedUpdateContext == nil,
+          !self.communityUpdateRequested
         else {
           result(FlutterError(
             code: "update_already_in_progress",
@@ -665,6 +669,29 @@ class AppDelegate: FlutterAppDelegate, SPUUpdaterDelegate {
         _ = self.updaterController.updater.clearFeedURLFromUserDefaults()
         self.updaterController.checkForUpdates(nil)
         result(true)
+      case "checkCommunityUpdate":
+        guard self.hasUpdateVerificationKey else {
+          result(FlutterError(
+            code: "update_verification_not_configured",
+            message: "This app does not contain the public Sparkle verification key required for official updates.",
+            details: nil))
+          return
+        }
+        guard self.updaterController.updater.canCheckForUpdates,
+          self.authorizedUpdateContext == nil,
+          !self.communityUpdateRequested
+        else {
+          result(FlutterError(
+            code: "update_already_in_progress",
+            message: "An update check is already in progress.",
+            details: nil))
+          return
+        }
+        self.communityUpdateRequested = true
+        self.updaterController.updater.httpHeaders = nil
+        _ = self.updaterController.updater.clearFeedURLFromUserDefaults()
+        self.updaterController.checkForUpdates(nil)
+        result(true)
       case "openCodexLogin":
         guard let binary = call.arguments as? String else {
           result(false)
@@ -691,7 +718,12 @@ class AppDelegate: FlutterAppDelegate, SPUUpdaterDelegate {
   }
 
   func feedURLString(for updater: SPUUpdater) -> String? {
-    authorizedUpdateContext?.appcastURL.absoluteString
+    if let context = authorizedUpdateContext {
+      return context.appcastURL.absoluteString
+    }
+    return communityUpdateRequested
+      ? Self.communityUpdateFeedURL.absoluteString
+      : nil
   }
 
   func updater(
@@ -699,20 +731,34 @@ class AppDelegate: FlutterAppDelegate, SPUUpdaterDelegate {
     shouldProceedWithUpdate updateItem: SUAppcastItem,
     updateCheck: SPUUpdateCheck
   ) throws {
-    guard let context = authorizedUpdateContext,
-      context.expiresAt > Date(),
-      context.matches(updateItem)
+    if let context = authorizedUpdateContext {
+      guard context.expiresAt > Date(), context.matches(updateItem) else {
+        clearUpdateSession()
+        throw NSError(
+          domain: "ai.theditch.update-authorization",
+          code: 1,
+          userInfo: [
+            NSLocalizedDescriptionKey:
+              "The update feed did not match the release authorized by Ditch Relay."
+          ])
+      }
+      updater.httpHeaders = nil
+      return
+    }
+    guard communityUpdateRequested,
+      updateItem.fileURL?.scheme == "https",
+      updateItem.fileURL?.host?.lowercased()
+        == Self.communityUpdateFeedURL.host?.lowercased()
     else {
-      clearAuthorizedUpdateSession()
+      clearUpdateSession()
       throw NSError(
         domain: "ai.theditch.update-authorization",
-        code: 1,
+        code: 2,
         userInfo: [
           NSLocalizedDescriptionKey:
-            "The update feed did not match the release authorized by Ditch Relay."
+            "The Community update did not come from the official Ditch update host."
         ])
     }
-    updater.httpHeaders = nil
   }
 
   func updater(
@@ -728,13 +774,24 @@ class AppDelegate: FlutterAppDelegate, SPUUpdaterDelegate {
     with request: NSMutableURLRequest
   ) {
     request.setValue(nil, forHTTPHeaderField: "Authorization")
+    if communityUpdateRequested {
+      guard request.url?.scheme == "https",
+        request.url?.host?.lowercased()
+          == Self.communityUpdateFeedURL.host?.lowercased()
+      else {
+        request.url = nil
+        clearUpdateSession()
+        return
+      }
+      return
+    }
     guard let context = authorizedUpdateContext,
       context.expiresAt > Date(),
       context.matches(item),
       request.url == context.artifactURL
     else {
       request.url = nil
-      clearAuthorizedUpdateSession()
+      clearUpdateSession()
       return
     }
     request.setValue("Bearer \(context.bearer)", forHTTPHeaderField: "Authorization")
@@ -745,16 +802,17 @@ class AppDelegate: FlutterAppDelegate, SPUUpdaterDelegate {
     didFinishUpdateCycleFor updateCheck: SPUUpdateCheck,
     error: Error?
   ) {
-    clearAuthorizedUpdateSession()
+    clearUpdateSession()
   }
 
   func updater(_ updater: SPUUpdater, didAbortWithError error: Error) {
-    clearAuthorizedUpdateSession()
+    clearUpdateSession()
   }
 
-  private func clearAuthorizedUpdateSession() {
+  private func clearUpdateSession() {
     updaterController.updater.httpHeaders = nil
     authorizedUpdateContext = nil
+    communityUpdateRequested = false
   }
 
   private func notificationAuthorizationStatus(

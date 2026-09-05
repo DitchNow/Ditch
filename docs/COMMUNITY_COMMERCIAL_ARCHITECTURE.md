@@ -45,6 +45,8 @@ The publisher signs durable release metadata binding Commercial edition, release
 
 Official builds embed the public verification keys for their selected environment. Those public trust roots must be published so source builders can configure the same authorized upgrade path. Signing private keys, billing credentials, artifact authorization, Relay authorization, and Apple release credentials never belong in Community source.
 
+Hosted pricing, entitlement, and Remote Control are separately gated by a per-build credential injected only by the official release environment and exchanged for a short-lived machine-bound Relay session. This prevents a checkout containing only Community source from using hosted services. On current macOS this is not hardware-backed remote attestation, so a determined reverse engineer can extract the distributed build credential; rotation, revocation, environment isolation, machine signatures, and short session lifetimes limit that exposure.
+
 ## Entitlement expiry
 
 Commercial entitlement gates only proprietary capabilities. Relay authorization remains the security boundary for hosted Remote Control; client gating is UX and defense in depth. Expiry leaves the installed Commercial binary, database, identity, projects, sessions, and SSH configuration intact. Local and SSH Community capabilities remain available, and renewal restores proprietary capability without a forced reinstall.

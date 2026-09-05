@@ -57,6 +57,32 @@ if [ "$DITCH_DEPLOYMENT_ENVIRONMENT" = staging ] && [ "$DITCH_RELAY_ORIGIN" = "$
 fi
 export DITCH_DEPLOYMENT_ENVIRONMENT DITCH_EDITION DITCH_RELAY_ORIGIN DITCH_UPDATE_ALLOWED_HOSTS
 
+# Official release machines inject a per-build credential from the protected
+# environment or an ignored mode-0600 file. Source builds intentionally omit
+# it and therefore cannot obtain a hosted-services session from Relay.
+OFFICIAL_BUILD_CREDENTIAL_FILE="${DITCH_OFFICIAL_BUILD_CREDENTIAL_FILE:-$WORKSPACE_ROOT/.release-keys/official-build-$DITCH_DEPLOYMENT_ENVIRONMENT.token}"
+if [ -z "${DITCH_OFFICIAL_BUILD_CREDENTIAL:-}" ] && [ -f "$OFFICIAL_BUILD_CREDENTIAL_FILE" ]; then
+  [ "$(stat -f '%u' "$OFFICIAL_BUILD_CREDENTIAL_FILE")" = "$(id -u)" ] || {
+    echo "error: official build credential must be owned by the current user" >&2
+    exit 1
+  }
+  [ "$(stat -f '%Lp' "$OFFICIAL_BUILD_CREDENTIAL_FILE")" = 600 ] || {
+    echo "error: official build credential must have mode 0600" >&2
+    exit 1
+  }
+  DITCH_OFFICIAL_BUILD_CREDENTIAL=$(tr -d '\r\n' < "$OFFICIAL_BUILD_CREDENTIAL_FILE")
+fi
+if [ -n "${DITCH_OFFICIAL_BUILD_CREDENTIAL:-}" ]; then
+  case "$DITCH_OFFICIAL_BUILD_CREDENTIAL" in
+    *[!A-Za-z0-9_-]*) echo "error: official build credential must be unpadded base64url" >&2; exit 1 ;;
+  esac
+  [ "${#DITCH_OFFICIAL_BUILD_CREDENTIAL}" -ge 43 ] && [ "${#DITCH_OFFICIAL_BUILD_CREDENTIAL}" -le 128 ] || {
+    echo "error: official build credential must contain 32-96 random bytes" >&2
+    exit 1
+  }
+  export DITCH_OFFICIAL_BUILD_CREDENTIAL
+fi
+
 # Keep every object linked into the nested helper on the same explicit minimum
 # OS version. Without this, a newer Xcode stamps its own host OS as the Swift
 # executable's minimum even when the enclosing Flutter app supports older Macs.

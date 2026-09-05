@@ -90,7 +90,10 @@ jobs:
       - name: Build signed staging application
         env:
           DITCH_FLUTTER: ${{ env.FLUTTER_ROOT }}
-        run: scripts/macos-app staging build --release --build-name '${{ inputs.version }}' --build-number '${{ inputs.build_sequence }}'
+          DITCH_OFFICIAL_BUILD_CREDENTIAL: ${{ secrets.DITCH_OFFICIAL_BUILD_CREDENTIAL_STAGING }}
+        run: |
+          test -n "$DITCH_OFFICIAL_BUILD_CREDENTIAL"
+          scripts/macos-app staging build --release --build-name '${{ inputs.version }}' --build-number '${{ inputs.build_sequence }}'
       - run: scripts/check-community-leakage
       - name: Verify application signature
         env:

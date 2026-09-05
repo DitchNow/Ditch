@@ -2397,6 +2397,16 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
     final editionSections = widget.editionSurface.settingsSections(
       _runtimeClient,
     );
+    final settingsSections = [
+      ...editionSections,
+      EditionSettingsSection(
+        id: 'upgrade-ditch',
+        icon: Icons.system_update_alt,
+        title: 'Upgrade Ditch',
+        subtitle: 'Check for updates for your current license',
+        dialogBuilder: (client) => DitchUpdateDialog(client: client),
+      ),
+    ];
     final section = await showDialog<String>(
       context: context,
       builder: (context) => SimpleDialog(
@@ -2410,7 +2420,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
               subtitle: Text('Installation and runtime setup'),
             ),
           ),
-          ...editionSections.map(
+          ...settingsSections.map(
             (entry) => SimpleDialogOption(
               key: Key('settings-${entry.id}'),
               onPressed: () => Navigator.pop(context, entry.id),
@@ -2443,7 +2453,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
       await _openCodexSettings();
     } else {
       EditionSettingsSection? selected;
-      for (final entry in editionSections) {
+      for (final entry in settingsSections) {
         if (entry.id == section) {
           selected = entry;
           break;
@@ -5278,6 +5288,252 @@ class NotificationSetupBanner extends StatelessWidget {
   }
 }
 
+class DitchUpdateDialog extends StatefulWidget {
+  const DitchUpdateDialog({required this.client, super.key});
+
+  final DitchRuntimeClient client;
+
+  @override
+  State<DitchUpdateDialog> createState() => _DitchUpdateDialogState();
+}
+
+class _DitchUpdateDialogState extends State<DitchUpdateDialog> {
+  static const _applicationChannel = MethodChannel('the_ditch/application');
+  RuntimeStatusDto? _runtime;
+  DitchCurrentLicense? _license;
+  Map<String, dynamic>? _release;
+  String? _installedVersion;
+  String? _message;
+  String? _error;
+  bool _loading = true;
+  bool _checking = false;
+  bool _installing = false;
+
+  @override
+  void initState() {
+    super.initState();
+    unawaited(_load());
+  }
+
+  Future<void> _load() async {
+    try {
+      final runtime = await widget.client.runtimeStatus();
+      final entitlement = await widget.client.commercialEntitlement();
+      final metadata = await _applicationChannel
+          .invokeMapMethod<String, dynamic>('appVersion');
+      final version = metadata?['version']?.trim();
+      final build = metadata?['build']?.trim();
+      if (!mounted) return;
+      setState(() {
+        _runtime = runtime;
+        _license = DitchCurrentLicense.fromEntitlement(entitlement);
+        _installedVersion = version == null || version.isEmpty
+            ? null
+            : build == null || build.isEmpty
+            ? 'v$version'
+            : 'v$version.$build';
+        _loading = false;
+      });
+    } on Object catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _error = _friendlyError(error);
+        _loading = false;
+      });
+    }
+  }
+
+  Future<void> _checkForUpdates() async {
+    final license = _license;
+    final runtime = _runtime;
+    if (license == null || runtime == null) return;
+    setState(() {
+      _checking = true;
+      _release = null;
+      _message = null;
+      _error = null;
+    });
+    try {
+      if (license.isCommercial &&
+          (license.status == 'active' || license.status == 'over_limit')) {
+        final release = await widget.client.checkCommercialRelease();
+        final manifest = (release['manifest'] as Map?)?.cast<String, dynamic>();
+        final sequence = (manifest?['release_sequence'] as num?)?.toInt();
+        if (sequence == null) {
+          throw const FormatException(
+            'The Relay returned incomplete update metadata.',
+          );
+        }
+        if (!mounted) return;
+        setState(() {
+          if (sequence > runtime.releaseSequence) {
+            _release = release;
+            final version = manifest?['version']?.toString() ?? 'new';
+            final build = manifest?['build']?.toString();
+            _message = build == null
+                ? 'Ditch $version is available.'
+                : 'Ditch $version.$build is available.';
+          } else {
+            _message = 'Ditch is up to date for ${license.displayName}.';
+          }
+          _checking = false;
+        });
+        return;
+      }
+
+      final started = await _applicationChannel.invokeMethod<bool>(
+        'checkCommunityUpdate',
+      );
+      if (started != true) {
+        throw const FormatException(
+          'The Community update check could not be started.',
+        );
+      }
+      if (!mounted) return;
+      setState(() {
+        _checking = false;
+        _message = 'Sparkle is checking the official Community update channel.';
+      });
+    } on Object catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _checking = false;
+        _error = _friendlyError(error);
+      });
+    }
+  }
+
+  Future<void> _installCommercialUpdate() async {
+    final release = _release;
+    if (release == null) return;
+    setState(() {
+      _installing = true;
+      _error = null;
+    });
+    try {
+      await startAuthorizedCommercialUpdate(release);
+      if (!mounted) return;
+      setState(() {
+        _installing = false;
+        _message =
+            'Verified update ready. Follow the Sparkle window to install and restart Ditch.';
+      });
+    } on Object catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _installing = false;
+        _error = _friendlyError(error);
+      });
+    }
+  }
+
+  String _friendlyError(Object error) {
+    if (error is DitchRuntimeException) {
+      return switch (error.code) {
+        'official_build_required' ||
+        'commercial_offers_official_build_required' ||
+        'commercial_entitlement_official_build_required' =>
+          'This source build cannot use DitchNow hosted services. Install an official signed Community build to check prices, licenses, and hosted updates.',
+        'commercial_release_unavailable' =>
+          'No compatible Commercial update is currently available.',
+        'commercial_entitlement_failed' =>
+          'Ditch could not load the current license from the Relay.',
+        _ => error.message,
+      };
+    }
+    if (error is PlatformException &&
+        error.code == 'update_verification_not_configured') {
+      return 'This source build has no official update verification key. Install an official signed Community build to receive Ditch updates.';
+    }
+    if (error is FormatException) return error.message;
+    return 'Ditch could not check for updates. $error';
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final license = _license;
+    final busy = _loading || _checking || _installing;
+    return AlertDialog(
+      icon: const Icon(Icons.system_update_alt),
+      title: const Text('Upgrade Ditch'),
+      content: SizedBox(
+        width: 520,
+        child: _loading
+            ? const Center(child: CircularProgressIndicator())
+            : Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  ListTile(
+                    contentPadding: EdgeInsets.zero,
+                    leading: const Icon(Icons.verified_outlined),
+                    title: Text(
+                      license == null
+                          ? 'Current license unavailable'
+                          : 'Current license: ${license.displayName}',
+                      key: const Key('ditch-current-license'),
+                    ),
+                    subtitle: Text(
+                      license == null
+                          ? 'The current license could not be loaded.'
+                          : '${license.edition == 'commercial' ? 'Commercial' : 'Community'} · ${license.status}',
+                    ),
+                  ),
+                  if (license != null && license.plans.length > 1)
+                    ...license.plans.map(
+                      (plan) => Padding(
+                        padding: const EdgeInsets.only(left: 40, bottom: 4),
+                        child: Text(plan.displayName),
+                      ),
+                    ),
+                  if (_installedVersion != null)
+                    Text(
+                      'Installed $_installedVersion',
+                      key: const Key('ditch-installed-version'),
+                    ),
+                  if (_checking || _installing) ...[
+                    const SizedBox(height: 16),
+                    const LinearProgressIndicator(),
+                  ],
+                  if (_message != null) ...[
+                    const SizedBox(height: 12),
+                    Text(_message!, key: const Key('ditch-update-message')),
+                  ],
+                  if (_error != null) ...[
+                    const SizedBox(height: 12),
+                    SelectableText(
+                      _error!,
+                      key: const Key('ditch-update-error'),
+                      style: TextStyle(
+                        color: Theme.of(context).colorScheme.error,
+                      ),
+                    ),
+                  ],
+                ],
+              ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(context),
+          child: const Text('Close'),
+        ),
+        if (_release != null)
+          FilledButton(
+            key: const Key('install-ditch-update'),
+            onPressed: busy ? null : _installCommercialUpdate,
+            child: const Text('Install Update'),
+          )
+        else
+          FilledButton(
+            key: const Key('check-ditch-update'),
+            onPressed: busy || license == null ? null : _checkForUpdates,
+            child: const Text('Check for Updates'),
+          ),
+      ],
+    );
+  }
+}
+
 class CommercialUpgradeDialog extends StatefulWidget {
   const CommercialUpgradeDialog({
     required this.client,
@@ -5747,23 +6003,6 @@ class _CommercialUpgradeDialogState extends State<CommercialUpgradeDialog> {
               : 'Upgrade',
       };
 
-  String _planLabel(Object? value) {
-    final plans = value
-        ?.toString()
-        .split('+')
-        .map(
-          (plan) => switch (plan) {
-            'commercial_monthly' => 'Commercial Monthly',
-            'commercial_lifetime' => 'Commercial Lifetime',
-            'lifetime_extra_pair' => 'Lifetime extra pair',
-            'administrative' => 'Commercial',
-            _ => 'Commercial',
-          },
-        )
-        .toList(growable: false);
-    return plans == null || plans.isEmpty ? 'Commercial' : plans.join(' + ');
-  }
-
   Widget _offerCard(BuildContext context, CommercialOffer offer) {
     final locale = Localizations.localeOf(context);
     final base = offer.basePrice.format(locale);
@@ -5931,6 +6170,9 @@ class _CommercialUpgradeDialogState extends State<CommercialUpgradeDialog> {
   @override
   Widget build(BuildContext context) {
     final entitlement = _entitlement;
+    final currentLicense = entitlement == null
+        ? null
+        : DitchCurrentLicense.fromEntitlement(entitlement);
     final active = entitlement?['active'] == true;
     final status =
         entitlement?['status']?.toString() ?? (active ? 'active' : 'inactive');
@@ -6069,7 +6311,7 @@ class _CommercialUpgradeDialogState extends State<CommercialUpgradeDialog> {
                     key: const Key('commercial-active-status'),
                     style: Theme.of(context).textTheme.titleLarge,
                   ),
-                  Text(_planLabel(entitlement?['plan'])),
+                  Text(currentLicense?.displayName ?? 'Ditch Commercial'),
                   Text(
                     '${entitlement?['mac_slots'] ?? 0} Mac slots · ${entitlement?['iphone_slots'] ?? 0} iPhone slots',
                   ),
@@ -6101,7 +6343,7 @@ class _CommercialUpgradeDialogState extends State<CommercialUpgradeDialog> {
                   _offerSection(context, 'Add capacity', capacityOffers),
                 ] else if (expired) ...[
                   Text(
-                    'Commercial subscription expired.',
+                    '${currentLicense?.displayName ?? 'Ditch Commercial'} expired.',
                     style: Theme.of(context).textTheme.titleLarge,
                   ),
                   const Text('Local and SSH Ditch continue to work.'),
