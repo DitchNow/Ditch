@@ -52,15 +52,16 @@ Map<String, Object> authorizedCommercialUpdateArguments(
       build == null ||
       build.isEmpty ||
       (channel != 'stable' && channel != 'beta')) {
-    throw const FormatException(
-      'Authorized release metadata is incomplete.',
-    );
+    throw const FormatException('Authorized release metadata is incomplete.');
   }
   final updateSession = (release['update_session'] as Map?)
       ?.cast<String, dynamic>();
   final bearer = updateSession?['bearer']?.toString();
   final expiresAt = updateSession?['expires_at']?.toString();
-  if (bearer == null || bearer.isEmpty || expiresAt == null || expiresAt.isEmpty) {
+  if (bearer == null ||
+      bearer.isEmpty ||
+      expiresAt == null ||
+      expiresAt.isEmpty) {
     throw const FormatException(
       'Relay did not authorize an authenticated Commercial update session.',
     );
@@ -346,6 +347,8 @@ class ProjectFilesState {
 }
 
 enum AgentApprovalPreset { ask, approveForMe, fullAccess }
+
+enum _RemotePermissionDecision { allowOnce, allowSession, deny }
 
 class AgentModelOption {
   const AgentModelOption({
@@ -1500,6 +1503,23 @@ class DitchRuntimeClient {
     });
   }
 
+  Future<Map<String, dynamic>> approvePermission(
+    String requestId, {
+    bool forSession = false,
+  }) {
+    return request({
+      forSession ? 'ApprovePermissionForSession' : 'ApprovePermission': {
+        'request_id': requestId,
+      },
+    });
+  }
+
+  Future<Map<String, dynamic>> denyPermission(String requestId) {
+    return request({
+      'DenyPermission': {'request_id': requestId, 'reason': 'Denied by user'},
+    });
+  }
+
   Future<Map<String, dynamic>> dismissAttention(String attentionId) {
     return request({
       'DismissAttention': {'attention_id': attentionId},
@@ -1629,6 +1649,9 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
   final Map<String, ProjectTerminalSession> _projectTerminals = {};
   final Map<String, ProjectFilesState> _projectFiles = {};
   final Map<String, String> _remoteHostStatus = {};
+  final List<Map<String, dynamic>> _permissionQueue = [];
+  final Set<String> _pendingPermissionIds = {};
+  bool _showingPermission = false;
 
   StreamSubscription<Map<String, dynamic>>? _runtimeEvents;
   Timer? _productUpdateTimer;
@@ -2623,6 +2646,12 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
         unawaited(_loadAgentMessages(session, refreshLatest: true));
       }
     }
+    final permissionsJson = snapshot['permissions'];
+    if (permissionsJson is List) {
+      for (final request in permissionsJson) {
+        _enqueueRemotePermission(request);
+      }
+    }
     _scheduleStatusBarUpdate();
     final pendingTarget = _pendingNotificationTarget;
     if (pendingTarget != null) {
@@ -3095,40 +3124,8 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
             'Remote project does not have an SSH host alias.',
           );
         }
-        var setup = await _runtimeClient.checkRemoteSetup(alias: alias);
-        final checks = setup['checks'];
-        final sandboxReady = remoteSetupCheckHasState(
-          setup,
-          key: 'codex_sandbox',
-          state: 'ready',
-        );
-        final sandboxRequired =
-            agentExecutionSettings.approval != AgentApprovalPreset.fullAccess;
-        final sandboxCanBeConfigured =
-            checks is List &&
-            checks.whereType<Map>().any(
-              (item) =>
-                  item['key'] == 'codex_sandbox' &&
-                  item['state'] == 'install_available',
-            );
-        if (sandboxRequired && !sandboxReady && sandboxCanBeConfigured) {
-          if (!mounted) return false;
-          final configured = await showDialog<bool>(
-            context: context,
-            barrierDismissible: true,
-            builder: (context) => CodexAuthenticationDialog(
-              client: _runtimeClient,
-              alias: alias,
-              sandboxSetup: true,
-            ),
-          );
-          if (configured != true || !mounted) return false;
-          setup = await _runtimeClient.checkRemoteSetup(alias: alias);
-        }
-        if (!remoteSetupReadyForExecution(
-          setup,
-          requireCodexSandbox: sandboxRequired,
-        )) {
+        final setup = await _runtimeClient.checkRemoteSetup(alias: alias);
+        if (!remoteSetupReadyForExecution(setup, requireCodexSandbox: false)) {
           if (!mounted) return false;
           final repaired = await showDialog<bool>(
             context: context,
@@ -3138,7 +3135,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
               initialAlias: alias,
               initialSetup: setup,
               repairOnly: true,
-              requireCodexSandbox: sandboxRequired,
+              requireCodexSandbox: false,
             ),
           );
           if (repaired != true) return false;
@@ -3745,6 +3742,12 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
       return;
     }
 
+    final permissionRequested = eventBody['PermissionRequested'];
+    if (permissionRequested is Map) {
+      _enqueueRemotePermission(permissionRequested);
+      return;
+    }
+
     final bell = eventBody['Bell'];
     if (bell is Map<String, dynamic>) {
       _addAttentionRequired(
@@ -3754,6 +3757,139 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
         body: bell['reason']?.toString() ?? 'Agent session needs attention.',
         sessionLocalId: _agentIdToString(bell['agent_id']),
       );
+    }
+  }
+
+  void _enqueueRemotePermission(Object? value) {
+    if (value is! Map) return;
+    final request = Map<String, dynamic>.from(value);
+    final requestId = request['id']?.toString();
+    final projectId = request['project_id']?.toString();
+    final isRemoteProject = _projects.any(
+      (project) => project.id == projectId && project.isRemote,
+    );
+    if (requestId == null ||
+        !isRemoteProject ||
+        !_pendingPermissionIds.add(requestId)) {
+      return;
+    }
+    _permissionQueue.add(request);
+    unawaited(_showNextRemotePermission());
+  }
+
+  Future<void> _showNextRemotePermission() async {
+    if (_showingPermission || _permissionQueue.isEmpty || !mounted) return;
+    _showingPermission = true;
+    try {
+      while (_permissionQueue.isNotEmpty && mounted) {
+        final request = _permissionQueue.removeAt(0);
+        final requestId = request['id']?.toString();
+        if (requestId == null) continue;
+        final command = request['command']?.toString().trim();
+        final target = request['target']?.toString().trim();
+        final summary =
+            request['summary']?.toString().trim() ??
+            'Codex is requesting permission on the SSH host.';
+        final action = request['action']?.toString();
+        if (!mounted) break;
+        final decision = await showDialog<_RemotePermissionDecision>(
+          context: context,
+          barrierDismissible: false,
+          builder: (context) => AlertDialog(
+            icon: const Icon(Icons.security_outlined),
+            title: Text(
+              action == 'AccessNetwork'
+                  ? 'Allow remote network access?'
+                  : action == 'EditFiles'
+                  ? 'Allow remote file changes?'
+                  : 'Allow remote command?',
+            ),
+            content: SizedBox(
+              width: 560,
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(summary),
+                  if (command != null && command.isNotEmpty) ...[
+                    const SizedBox(height: 14),
+                    const Text('Command'),
+                    const SizedBox(height: 6),
+                    Container(
+                      width: double.infinity,
+                      padding: const EdgeInsets.all(10),
+                      decoration: BoxDecoration(
+                        color: context.ditch.surfaceHover,
+                        borderRadius: BorderRadius.circular(8),
+                      ),
+                      child: SelectableText(
+                        command,
+                        style: const TextStyle(fontFamily: 'monospace'),
+                      ),
+                    ),
+                  ],
+                  if (target != null && target.isNotEmpty) ...[
+                    const SizedBox(height: 12),
+                    Text('Target: $target'),
+                  ],
+                  const SizedBox(height: 14),
+                  const Text(
+                    'This action will run with the SSH user’s permissions on the remote machine.',
+                  ),
+                ],
+              ),
+            ),
+            actions: [
+              TextButton(
+                onPressed: () =>
+                    Navigator.pop(context, _RemotePermissionDecision.deny),
+                child: const Text('Deny'),
+              ),
+              OutlinedButton(
+                onPressed: () => Navigator.pop(
+                  context,
+                  _RemotePermissionDecision.allowSession,
+                ),
+                child: const Text('Allow for Session'),
+              ),
+              FilledButton(
+                onPressed: () =>
+                    Navigator.pop(context, _RemotePermissionDecision.allowOnce),
+                child: const Text('Allow Once'),
+              ),
+            ],
+          ),
+        );
+        try {
+          switch (decision) {
+            case _RemotePermissionDecision.allowOnce:
+              await _runtimeClient.approvePermission(requestId);
+            case _RemotePermissionDecision.allowSession:
+              await _runtimeClient.approvePermission(
+                requestId,
+                forSession: true,
+              );
+            case _RemotePermissionDecision.deny:
+            case null:
+              await _runtimeClient.denyPermission(requestId);
+          }
+        } on Object catch (error) {
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(
+                content: Text('Could not answer Codex approval: $error'),
+              ),
+            );
+          }
+        } finally {
+          _pendingPermissionIds.remove(requestId);
+        }
+      }
+    } finally {
+      _showingPermission = false;
+      if (_permissionQueue.isNotEmpty && mounted) {
+        unawaited(_showNextRemotePermission());
+      }
     }
   }
 
@@ -9735,7 +9871,7 @@ class AddRemoteProjectDialog extends StatefulWidget {
     this.initialAlias,
     this.initialSetup,
     this.repairOnly = false,
-    this.requireCodexSandbox = true,
+    this.requireCodexSandbox = false,
     super.key,
   });
   final DitchRuntimeClient client;
@@ -10121,6 +10257,7 @@ class _AddRemoteProjectDialogState extends State<AddRemoteProjectDialog> {
               item['state'] == 'authentication_required',
         );
     final codexSandboxNeedsSetup =
+        widget.requireCodexSandbox &&
         !runtimeNeedsInstall &&
         checks is List &&
         checks.whereType<Map>().any(
@@ -10204,26 +10341,33 @@ class _AddRemoteProjectDialogState extends State<AddRemoteProjectDialog> {
                     ),
                   ] else if (!selectingDirectory) ...[
                     if (checks is List)
-                      ...checks.whereType<Map>().map(
-                        (item) => ListTile(
-                          dense: true,
-                          leading: Icon(
-                            item['state'] == 'ready'
-                                ? Icons.check_circle_outline
-                                : Icons.info_outline,
+                      ...checks
+                          .whereType<Map>()
+                          .where(
+                            (item) =>
+                                widget.requireCodexSandbox ||
+                                item['key'] != 'codex_sandbox',
+                          )
+                          .map(
+                            (item) => ListTile(
+                              dense: true,
+                              leading: Icon(
+                                item['state'] == 'ready'
+                                    ? Icons.check_circle_outline
+                                    : Icons.info_outline,
+                              ),
+                              title: Text(item['label']?.toString() ?? ''),
+                              subtitle: Text(
+                                [
+                                      item['detail']?.toString(),
+                                      item['technical_detail']?.toString(),
+                                    ]
+                                    .whereType<String>()
+                                    .where((value) => value.isNotEmpty)
+                                    .join('\n'),
+                              ),
+                            ),
                           ),
-                          title: Text(item['label']?.toString() ?? ''),
-                          subtitle: Text(
-                            [
-                                  item['detail']?.toString(),
-                                  item['technical_detail']?.toString(),
-                                ]
-                                .whereType<String>()
-                                .where((value) => value.isNotEmpty)
-                                .join('\n'),
-                          ),
-                        ),
-                      ),
                     if (runtimeNeedsInstall)
                       FilledButton.tonalIcon(
                         onPressed: _busy ? null : _installRuntime,

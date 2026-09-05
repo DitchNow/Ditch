@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 pub const PROTOCOL_VERSION: u16 = 1;
-pub const REMOTE_RUNTIME_PROTOCOL_VERSION: u16 = 2;
+pub const REMOTE_RUNTIME_PROTOCOL_VERSION: u16 = 3;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Envelope<T> {
@@ -159,6 +159,34 @@ pub enum ClientRequest {
         #[serde(default)]
         execution_profile: AgentExecutionProfile,
     },
+    /// Internal SSH-daemon command. Desktop clients use `StartCodexSession`;
+    /// the local runtime translates remote projects to this App Server-only
+    /// launch so local Codex sessions keep their existing execution path.
+    StartRemoteCodexAppServerSession {
+        project_id: ProjectId,
+        project_name: String,
+        project_root: String,
+        prompt: String,
+        #[serde(default)]
+        execution_profile: AgentExecutionProfile,
+    },
+    /// Internal SSH-daemon counterpart to `ResumeCodexSession`.
+    ResumeRemoteCodexAppServerSession {
+        project_id: ProjectId,
+        project_name: String,
+        project_root: String,
+        thread_id: String,
+        prompt: String,
+        #[serde(default)]
+        execution_profile: AgentExecutionProfile,
+    },
+    /// Internal SSH-daemon follow-up for an App Server-backed remote agent.
+    PromptRemoteCodexAppServerAgent {
+        agent_id: AgentId,
+        prompt: String,
+        #[serde(default)]
+        execution_profile: AgentExecutionProfile,
+    },
     StartCodex {
         project_id: ProjectId,
         prompt: String,
@@ -245,6 +273,9 @@ pub enum ClientRequest {
     CheckCommercialRelease,
     CurrentCommercialRelease,
     ApprovePermission {
+        request_id: Uuid,
+    },
+    ApprovePermissionForSession {
         request_id: Uuid,
     },
     DenyPermission {
@@ -460,6 +491,8 @@ pub struct Snapshot {
     pub agents: Vec<AgentRun>,
     pub attention: Vec<RuntimeAttention>,
     pub messages: Vec<AgentChatMessage>,
+    #[serde(default)]
+    pub permissions: Vec<PermissionRequest>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

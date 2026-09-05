@@ -30,6 +30,14 @@ target_std_available() {
   [ -f "$1" ]
 }
 
+rustup_target_std_available() {
+  command -v rustup >/dev/null 2>&1 || return 1
+  target_libdir=$(rustup run stable rustc --print target-libdir --target "$1" 2>/dev/null || true)
+  [ -n "$target_libdir" ] || return 1
+  set -- "$target_libdir"/libstd-*.rlib
+  [ -f "$1" ]
+}
+
 build_linux_with_docker() {
   target=$1
   case "$target" in
@@ -60,6 +68,11 @@ build_target() {
     cargo build --locked --release --target "$target" -p ditchd
     return
   fi
+  if rustup_target_std_available "$target"; then
+    rustup_rustc=$(rustup which --toolchain stable rustc)
+    RUSTC="$rustup_rustc" rustup run stable cargo build --locked --release --target "$target" -p ditchd
+    return
+  fi
   case "$target" in
     *-unknown-linux-gnu)
       if command -v docker >/dev/null 2>&1; then
@@ -69,7 +82,7 @@ build_target() {
       ;;
   esac
   echo "error: Rust standard library for $target is unavailable." >&2
-  echo "Install the target with rustup, or install Docker for Linux artifacts." >&2
+  echo "Install the target for the active toolchain with rustup, or install Docker for Linux artifacts." >&2
   exit 1
 }
 
@@ -79,7 +92,7 @@ temporary="$manifest.tmp"
 
 printf '{\n  "edition": "community",\n  "version": "%s",\n  "build_identifier": "%s",\n  "community_revision": "%s",\n  "remote_runtime_protocol_version": %s,\n  "artifacts": [\n' \
   "$version" "$DITCH_BUILD_IDENTIFIER" "$community_revision" "$remote_protocol" > "$temporary"
-separator=''
+has_artifact=''
 for target in $targets; do
   build_target "$target"
   source_binary="$workspace/target/$target/release/ditchd"
@@ -91,9 +104,12 @@ for target in $targets; do
   else
     checksum=$(sha256sum "$output/$artifact" | awk '{print $1}')
   fi
-  printf '%s    {"target":"%s","sha256":"%s","artifact":"%s"}' \
-    "$separator" "$target" "$checksum" "$artifact" >> "$temporary"
-  separator=',\n'
+  if [ -n "$has_artifact" ]; then
+    printf ',\n' >> "$temporary"
+  fi
+  printf '    {"target":"%s","sha256":"%s","artifact":"%s"}' \
+    "$target" "$checksum" "$artifact" >> "$temporary"
+  has_artifact=1
 done
 printf '\n  ]\n}\n' >> "$temporary"
 mv "$temporary" "$manifest"
