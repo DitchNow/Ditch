@@ -64,12 +64,26 @@ downloaded archive before installation.
 
 ## Release environment
 
-Create `.env.release-secrets.staging` and `.env.release-secrets.production` on
-the release Mac. These ignored files must be owned by the current user and
-have mode `0600`; `scripts/macos-release` validates both properties before it
-loads them. Keep app verification values in the ignored local
-`apps/macos/config/.env.release.<environment>` files instead. Start from
-`apps/macos/config/release.example`; no `.env` file is committed.
+The repository root is the only application and release workspace. Create
+`.env.release-secrets.staging` and `.env.release-secrets.production` there.
+These ignored files must be owned by the current user and have mode `0600`;
+`scripts/macos-release` validates both properties before it loads them. Keep
+public app and release verification values only in
+`apps/macos/config/.env.<environment>` and
+`apps/macos/config/.env.release.<environment>`. Start from the examples in that
+directory.
+
+Private signing keys and per-build official credentials belong outside every
+checkout under:
+
+```text
+~/Library/Application Support/DitchNow/ReleaseKeys/staging/
+~/Library/Application Support/DitchNow/ReleaseKeys/production/
+```
+
+Release outputs, immutable publication inputs, and receipts are written only
+under `dist/commercial/`. The obsolete root `staging.sh` and `production.sh`
+wrappers are unsupported; invoke `scripts/macos-release` directly.
 
 Staging and production must use different Sparkle Keychain accounts and
 different Sparkle/P-256 public keys. The release machine's public trust files
@@ -123,8 +137,28 @@ scripts/macos-release staging preflight 1.2.0 120 1.0.0 1 beta
 
 The command tests both Community and Commercial, builds the single-runtime
 app, signs/notarizes/staples a DMG, generates an Ed25519-signed appcast, signs
-the durable release descriptor, uploads immutable objects, downloads them back
-to verify hashes, and registers the release with Relay last.
+the durable release descriptor, registers the official build, uploads and
+downloads immutable objects to verify their hashes, and finally registers the
+Commercial release. The receipt records both Relay registrations without
+recording the raw credential.
+
+### One-time build 108 bridge
+
+Installed build 108 compares the signed descriptor's Community revision for
+exact equality. Build 109 therefore needs one explicit compatibility bridge:
+
+```sh
+scripts/macos-release staging all \
+  0.1.0 109 0.1.0 108 beta \
+  --legacy-source-revision 714a2b044355604d8d22cb966052eea9d10522e9
+```
+
+This flag changes only the signed v1 descriptor field consumed by the source
+client. The rebuilt app embeds the actual `COMMUNITY_REVISION`, and the
+official-build registration sends that same actual target revision. Normal
+releases omit the flag. Production additionally requires
+`--confirm-production-legacy-bridge` so an inherited bridge cannot be
+published accidentally.
 
 Test on a disposable Mac/user profile: purchase with the Stripe test context,
 wait for Relay entitlement, upgrade Community, create local and SSH sessions,

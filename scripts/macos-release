@@ -5,7 +5,15 @@ workspace=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
 
 usage() {
   cat >&2 <<'EOF'
-usage: scripts/macos-release staging|production preflight|build|verify|publish|all VERSION BUILD MIN_COMMUNITY_VERSION MIN_COMMUNITY_BUILD [stable|beta]
+usage: scripts/macos-release staging|production preflight|build|verify|publish|all VERSION BUILD MIN_COMMUNITY_VERSION MIN_COMMUNITY_BUILD [stable|beta] [OPTIONS]
+
+Options:
+  --legacy-source-revision REVISION
+      Sign the legacy v1 descriptor for one exact source revision while the
+      target app and official-build registration retain the actual target
+      Community revision. Intended only for a one-time signed bridge release.
+  --confirm-production-legacy-bridge
+      Required in addition to --legacy-source-revision for production.
 
 Required release environment:
   apps/macos/config/.env.release.<environment>       public trust values
@@ -32,7 +40,35 @@ version=${3:-}
 build=${4:-}
 minimum_version=${5:-}
 minimum_build=${6:-}
-channel=${7:-stable}
+channel=stable
+if [ $# -ge 7 ]; then
+  case "$7" in
+    stable|beta) channel=$7; shift 7 ;;
+    --*) shift 6 ;;
+    *) usage ;;
+  esac
+else
+  shift "$#"
+fi
+
+legacy_source_revision=
+confirm_production_legacy_bridge=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --legacy-source-revision)
+      [ $# -ge 2 ] || usage
+      [ -z "$legacy_source_revision" ] || { echo "error: --legacy-source-revision may be supplied only once" >&2; exit 2; }
+      legacy_source_revision=$2
+      shift 2
+      ;;
+    --confirm-production-legacy-bridge)
+      [ "$confirm_production_legacy_bridge" -eq 0 ] || usage
+      confirm_production_legacy_bridge=1
+      shift
+      ;;
+    *) usage ;;
+  esac
+done
 
 case "$environment" in staging|production) ;; *) usage ;; esac
 case "$action" in preflight|build|verify|publish|all) ;; *) usage ;; esac
@@ -55,6 +91,26 @@ printf '%s\n' "$version" | grep -Eq '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9]
   exit 2
 }
 valid_semver "$minimum_version" || { echo "error: MIN_COMMUNITY_VERSION must be valid SemVer" >&2; exit 2; }
+case "$legacy_source_revision" in
+  '')
+    [ "$confirm_production_legacy_bridge" -eq 0 ] || {
+      echo "error: --confirm-production-legacy-bridge requires --legacy-source-revision" >&2
+      exit 2
+    }
+    ;;
+  *[!0-9a-f]*)
+    echo "error: legacy source revision must be one lowercase 40-character Git commit" >&2
+    exit 2
+    ;;
+esac
+[ -z "$legacy_source_revision" ] || [ "${#legacy_source_revision}" -eq 40 ] || {
+  echo "error: legacy source revision must be one lowercase 40-character Git commit" >&2
+  exit 2
+}
+[ "$environment" != production ] || [ -z "$legacy_source_revision" ] || [ "$confirm_production_legacy_bridge" -eq 1 ] || {
+  echo "error: production legacy bridges also require --confirm-production-legacy-bridge" >&2
+  exit 2
+}
 
 required() {
   name=$1
@@ -207,6 +263,12 @@ verify_environment_isolation() {
 load_official_build_credential() {
   required DITCH_OFFICIAL_BUILD_CREDENTIAL_FILE
   require_private_file "$DITCH_OFFICIAL_BUILD_CREDENTIAL_FILE" "official build credential file"
+  expected_credential_name="official-build-$version-$build.b64"
+  [ "$(basename "$DITCH_OFFICIAL_BUILD_CREDENTIAL_FILE")" = "$expected_credential_name" ] || {
+    echo "error: official build credential must be a per-build file named $expected_credential_name" >&2
+    exit 1
+  }
+  unset DITCH_OFFICIAL_BUILD_CREDENTIAL
   DITCH_OFFICIAL_BUILD_CREDENTIAL=$(tr -d '\r\n' < "$DITCH_OFFICIAL_BUILD_CREDENTIAL_FILE")
   case "$DITCH_OFFICIAL_BUILD_CREDENTIAL" in
     *[!A-Za-z0-9_-]*) echo "error: official build credential must be unpadded base64url" >&2; exit 1 ;;
@@ -215,7 +277,6 @@ load_official_build_credential() {
     echo "error: official build credential must contain 32-96 random bytes" >&2
     exit 1
   }
-  export DITCH_OFFICIAL_BUILD_CREDENTIAL
 }
 
 load_cloudflare_token() {
@@ -247,12 +308,34 @@ load_release_trust_environment
 load_release_secrets
 load_official_build_credential
 verify_environment_isolation
+target_community_revision=$(tr -d '\r\n' < "$workspace/COMMUNITY_REVISION")
+case "$target_community_revision" in
+  *[!0-9a-f]*)
+    echo "error: COMMUNITY_REVISION must contain one lowercase 40-character Git commit" >&2
+    exit 1
+    ;;
+esac
+[ "${#target_community_revision}" -eq 40 ] || {
+  echo "error: COMMUNITY_REVISION must contain one lowercase 40-character Git commit" >&2
+  exit 1
+}
+if [ -n "$legacy_source_revision" ]; then
+  git -C "$workspace/community" cat-file -e "$legacy_source_revision^{commit}" 2>/dev/null || {
+    echo "error: legacy source revision is not present in the Community repository" >&2
+    exit 1
+  }
+  git -C "$workspace/community" merge-base --is-ancestor "$legacy_source_revision" "$target_community_revision" || {
+    echo "error: legacy source revision must be an ancestor of the target Community revision" >&2
+    exit 1
+  }
+  echo "warning: signed legacy bridge enabled for source revision $legacy_source_revision" >&2
+fi
 [ "$build" -gt "$DITCH_COMMUNITY_BUILD_SEQUENCE" ] || {
   echo "error: Commercial build $build must be newer than Community build $DITCH_COMMUNITY_BUILD_SEQUENCE" >&2
   exit 2
 }
-[ "$minimum_build" -le "$DITCH_COMMUNITY_BUILD_SEQUENCE" ] || {
-  echo "error: minimum Community build $minimum_build exceeds embedded Community build $DITCH_COMMUNITY_BUILD_SEQUENCE" >&2
+[ "$minimum_build" -lt "$build" ] || {
+  echo "error: minimum source build $minimum_build must be older than target build $build" >&2
   exit 2
 }
 export DITCH_APP_VERSION="$version"
@@ -264,6 +347,9 @@ export DITCH_RELEASE_CHANNEL="$channel"
 export DITCH_MINIMUM_COMMUNITY_VERSION="$minimum_version"
 export DITCH_MINIMUM_COMMUNITY_BUILD="$minimum_build"
 export DITCH_BUNDLE_ID=ai.theditch.app
+runtime_bundle_id=ai.theditch.runtime
+descriptor_community_revision=${legacy_source_revision:-$target_community_revision}
+official_build_register_url="$DITCH_RELAY_ORIGIN/v1/internal/official-builds"
 
 release_id_file="$workspace/dist/commercial/.current-$environment-$version-$build-release-id"
 release_time_file="$workspace/dist/commercial/.current-$environment-$version-$build-published-at"
@@ -437,6 +523,30 @@ preflight_release() {
   fi
   rm -f "$capability_response"
 
+  official_capability_response=$(mktemp "${TMPDIR:-/tmp}/ditch-official-build-capabilities.XXXXXX")
+  official_capability_status=$(curl --silent --show-error --output "$official_capability_response" --write-out '%{http_code}' \
+    --proto '=https' --tlsv1.2 \
+    --header "authorization: Bearer $DITCH_RELEASE_REGISTER_TOKEN" \
+    "$official_build_register_url/capabilities")
+  expected_app_attest_environment=production
+  [ "$environment" = staging ] && expected_app_attest_environment=sandbox
+  if [ "$official_capability_status" != 200 ] || ! jq -e \
+      --arg runtime_bundle_id "$runtime_bundle_id" \
+      --arg app_id "$DITCH_APPLE_TEAM_ID.$runtime_bundle_id" \
+      --arg app_attest_environment "$expected_app_attest_environment" '
+        .protocol_version == 1 and
+        .active_auth_mode == "embedded_credential" and
+        .idempotent_registration == true and
+        .runtime_bundle_id == $runtime_bundle_id and
+        .app_id == $app_id and
+        .app_attest_environment == $app_attest_environment
+      ' "$official_capability_response" >/dev/null 2>&1; then
+    rm -f "$official_capability_response"
+    echo "error: Relay does not implement the expected embedded-credential official-build contract" >&2
+    exit 1
+  fi
+  rm -f "$official_capability_response"
+
   if [ -n "${DITCH_NOTARY_KEYCHAIN:-}" ]; then
     xcrun notarytool history --keychain-profile "$DITCH_NOTARY_PROFILE" \
       --keychain "$DITCH_NOTARY_KEYCHAIN" >/dev/null
@@ -559,6 +669,7 @@ build_release() {
   (cd "$workspace" && \
     DITCH_COMMERCIAL_ARTIFACT="$artifact" \
     DITCH_COMMERCIAL_MANIFEST_OUTPUT="$signed_release" \
+    DITCH_LEGACY_SOURCE_COMMUNITY_REVISION="$legacy_source_revision" \
     DITCH_RELEASE_MANIFEST_PUBLIC_KEY_SEC1_B64="$DITCH_RELEASE_MANIFEST_PUBLIC_KEY_SEC1_B64" \
       cargo run --locked -p ditch_commercial --bin sign_commercial_release)
   verify_release
@@ -583,6 +694,9 @@ verify_release() {
     --arg channel "$channel" \
     --arg bundle_id "$DITCH_BUNDLE_ID" \
     --arg team_id "$DITCH_APPLE_TEAM_ID" \
+    --arg minimum_version "$minimum_version" \
+    --arg minimum_build "$minimum_build" \
+    --arg community_revision "$descriptor_community_revision" \
     --arg appcast_url "$DITCH_AUTHORIZED_APPCAST_URL" \
     --arg artifact_url "$DITCH_AUTHORIZED_ARTIFACT_URL" \
     '.manifest.release_id == $release_id and
@@ -592,6 +706,9 @@ verify_release() {
      .manifest.channel == $channel and
      .manifest.bundle_id == $bundle_id and
      .manifest.team_id == $team_id and
+     .manifest.minimum_community_version == $minimum_version and
+     .manifest.minimum_community_build == ($minimum_build | tonumber) and
+     .manifest.community_revision == $community_revision and
      .manifest.appcast_url == $appcast_url and
      .manifest.artifact_url == $artifact_url and
      (.signature | type == "string" and length > 0)' \
@@ -645,6 +762,68 @@ upload_object() {
   rm -f "$verify_copy"
 }
 
+register_official_build() {
+  official_build_request=$(mktemp "${TMPDIR:-/tmp}/ditch-official-build-register-request.XXXXXX")
+  official_build_response=$(mktemp "${TMPDIR:-/tmp}/ditch-official-build-register-response.XXXXXX")
+  published_at_ms=$(jq -nr --arg published_at "$release_published_at" \
+    '$published_at | fromdateiso8601 | . * 1000 | floor')
+  credential_sha256=$(printf '%s' "$DITCH_OFFICIAL_BUILD_CREDENTIAL" | shasum -a 256 | awk '{print $1}')
+  jq -n \
+    --argjson protocol_version 1 \
+    --arg build_id "$release_id" \
+    --arg deployment_environment "$environment" \
+    --arg edition commercial \
+    --arg version "$version" \
+    --argjson build "$build" \
+    --arg channel "$channel" \
+    --arg community_revision "$target_community_revision" \
+    --argjson published_at "$published_at_ms" \
+    --arg credential_sha256 "$credential_sha256" \
+    '{protocol_version:$protocol_version,build_id:$build_id,deployment_environment:$deployment_environment,
+      edition:$edition,version:$version,build:$build,channel:$channel,
+      community_revision:$community_revision,published_at:$published_at,
+      credential_sha256:$credential_sha256}' > "$official_build_request"
+
+  official_build_status=$(curl --silent --show-error --output "$official_build_response" --write-out '%{http_code}' \
+    --proto '=https' --tlsv1.2 \
+    --header "authorization: Bearer $DITCH_RELEASE_REGISTER_TOKEN" \
+    --header 'content-type: application/json' \
+    --data-binary "@$official_build_request" \
+    "$official_build_register_url")
+  rm -f "$official_build_request"
+  case "$official_build_status" in
+    200|201) ;;
+    *)
+      echo "error: Relay official-build registration returned HTTP $official_build_status" >&2
+      sed -n '1,20p' "$official_build_response" >&2
+      rm -f "$official_build_response"
+      exit 1
+      ;;
+  esac
+  jq -e \
+    --arg id "$release_id" \
+    --arg deployment_environment "$environment" \
+    --arg edition commercial \
+    --arg version "$version" \
+    --argjson build "$build" \
+    --arg channel "$channel" \
+    --arg community_revision "$target_community_revision" '
+      .protocol_version == 1 and
+      .official_build.id == $id and
+      .official_build.deployment_environment == $deployment_environment and
+      .official_build.edition == $edition and
+      .official_build.version == $version and
+      .official_build.build == $build and
+      .official_build.channel == $channel and
+      .official_build.community_revision == $community_revision and
+      .official_build.state == "enabled"
+    ' "$official_build_response" >/dev/null || {
+      echo "error: Relay returned mismatched official-build metadata" >&2
+      rm -f "$official_build_response"
+      exit 1
+    }
+}
+
 publish_release() {
   verify_release
   required DITCH_R2_BUCKET
@@ -652,6 +831,8 @@ publish_release() {
   load_release_register_token
   required DITCH_RELEASE_REGISTER_TOKEN
   command -v jq >/dev/null 2>&1 || { echo "error: jq is required" >&2; exit 1; }
+
+  register_official_build
 
   prefix="commercial/$environment/$channel/$release_id"
   upload_object "$artifact" "$prefix/$artifact_name" application/x-apple-diskimage
@@ -670,13 +851,10 @@ publish_release() {
     --arg sha256 "$(hash_file "$artifact")" \
     --arg minimum_version "$minimum_version" \
     --argjson minimum_build "$minimum_build" \
-    --arg official_build_credential_sha256 "$(printf '%s' "$DITCH_OFFICIAL_BUILD_CREDENTIAL" | shasum -a 256 | awk '{print $1}')" \
     --slurpfile signature_metadata "$signed_release" \
-    '{protocol_version:$protocol_version,release_id:$release_id,environment:$environment,edition:$edition,
-      version:$version,build:$build,channel:$channel,
+    '{protocol_version:$protocol_version,release_id:$release_id,version:$version,build:$build,channel:$channel,
       artifact_key:$artifact_key,appcast_key:$appcast_key,descriptor_key:$descriptor_key,
       sha256:$sha256,minimum_version:$minimum_version,minimum_build:$minimum_build,
-      official_build_credential_sha256:$official_build_credential_sha256,
       signature_metadata:$signature_metadata[0]}' > "$registration"
 
   response=$(mktemp "${TMPDIR:-/tmp}/ditch-release-register.XXXXXX")
@@ -686,29 +864,54 @@ publish_release() {
     --header 'content-type: application/json' \
     --data-binary "@$registration" \
     "$DITCH_RELEASE_REGISTER_URL")
-  [ "$status" = 201 ] || {
+  case "$status" in
+    200|201) ;;
+    *)
     echo "error: Relay release registration returned HTTP $status" >&2
     sed -n '1,20p' "$response" >&2
-    rm -f "$response"
+    rm -f "$response" "$official_build_response"
     exit 1
-  }
+    ;;
+  esac
   registered_release_id=$(jq -r '.release_id // empty' "$response")
   [ "$registered_release_id" = "$release_id" ] || {
     echo "error: Relay registered release ID $registered_release_id, expected signed release ID $release_id" >&2
-    rm -f "$response"
+    rm -f "$response" "$official_build_response"
     exit 1
   }
   jq -n \
+    --argjson protocol_version 1 \
     --arg release_id "$release_id" \
     --arg environment "$environment" \
+    --arg edition commercial \
     --arg channel "$channel" \
     --arg version "$version" \
-    --arg build "$build" \
+    --argjson build "$build" \
+    --argjson release_sequence "$build" \
+    --arg target_community_revision "$target_community_revision" \
+    --arg legacy_source_community_revision "$legacy_source_revision" \
+    --arg release_published_at "$release_published_at" \
+    --arg official_build_http_status "$official_build_status" \
+    --arg commercial_release_http_status "$status" \
+    --arg artifact_key "$prefix/$artifact_name" \
+    --arg appcast_key "$prefix/appcast.xml" \
+    --arg descriptor_key "$prefix/release.json" \
     --arg artifact_sha256 "$(hash_file "$artifact")" \
-    --arg published_at "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
-    '{release_id:$release_id,environment:$environment,channel:$channel,version:$version,
-      build:$build,artifact_sha256:$artifact_sha256,published_at:$published_at}' > "$receipt"
-  rm -f "$response"
+    --arg appcast_sha256 "$(hash_file "$appcast")" \
+    --arg descriptor_sha256 "$(hash_file "$signed_release")" \
+    --arg completed_at "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+    --slurpfile official_build "$official_build_response" \
+    --slurpfile commercial_release "$response" \
+    '{protocol_version:$protocol_version,release_id:$release_id,environment:$environment,
+      edition:$edition,channel:$channel,version:$version,build:$build,release_sequence:$release_sequence,
+      target_community_revision:$target_community_revision,
+      legacy_source_community_revision:(if $legacy_source_community_revision == "" then null else $legacy_source_community_revision end),
+      release_published_at:$release_published_at,completed_at:$completed_at,
+      official_build_registration:{http_status:($official_build_http_status | tonumber),response:$official_build[0]},
+      commercial_release_registration:{http_status:($commercial_release_http_status | tonumber),response:$commercial_release[0]},
+      objects:{artifact:{key:$artifact_key,sha256:$artifact_sha256},appcast:{key:$appcast_key,sha256:$appcast_sha256},
+        descriptor:{key:$descriptor_key,sha256:$descriptor_sha256}}}' > "$receipt"
+  rm -f "$response" "$official_build_response"
   echo "Published Commercial $version ($build) as $release_id"
 }
 

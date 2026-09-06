@@ -60,8 +60,8 @@ export DITCH_DEPLOYMENT_ENVIRONMENT DITCH_EDITION DITCH_RELAY_ORIGIN DITCH_UPDAT
 # Official release machines inject a per-build credential from the protected
 # environment or an ignored mode-0600 file. Source builds intentionally omit
 # it and therefore cannot obtain a hosted-services session from Relay.
-OFFICIAL_BUILD_CREDENTIAL_FILE="${DITCH_OFFICIAL_BUILD_CREDENTIAL_FILE:-$WORKSPACE_ROOT/.release-keys/official-build-$DITCH_DEPLOYMENT_ENVIRONMENT.token}"
-if [ -z "${DITCH_OFFICIAL_BUILD_CREDENTIAL:-}" ] && [ -f "$OFFICIAL_BUILD_CREDENTIAL_FILE" ]; then
+OFFICIAL_BUILD_CREDENTIAL_FILE="${DITCH_OFFICIAL_BUILD_CREDENTIAL_FILE:-}"
+if [ -z "${DITCH_OFFICIAL_BUILD_CREDENTIAL:-}" ] && [ -n "$OFFICIAL_BUILD_CREDENTIAL_FILE" ] && [ -f "$OFFICIAL_BUILD_CREDENTIAL_FILE" ]; then
   [ "$(stat -f '%u' "$OFFICIAL_BUILD_CREDENTIAL_FILE")" = "$(id -u)" ] || {
     echo "error: official build credential must be owned by the current user" >&2
     exit 1

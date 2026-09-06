@@ -15,8 +15,6 @@ dist/
 *.iml
 *.log
 *.swp
-/production.sh
-/staging.sh
 
 apps/macos/macos/Flutter/ephemeral/
 apps/macos/macos/Pods/
