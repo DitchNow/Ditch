@@ -21,10 +21,18 @@ class CommercialEditionSurface implements EditionSurface {
 }
 
 class RemoteSettingsDialog extends StatefulWidget {
-  const RemoteSettingsDialog({required this.client, this.sshAlias, super.key});
+  const RemoteSettingsDialog({
+    required this.client,
+    this.sshAlias,
+    this.deploymentEnvironment = ditchDeploymentEnvironment,
+    this.relayOrigin = ditchRelayOrigin,
+    super.key,
+  });
 
   final DitchRuntimeClient client;
   final String? sshAlias;
+  final String deploymentEnvironment;
+  final String relayOrigin;
 
   @override
   State<RemoteSettingsDialog> createState() => _RemoteSettingsDialogState();
@@ -33,6 +41,7 @@ class RemoteSettingsDialog extends StatefulWidget {
 class _RemoteSettingsDialogState extends State<RemoteSettingsDialog> {
   static const _applicationChannel = MethodChannel('the_ditch/application');
   Map<String, dynamic>? _status;
+  Map<String, dynamic>? _entitlement;
   Map<String, dynamic>? _pairing;
   Timer? _timer;
   bool _busy = false;
@@ -72,6 +81,13 @@ class _RemoteSettingsDialogState extends State<RemoteSettingsDialog> {
   }
 
   Future<void> _refresh() async {
+    Map<String, dynamic>? entitlement;
+    Object? entitlementError;
+    try {
+      entitlement = await widget.client.commercialEntitlement();
+    } on Object catch (error) {
+      entitlementError = error;
+    }
     try {
       final response = await _requestLocalOrRemote(
         'RemoteControlStatus',
@@ -80,12 +96,23 @@ class _RemoteSettingsDialogState extends State<RemoteSettingsDialog> {
       );
       if (!mounted) return;
       setState(() {
-        _status = (response['RemoteControlStatus'] as Map?)
-            ?.cast<String, dynamic>();
-        _error = null;
+        _entitlement = entitlement;
+        _status = entitlementError == null
+            ? (response['RemoteControlStatus'] as Map?)?.cast<String, dynamic>()
+            : null;
+        _error = entitlementError == null
+            ? null
+            : _friendlyHostedServiceError(entitlementError);
       });
     } on Object catch (error) {
-      if (mounted) setState(() => _error = '$error');
+      if (mounted) {
+        setState(() {
+          _entitlement = entitlement;
+          _error = entitlementError == null
+              ? '$error'
+              : _friendlyHostedServiceError(entitlementError);
+        });
+      }
     }
   }
 
@@ -222,9 +249,38 @@ class _RemoteSettingsDialogState extends State<RemoteSettingsDialog> {
     }
   }
 
+  Future<void> _viewCommercialPlans() async {
+    await showDialog<void>(
+      context: context,
+      builder: (context) => CommercialUpgradeDialog(client: widget.client),
+    );
+    if (mounted) unawaited(_refresh());
+  }
+
+  String _friendlyHostedServiceError(Object error) {
+    if (error is DitchRuntimeException &&
+        error.code == 'official_build_required') {
+      return 'This source build cannot use DitchNow hosted services. Install an official signed Community or Commercial build to use Remote Control.';
+    }
+    return '$error';
+  }
+
   @override
   Widget build(BuildContext context) {
-    final expired = _error?.contains('Commercial subscription expired') == true;
+    final license = _entitlement == null
+        ? null
+        : DitchCurrentLicense.fromEntitlement(_entitlement!);
+    final legacyExpired =
+        license == null &&
+        _error?.contains('Commercial subscription expired') == true;
+    final hostedAccessUnavailable =
+        legacyExpired ||
+        (license != null &&
+            license.status != 'active' &&
+            license.status != 'over_limit');
+    final billingManagementAvailable =
+        _entitlement?['billing_management_available'] == true;
+    final renewalAvailable = _entitlement?['renewal_available'] == true;
     final devices =
         (_status?['devices'] as List?)?.whereType<Map>().toList() ?? const [];
     return AlertDialog(
@@ -236,12 +292,22 @@ class _RemoteSettingsDialogState extends State<RemoteSettingsDialog> {
       ),
       content: SizedBox(
         width: 580,
-        child: expired
+        child: hostedAccessUnavailable
             ? Column(
                 mainAxisSize: MainAxisSize.min,
                 children: [
+                  if (widget.deploymentEnvironment == 'staging') ...[
+                    StagingEnvironmentBanner(
+                      key: const Key('remote-staging-environment'),
+                      relayOrigin: widget.relayOrigin,
+                    ),
+                    const SizedBox(height: 12),
+                  ],
                   Text(
-                    'Commercial subscription expired.',
+                    legacyExpired
+                        ? 'Commercial subscription expired.'
+                        : '${license?.displayName ?? 'Current license'} is ${license?.status ?? 'inactive'}.',
+                    key: const Key('remote-current-license'),
                     style: Theme.of(context).textTheme.titleSmall,
                   ),
                   const SizedBox(height: 8),
@@ -249,8 +315,18 @@ class _RemoteSettingsDialogState extends State<RemoteSettingsDialog> {
                   const SizedBox(height: 12),
                   FilledButton(
                     key: const Key('renew-commercial'),
-                    onPressed: _billingBusy ? null : _openBillingManagement,
-                    child: const Text('Renew'),
+                    onPressed: _billingBusy
+                        ? null
+                        : billingManagementAvailable
+                        ? _openBillingManagement
+                        : _viewCommercialPlans,
+                    child: Text(
+                      billingManagementAvailable && renewalAvailable
+                          ? 'Renew'
+                          : billingManagementAvailable
+                          ? 'Manage Billing'
+                          : 'View Plans',
+                    ),
                   ),
                   if (_billingError != null) ...[
                     const SizedBox(height: 10),
@@ -264,14 +340,35 @@ class _RemoteSettingsDialogState extends State<RemoteSettingsDialog> {
                 ],
               )
             : _status == null
-            ? _error == null
-                  ? const Center(child: CircularProgressIndicator())
-                  : SelectableText(_error!)
+            ? Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  if (widget.deploymentEnvironment == 'staging') ...[
+                    StagingEnvironmentBanner(
+                      key: const Key('remote-staging-environment'),
+                      relayOrigin: widget.relayOrigin,
+                    ),
+                    const SizedBox(height: 12),
+                  ],
+                  if (_error == null)
+                    const Center(child: CircularProgressIndicator())
+                  else
+                    SelectableText(_error!),
+                ],
+              )
             : SingleChildScrollView(
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.stretch,
                   mainAxisSize: MainAxisSize.min,
                   children: [
+                    if (widget.deploymentEnvironment == 'staging') ...[
+                      StagingEnvironmentBanner(
+                        key: const Key('remote-staging-environment'),
+                        relayOrigin: widget.relayOrigin,
+                      ),
+                      const SizedBox(height: 12),
+                    ],
                     ListTile(
                       contentPadding: EdgeInsets.zero,
                       leading: Icon(
@@ -330,13 +427,13 @@ class _RemoteSettingsDialogState extends State<RemoteSettingsDialog> {
               ),
       ),
       actions: [
-        if (!expired)
+        if (!hostedAccessUnavailable && billingManagementAvailable)
           TextButton(
             key: const Key('manage-commercial-billing'),
             onPressed: _billingBusy ? null : _openBillingManagement,
             child: const Text('Manage Billing'),
           ),
-        if (_pairing == null && !expired)
+        if (_pairing == null && !hostedAccessUnavailable)
           FilledButton.icon(
             key: const Key('connect-iphone'),
             onPressed: _busy || _status?['configured'] != true

@@ -21,6 +21,7 @@ Optional:
   DITCH_SPARKLE_PRIVATE_KEY_FILE            mode-0600 Sparkle Ed25519 private-key file
   DITCH_NOTARY_KEYCHAIN                     explicit notarytool Keychain path
   DITCH_CLOUDFLARE_API_TOKEN_FILE           mode-0600 Cloudflare API token file
+  DITCH_OFFICIAL_BUILD_CREDENTIAL_FILE      mode-0600 per-build Relay credential file
 EOF
   exit 2
 }
@@ -129,7 +130,7 @@ load_release_secrets() {
     key=${line%%=*}
     value=${line#*=}
     case "$key" in
-      DITCH_CODESIGN_IDENTITY|DITCH_NOTARY_PROFILE|DITCH_NOTARY_KEYCHAIN|DITCH_RELEASE_MANIFEST_SIGNING_KEY_FILE|DITCH_R2_BUCKET|DITCH_RELEASE_REGISTER_URL|DITCH_RELEASE_REGISTER_TOKEN|DITCH_RELEASE_REGISTER_TOKEN_FILE|DITCH_CLOUDFLARE_API_TOKEN_FILE|DITCH_WRANGLER|DITCH_SPARKLE_KEY_ACCOUNT|DITCH_SPARKLE_PRIVATE_KEY_FILE|DITCH_FLUTTER)
+      DITCH_CODESIGN_IDENTITY|DITCH_NOTARY_PROFILE|DITCH_NOTARY_KEYCHAIN|DITCH_RELEASE_MANIFEST_SIGNING_KEY_FILE|DITCH_R2_BUCKET|DITCH_RELEASE_REGISTER_URL|DITCH_RELEASE_REGISTER_TOKEN|DITCH_RELEASE_REGISTER_TOKEN_FILE|DITCH_CLOUDFLARE_API_TOKEN_FILE|DITCH_OFFICIAL_BUILD_CREDENTIAL_FILE|DITCH_WRANGLER|DITCH_SPARKLE_KEY_ACCOUNT|DITCH_SPARKLE_PRIVATE_KEY_FILE|DITCH_FLUTTER)
         [ -n "$value" ] || { echo "error: $key is empty in $file" >&2; exit 1; }
         export "$key=$value"
         ;;
@@ -160,6 +161,7 @@ verify_environment_isolation() {
   other_r2_bucket=$(environment_value "$other_secrets" DITCH_R2_BUCKET)
   other_register_token_file=$(environment_value "$other_secrets" DITCH_RELEASE_REGISTER_TOKEN_FILE)
   other_cloudflare_token_file=$(environment_value "$other_secrets" DITCH_CLOUDFLARE_API_TOKEN_FILE)
+  other_build_credential_file=$(environment_value "$other_secrets" DITCH_OFFICIAL_BUILD_CREDENTIAL_FILE)
   [ "$DITCH_RELEASE_MANIFEST_PUBLIC_KEY_SEC1_B64" != "$other_manifest_key" ] || {
     echo "error: staging and production must use different release-manifest signing keys" >&2
     exit 1
@@ -192,6 +194,28 @@ verify_environment_isolation() {
       exit 1
     }
   fi
+  if [ -n "${DITCH_OFFICIAL_BUILD_CREDENTIAL_FILE:-}" ] && [ -n "$other_build_credential_file" ]; then
+    require_private_file "$DITCH_OFFICIAL_BUILD_CREDENTIAL_FILE" "official build credential file"
+    require_private_file "$other_build_credential_file" "other environment's official build credential file"
+    [ "$(hash_file "$DITCH_OFFICIAL_BUILD_CREDENTIAL_FILE")" != "$(hash_file "$other_build_credential_file")" ] || {
+      echo "error: staging and production must use different official build credentials" >&2
+      exit 1
+    }
+  fi
+}
+
+load_official_build_credential() {
+  required DITCH_OFFICIAL_BUILD_CREDENTIAL_FILE
+  require_private_file "$DITCH_OFFICIAL_BUILD_CREDENTIAL_FILE" "official build credential file"
+  DITCH_OFFICIAL_BUILD_CREDENTIAL=$(tr -d '\r\n' < "$DITCH_OFFICIAL_BUILD_CREDENTIAL_FILE")
+  case "$DITCH_OFFICIAL_BUILD_CREDENTIAL" in
+    *[!A-Za-z0-9_-]*) echo "error: official build credential must be unpadded base64url" >&2; exit 1 ;;
+  esac
+  [ "${#DITCH_OFFICIAL_BUILD_CREDENTIAL}" -ge 43 ] && [ "${#DITCH_OFFICIAL_BUILD_CREDENTIAL}" -le 128 ] || {
+    echo "error: official build credential must contain 32-96 random bytes" >&2
+    exit 1
+  }
+  export DITCH_OFFICIAL_BUILD_CREDENTIAL
 }
 
 load_cloudflare_token() {
@@ -221,6 +245,7 @@ load_release_register_token() {
 load_public_environment
 load_release_trust_environment
 load_release_secrets
+load_official_build_credential
 verify_environment_isolation
 [ "$build" -gt "$DITCH_COMMUNITY_BUILD_SEQUENCE" ] || {
   echo "error: Commercial build $build must be newer than Community build $DITCH_COMMUNITY_BUILD_SEQUENCE" >&2
@@ -551,6 +576,8 @@ verify_release() {
   [ "$actual_digest" = "$manifest_digest" ] || { echo "error: signed descriptor digest mismatch" >&2; exit 1; }
   jq -e \
     --arg release_id "$release_id" \
+    --arg environment "$environment" \
+    --arg edition "commercial" \
     --arg version "$version" \
     --arg build "$build" \
     --arg channel "$channel" \
@@ -643,10 +670,13 @@ publish_release() {
     --arg sha256 "$(hash_file "$artifact")" \
     --arg minimum_version "$minimum_version" \
     --argjson minimum_build "$minimum_build" \
+    --arg official_build_credential_sha256 "$(printf '%s' "$DITCH_OFFICIAL_BUILD_CREDENTIAL" | shasum -a 256 | awk '{print $1}')" \
     --slurpfile signature_metadata "$signed_release" \
-    '{protocol_version:$protocol_version,release_id:$release_id,version:$version,build:$build,channel:$channel,
+    '{protocol_version:$protocol_version,release_id:$release_id,environment:$environment,edition:$edition,
+      version:$version,build:$build,channel:$channel,
       artifact_key:$artifact_key,appcast_key:$appcast_key,descriptor_key:$descriptor_key,
       sha256:$sha256,minimum_version:$minimum_version,minimum_build:$minimum_build,
+      official_build_credential_sha256:$official_build_credential_sha256,
       signature_metadata:$signature_metadata[0]}' > "$registration"
 
   response=$(mktemp "${TMPDIR:-/tmp}/ditch-release-register.XXXXXX")

@@ -294,6 +294,7 @@ dependencies = [
  "chrono",
  "ditch_commercial_remote",
  "ditch_identity",
+ "ditch_upgrade",
  "p256",
  "rand_core 0.6.4",
  "semver",

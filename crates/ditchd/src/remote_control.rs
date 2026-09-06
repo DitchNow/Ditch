@@ -317,7 +317,7 @@ pub(super) fn create_pairing(state: Arc<Mutex<RuntimeState>>) -> ServerResponse 
     if !has_remote_control_entitlement(&state) {
         return entitlement_required();
     }
-    let (origin, identity, machine_name) = {
+    let (origin, identity, installation_identity, machine_name) = {
         let mut state = state
             .lock()
             .expect("runtime state lock should not be poisoned");
@@ -331,9 +331,13 @@ pub(super) fn create_pairing(state: Arc<Mutex<RuntimeState>>) -> ServerResponse 
             Ok(value) => value,
             Err(error) => return protocol_error("remote_identity_failed", error),
         };
+        let installation_identity = state.installation_identity.clone();
         let name = machine_name();
-        (origin, identity, name)
+        (origin, identity, installation_identity, name)
     };
+    if let Err(error) = refresh_official_build_authorization(&installation_identity) {
+        return protocol_error("remote_official_build_failed", error);
+    }
     if let Err(error) = register_machine(&origin, &identity, &machine_name) {
         return protocol_error("remote_registration_failed", error);
     }
@@ -569,18 +573,32 @@ fn ensure_identity(state: &mut RuntimeState) -> Result<MachineIdentity, String> 
 fn remote_identity(
     state: &Arc<Mutex<RuntimeState>>,
 ) -> Result<(String, MachineIdentity), ServerResponse> {
-    let mut state = state
-        .lock()
-        .expect("runtime state lock should not be poisoned");
-    let Some(origin) = state.edition.remote.relay_origin.clone() else {
-        return Err(protocol_error(
-            "remote_not_configured",
-            "The remote relay configuration is invalid.",
-        ));
+    let (origin, identity, installation_identity) = {
+        let mut state = state
+            .lock()
+            .expect("runtime state lock should not be poisoned");
+        let Some(origin) = state.edition.remote.relay_origin.clone() else {
+            return Err(protocol_error(
+                "remote_not_configured",
+                "The remote relay configuration is invalid.",
+            ));
+        };
+        let identity = ensure_identity(&mut state)
+            .map_err(|error| protocol_error("remote_identity_failed", error))?;
+        (origin, identity, state.installation_identity.clone())
     };
-    let identity = ensure_identity(&mut state)
-        .map_err(|error| protocol_error("remote_identity_failed", error))?;
+    refresh_official_build_authorization(&installation_identity)
+        .map_err(|error| protocol_error("remote_official_build_failed", error))?;
     Ok((origin, identity))
+}
+
+fn refresh_official_build_authorization(
+    identity: &ditch_identity::InstallationIdentity,
+) -> Result<(), String> {
+    ditch_upgrade::HttpUpgradeBackend::official()
+        .and_then(|backend| backend.official_build_authorization(identity))
+        .map(|_| ())
+        .map_err(|error| error.to_string())
 }
 
 fn register_machine(origin: &str, identity: &MachineIdentity, name: &str) -> Result<(), String> {
@@ -619,6 +637,10 @@ fn signed_request(
         .set("X-Ditch-Timestamp", &timestamp.to_string())
         .set("X-Ditch-Nonce", &nonce)
         .set("X-Ditch-Signature", &identity.sign(canonical.as_bytes()));
+    let request = match ditch_upgrade::cached_official_build_bearer() {
+        Some(bearer) => request.set("X-Ditch-Official-Build", &bearer),
+        None => request,
+    };
     let response = request.send_bytes(body).map_err(response_error)?;
     if response.status() == 204 {
         return Ok(Value::Null);

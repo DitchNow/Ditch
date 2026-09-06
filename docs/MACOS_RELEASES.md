@@ -20,6 +20,10 @@ authorization. GitHub Releases are not involved.
    registration contract, read the R2 objects, verify the signed descriptor,
    and issue short-lived appcast/artifact sessions only after entitlement
    checks.
+6. Generate a unique per-build official-build credential with at least 32
+   random bytes, register only its SHA-256 hash and immutable build metadata
+   with the matching Relay environment, and store the raw value in a mode-0600
+   file outside Git.
 
 No Stripe key, webhook secret, Cloudflare token, Apple private key, or release
 signing private key is embedded in Ditch.
@@ -82,6 +86,7 @@ DITCH_R2_BUCKET
 DITCH_RELEASE_REGISTER_URL
 DITCH_RELEASE_REGISTER_TOKEN_FILE
 DITCH_CLOUDFLARE_API_TOKEN_FILE
+DITCH_OFFICIAL_BUILD_CREDENTIAL_FILE
 ```
 
 The token variables may contain values directly, but file references are
@@ -90,6 +95,14 @@ Cloudflare token only from the protected file, verifies Wrangler's account and
 the exact environment-specific R2 bucket, and checks Relay's release-contract
 capabilities before building. `DITCH_FLUTTER` can point to a Flutter executable
 when it is not on PATH.
+
+The official-build credential is injected only into the signed in-process
+macOS runtime host and exchanged for short-lived, machine-bound Relay sessions.
+The standalone CLI and SSH runtime artifacts are built without it. It keeps
+ordinary Community source builds out of hosted services, but it is not
+hardware-backed remote attestation and can be extracted by a determined
+reverse engineer. Rotate and revoke it per build; never reuse it across staging
+and production.
 
 ## Staging
 

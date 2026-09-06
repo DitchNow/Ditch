@@ -10,6 +10,7 @@ base64.workspace = true
 chrono.workspace = true
 ditch_identity.workspace = true
 ditch_remote.workspace = true
+ditch_upgrade.workspace = true
 p256.workspace = true
 rand_core.workspace = true
 semver.workspace = true
