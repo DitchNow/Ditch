@@ -1,5 +1,9 @@
 # Ditch
 
+<p align="center">
+  <img src="ditch_gif.gif" alt="Ditch demo" width="800">
+</p>
+
 **Ditch Community Edition** is a macOS workspace for running, following, and returning to local or SSH-hosted Codex sessions across multiple projects.
 
 [Download](https://theditch.dev/#beta) · [Website](https://theditch.dev)
