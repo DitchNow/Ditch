@@ -51,18 +51,42 @@ fn parse_u64(name: &str) -> Result<u64, Box<dyn Error>> {
     Ok(required(name)?.parse()?)
 }
 
+fn valid_revision(revision: &str) -> bool {
+    revision.len() == 40
+        && revision
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
+fn select_descriptor_revision(
+    actual_revision: String,
+    legacy_revision: Option<String>,
+) -> Result<String, Box<dyn Error>> {
+    let revision = legacy_revision.unwrap_or(actual_revision);
+    if !valid_revision(&revision) {
+        return Err(
+            "release descriptor Community revision must be one lowercase full Git commit".into(),
+        );
+    }
+    Ok(revision)
+}
+
+fn descriptor_revision(actual_revision: String) -> Result<String, Box<dyn Error>> {
+    let legacy_revision = env::var("DITCH_LEGACY_SOURCE_COMMUNITY_REVISION")
+        .ok()
+        .filter(|value| !value.is_empty());
+    select_descriptor_revision(actual_revision, legacy_revision)
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     let artifact = PathBuf::from(required("DITCH_COMMERCIAL_ARTIFACT")?);
     let output = PathBuf::from(required("DITCH_COMMERCIAL_MANIFEST_OUTPUT")?);
     let artifact_bytes = fs::read(&artifact)?;
-    let revision = fs::read_to_string("COMMUNITY_REVISION")?.trim().to_owned();
-    if revision.len() != 40
-        || !revision
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
-    {
+    let actual_revision = fs::read_to_string("COMMUNITY_REVISION")?.trim().to_owned();
+    if !valid_revision(&actual_revision) {
         return Err("COMMUNITY_REVISION must contain one lowercase full Git commit".into());
     }
+    let revision = descriptor_revision(actual_revision)?;
     let published_at =
         DateTime::parse_from_rfc3339(&required("DITCH_RELEASE_PUBLISHED_AT")?)?.with_timezone(&Utc);
     if published_at > Utc::now() + chrono::Duration::minutes(5) {
@@ -166,4 +190,34 @@ fn main() -> Result<(), Box<dyn Error>> {
     fs::write(&temporary, serde_json::to_vec_pretty(&release)?)?;
     fs::rename(temporary, output)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{select_descriptor_revision, valid_revision};
+
+    const ACTUAL: &str = "9b8b2a8444c053d672ccdf087bcfbd65667db7f5";
+    const LEGACY: &str = "714a2b044355604d8d22cb966052eea9d10522e9";
+
+    #[test]
+    fn uses_actual_revision_for_normal_releases() {
+        assert_eq!(
+            select_descriptor_revision(ACTUAL.to_owned(), None).unwrap(),
+            ACTUAL
+        );
+    }
+
+    #[test]
+    fn uses_explicit_legacy_revision_only_for_descriptor() {
+        assert_eq!(
+            select_descriptor_revision(ACTUAL.to_owned(), Some(LEGACY.to_owned())).unwrap(),
+            LEGACY
+        );
+    }
+
+    #[test]
+    fn rejects_noncanonical_revisions() {
+        assert!(!valid_revision(&LEGACY.to_uppercase()));
+        assert!(select_descriptor_revision(ACTUAL.to_owned(), Some("abc".to_owned())).is_err());
+    }
 }

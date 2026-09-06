@@ -222,6 +222,9 @@ fn signed_request(
     path: &str,
     body: &[u8],
 ) -> Result<ureq::Response, String> {
+    let official_build_bearer = ditch_upgrade::HttpUpgradeBackend::official()
+        .and_then(|backend| backend.official_build_authorization(identity))
+        .map_err(|error| error.to_string())?;
     let installation_id = identity.installation_id();
     let timestamp = Utc::now().timestamp_millis();
     let mut nonce = [0_u8; 16];
@@ -243,6 +246,9 @@ fn signed_request(
         .set("X-Ditch-Timestamp", &timestamp.to_string())
         .set("X-Ditch-Nonce", &nonce)
         .set("X-Ditch-Signature", &identity.sign(canonical.as_bytes()));
+    if let Some(bearer) = official_build_bearer.as_deref() {
+        request = request.set("X-Ditch-Official-Build", bearer);
+    }
     if !body.is_empty() {
         request = request.set("content-type", "application/json");
     }

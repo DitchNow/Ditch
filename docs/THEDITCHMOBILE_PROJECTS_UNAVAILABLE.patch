@@ -1,0 +1,134 @@
+--- a/lib/data/remote/remote_api.dart
++++ b/lib/data/remote/remote_api.dart
+@@ -1,8 +1,9 @@
+ import 'dart:async';
+ import 'dart:convert';
+ import 'dart:io';
+-import 'dart:isolate';
+ 
++import 'package:flutter/foundation.dart';
++
+ import '../../domain/errors.dart';
+ import '../../platform/platform_services.dart';
+ import 'protocol.dart';
+@@ -62,7 +63,7 @@
+           : objectMap(
+               responseBody.length < 4 * 1024
+                   ? jsonDecode(responseBody)
+-                  : await Isolate.run(() => jsonDecode(responseBody)),
++                  : await compute(_decodeJsonBody, responseBody),
+               'response',
+             );
+       if (response.isRedirect) {
+@@ -240,8 +241,9 @@
+     );
+     final rawAttention = attentionResponse.json['attention'];
+     if (rawAttention is! List) badWire('attention');
+-    final attention = await Isolate.run(
+-      () => _normalizeAttention(rawAttention),
++    final attention = await compute(
++      _normalizeAttention,
++      rawAttention.cast<Object?>(),
+     );
+     return {
+       'protocol_version': remoteProtocolVersion,
+@@ -413,6 +415,8 @@
+   }
+ }
+ 
++Object? _decodeJsonBody(String responseBody) => jsonDecode(responseBody);
++
+ String _machineKind(Map<String, Object?>? machine) {
+   final value =
+       machine?['kind'] ?? machine?['machine_type'] ?? machine?['node_type'];
+--- a/lib/data/remote/remote_repository.dart
++++ b/lib/data/remote/remote_repository.dart
+@@ -1,6 +1,8 @@
+ import 'dart:async';
+ import 'dart:convert';
+ import 'dart:isolate';
++
++import 'package:flutter/foundation.dart';
+ 
+ import '../../domain/errors.dart';
+ import '../../domain/models.dart';
+@@ -194,7 +196,7 @@
+     }
+     // Protocol validation and model construction scale with projection size.
+     // Keep the complete pass off the UI isolate, not only JSON tokenization.
+-    final decoded = await Isolate.run(() => _decodeProjection(json));
++    final decoded = await compute(_decodeProjection, json);
+     machines = decoded.machines;
+     projects = _mergeProjects(const [], decoded.projects);
+     sessions = decoded.includesSessions ? decoded.sessions : sessions;
+--- a/lib/features/projects/projects_screen.dart
++++ b/lib/features/projects/projects_screen.dart
+@@ -5,6 +5,7 @@
+ import '../../app/app_controller.dart';
+ import '../../app/controller_selector.dart';
+ import '../../design/widgets.dart';
++import '../../domain/errors.dart';
+ import '../../domain/models.dart';
+ import '../../domain/remote_state.dart';
+ import 'project_detail_screen.dart';
+@@ -56,6 +57,7 @@
+       controller.projectsHaveMore,
+       controller.projectPageError,
+       controller.authorizationState,
++      controller.error,
+     ),
+     builder: (context, _) => Scaffold(
+       appBar: AppBar(
+@@ -83,7 +85,10 @@
+                       physics: const AlwaysScrollableScrollPhysics(),
+                       slivers: [
+                         SliverFillRemaining(
+-                          child: _emptyState(controller.projectionState),
++                          child: _emptyState(
++                            controller.projectionState,
++                            controller.error,
++                          ),
+                         ),
+                       ],
+                     )
+@@ -121,21 +126,24 @@
+     ),
+   );
+ 
+-  static Widget _emptyState(ProjectionState state) => switch (state) {
+-    ProjectionState.loading => const Center(
+-      child: CircularProgressIndicator.adaptive(),
+-    ),
+-    ProjectionState.unavailable => const EmptyState(
+-      icon: Icons.cloud_off_outlined,
+-      title: 'Projects temporarily unavailable',
+-      body: 'Reconnect to the relay, then pull to refresh.',
+-    ),
+-    _ => const EmptyState(
+-      icon: Icons.folder_open_rounded,
+-      title: 'No projected projects',
+-      body: 'Projects from connected Macs will appear here.',
+-    ),
+-  };
++  static Widget _emptyState(ProjectionState state, Object? error) =>
++      switch (state) {
++        ProjectionState.loading => const Center(
++          child: CircularProgressIndicator.adaptive(),
++        ),
++        ProjectionState.unavailable => EmptyState(
++          icon: Icons.cloud_off_outlined,
++          title: 'Projects temporarily unavailable',
++          body: error is DitchException
++              ? '${error.userMessage}\n\nPull to refresh.'
++              : 'Reconnect to the relay, then pull to refresh.',
++        ),
++        _ => const EmptyState(
++          icon: Icons.folder_open_rounded,
++          title: 'No projected projects',
++          body: 'Projects from connected Macs will appear here.',
++        ),
++      };
+ }
+ 
+ class _PageFooter extends StatelessWidget {
+
