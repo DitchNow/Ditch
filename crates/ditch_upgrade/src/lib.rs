@@ -17,6 +17,7 @@ use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 use thiserror::Error;
 use url::Url;
 use uuid::Uuid;
@@ -32,6 +33,50 @@ pub const CONFIGURED_UPGRADE_API_ORIGIN: &str = match option_env!("DITCH_RELAY_O
     None => OFFICIAL_UPGRADE_API_ORIGIN,
 };
 pub const CANONICAL_BUNDLE_ID: &str = "ai.theditch.app";
+
+const OFFICIAL_BUILD_SESSION_SAFETY_MARGIN_SECONDS: i64 = 60;
+
+#[derive(Clone)]
+struct CachedOfficialBuildSession {
+    bearer: String,
+    expires_at: DateTime<Utc>,
+}
+
+static OFFICIAL_BUILD_SESSION: OnceLock<Mutex<Option<CachedOfficialBuildSession>>> =
+    OnceLock::new();
+static OFFICIAL_BUILD_CREDENTIAL: OnceLock<Zeroizing<String>> = OnceLock::new();
+
+/// Configures the release credential inside the signed local macOS runtime.
+/// Standalone daemons and CLI binaries never call this function and therefore
+/// remain unable to establish an official-build session.
+pub fn configure_official_build_credential(credential: &[u8]) -> bool {
+    let Ok(credential) = std::str::from_utf8(credential) else {
+        return false;
+    };
+    if credential.len() < 43
+        || credential.len() > 128
+        || !credential
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return false;
+    }
+    OFFICIAL_BUILD_CREDENTIAL
+        .set(Zeroizing::new(credential.to_owned()))
+        .is_ok()
+}
+
+/// Returns the current short-lived official-build bearer for Commercial
+/// transports that share this process. The bearer never crosses IPC.
+pub fn cached_official_build_bearer() -> Option<String> {
+    OFFICIAL_BUILD_SESSION
+        .get()?
+        .lock()
+        .ok()?
+        .as_ref()
+        .filter(|session| session.expires_at > Utc::now())
+        .map(|session| session.bearer.clone())
+}
 
 fn expected_release_channel(environment: &str) -> Result<&'static str, UpgradeError> {
     match environment {
@@ -305,6 +350,27 @@ pub struct EntitlementSummary {
     pub mac_slots: u16,
     pub iphone_slots: u16,
     pub billing_management_available: bool,
+    pub renewal_available: bool,
+    pub current_license: CurrentLicenseSummary,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CurrentLicenseSummary {
+    pub edition: String,
+    pub status: String,
+    pub display_name: String,
+    #[serde(default)]
+    pub plans: Vec<CurrentLicensePlan>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CurrentLicensePlan {
+    pub kind: String,
+    pub display_name: String,
+    pub billing_type: String,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid_until: Option<DateTime<Utc>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -459,6 +525,19 @@ pub trait UpgradeBackend {
     ) -> Result<SignedCommercialRelease, UpgradeError>;
 }
 
+#[derive(Deserialize)]
+struct OfficialBuildSessionEnvelope {
+    official_build_session: OfficialBuildSessionResponse,
+}
+
+#[derive(Deserialize)]
+struct OfficialBuildSessionResponse {
+    bearer: String,
+    expires_at: DateTime<Utc>,
+    build: u64,
+    version: String,
+}
+
 pub struct HttpUpgradeBackend {
     origin: Url,
 }
@@ -510,6 +589,16 @@ impl HttpUpgradeBackend {
         Ok(Self { origin })
     }
 
+    /// Exchanges the release-injected build credential for a short-lived,
+    /// machine-bound session. Source builds contain no credential and return
+    /// `None`, allowing the Relay's rollout mode to decide whether to reject.
+    pub fn official_build_authorization(
+        &self,
+        identity: &InstallationIdentity,
+    ) -> Result<Option<String>, UpgradeError> {
+        self.official_build_bearer(identity)
+    }
+
     fn endpoint(&self, path: &str) -> Result<Url, UpgradeError> {
         self.origin
             .join(path)
@@ -536,6 +625,94 @@ impl HttpUpgradeBackend {
                 .unwrap_or_else(|error| UpgradeError::Network(error.to_string())),
             error => UpgradeError::Network(error.to_string()),
         }
+    }
+
+    fn official_build_number() -> Result<u64, UpgradeError> {
+        option_env!("DITCH_BUILD_NUMBER")
+            .unwrap_or("0")
+            .parse()
+            .map_err(|_| UpgradeError::InvalidResponse("invalid official build number".to_owned()))
+    }
+
+    fn create_official_build_session(
+        &self,
+        identity: &InstallationIdentity,
+        credential: &str,
+    ) -> Result<CachedOfficialBuildSession, UpgradeError> {
+        #[derive(Serialize)]
+        struct Request {
+            protocol_version: u16,
+            build: u64,
+            version: &'static str,
+            edition: &'static str,
+            deployment_environment: &'static str,
+        }
+
+        let version = option_env!("DITCH_APP_VERSION").unwrap_or(env!("CARGO_PKG_VERSION"));
+        let body = serde_json::to_vec(&Request {
+            protocol_version: 1,
+            build: Self::official_build_number()?,
+            version,
+            edition: option_env!("DITCH_EDITION").unwrap_or("community"),
+            deployment_environment: DEPLOYMENT_ENVIRONMENT,
+        })
+        .map_err(|error| UpgradeError::InvalidResponse(error.to_string()))?;
+        let response: OfficialBuildSessionEnvelope = self.machine_signed_json(
+            identity,
+            "POST",
+            "/v1/official-build/session",
+            &body,
+            Some(credential),
+        )?;
+        let session = response.official_build_session;
+        if session.expires_at <= Utc::now()
+            || session.expires_at > Utc::now() + chrono::Duration::hours(1)
+            || session.build != Self::official_build_number()?
+            || session.version != version
+            || session.bearer.len() < 32
+            || session.bearer.len() > 512
+            || !session
+                .bearer
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        {
+            return Err(UpgradeError::InvalidResponse(
+                "Relay returned an invalid official-build session".to_owned(),
+            ));
+        }
+        Ok(CachedOfficialBuildSession {
+            bearer: session.bearer,
+            expires_at: session.expires_at,
+        })
+    }
+
+    fn official_build_bearer(
+        &self,
+        identity: &InstallationIdentity,
+    ) -> Result<Option<String>, UpgradeError> {
+        let cache = OFFICIAL_BUILD_SESSION.get_or_init(|| Mutex::new(None));
+        if let Some(session) = cache
+            .lock()
+            .map_err(|_| UpgradeError::Rejected)?
+            .as_ref()
+            .filter(|session| {
+                session.expires_at
+                    > Utc::now()
+                        + chrono::Duration::seconds(OFFICIAL_BUILD_SESSION_SAFETY_MARGIN_SECONDS)
+            })
+            .cloned()
+        {
+            return Ok(Some(session.bearer));
+        }
+
+        let Some(credential) = OFFICIAL_BUILD_CREDENTIAL.get() else {
+            return Ok(None);
+        };
+        self.register(identity)?;
+        let session = self.create_official_build_session(identity, credential.as_str())?;
+        let bearer = session.bearer.clone();
+        *cache.lock().map_err(|_| UpgradeError::Rejected)? = Some(session);
+        Ok(Some(bearer))
     }
 
     fn register(&self, identity: &InstallationIdentity) -> Result<(), UpgradeError> {
@@ -569,12 +746,13 @@ impl HttpUpgradeBackend {
         Ok(())
     }
 
-    fn signed_response(
+    fn machine_signed_response(
         &self,
         identity: &InstallationIdentity,
         method: &str,
         path_and_query: &str,
         body: &[u8],
+        official_build_bearer: Option<&str>,
     ) -> Result<ureq::Response, UpgradeError> {
         let timestamp = Utc::now().timestamp_millis();
         let mut nonce = [0_u8; 16];
@@ -597,6 +775,9 @@ impl HttpUpgradeBackend {
             .set("X-Ditch-Timestamp", &timestamp.to_string())
             .set("X-Ditch-Nonce", &nonce)
             .set("X-Ditch-Signature", &identity.sign(canonical.as_bytes()));
+        if let Some(bearer) = official_build_bearer {
+            request = request.set("X-Ditch-Official-Build", bearer);
+        }
         if !body.is_empty() {
             request = request.set("content-type", "application/json");
         }
@@ -605,6 +786,36 @@ impl HttpUpgradeBackend {
         } else {
             request.send_bytes(body).map_err(Self::relay_error)
         }
+    }
+
+    fn signed_response(
+        &self,
+        identity: &InstallationIdentity,
+        method: &str,
+        path_and_query: &str,
+        body: &[u8],
+    ) -> Result<ureq::Response, UpgradeError> {
+        let bearer = self.official_build_bearer(identity)?;
+        self.machine_signed_response(identity, method, path_and_query, body, bearer.as_deref())
+    }
+
+    fn machine_signed_json<R: for<'de> Deserialize<'de>>(
+        &self,
+        identity: &InstallationIdentity,
+        method: &str,
+        path_and_query: &str,
+        body: &[u8],
+        official_build_bearer: Option<&str>,
+    ) -> Result<R, UpgradeError> {
+        self.machine_signed_response(
+            identity,
+            method,
+            path_and_query,
+            body,
+            official_build_bearer,
+        )?
+        .into_json()
+        .map_err(|error| UpgradeError::InvalidResponse(error.to_string()))
     }
 
     fn signed_json<R: for<'de> Deserialize<'de>>(
@@ -661,6 +872,10 @@ struct RelayEntitlement {
     valid_until: Option<DateTime<Utc>>,
     #[serde(default)]
     billing_management_available: Option<bool>,
+    #[serde(default)]
+    renewal_available: bool,
+    #[serde(default)]
+    current_license: Option<CurrentLicenseSummary>,
     capabilities: RelayCapabilities,
 }
 
@@ -685,9 +900,29 @@ impl From<RelayEntitlement> for EntitlementSummary {
     fn from(value: RelayEntitlement) -> Self {
         let active = value.capabilities.remote_control.enabled
             && matches!(value.status.as_str(), "active" | "over_limit");
-        let billing_management_available = value
-            .billing_management_available
-            .unwrap_or(value.plan != "community");
+        let billing_management_available = value.billing_management_available.unwrap_or(false);
+        let current_license = value.current_license.unwrap_or_else(|| {
+            let commercial = value.plan != "community";
+            CurrentLicenseSummary {
+                edition: if commercial {
+                    "commercial"
+                } else {
+                    "community"
+                }
+                .to_owned(),
+                status: if commercial {
+                    value.status.clone()
+                } else {
+                    "active".to_owned()
+                },
+                display_name: if commercial {
+                    "Ditch Commercial".to_owned()
+                } else {
+                    "Ditch Community".to_owned()
+                },
+                plans: Vec::new(),
+            }
+        });
         Self {
             active,
             plan: (value.plan != "community").then_some(value.plan),
@@ -696,6 +931,8 @@ impl From<RelayEntitlement> for EntitlementSummary {
             mac_slots: value.capabilities.remote_control.macs.allowed,
             iphone_slots: value.capabilities.remote_control.ios.allowed,
             billing_management_available,
+            renewal_available: value.renewal_available,
+            current_license,
         }
     }
 }
@@ -1162,6 +1399,17 @@ mod tests {
                 mac_slots: u16::from(active),
                 iphone_slots: u16::from(active),
                 billing_management_available: active,
+                renewal_available: !active,
+                current_license: CurrentLicenseSummary {
+                    edition: if active { "commercial" } else { "community" }.to_owned(),
+                    status: "active".to_owned(),
+                    display_name: if active {
+                        "Ditch Commercial Test".to_owned()
+                    } else {
+                        "Ditch Community".to_owned()
+                    },
+                    plans: Vec::new(),
+                },
             })
         }
 

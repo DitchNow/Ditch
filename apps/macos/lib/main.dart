@@ -28,6 +28,85 @@ const ditchRelayOrigin = String.fromEnvironment(
 );
 const _ditchApplicationChannel = MethodChannel('the_ditch/application');
 
+class StagingEnvironmentBanner extends StatelessWidget {
+  const StagingEnvironmentBanner({
+    required this.relayOrigin,
+    this.onOpenRelay,
+    this.relayLinkKey,
+    super.key,
+  });
+
+  final String relayOrigin;
+  final VoidCallback? onOpenRelay;
+  final Key? relayLinkKey;
+
+  @override
+  Widget build(BuildContext context) {
+    final relay = Text(relayOrigin, overflow: TextOverflow.ellipsis);
+    return Container(
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: Theme.of(context).colorScheme.tertiaryContainer,
+        borderRadius: BorderRadius.circular(10),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.center,
+        children: [
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 5),
+            decoration: BoxDecoration(
+              color: Theme.of(context).colorScheme.tertiary,
+              borderRadius: BorderRadius.circular(999),
+            ),
+            child: Text(
+              'TEST MODE',
+              style: TextStyle(
+                color: Theme.of(context).colorScheme.onTertiary,
+                fontWeight: FontWeight.w700,
+                fontSize: 12,
+              ),
+            ),
+          ),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text(
+                  'Relay',
+                  style: TextStyle(fontWeight: FontWeight.w600),
+                ),
+                const SizedBox(height: 2),
+                const Text(
+                  'Purchases, licenses, pairing, and updates do not affect production.',
+                ),
+                const SizedBox(height: 4),
+                if (onOpenRelay == null)
+                  relay
+                else
+                  Semantics(
+                    link: true,
+                    child: TextButton(
+                      key: relayLinkKey,
+                      onPressed: onOpenRelay,
+                      style: TextButton.styleFrom(
+                        alignment: Alignment.centerLeft,
+                        padding: EdgeInsets.zero,
+                        minimumSize: Size.zero,
+                        tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                      ),
+                      child: relay,
+                    ),
+                  ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
 Map<String, Object> authorizedCommercialUpdateArguments(
   Map<String, dynamic> release,
 ) {
@@ -140,12 +219,16 @@ class TheDitchApp extends StatefulWidget {
     this.connectRuntimeOnStart = true,
     this.initialProjects = const [],
     this.editionSurface = const CommunityEditionSurface(),
+    this.deploymentEnvironment = ditchDeploymentEnvironment,
+    this.relayOrigin = ditchRelayOrigin,
     super.key,
   });
 
   final bool connectRuntimeOnStart;
   final List<DitchProject> initialProjects;
   final EditionSurface editionSurface;
+  final String deploymentEnvironment;
+  final String relayOrigin;
 
   @override
   State<TheDitchApp> createState() => _TheDitchAppState();
@@ -180,7 +263,7 @@ class _TheDitchAppState extends State<TheDitchApp> {
     return ValueListenableBuilder<ThemeMode>(
       valueListenable: ditchThemeMode,
       builder: (context, themeMode, _) => MaterialApp(
-        title: ditchDeploymentEnvironment == 'staging'
+        title: widget.deploymentEnvironment == 'staging'
             ? 'Ditch Staging'
             : 'Ditch',
         debugShowCheckedModeBanner: false,
@@ -191,6 +274,8 @@ class _TheDitchAppState extends State<TheDitchApp> {
           connectRuntimeOnStart: widget.connectRuntimeOnStart,
           initialProjects: widget.initialProjects,
           editionSurface: widget.editionSurface,
+          deploymentEnvironment: widget.deploymentEnvironment,
+          relayOrigin: widget.relayOrigin,
         ),
       ),
     );
@@ -1612,12 +1697,16 @@ class CommandCenterScreen extends StatefulWidget {
     this.connectRuntimeOnStart = true,
     this.initialProjects = const [],
     this.editionSurface = const CommunityEditionSurface(),
+    this.deploymentEnvironment = ditchDeploymentEnvironment,
+    this.relayOrigin = ditchRelayOrigin,
     super.key,
   });
 
   final bool connectRuntimeOnStart;
   final List<DitchProject> initialProjects;
   final EditionSurface editionSurface;
+  final String deploymentEnvironment;
+  final String relayOrigin;
 
   @override
   State<CommandCenterScreen> createState() => _CommandCenterScreenState();
@@ -2392,14 +2481,38 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
   }
 
   Future<void> _openAppSettings() async {
+    final appVersion = await _installedAppVersionLabel();
+    if (!mounted) return;
     final editionSections = widget.editionSurface.settingsSections(
       _runtimeClient,
     );
+    final settingsSections = [
+      ...editionSections,
+      EditionSettingsSection(
+        id: 'upgrade-ditch',
+        icon: Icons.system_update_alt,
+        title: 'Upgrade Ditch',
+        subtitle: 'Check for updates for your current license',
+        dialogBuilder: (client) => DitchUpdateDialog(
+          client: client,
+          deploymentEnvironment: widget.deploymentEnvironment,
+          relayOrigin: widget.relayOrigin,
+        ),
+      ),
+    ];
     final section = await showDialog<String>(
       context: context,
       builder: (context) => SimpleDialog(
         title: const Text('Settings'),
         children: [
+          if (widget.deploymentEnvironment == 'staging')
+            Padding(
+              padding: const EdgeInsets.fromLTRB(24, 0, 24, 12),
+              child: StagingEnvironmentBanner(
+                key: const Key('settings-staging-environment'),
+                relayOrigin: widget.relayOrigin,
+              ),
+            ),
           SimpleDialogOption(
             onPressed: () => Navigator.pop(context, 'codex'),
             child: const ListTile(
@@ -2408,7 +2521,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
               subtitle: Text('Installation and runtime setup'),
             ),
           ),
-          ...editionSections.map(
+          ...settingsSections.map(
             (entry) => SimpleDialogOption(
               key: Key('settings-${entry.id}'),
               onPressed: () => Navigator.pop(context, entry.id),
@@ -2419,6 +2532,20 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
               ),
             ),
           ),
+          if (appVersion != null) ...[
+            const Divider(height: 1),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(24, 12, 24, 4),
+              child: Text(
+                appVersion,
+                key: const Key('settings-version'),
+                textAlign: TextAlign.center,
+                style: Theme.of(context).textTheme.labelSmall?.copyWith(
+                  color: context.ditch.mutedText,
+                ),
+              ),
+            ),
+          ],
         ],
       ),
     );
@@ -2427,7 +2554,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
       await _openCodexSettings();
     } else {
       EditionSettingsSection? selected;
-      for (final entry in editionSections) {
+      for (final entry in settingsSections) {
         if (entry.id == section) {
           selected = entry;
           break;
@@ -2438,6 +2565,19 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
         context: context,
         builder: (context) => selected!.dialogBuilder(_runtimeClient),
       );
+    }
+  }
+
+  Future<String?> _installedAppVersionLabel() async {
+    try {
+      final metadata = await _applicationChannel
+          .invokeMapMethod<String, dynamic>('appVersion');
+      final version = metadata?['version']?.trim();
+      final build = metadata?['build']?.trim();
+      if (version == null || version.isEmpty) return null;
+      return build == null || build.isEmpty ? 'v$version' : 'v$version.$build';
+    } on MissingPluginException {
+      return null;
     }
   }
 
@@ -2882,7 +3022,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
     ).showSnackBar(const SnackBar(content: Text('Project path copied.')));
   }
 
-  Future<void> _checkRemoteSetupForProject(DitchProject project) async {
+  Future<void> _reconnectRemoteProject(DitchProject project) async {
     final alias = project.sshHostAlias;
     if (alias == null) return;
     await showDialog<bool>(
@@ -4722,8 +4862,8 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
                             unawaited(_revealProjectInFinder(project)),
                         onCopyProjectPath: (project) =>
                             unawaited(_copyProjectPath(project)),
-                        onCheckRemoteSetup: (project) =>
-                            unawaited(_checkRemoteSetupForProject(project)),
+                        onReconnectRemoteProject: (project) =>
+                            unawaited(_reconnectRemoteProject(project)),
                         onDeleteProject: (project) =>
                             unawaited(_deleteProject(project)),
                         summaryForProject: (project) => summarizeProjectAgents(
@@ -5249,6 +5389,273 @@ class NotificationSetupBanner extends StatelessWidget {
   }
 }
 
+class DitchUpdateDialog extends StatefulWidget {
+  const DitchUpdateDialog({
+    required this.client,
+    this.deploymentEnvironment = ditchDeploymentEnvironment,
+    this.relayOrigin = ditchRelayOrigin,
+    super.key,
+  });
+
+  final DitchRuntimeClient client;
+  final String deploymentEnvironment;
+  final String relayOrigin;
+
+  @override
+  State<DitchUpdateDialog> createState() => _DitchUpdateDialogState();
+}
+
+class _DitchUpdateDialogState extends State<DitchUpdateDialog> {
+  static const _applicationChannel = MethodChannel('the_ditch/application');
+  RuntimeStatusDto? _runtime;
+  DitchCurrentLicense? _license;
+  Map<String, dynamic>? _release;
+  String? _installedVersion;
+  String? _message;
+  String? _error;
+  bool _loading = true;
+  bool _checking = false;
+  bool _installing = false;
+
+  @override
+  void initState() {
+    super.initState();
+    unawaited(_load());
+  }
+
+  Future<void> _load() async {
+    try {
+      final runtime = await widget.client.runtimeStatus();
+      final entitlement = await widget.client.commercialEntitlement();
+      final metadata = await _applicationChannel
+          .invokeMapMethod<String, dynamic>('appVersion');
+      final version = metadata?['version']?.trim();
+      final build = metadata?['build']?.trim();
+      if (!mounted) return;
+      setState(() {
+        _runtime = runtime;
+        _license = DitchCurrentLicense.fromEntitlement(entitlement);
+        _installedVersion = version == null || version.isEmpty
+            ? null
+            : build == null || build.isEmpty
+            ? 'v$version'
+            : 'v$version.$build';
+        _loading = false;
+      });
+    } on Object catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _error = _friendlyError(error);
+        _loading = false;
+      });
+    }
+  }
+
+  Future<void> _checkForUpdates() async {
+    final license = _license;
+    final runtime = _runtime;
+    if (license == null || runtime == null) return;
+    setState(() {
+      _checking = true;
+      _release = null;
+      _message = null;
+      _error = null;
+    });
+    try {
+      if (license.isCommercial &&
+          (license.status == 'active' || license.status == 'over_limit')) {
+        final release = await widget.client.checkCommercialRelease();
+        final manifest = (release['manifest'] as Map?)?.cast<String, dynamic>();
+        final sequence = (manifest?['release_sequence'] as num?)?.toInt();
+        if (sequence == null) {
+          throw const FormatException(
+            'The Relay returned incomplete update metadata.',
+          );
+        }
+        if (!mounted) return;
+        setState(() {
+          if (sequence > runtime.releaseSequence) {
+            _release = release;
+            final version = manifest?['version']?.toString() ?? 'new';
+            final build = manifest?['build']?.toString();
+            _message = build == null
+                ? 'Ditch $version is available.'
+                : 'Ditch $version.$build is available.';
+          } else {
+            _message = 'Ditch is up to date for ${license.displayName}.';
+          }
+          _checking = false;
+        });
+        return;
+      }
+
+      final started = await _applicationChannel.invokeMethod<bool>(
+        'checkCommunityUpdate',
+      );
+      if (started != true) {
+        throw const FormatException(
+          'The Community update check could not be started.',
+        );
+      }
+      if (!mounted) return;
+      setState(() {
+        _checking = false;
+        _message = 'Sparkle is checking the official Community update channel.';
+      });
+    } on Object catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _checking = false;
+        _error = _friendlyError(error);
+      });
+    }
+  }
+
+  Future<void> _installCommercialUpdate() async {
+    final release = _release;
+    if (release == null) return;
+    setState(() {
+      _installing = true;
+      _error = null;
+    });
+    try {
+      await startAuthorizedCommercialUpdate(release);
+      if (!mounted) return;
+      setState(() {
+        _installing = false;
+        _message =
+            'Verified update ready. Follow the Sparkle window to install and restart Ditch.';
+      });
+    } on Object catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _installing = false;
+        _error = _friendlyError(error);
+      });
+    }
+  }
+
+  String _friendlyError(Object error) {
+    if (error is DitchRuntimeException) {
+      return switch (error.code) {
+        'official_build_required' ||
+        'commercial_offers_official_build_required' ||
+        'commercial_entitlement_official_build_required' =>
+          'This source build cannot use DitchNow hosted services. Install an official signed Community build to check prices, licenses, and hosted updates.',
+        'commercial_release_unavailable' =>
+          'No compatible Commercial update is currently available.',
+        'commercial_entitlement_failed' =>
+          'Ditch could not load the current license from the Relay.',
+        _ => error.message,
+      };
+    }
+    if (error is PlatformException &&
+        error.code == 'update_verification_not_configured') {
+      return 'This source build has no official update verification key. Install an official signed Community build to receive Ditch updates.';
+    }
+    if (error is FormatException) return error.message;
+    return 'Ditch could not check for updates. $error';
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final license = _license;
+    final busy = _loading || _checking || _installing;
+    return AlertDialog(
+      icon: const Icon(Icons.system_update_alt),
+      title: const Text('Upgrade Ditch'),
+      content: SizedBox(
+        width: 520,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            if (widget.deploymentEnvironment == 'staging') ...[
+              StagingEnvironmentBanner(
+                key: const Key('update-staging-environment'),
+                relayOrigin: widget.relayOrigin,
+              ),
+              const SizedBox(height: 12),
+            ],
+            if (_loading)
+              const Center(child: CircularProgressIndicator())
+            else
+              Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  ListTile(
+                    contentPadding: EdgeInsets.zero,
+                    leading: const Icon(Icons.verified_outlined),
+                    title: Text(
+                      license == null
+                          ? 'Current license unavailable'
+                          : 'Current license: ${license.displayName}',
+                      key: const Key('ditch-current-license'),
+                    ),
+                    subtitle: Text(
+                      license == null
+                          ? 'The current license could not be loaded.'
+                          : '${license.edition == 'commercial' ? 'Commercial' : 'Community'} · ${license.status}',
+                    ),
+                  ),
+                  if (license != null && license.plans.length > 1)
+                    ...license.plans.map(
+                      (plan) => Padding(
+                        padding: const EdgeInsets.only(left: 40, bottom: 4),
+                        child: Text(plan.displayName),
+                      ),
+                    ),
+                  if (_installedVersion != null)
+                    Text(
+                      'Installed $_installedVersion',
+                      key: const Key('ditch-installed-version'),
+                    ),
+                  if (_checking || _installing) ...[
+                    const SizedBox(height: 16),
+                    const LinearProgressIndicator(),
+                  ],
+                  if (_message != null) ...[
+                    const SizedBox(height: 12),
+                    Text(_message!, key: const Key('ditch-update-message')),
+                  ],
+                  if (_error != null) ...[
+                    const SizedBox(height: 12),
+                    SelectableText(
+                      _error!,
+                      key: const Key('ditch-update-error'),
+                      style: TextStyle(
+                        color: Theme.of(context).colorScheme.error,
+                      ),
+                    ),
+                  ],
+                ],
+              ),
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(context),
+          child: const Text('Close'),
+        ),
+        if (_release != null)
+          FilledButton(
+            key: const Key('install-ditch-update'),
+            onPressed: busy ? null : _installCommercialUpdate,
+            child: const Text('Install Update'),
+          )
+        else
+          FilledButton(
+            key: const Key('check-ditch-update'),
+            onPressed: busy || license == null ? null : _checkForUpdates,
+            child: const Text('Check for Updates'),
+          ),
+      ],
+    );
+  }
+}
+
 class CommercialUpgradeDialog extends StatefulWidget {
   const CommercialUpgradeDialog({
     required this.client,
@@ -5718,23 +6125,6 @@ class _CommercialUpgradeDialogState extends State<CommercialUpgradeDialog> {
               : 'Upgrade',
       };
 
-  String _planLabel(Object? value) {
-    final plans = value
-        ?.toString()
-        .split('+')
-        .map(
-          (plan) => switch (plan) {
-            'commercial_monthly' => 'Commercial Monthly',
-            'commercial_lifetime' => 'Commercial Lifetime',
-            'lifetime_extra_pair' => 'Lifetime extra pair',
-            'administrative' => 'Commercial',
-            _ => 'Commercial',
-          },
-        )
-        .toList(growable: false);
-    return plans == null || plans.isEmpty ? 'Commercial' : plans.join(' + ');
-  }
-
   Widget _offerCard(BuildContext context, CommercialOffer offer) {
     final locale = Localizations.localeOf(context);
     final base = offer.basePrice.format(locale);
@@ -5902,6 +6292,9 @@ class _CommercialUpgradeDialogState extends State<CommercialUpgradeDialog> {
   @override
   Widget build(BuildContext context) {
     final entitlement = _entitlement;
+    final currentLicense = entitlement == null
+        ? null
+        : DitchCurrentLicense.fromEntitlement(entitlement);
     final active = entitlement?['active'] == true;
     final status =
         entitlement?['status']?.toString() ?? (active ? 'active' : 'inactive');
@@ -5957,66 +6350,11 @@ class _CommercialUpgradeDialogState extends State<CommercialUpgradeDialog> {
               ),
               const SizedBox(height: 8),
               if (widget.deploymentEnvironment == 'staging') ...[
-                Container(
+                StagingEnvironmentBanner(
                   key: const Key('commercial-staging-environment'),
-                  padding: const EdgeInsets.all(12),
-                  decoration: BoxDecoration(
-                    color: Theme.of(context).colorScheme.tertiaryContainer,
-                    borderRadius: BorderRadius.circular(10),
-                  ),
-                  child: Row(
-                    crossAxisAlignment: CrossAxisAlignment.center,
-                    children: [
-                      Container(
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 9,
-                          vertical: 5,
-                        ),
-                        decoration: BoxDecoration(
-                          color: Theme.of(context).colorScheme.tertiary,
-                          borderRadius: BorderRadius.circular(999),
-                        ),
-                        child: Text(
-                          'TEST MODE',
-                          style: TextStyle(
-                            color: Theme.of(context).colorScheme.onTertiary,
-                            fontWeight: FontWeight.w700,
-                            fontSize: 12,
-                          ),
-                        ),
-                      ),
-                      const SizedBox(width: 12),
-                      Expanded(
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Text(
-                              'Relay',
-                              style: Theme.of(context).textTheme.labelMedium,
-                            ),
-                            Semantics(
-                              link: true,
-                              child: TextButton(
-                                key: const Key('commercial-staging-relay-link'),
-                                onPressed: _openRelayOrigin,
-                                style: TextButton.styleFrom(
-                                  alignment: Alignment.centerLeft,
-                                  padding: EdgeInsets.zero,
-                                  minimumSize: Size.zero,
-                                  tapTargetSize:
-                                      MaterialTapTargetSize.shrinkWrap,
-                                ),
-                                child: Text(
-                                  widget.relayOrigin,
-                                  overflow: TextOverflow.ellipsis,
-                                ),
-                              ),
-                            ),
-                          ],
-                        ),
-                      ),
-                    ],
-                  ),
+                  relayOrigin: widget.relayOrigin,
+                  relayLinkKey: const Key('commercial-staging-relay-link'),
+                  onOpenRelay: _openRelayOrigin,
                 ),
                 const SizedBox(height: 12),
               ],
@@ -6040,7 +6378,7 @@ class _CommercialUpgradeDialogState extends State<CommercialUpgradeDialog> {
                     key: const Key('commercial-active-status'),
                     style: Theme.of(context).textTheme.titleLarge,
                   ),
-                  Text(_planLabel(entitlement?['plan'])),
+                  Text(currentLicense?.displayName ?? 'Ditch Commercial'),
                   Text(
                     '${entitlement?['mac_slots'] ?? 0} Mac slots · ${entitlement?['iphone_slots'] ?? 0} iPhone slots',
                   ),
@@ -6072,7 +6410,7 @@ class _CommercialUpgradeDialogState extends State<CommercialUpgradeDialog> {
                   _offerSection(context, 'Add capacity', capacityOffers),
                 ] else if (expired) ...[
                   Text(
-                    'Commercial subscription expired.',
+                    '${currentLicense?.displayName ?? 'Ditch Commercial'} expired.',
                     style: Theme.of(context).textTheme.titleLarge,
                   ),
                   const Text('Local and SSH Ditch continue to work.'),
@@ -6215,8 +6553,8 @@ class DitchToolbar extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final tokens = context.ditch;
-    final (label, color) = switch (connection) {
-      RuntimeConnectionPhase.connected => ('Connected', tokens.success),
+    final connectionStatus = switch (connection) {
+      RuntimeConnectionPhase.connected => null,
       RuntimeConnectionPhase.connecting => ('Connecting', tokens.waiting),
       RuntimeConnectionPhase.reconnecting => ('Reconnecting', tokens.waiting),
       RuntimeConnectionPhase.unavailable => (
@@ -6248,14 +6586,22 @@ class DitchToolbar extends StatelessWidget {
                 style: Theme.of(context).textTheme.titleMedium,
               ),
             ),
-            Container(
-              width: 7,
-              height: 7,
-              decoration: BoxDecoration(color: color, shape: BoxShape.circle),
-            ),
-            const SizedBox(width: 7),
-            Text(label, style: Theme.of(context).textTheme.bodySmall),
-            const SizedBox(width: 6),
+            if (connectionStatus != null) ...[
+              Container(
+                width: 7,
+                height: 7,
+                decoration: BoxDecoration(
+                  color: connectionStatus.$2,
+                  shape: BoxShape.circle,
+                ),
+              ),
+              const SizedBox(width: 7),
+              Text(
+                connectionStatus.$1,
+                style: Theme.of(context).textTheme.bodySmall,
+              ),
+              const SizedBox(width: 6),
+            ],
             PopupMenuButton<ThemeMode>(
               key: const Key('theme-mode-menu'),
               tooltip: 'Appearance',
@@ -6276,6 +6622,7 @@ class DitchToolbar extends StatelessWidget {
               ],
             ),
             IconButton(
+              key: const Key('app-settings-button'),
               tooltip: codexAvailable
                   ? 'Codex installation'
                   : 'Codex not found — choose an installation',
@@ -6718,7 +7065,7 @@ class ProjectSidebar extends StatelessWidget {
     required this.onSelectProject,
     required this.onRevealProject,
     required this.onCopyProjectPath,
-    required this.onCheckRemoteSetup,
+    required this.onReconnectRemoteProject,
     required this.onDeleteProject,
     required this.summaryForProject,
     super.key,
@@ -6732,7 +7079,7 @@ class ProjectSidebar extends StatelessWidget {
   final ValueChanged<int> onSelectProject;
   final ValueChanged<DitchProject> onRevealProject;
   final ValueChanged<DitchProject> onCopyProjectPath;
-  final ValueChanged<DitchProject> onCheckRemoteSetup;
+  final ValueChanged<DitchProject> onReconnectRemoteProject;
   final ValueChanged<DitchProject> onDeleteProject;
   final ProjectAgentSummary Function(DitchProject) summaryForProject;
 
@@ -6779,8 +7126,8 @@ class ProjectSidebar extends StatelessWidget {
                         onTap: () => onSelectProject(index),
                         onReveal: () => onRevealProject(project),
                         onCopyPath: () => onCopyProjectPath(project),
-                        onCheckRemoteSetup: project.isRemote
-                            ? () => onCheckRemoteSetup(project)
+                        onReconnect: project.isRemote
+                            ? () => onReconnectRemoteProject(project)
                             : null,
                         onDelete: () => onDeleteProject(project),
                         runningCount: summary.runningCount,
@@ -6813,7 +7160,7 @@ class ProjectTile extends StatelessWidget {
     required this.onTap,
     required this.onReveal,
     required this.onCopyPath,
-    this.onCheckRemoteSetup,
+    this.onReconnect,
     required this.onDelete,
     this.runningCount = 0,
     this.stoppedCount = 0,
@@ -6830,7 +7177,7 @@ class ProjectTile extends StatelessWidget {
   final VoidCallback onTap;
   final VoidCallback onReveal;
   final VoidCallback onCopyPath;
-  final VoidCallback? onCheckRemoteSetup;
+  final VoidCallback? onReconnect;
   final VoidCallback onDelete;
   final int runningCount;
   final int stoppedCount;
@@ -6860,10 +7207,10 @@ class ProjectTile extends StatelessWidget {
           value: _ProjectMenuAction.copyPath,
           child: Text('Copy Project Path'),
         ),
-        if (onCheckRemoteSetup != null)
+        if (onReconnect != null)
           const PopupMenuItem(
-            value: _ProjectMenuAction.checkRemoteSetup,
-            child: Text('Check Remote Setup'),
+            value: _ProjectMenuAction.reconnect,
+            child: Text('Reconnect'),
           ),
         const PopupMenuDivider(),
         const PopupMenuItem(
@@ -6875,8 +7222,8 @@ class ProjectTile extends StatelessWidget {
     switch (action) {
       case _ProjectMenuAction.copyPath:
         onCopyPath();
-      case _ProjectMenuAction.checkRemoteSetup:
-        onCheckRemoteSetup?.call();
+      case _ProjectMenuAction.reconnect:
+        onReconnect?.call();
       case _ProjectMenuAction.delete:
         onDelete();
       case null:
@@ -6952,20 +7299,32 @@ class ProjectTile extends StatelessWidget {
                 ),
               ),
               const SizedBox(width: 4),
-              IconButton(
-                key: ValueKey('reveal-project-$path'),
-                onPressed: isRemote ? null : onReveal,
-                tooltip: isRemote
-                    ? 'Source remains on the remote machine'
-                    : 'Show in Finder',
-                visualDensity: VisualDensity.compact,
-                constraints: const BoxConstraints.tightFor(
-                  width: 28,
-                  height: 28,
+              if (isRemote)
+                IconButton(
+                  key: ValueKey('reconnect-project-$path'),
+                  onPressed: onReconnect,
+                  tooltip: 'Reconnect',
+                  visualDensity: VisualDensity.compact,
+                  constraints: const BoxConstraints.tightFor(
+                    width: 28,
+                    height: 28,
+                  ),
+                  padding: EdgeInsets.zero,
+                  icon: const Icon(Icons.sync, size: 16),
+                )
+              else
+                IconButton(
+                  key: ValueKey('reveal-project-$path'),
+                  onPressed: onReveal,
+                  tooltip: 'Show in Finder',
+                  visualDensity: VisualDensity.compact,
+                  constraints: const BoxConstraints.tightFor(
+                    width: 28,
+                    height: 28,
+                  ),
+                  padding: EdgeInsets.zero,
+                  icon: const Icon(Icons.folder_open_outlined, size: 16),
                 ),
-                padding: EdgeInsets.zero,
-                icon: const Icon(Icons.folder_open_outlined, size: 16),
-              ),
             ],
           ),
         ),
@@ -6974,7 +7333,7 @@ class ProjectTile extends StatelessWidget {
   }
 }
 
-enum _ProjectMenuAction { copyPath, checkRemoteSetup, delete }
+enum _ProjectMenuAction { copyPath, reconnect, delete }
 
 class AgentsSurface extends StatelessWidget {
   const AgentsSurface({

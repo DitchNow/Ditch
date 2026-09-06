@@ -374,6 +374,96 @@ class CommercialOfferCatalog {
   final DateTime? refreshedAt;
 }
 
+class DitchLicensePlan {
+  const DitchLicensePlan({
+    required this.kind,
+    required this.displayName,
+    required this.billingType,
+    required this.status,
+    required this.validUntil,
+  });
+
+  factory DitchLicensePlan.fromJson(Map<String, dynamic> json) {
+    final displayName = _requiredString(json['display_name'], 'display_name');
+    if (displayName.length > 200) {
+      throw const FormatException('Ditch license plan name is too long.');
+    }
+    return DitchLicensePlan(
+      kind: _requiredString(json['kind'], 'kind'),
+      displayName: displayName,
+      billingType: _requiredString(json['billing_type'], 'billing_type'),
+      status: _requiredString(json['status'], 'status'),
+      validUntil: json['valid_until'] == null
+          ? null
+          : _rfc3339Utc(json['valid_until']),
+    );
+  }
+
+  final String kind;
+  final String displayName;
+  final String billingType;
+  final String status;
+  final DateTime? validUntil;
+}
+
+class DitchCurrentLicense {
+  const DitchCurrentLicense({
+    required this.edition,
+    required this.status,
+    required this.displayName,
+    required this.plans,
+  });
+
+  factory DitchCurrentLicense.fromEntitlement(Map<String, dynamic> json) {
+    final raw = json['current_license'];
+    if (raw is Map) {
+      final license = raw.cast<String, dynamic>();
+      final rawPlans = license['plans'];
+      if (rawPlans is! List || rawPlans.length > 20) {
+        throw const FormatException('Invalid current Ditch license plans.');
+      }
+      final displayName = _requiredString(
+        license['display_name'],
+        'display_name',
+      );
+      if (displayName.length > 200) {
+        throw const FormatException('Current Ditch license name is too long.');
+      }
+      return DitchCurrentLicense(
+        edition: _requiredString(license['edition'], 'edition'),
+        status: _requiredString(license['status'], 'status'),
+        displayName: displayName,
+        plans: List.unmodifiable(
+          rawPlans.map((value) {
+            if (value is! Map) {
+              throw const FormatException('Invalid Ditch license plan.');
+            }
+            return DitchLicensePlan.fromJson(value.cast<String, dynamic>());
+          }),
+        ),
+      );
+    }
+
+    final plan = json['plan']?.toString();
+    final commercial =
+        json['active'] == true ||
+        (plan != null && plan.isNotEmpty && plan != 'community');
+    return DitchCurrentLicense(
+      edition: commercial ? 'commercial' : 'community',
+      status: commercial ? json['status']?.toString() ?? 'active' : 'active',
+      displayName: commercial ? 'Ditch Commercial' : 'Ditch Community',
+      plans: const [],
+    );
+  }
+
+  final String edition;
+  final String status;
+  final String displayName;
+  final List<DitchLicensePlan> plans;
+
+  bool get isCommercial => edition == 'commercial';
+}
+
 String _requiredString(Object? value, String field) {
   if (value is! String || value.trim().isEmpty) {
     throw FormatException('Missing Commercial offer $field.');

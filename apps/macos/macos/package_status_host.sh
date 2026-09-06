@@ -57,6 +57,54 @@ if [ "$DITCH_DEPLOYMENT_ENVIRONMENT" = staging ] && [ "$DITCH_RELAY_ORIGIN" = "$
 fi
 export DITCH_DEPLOYMENT_ENVIRONMENT DITCH_EDITION DITCH_RELAY_ORIGIN DITCH_UPDATE_ALLOWED_HOSTS
 
+# Official release machines inject a per-build credential from the protected
+# environment or an ignored mode-0600 file. Source builds intentionally omit
+# it and therefore cannot obtain a hosted-services session from Relay.
+OFFICIAL_BUILD_CREDENTIAL_FILE="${DITCH_OFFICIAL_BUILD_CREDENTIAL_FILE:-$WORKSPACE_ROOT/.release-keys/official-build-$DITCH_DEPLOYMENT_ENVIRONMENT.token}"
+if [ -z "${DITCH_OFFICIAL_BUILD_CREDENTIAL:-}" ] && [ -f "$OFFICIAL_BUILD_CREDENTIAL_FILE" ]; then
+  [ "$(stat -f '%u' "$OFFICIAL_BUILD_CREDENTIAL_FILE")" = "$(id -u)" ] || {
+    echo "error: official build credential must be owned by the current user" >&2
+    exit 1
+  }
+  [ "$(stat -f '%Lp' "$OFFICIAL_BUILD_CREDENTIAL_FILE")" = 600 ] || {
+    echo "error: official build credential must have mode 0600" >&2
+    exit 1
+  }
+  DITCH_OFFICIAL_BUILD_CREDENTIAL=$(tr -d '\r\n' < "$OFFICIAL_BUILD_CREDENTIAL_FILE")
+fi
+if [ -n "${DITCH_OFFICIAL_BUILD_CREDENTIAL:-}" ]; then
+  case "$DITCH_OFFICIAL_BUILD_CREDENTIAL" in
+    *[!A-Za-z0-9_-]*) echo "error: official build credential must be unpadded base64url" >&2; exit 1 ;;
+  esac
+  [ "${#DITCH_OFFICIAL_BUILD_CREDENTIAL}" -ge 43 ] && [ "${#DITCH_OFFICIAL_BUILD_CREDENTIAL}" -le 128 ] || {
+    echo "error: official build credential must contain 32-96 random bytes" >&2
+    exit 1
+  }
+fi
+
+# Keep the raw credential out of Cargo's compile environment so it cannot
+# enter ditch_cli or any SSH runtime. Only a temporary Swift source linked into
+# the signed, in-process macOS runtime host carries it.
+OFFICIAL_BUILD_SWIFT="${TARGET_TEMP_DIR:-${TMPDIR:-/tmp}}/DitchOfficialBuildCredential.swift"
+trap 'rm -f "$OFFICIAL_BUILD_SWIFT"' EXIT HUP INT TERM
+if [ -n "${DITCH_OFFICIAL_BUILD_CREDENTIAL:-}" ]; then
+  {
+    printf '%s\n' 'import Foundation'
+    printf '%s\n' '@_silgen_name("ditch_set_official_build_credential")'
+    printf '%s\n' 'private func ditchSetOfficialBuildCredential(_ bytes: UnsafePointer<UInt8>?, _ length: Int) -> Int32'
+    printf 'private let ditchOfficialBuildCredential = "%s"\n' "$DITCH_OFFICIAL_BUILD_CREDENTIAL"
+    printf '%s\n' 'func configureOfficialBuildCredential() -> Bool {'
+    printf '%s\n' '  let bytes = Array(ditchOfficialBuildCredential.utf8)'
+    printf '%s\n' '  return bytes.withUnsafeBufferPointer {'
+    printf '%s\n' '    ditchSetOfficialBuildCredential($0.baseAddress, $0.count) == 0'
+    printf '%s\n' '  }'
+    printf '%s\n' '}'
+  } > "$OFFICIAL_BUILD_SWIFT"
+else
+  printf '%s\n' 'func configureOfficialBuildCredential() -> Bool { true }' > "$OFFICIAL_BUILD_SWIFT"
+fi
+unset DITCH_OFFICIAL_BUILD_CREDENTIAL
+
 # Keep every object linked into the nested helper on the same explicit minimum
 # OS version. Without this, a newer Xcode stamps its own host OS as the Swift
 # executable's minimum even when the enclosing Flutter app supports older Macs.
@@ -171,10 +219,13 @@ export CLANG_MODULE_CACHE_PATH="$SWIFT_CACHE"
 /usr/bin/swiftc -parse-as-library \
   -target "$BUILD_ARCH-apple-macos$DEPLOYMENT_TARGET" \
   "$PROJECT_DIR/StatusHost/StatusHost.swift" \
+  "$OFFICIAL_BUILD_SWIFT" \
   "$DITCHD_LIBRARY" \
   -framework Cocoa \
   -framework UserNotifications \
   -o "$HELPER_MACOS/ditchd"
+rm -f "$OFFICIAL_BUILD_SWIFT"
+trap - EXIT HUP INT TERM
 
 cat > "$HELPER_CONTENTS/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>

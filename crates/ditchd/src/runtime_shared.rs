@@ -1569,7 +1569,7 @@ fn handle_request(request: ClientRequest, state: Arc<Mutex<RuntimeState>>) -> Se
                 .and_then(|backend| backend.commercial_offers(&installation))
             {
                 Ok(catalog) => ServerResponse::CommercialOffers(catalog),
-                Err(error) => protocol_error("commercial_offers_failed", error.to_string()),
+                Err(error) => commercial_service_error("commercial_offers_failed", error),
             }
         }
         ClientRequest::CreateCommercialCheckout { offer_id } => {
@@ -1582,7 +1582,7 @@ fn handle_request(request: ClientRequest, state: Arc<Mutex<RuntimeState>>) -> Se
                 .and_then(|backend| backend.create_checkout(&installation, offer_id.trim()))
             {
                 Ok(checkout) => ServerResponse::CommercialCheckout(checkout),
-                Err(error) => protocol_error("commercial_checkout_failed", error.to_string()),
+                Err(error) => commercial_service_error("commercial_checkout_failed", error),
             }
         }
         ClientRequest::CommercialEntitlement => {
@@ -1595,7 +1595,7 @@ fn handle_request(request: ClientRequest, state: Arc<Mutex<RuntimeState>>) -> Se
                 .and_then(|backend| backend.entitlement(&installation))
             {
                 Ok(entitlement) => ServerResponse::CommercialEntitlement(entitlement),
-                Err(error) => protocol_error("commercial_entitlement_failed", error.to_string()),
+                Err(error) => commercial_service_error("commercial_entitlement_failed", error),
             }
         }
         ClientRequest::RedeemCommercialLicense { mut license_key } => {
@@ -1612,7 +1612,7 @@ fn handle_request(request: ClientRequest, state: Arc<Mutex<RuntimeState>>) -> Se
             license_key.clear();
             match response {
                 Ok(entitlement) => ServerResponse::CommercialEntitlement(entitlement),
-                Err(error) => protocol_error("commercial_redemption_failed", error.to_string()),
+                Err(error) => commercial_service_error("commercial_redemption_failed", error),
             }
         }
         ClientRequest::CommercialBillingManagement => {
@@ -1625,9 +1625,10 @@ fn handle_request(request: ClientRequest, state: Arc<Mutex<RuntimeState>>) -> Se
                 .and_then(|backend| backend.billing_management(&installation))
             {
                 Ok(session) => ServerResponse::CommercialBillingManagement(session),
-                Err(error) => {
-                    protocol_error("commercial_billing_management_failed", error.to_string())
-                }
+                Err(error) => commercial_service_error(
+                    "commercial_billing_management_failed",
+                    error,
+                ),
             }
         }
         ClientRequest::CheckCommercialRelease => current_commercial_release(state, false),
@@ -5462,6 +5463,15 @@ fn protocol_error(code: impl Into<String>, message: impl Into<String>) -> Server
         code: code.into(),
         message: message.into(),
     })
+}
+
+fn commercial_service_error(default_code: &'static str, error: UpgradeError) -> ServerResponse {
+    match error {
+        UpgradeError::Relay { code, message } if code == "official_build_required" => {
+            protocol_error(code, message)
+        }
+        error => protocol_error(default_code, error.to_string()),
+    }
 }
 
 fn commercial_release_error(error: UpgradeError) -> ServerResponse {

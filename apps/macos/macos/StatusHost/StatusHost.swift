@@ -55,6 +55,11 @@ final class StatusHost: NSObject, NSApplicationDelegate, UNUserNotificationCente
       .deletingLastPathComponent()
       .path ?? URL(fileURLWithPath: CommandLine.arguments[0]).deletingLastPathComponent().path
     pidFilePath = StatusHost.defaultPidFilePath()
+    guard configureOfficialBuildCredential() else {
+      log("official build credential configuration failed")
+      NSApp.terminate(nil)
+      return
+    }
     let obsoletePid = FileManager.default.homeDirectoryForCurrentUser
       .appendingPathComponent("Library/Application Support/The Ditch/ditch-status-host.pid").path
     try? FileManager.default.removeItem(atPath: obsoletePid)

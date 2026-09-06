@@ -28,6 +28,16 @@ macOS application.
 CI creates its environment files at runtime from protected environment values;
 no `.env` file is committed to the repository.
 
+Official DitchNow builds additionally require a per-build Relay credential.
+Supply `DITCH_OFFICIAL_BUILD_CREDENTIAL` from protected CI, or put the raw
+unpadded base64url value in the ignored mode-0600 file
+`.release-keys/official-build-<environment>.token`. Source builds intentionally
+omit it and cannot create a hosted-services session. Rotate the credential for
+every published build and register only its hash with the matching Relay. The
+packager removes the credential from Cargo's environment and injects it only
+into the signed in-process macOS runtime host; standalone CLI and SSH runtime
+artifacts remain credential-free.
+
 Use the repository wrapper so Flutter, Xcode, the bundled Rust runtime, and the
 native Commercial-update allowlist receive one consistent configuration:
 
