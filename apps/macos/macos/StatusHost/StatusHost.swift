@@ -115,7 +115,10 @@ final class StatusHost: NSObject, NSApplicationDelegate, UNUserNotificationCente
     let notifications = UNUserNotificationCenter.current()
     notifications.removeAllDeliveredNotifications()
     notifications.removeAllPendingNotificationRequests()
-    if !pidFilePath.isEmpty {
+    // A helper that loses startup arbitration must not delete the winner's PID.
+    if let pid = try? String(contentsOfFile: pidFilePath, encoding: .utf8),
+      pid.trimmingCharacters(in: .whitespacesAndNewlines)
+        == String(ProcessInfo.processInfo.processIdentifier) {
       try? FileManager.default.removeItem(atPath: pidFilePath)
     }
   }
@@ -1042,8 +1045,12 @@ private final class NotificationControlServer {
     }
     guard Self.withAddress(path: path, body: { address, length in
       Darwin.bind(server, address, length)
-    }) == 0,
-      chmod(path, mode_t(S_IRUSR | S_IWUSR)) == 0,
+    }) == 0 else {
+      // bind failed: this process does not own the path and must not unlink it.
+      Darwin.close(server)
+      return false
+    }
+    guard chmod(path, mode_t(S_IRUSR | S_IWUSR)) == 0,
       Darwin.listen(server, 8) == 0
     else {
       Darwin.close(server)

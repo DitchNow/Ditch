@@ -89,6 +89,7 @@ class AppDelegate: FlutterAppDelegate, SPUUpdaterDelegate {
   }
 
   struct RunningRuntimeStatus {
+    var pid: Int32? = nil
     let activeSessionCount: Int
     let edition: String
     let deploymentEnvironment: String
@@ -96,6 +97,14 @@ class AppDelegate: FlutterAppDelegate, SPUUpdaterDelegate {
     let buildNumber: String
     let releaseSequence: Int
     let communityRevision: String?
+
+    func matches(
+      _ configuration: DeploymentConfiguration,
+      bundleURL: URL?, expectedBundleURL: URL
+    ) -> Bool {
+      matches(configuration)
+        && bundleURL?.resolvingSymlinksInPath() == expectedBundleURL.resolvingSymlinksInPath()
+    }
 
     func matches(_ configuration: DeploymentConfiguration) -> Bool {
       edition == configuration.edition
@@ -105,6 +114,17 @@ class AppDelegate: FlutterAppDelegate, SPUUpdaterDelegate {
         && releaseSequence == configuration.releaseSequence
         && communityRevision == configuration.communityRevision
     }
+  }
+
+  static func validatedCommercialUpdateExpiry(_ rawExpiry: String, now: Date = Date()) -> Date? {
+    let formatter = ISO8601DateFormatter()
+    formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    // Relay emits milliseconds; also accept whole-second RFC 3339 timestamps.
+    let expiry = formatter.date(from: rawExpiry)
+      ?? ISO8601DateFormatter().date(from: rawExpiry)
+    guard let expiry, expiry > now, expiry <= now.addingTimeInterval(24 * 60 * 60)
+    else { return nil }
+    return expiry
   }
 
   private struct AuthorizedUpdateContext {
@@ -161,7 +181,7 @@ class AppDelegate: FlutterAppDelegate, SPUUpdaterDelegate {
     guard acceptBundledReleaseSequence() else { return }
     applyThemeMode(UserDefaults.standard.string(forKey: "themeMode") ?? "system")
     persistRuntimeEnvironment()
-    registerStatusHelper()
+    runtimeAvailable { _ in }
     configureUninstallMenuItem()
   }
 
@@ -211,72 +231,130 @@ class AppDelegate: FlutterAppDelegate, SPUUpdaterDelegate {
     }
   }
 
-  private func registerStatusHelper() {
-    let environment = deploymentConfiguration.environment
-    guard environment == "staging" || environment == "production" else {
-      NSLog("Ditch refused to register a runtime with invalid deployment configuration")
-      return
-    }
-    let defaults = UserDefaults.standard
-    let previousEnvironment = defaults.string(
-      forKey: Self.runtimeDeploymentEnvironmentDefaultsKey)
-    let runningRuntime = runningRuntimeStatus()
-    let replacingEnvironment = previousEnvironment != nil && previousEnvironment != environment
-    let replacingBuild = runningRuntime.map { !$0.matches(deploymentConfiguration) } ?? false
-    let replacingRuntime = replacingEnvironment || replacingBuild
-    if replacingRuntime {
-      let activeSessions = runningRuntime?.activeSessionCount
-      let socketExists = FileManager.default.fileExists(atPath: runtimeSocketURL.path)
-      if let activeSessions, activeSessions > 0 {
-        refuseRuntimeEnvironmentSwitch(
-          "The running \(runningRuntime?.edition ?? previousEnvironment ?? "existing") runtime has \(activeSessions) active agent\(activeSessions == 1 ? "" : "s"). Let them finish or stop them explicitly before installing Ditch \(deploymentConfiguration.edition.capitalized) \(deploymentConfiguration.buildIdentifier).")
-        return
-      }
-      if activeSessions == nil && socketExists && runtimeProcessAppearsAlive {
-        refuseRuntimeEnvironmentSwitch(
-          "Ditch could not verify whether the running runtime has active agents. Stop it explicitly before installing Ditch \(deploymentConfiguration.edition.capitalized) \(deploymentConfiguration.buildIdentifier).")
-        return
-      }
-      _ = Self.runProcess(
-        executable: bundledExecutable("ditch_cli"),
-        arguments: ["runtime", "stop"],
-        timeout: 5)
-    }
+  private var runtimeLaunchPending = false
 
-    if #available(macOS 13.0, *) {
-      // Clean up the superseded three-process architecture. Unregistering the
-      // obsolete login item does not send a shutdown request to the runtime.
-      let obsolete = SMAppService.loginItem(identifier: Self.obsoleteLoginItemIdentifier)
-      if obsolete.status == .enabled {
-        try? obsolete.unregister()
-      }
-      let service = SMAppService.loginItem(identifier: Self.runtimeLoginItemIdentifier)
-      var shouldRegister = service.status != .enabled
-      if replacingRuntime,
-        service.status == .enabled || service.status == .requiresApproval
-      {
-        do {
-          try service.unregister()
-        } catch {
-          NSLog("Ditch could not replace its runtime environment: \(error)")
-          return
-        }
-        shouldRegister = true
-      }
-      guard shouldRegister else { return }
-      do {
-        try service.register()
-        defaults.set(environment, forKey: Self.runtimeDeploymentEnvironmentDefaultsKey)
-      } catch {
-        NSLog("Ditch could not register its runtime: \(error)")
-      }
-    } else {
-      if replacingRuntime {
-        _ = SMLoginItemSetEnabled(Self.runtimeLoginItemIdentifier as CFString, false)
-      }
-      _ = SMLoginItemSetEnabled(Self.runtimeLoginItemIdentifier as CFString, true)
-      defaults.set(environment, forKey: Self.runtimeDeploymentEnvironmentDefaultsKey)
+  private lazy var runtimeStartup = RuntimeStartupCoordinator(
+    inspect: { [unowned self] in self.inspectRuntimeStartup() },
+    stop: { [unowned self] in
+      Self.runProcess(
+        executable: self.bundledExecutable("ditch_cli"),
+        arguments: ["runtime", "stop"], timeout: 2) == 0
+    },
+    unregister: { [unowned self] in try self.unregisterRuntimeForReplacement() },
+    register: { [unowned self] in try self.registerRuntimeForStartup() },
+    launch: { [unowned self] in self.startRuntimeHost() },
+    log: { [unowned self] message in
+      Self.logRuntimeStartup(
+        "ui_pid=\(ProcessInfo.processInfo.processIdentifier) target=\(self.deploymentConfiguration.edition)/\(self.deploymentConfiguration.environment)/\(self.deploymentConfiguration.buildNumber): \(message)")
+    })
+
+  private static func logRuntimeStartup(_ message: String) {
+    NSLog("Ditch runtime startup: \(message)")
+    let directory = FileManager.default.homeDirectoryForCurrentUser
+      .appendingPathComponent("Library/Application Support/The Ditch/logs", isDirectory: true)
+    try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    let path = directory.appendingPathComponent("runtime.log").path
+    let descriptor = Darwin.open(path, O_WRONLY | O_APPEND | O_CREAT, mode_t(S_IRUSR | S_IWUSR))
+    guard descriptor >= 0 else { return }
+    defer { Darwin.close(descriptor) }
+    let data = Data("\(Date()) runtime startup: \(message)\n".utf8)
+    data.withUnsafeBytes { bytes in
+      _ = Darwin.write(descriptor, bytes.baseAddress!, bytes.count)
     }
+  }
+
+  private var runtimeHelperURL: URL {
+    Bundle.main.bundleURL.appendingPathComponent(
+      "Contents/Library/LoginItems/The Ditch Runtime.app", isDirectory: true)
+  }
+
+  private func inspectRuntimeStartup() -> RuntimeStartupCoordinator.Observation {
+    let status = runningRuntimeStatus()
+    var applications: [NSRunningApplication] = []
+    DispatchQueue.main.sync {
+      applications = NSRunningApplication.runningApplications(
+        withBundleIdentifier: Self.runtimeLoginItemIdentifier).filter { !$0.isTerminated }
+    }
+    let processIDs = Set(applications.map(\.processIdentifier))
+    let runtime = status.flatMap { status -> RuntimeStartupCoordinator.Status? in
+      guard let pid = status.pid else { return nil }
+      guard let bundleURL = applications.first(where: { $0.processIdentifier == pid })?.bundleURL
+      else { return nil }
+      return RuntimeStartupCoordinator.Status(
+        pid: pid,
+        matches: status.matches(
+          deploymentConfiguration, bundleURL: bundleURL, expectedBundleURL: runtimeHelperURL),
+        activeSessions: status.activeSessionCount,
+        build: "\(status.edition)/\(status.deploymentEnvironment)/\(status.buildNumber)")
+    }
+    return RuntimeStartupCoordinator.Observation(
+      status: runtime, processIDs: processIDs,
+      connectionsBusy: Self.runtimeSocketHasOwner(runtimeSocketURL.path)
+        || Self.runtimeSocketHasOwner(Self.notificationControlSocketPath()))
+  }
+
+  private func unregisterRuntimeForReplacement() throws {
+    try DispatchQueue.main.sync {
+      if #available(macOS 13.0, *) {
+        let service = SMAppService.loginItem(identifier: Self.runtimeLoginItemIdentifier)
+        if service.status == .enabled || service.status == .requiresApproval {
+          do { try service.unregister() }
+          catch {
+            Self.logRuntimeStartup("unregister failed: \(error)")
+            throw RuntimeStartupCoordinator.Failure.registration
+          }
+        }
+      } else {
+        guard SMLoginItemSetEnabled(Self.runtimeLoginItemIdentifier as CFString, false) else {
+          throw RuntimeStartupCoordinator.Failure.registration
+        }
+      }
+    }
+  }
+
+  private func registerRuntimeForStartup() throws {
+    try DispatchQueue.main.sync {
+      if #available(macOS 13.0, *) {
+        let obsolete = SMAppService.loginItem(identifier: Self.obsoleteLoginItemIdentifier)
+        if obsolete.status == .enabled { try? obsolete.unregister() }
+        let service = SMAppService.loginItem(identifier: Self.runtimeLoginItemIdentifier)
+        if service.status != .enabled {
+          do { try service.register() }
+          catch {
+            Self.logRuntimeStartup("registration failed: \(error)")
+            throw RuntimeStartupCoordinator.Failure.registration
+          }
+        }
+      } else {
+        guard SMLoginItemSetEnabled(Self.runtimeLoginItemIdentifier as CFString, true) else {
+          throw RuntimeStartupCoordinator.Failure.registration
+        }
+      }
+      UserDefaults.standard.set(
+        deploymentConfiguration.environment,
+        forKey: Self.runtimeDeploymentEnvironmentDefaultsKey)
+    }
+  }
+
+  private static func runtimeSocketHasOwner(_ path: String) -> Bool {
+    let client = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
+    guard client >= 0 else { return true }
+    defer { Darwin.close(client) }
+    _ = fcntl(client, F_SETFL, O_NONBLOCK)
+    var address = sockaddr_un()
+    address.sun_family = sa_family_t(AF_UNIX)
+    guard path.utf8.count < MemoryLayout.size(ofValue: address.sun_path) else { return true }
+    withUnsafeMutablePointer(to: &address.sun_path) { pointer in
+      path.withCString { source in
+        _ = strcpy(UnsafeMutableRawPointer(pointer).assumingMemoryBound(to: CChar.self), source)
+      }
+    }
+    let result = withUnsafePointer(to: &address) { pointer in
+      pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+        Darwin.connect(client, $0, socklen_t(MemoryLayout<sa_family_t>.size + path.utf8.count + 1))
+      }
+    }
+    return result == 0 || (errno != ENOENT && errno != ECONNREFUSED)
   }
 
   private var runtimeSocketURL: URL {
@@ -285,26 +363,16 @@ class AppDelegate: FlutterAppDelegate, SPUUpdaterDelegate {
       .appendingPathComponent("ditchd.sock")
   }
 
-  private var runtimeProcessAppearsAlive: Bool {
-    let pidURL = FileManager.default.homeDirectoryForCurrentUser
-      .appendingPathComponent("Library/Application Support/The Ditch", isDirectory: true)
-      .appendingPathComponent("ditchd.pid")
-    guard let rawPID = try? String(contentsOf: pidURL, encoding: .utf8),
-      let pid = Int32(rawPID.trimmingCharacters(in: .whitespacesAndNewlines)),
-      let application = NSRunningApplication(processIdentifier: pid)
-    else { return false }
-    return application.bundleIdentifier == Self.runtimeLoginItemIdentifier
-  }
-
   private func runningRuntimeStatus() -> RunningRuntimeStatus? {
     let result = Self.runProcessCapturingOutput(
       executable: bundledExecutable("ditch_cli"),
       arguments: ["runtime", "status"],
-      timeout: 5)
+      timeout: 1)
     guard result.status == 0,
       let value = try? JSONSerialization.jsonObject(with: result.output),
       let envelope = value as? [String: Any],
       let status = envelope["RuntimeStatus"] as? [String: Any],
+      let pid = status["pid"] as? NSNumber,
       let count = status["active_session_count"] as? NSNumber,
       let edition = status["edition"] as? String,
       let deploymentEnvironment = status["deployment_environment"] as? String,
@@ -313,6 +381,7 @@ class AppDelegate: FlutterAppDelegate, SPUUpdaterDelegate {
       let releaseSequence = status["release_sequence"] as? NSNumber
     else { return nil }
     return RunningRuntimeStatus(
+      pid: pid.int32Value,
       activeSessionCount: count.intValue,
       edition: edition,
       deploymentEnvironment: deploymentEnvironment,
@@ -322,16 +391,7 @@ class AppDelegate: FlutterAppDelegate, SPUUpdaterDelegate {
       communityRevision: status["community_revision"] as? String)
   }
 
-  private func refuseRuntimeEnvironmentSwitch(_ message: String) {
-    NSLog("Ditch refused runtime environment switch: \(message)")
-    let alert = NSAlert()
-    alert.messageText = "Ditch cannot switch environments yet"
-    alert.informativeText = message
-    alert.alertStyle = .warning
-    alert.addButton(withTitle: "Quit")
-    alert.runModal()
-    NSApp.terminate(nil)
-  }
+
 
   private func configureUninstallMenuItem() {
     guard let applicationMenu = NSApp.mainMenu?.items.first?.submenu,
@@ -513,7 +573,14 @@ class AppDelegate: FlutterAppDelegate, SPUUpdaterDelegate {
         self.pendingAgentNavigation = nil
         result(pending)
       case "runtimeAvailable":
-        self.runtimeAvailable { result($0) }
+        self.runtimeAvailable { outcome in
+          switch outcome {
+          case .success: result(true)
+          case .failure(let error):
+            result(FlutterError(
+              code: "runtime_startup_failed", message: error.localizedDescription, details: nil))
+          }
+        }
       case "appVersion":
         let version =
           Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? ""
@@ -643,9 +710,7 @@ class AppDelegate: FlutterAppDelegate, SPUUpdaterDelegate {
               CharacterSet.alphanumerics.contains($0) || "-_.".unicodeScalars.contains($0)
             }),
             let rawExpiry = arguments["expires_at"] as? String,
-            let expiry = ISO8601DateFormatter().date(from: rawExpiry),
-            expiry > Date(),
-            expiry <= Date().addingTimeInterval(24 * 60 * 60)
+            let expiry = Self.validatedCommercialUpdateExpiry(rawExpiry)
         else {
           result(FlutterError(
             code: "invalid_update_session",
@@ -903,21 +968,11 @@ class AppDelegate: FlutterAppDelegate, SPUUpdaterDelegate {
   }
 
   private func launchRuntimeApplication(completion: @escaping (Error?) -> Void) {
-    if !NSRunningApplication.runningApplications(
-      withBundleIdentifier: Self.runtimeLoginItemIdentifier
-    ).isEmpty {
-      completion(nil)
-      return
-    }
-    let helper = Bundle.main.bundleURL.appendingPathComponent(
-      "Contents/Library/LoginItems/The Ditch Runtime.app", isDirectory: true)
-    let configuration = NSWorkspace.OpenConfiguration()
-    configuration.activates = false
-    NSWorkspace.shared.openApplication(
-      at: helper,
-      configuration: configuration
-    ) { _, error in
-      completion(error)
+    runtimeAvailable { outcome in
+      switch outcome {
+      case .success: completion(nil)
+      case .failure(let error): completion(error)
+      }
     }
   }
 
@@ -1129,42 +1184,15 @@ class AppDelegate: FlutterAppDelegate, SPUUpdaterDelegate {
     return true
   }
 
-  private func runtimeAvailable(completion: @escaping (Bool) -> Void) {
-    let cli = bundledExecutable("ditch_cli")
-    guard FileManager.default.isExecutableFile(atPath: cli) else {
-      completion(false)
+  private func runtimeAvailable(completion: @escaping (Result<Void, Error>) -> Void) {
+    guard ["staging", "production"].contains(deploymentConfiguration.environment),
+      FileManager.default.isExecutableFile(atPath: bundledExecutable("ditch_cli")),
+      FileManager.default.fileExists(atPath: runtimeHelperURL.path)
+    else {
+      completion(.failure(RuntimeStartupCoordinator.Failure.configuration))
       return
     }
-    DispatchQueue.global(qos: .utility).async {
-      if Self.runProcess(
-        executable: cli,
-        arguments: ["runtime", "status"],
-        timeout: 2) == 0
-      {
-        DispatchQueue.main.async { completion(true) }
-        return
-      }
-
-      guard self.startRuntimeHost() else {
-        DispatchQueue.main.async { completion(false) }
-        return
-      }
-      for _ in 0..<30 {
-        Thread.sleep(forTimeInterval: 0.1)
-        if self.runtimeResponds(cli: cli) {
-          DispatchQueue.main.async { completion(true) }
-          return
-        }
-      }
-      DispatchQueue.main.async { completion(false) }
-    }
-  }
-
-  private func runtimeResponds(cli: String) -> Bool {
-    Self.runProcess(
-      executable: cli,
-      arguments: ["runtime", "status"],
-      timeout: 2) == 0
+    runtimeStartup.start(completion: completion)
   }
 
   private static func runProcess(
@@ -1239,17 +1267,25 @@ class AppDelegate: FlutterAppDelegate, SPUUpdaterDelegate {
   /// the nested bundle through LaunchServices preserves its macOS identity for
   /// login-item and notification services.
   private func startRuntimeHost() -> Bool {
-    let helper = Bundle.main.bundleURL.appendingPathComponent(
-      "Contents/Library/LoginItems/The Ditch Runtime.app", isDirectory: true)
-    guard FileManager.default.fileExists(atPath: helper.path) else {
-      return false
+    let finished = DispatchSemaphore(value: 0)
+    DispatchQueue.main.async {
+      guard !self.runtimeLaunchPending else { finished.signal(); return }
+      self.runtimeLaunchPending = true
+      let configuration = NSWorkspace.OpenConfiguration()
+      configuration.activates = false
+      // Use this exact bundle, even if an older mounted build shares its ID.
+      configuration.createsNewApplicationInstance = true
+      NSWorkspace.shared.openApplication(at: self.runtimeHelperURL, configuration: configuration) {
+        application, error in
+        self.runtimeLaunchPending = false
+        if let error { Self.logRuntimeStartup("launch failed: \(error)") }
+        if let application {
+          Self.logRuntimeStartup("launch requested pid=\(application.processIdentifier) path=\(self.runtimeHelperURL.path)")
+        }
+        finished.signal()
+      }
     }
-    var opened = false
-    DispatchQueue.main.sync {
-      opened = NSWorkspace.shared.open(helper)
-    }
-    if !opened { NSLog("Ditch could not start its runtime application") }
-    return opened
+    return finished.wait(timeout: .now() + 2) == .success
   }
 
   private func bundledExecutable(_ name: String) -> String {
@@ -1280,5 +1316,184 @@ class AppDelegate: FlutterAppDelegate, SPUUpdaterDelegate {
       window.appearance = NSApp.appearance
       window.backgroundColor = NSColor.windowBackgroundColor
     }
+  }
+}
+
+/// Serializes runtime handover and coalesces callers without blocking AppKit.
+/// The injected operations also let tests exercise shutdown/launch races.
+final class RuntimeStartupCoordinator {
+  struct Status {
+    let pid: Int32
+    let matches: Bool
+    let activeSessions: Int
+    let build: String
+  }
+
+  struct Observation {
+    let status: Status?
+    let processIDs: Set<Int32>
+    let connectionsBusy: Bool
+  }
+
+  enum Failure: Error, LocalizedError {
+    case activeSessions, unverifiedRuntime, stopFailed, shutdownTimedOut, startupTimedOut
+    case configuration, registration
+
+    var errorDescription: String? {
+      switch self {
+      case .activeSessions:
+        return "The previous Ditch Runtime still has active agents. Let them finish or stop them, then click Retry."
+      case .unverifiedRuntime:
+        return "Ditch could not verify the existing runtime. It has been left running to protect your agents. Click Retry when it is ready."
+      case .stopFailed:
+        return "The previous Ditch Runtime could not be stopped. Click Retry to try again."
+      case .shutdownTimedOut:
+        return "The previous Ditch Runtime is still shutting down. Click Retry to continue."
+      case .startupTimedOut:
+        return "Ditch Runtime did not become ready in time. Click Retry to start it again."
+      case .configuration:
+        return "This app is missing a valid runtime configuration. Reinstall the latest Ditch build."
+      case .registration:
+        return "Ditch could not register its background runtime. Check Login Items in System Settings, then click Retry."
+      }
+    }
+  }
+
+  private let inspect: () -> Observation
+  private let stop: () -> Bool
+  private let unregister: () throws -> Void
+  private let register: () throws -> Void
+  private let launch: () -> Bool
+  private let now: () -> TimeInterval
+  private let pause: (TimeInterval) -> Void
+  private let log: (String) -> Void
+  private let timeout: TimeInterval
+  private let queue = DispatchQueue(label: "ai.theditch.runtime.startup", qos: .utility)
+  private let lock = NSLock()
+  private var completions: [(Result<Void, Error>) -> Void] = []
+  private var inFlight = false
+
+  init(
+    inspect: @escaping () -> Observation,
+    stop: @escaping () -> Bool,
+    unregister: @escaping () throws -> Void,
+    register: @escaping () throws -> Void,
+    launch: @escaping () -> Bool,
+    now: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
+    pause: @escaping (TimeInterval) -> Void = Thread.sleep(forTimeInterval:),
+    timeout: TimeInterval = 20,
+    log: @escaping (String) -> Void = { NSLog("Ditch runtime startup: \($0)") }
+  ) {
+    self.inspect = inspect
+    self.stop = stop
+    self.unregister = unregister
+    self.register = register
+    self.launch = launch
+    self.now = now
+    self.pause = pause
+    self.timeout = timeout
+    self.log = log
+  }
+
+  func start(completion: @escaping (Result<Void, Error>) -> Void) {
+    lock.lock()
+    completions.append(completion)
+    if inFlight { lock.unlock(); return }
+    inFlight = true
+    lock.unlock()
+    queue.async {
+      let result = Result { try self.run() }
+      if case .failure(let error) = result { self.log(error.localizedDescription) }
+      self.lock.lock()
+      let callbacks = self.completions
+      self.completions = []
+      self.inFlight = false
+      self.lock.unlock()
+      DispatchQueue.main.async { callbacks.forEach { $0(result) } }
+    }
+  }
+
+  func run() throws {
+    let deadline = now() + timeout
+    var stopping: Set<Int32>?
+    var registered = false
+    var unregistered = false
+    var lastLaunch = -TimeInterval.infinity
+    var lastObservation: Observation?
+    log("begin handover")
+    while now() < deadline {
+      let observation = inspect()
+      lastObservation = observation
+      if let oldPIDs = stopping {
+        // Shutdown acknowledges the request before the old process exits.
+        // Do not launch while either its process or local connections survive.
+        if !oldPIDs.isDisjoint(with: observation.processIDs) {
+          pause(0.2)
+          continue
+        }
+        // Login Services may already have started this exact new build after
+        // the old process exited. Adopt it instead of waiting on its sockets.
+        if observation.status?.matches != true,
+          observation.connectionsBusy || observation.status != nil {
+          pause(0.2)
+          continue
+        }
+        log("previous runtime exited; handover can continue")
+        stopping = nil
+      }
+      if let status = observation.status {
+        if status.matches {
+          if !observation.processIDs.subtracting([status.pid]).isEmpty {
+            pause(0.2)
+            continue
+          }
+          if !registered {
+            try register()
+            registered = true
+            pause(0.2)
+            continue
+          }
+          log("ready pid=\(status.pid) build=\(status.build)")
+          return
+        }
+        guard status.activeSessions == 0 else { throw Failure.activeSessions }
+        log("stopping previous runtime pid=\(status.pid) build=\(status.build)")
+        guard stop() else { throw Failure.stopFailed }
+        try unregister()
+        unregistered = true
+        registered = false
+        stopping = observation.processIDs.union([status.pid])
+        continue
+      }
+      // An unresponsive helper may still own agents. Wait; never kill it or
+      // launch another helper on top of its notification connection.
+      if !observation.processIDs.isEmpty || observation.connectionsBusy {
+        pause(0.2)
+        continue
+      }
+      if !registered {
+        // Register only after handover. Registration itself may launch the
+        // helper; give that launch a chance before explicitly opening it.
+        if !unregistered { try unregister() }
+        try register()
+        unregistered = false
+        registered = true
+        lastLaunch = now()
+        pause(0.2)
+        continue
+      }
+      if now() - lastLaunch >= 1 {
+        log("opening bundled runtime")
+        _ = launch()
+        lastLaunch = now()
+      }
+      pause(0.2)
+    }
+    if stopping != nil { throw Failure.shutdownTimedOut }
+    if let observation = lastObservation,
+      !observation.processIDs.isEmpty || observation.connectionsBusy {
+      throw Failure.unverifiedRuntime
+    }
+    throw Failure.startupTimedOut
   }
 }
