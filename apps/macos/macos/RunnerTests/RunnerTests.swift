@@ -132,6 +132,14 @@ class RunnerTests: XCTestCase {
       communityRevision: String(repeating: "a", count: 40))
 
     XCTAssertTrue(matching.matches(expected))
+    let installedHelper = URL(fileURLWithPath:
+      "/Applications/Ditch.app/Contents/Library/LoginItems/The Ditch Runtime.app")
+    let mountedHelper = URL(fileURLWithPath:
+      "/Volumes/Old Ditch/Ditch.app/Contents/Library/LoginItems/The Ditch Runtime.app")
+    XCTAssertTrue(matching.matches(expected, bundleURL: installedHelper, expectedBundleURL: installedHelper))
+    XCTAssertFalse(matching.matches(expected, bundleURL: mountedHelper, expectedBundleURL: installedHelper))
+    XCTAssertFalse(matching.matches(expected, bundleURL: nil, expectedBundleURL: installedHelper))
+
     XCTAssertFalse(
       AppDelegate.RunningRuntimeStatus(
         activeSessionCount: 0,
@@ -164,4 +172,219 @@ class RunnerTests: XCTestCase {
       ).matches(expected))
   }
 
+}
+
+// MARK: Runtime startup regression tests
+final class RuntimeStartupFixture {
+  typealias Observation = RuntimeStartupCoordinator.Observation
+  typealias Status = RuntimeStartupCoordinator.Status
+  var time: TimeInterval = 0
+  var frames: [Observation] = [idle]
+  var events: [String] = []
+  var stopAccepted = true
+  var onRegister: (() throws -> Void)?
+  var onLaunch: (() -> Bool)?
+  var launchTimes: [TimeInterval] = []
+
+  static var idle: Observation {
+    Observation(status: nil, processIDs: [], connectionsBusy: false)
+  }
+  static var ready: Observation {
+    Observation(status: Status(pid: 200, matches: true, activeSessions: 0, build: "116"),
+      processIDs: [200], connectionsBusy: true)
+  }
+  static func old(active: Int = 0) -> Observation {
+    Observation(status: Status(pid: 100, matches: false, activeSessions: active, build: "115"),
+      processIDs: [100], connectionsBusy: true)
+  }
+
+  func coordinator(timeout: TimeInterval = 4) -> RuntimeStartupCoordinator {
+    RuntimeStartupCoordinator(
+      inspect: {
+        let observation = self.frames[0]
+        if self.frames.count > 1 { self.frames.removeFirst() }
+        return observation
+      },
+      stop: { self.events.append("stop"); return self.stopAccepted },
+      unregister: { self.events.append("unregister") },
+      register: { self.events.append("register"); try self.onRegister?() },
+      launch: {
+        self.events.append("launch")
+        self.launchTimes.append(self.time)
+        return self.onLaunch?() ?? false
+      },
+      now: { self.time },
+      pause: { self.time += $0 },
+      timeout: timeout,
+      log: { _ in })
+  }
+}
+
+final class RuntimeStartupTests: XCTestCase {
+  func testNewBuildStartedByLoginServicesDuringHandoverIsAdopted() throws {
+    let fixture = RuntimeStartupFixture()
+    fixture.frames = [RuntimeStartupFixture.old(), RuntimeStartupFixture.ready]
+    try fixture.coordinator().run()
+    XCTAssertEqual(fixture.events, ["stop", "unregister", "register"])
+  }
+
+  func testHandoverWaitsForBothProcessExitAndConnectionRelease() throws {
+    let fixture = RuntimeStartupFixture()
+    fixture.frames = [
+      .init(status: RuntimeStartupFixture.old().status, processIDs: [100], connectionsBusy: true),
+      RuntimeStartupFixture.old(),
+      .init(status: nil, processIDs: [100], connectionsBusy: false),
+      .init(status: nil, processIDs: [], connectionsBusy: true),
+      RuntimeStartupFixture.idle,
+    ]
+    fixture.onLaunch = { fixture.frames = [RuntimeStartupFixture.ready]; return true }
+    try fixture.coordinator().run()
+    XCTAssertEqual(fixture.events, ["stop", "unregister", "register", "launch"])
+    XCTAssertGreaterThanOrEqual(fixture.launchTimes[0], 1.6)
+  }
+
+  func testShutdownTimeoutDoesNotLaunchOrRegisterReplacement() {
+    let fixture = RuntimeStartupFixture()
+    fixture.frames = [RuntimeStartupFixture.old()]
+    XCTAssertThrowsError(try fixture.coordinator().run()) {
+      XCTAssertEqual($0 as? RuntimeStartupCoordinator.Failure, .shutdownTimedOut)
+    }
+    XCTAssertEqual(fixture.events, ["stop", "unregister"])
+  }
+
+  func testActiveAgentsPreventRuntimeReplacement() {
+    let fixture = RuntimeStartupFixture()
+    fixture.frames = [RuntimeStartupFixture.old(active: 1)]
+    XCTAssertThrowsError(try fixture.coordinator().run()) {
+      XCTAssertEqual($0 as? RuntimeStartupCoordinator.Failure, .activeSessions)
+    }
+    XCTAssertTrue(fixture.events.isEmpty)
+  }
+
+  func testFailedShutdownDoesNotUnregisterOrLaunch() {
+    let fixture = RuntimeStartupFixture()
+    fixture.frames = [RuntimeStartupFixture.old()]
+    fixture.stopAccepted = false
+    XCTAssertThrowsError(try fixture.coordinator().run()) {
+      XCTAssertEqual($0 as? RuntimeStartupCoordinator.Failure, .stopFailed)
+    }
+    XCTAssertEqual(fixture.events, ["stop"])
+  }
+
+  func testUnresponsiveRuntimeIsLeftRunningToProtectAgents() {
+    let fixture = RuntimeStartupFixture()
+    fixture.frames = [.init(status: nil, processIDs: [100], connectionsBusy: true)]
+    XCTAssertThrowsError(try fixture.coordinator().run()) {
+      XCTAssertEqual($0 as? RuntimeStartupCoordinator.Failure, .unverifiedRuntime)
+    }
+    XCTAssertTrue(fixture.events.isEmpty)
+  }
+
+  func testMatchingRuntimeIsReusedWithoutStoppingOrLaunching() throws {
+    let fixture = RuntimeStartupFixture()
+    fixture.frames = [RuntimeStartupFixture.ready]
+    try fixture.coordinator().run()
+    XCTAssertEqual(fixture.events, ["register"])
+  }
+
+  func testRegistrationLaunchIsObservedBeforeExplicitLaunch() throws {
+    let fixture = RuntimeStartupFixture()
+    fixture.onRegister = { fixture.frames = [RuntimeStartupFixture.ready] }
+    try fixture.coordinator().run()
+    XCTAssertEqual(fixture.events, ["unregister", "register"])
+  }
+
+  func testLaunchCollisionIsRetriedAfterConnectionClears() throws {
+    let fixture = RuntimeStartupFixture()
+    var launches = 0
+    fixture.onLaunch = {
+      launches += 1
+      if launches == 1 {
+        fixture.frames = [
+          .init(status: nil, processIDs: [], connectionsBusy: true),
+          .init(status: nil, processIDs: [], connectionsBusy: true),
+          RuntimeStartupFixture.idle,
+        ]
+      } else {
+        fixture.frames = [RuntimeStartupFixture.ready]
+      }
+      return true
+    }
+    try fixture.coordinator().run()
+    XCTAssertEqual(launches, 2)
+    XCTAssertGreaterThanOrEqual(fixture.launchTimes[1] - fixture.launchTimes[0], 1)
+  }
+
+  func testLaunchSuccessAloneDoesNotCountAsReadiness() {
+    let fixture = RuntimeStartupFixture()
+    fixture.onLaunch = { true }
+    XCTAssertThrowsError(try fixture.coordinator().run()) {
+      XCTAssertEqual($0 as? RuntimeStartupCoordinator.Failure, .startupTimedOut)
+    }
+    XCTAssertGreaterThan(fixture.launchTimes.count, 1)
+    XCTAssertLessThanOrEqual(fixture.time, 4.3)
+  }
+
+  func testRegistrationFailureDoesNotLaunch() {
+    let fixture = RuntimeStartupFixture()
+    fixture.onRegister = { throw RuntimeStartupCoordinator.Failure.registration }
+    XCTAssertThrowsError(try fixture.coordinator().run()) {
+      XCTAssertEqual($0 as? RuntimeStartupCoordinator.Failure, .registration)
+    }
+    XCTAssertEqual(fixture.events, ["unregister", "register"])
+  }
+
+  func testConcurrentStartupRequestsShareOneHandover() {
+    let inspected = DispatchSemaphore(value: 0)
+    let release = DispatchSemaphore(value: 0)
+    let completed = expectation(description: "both callers finish")
+    completed.expectedFulfillmentCount = 2
+    var inspections = 0
+    var registrations = 0
+    let coordinator = RuntimeStartupCoordinator(
+      inspect: {
+        inspections += 1
+        if inspections == 1 {
+          inspected.signal()
+          _ = release.wait(timeout: .now() + 2)
+        }
+        return RuntimeStartupFixture.ready
+      },
+      stop: { XCTFail("must not stop matching runtime"); return false },
+      unregister: { XCTFail("must not unregister matching runtime") },
+      register: { registrations += 1 },
+      launch: { XCTFail("must not launch another runtime"); return false },
+      pause: { _ in }, log: { _ in })
+    coordinator.start { result in
+      if case .failure(let error) = result { XCTFail(error.localizedDescription) }
+      completed.fulfill()
+    }
+    XCTAssertEqual(inspected.wait(timeout: .now() + 2), .success)
+    coordinator.start { result in
+      if case .failure(let error) = result { XCTFail(error.localizedDescription) }
+      completed.fulfill()
+    }
+    release.signal()
+    wait(for: [completed], timeout: 3)
+    XCTAssertEqual(registrations, 1)
+  }
+
+  func testRetryAfterFailureStartsANewAttempt() {
+    let fixture = RuntimeStartupFixture()
+    let coordinator = fixture.coordinator()
+    let failed = expectation(description: "first attempt times out")
+    coordinator.start { result in
+      if case .success = result { XCTFail("must verify readiness") }
+      failed.fulfill()
+    }
+    wait(for: [failed], timeout: 2)
+    fixture.onLaunch = { fixture.frames = [RuntimeStartupFixture.ready]; return true }
+    let recovered = expectation(description: "retry succeeds")
+    coordinator.start { result in
+      if case .failure(let error) = result { XCTFail(error.localizedDescription) }
+      recovered.fulfill()
+    }
+    wait(for: [recovered], timeout: 2)
+    XCTAssertEqual(fixture.events.filter { $0 == "register" }.count, 2)
+  }
 }

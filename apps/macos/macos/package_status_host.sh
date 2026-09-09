@@ -261,6 +261,10 @@ cat > "$HELPER_CONTENTS/Info.plist" <<'PLIST'
 </plist>
 PLIST
 
+# Let macOS distinguish the updated helper from older mounted app copies.
+/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $DITCH_APP_VERSION" "$HELPER_CONTENTS/Info.plist"
+/usr/libexec/PlistBuddy -c "Set :CFBundleVersion $DITCH_BUILD_NUMBER" "$HELPER_CONTENTS/Info.plist"
+
 cp "$DITCH_CLI_SOURCE" "$HELPER_MACOS/ditch_cli"
 cp "$DITCH_CLI_SOURCE" "$MAIN_MACOS/ditch_cli"
 # The remote artifact must be the portable Rust daemon, not the macOS status

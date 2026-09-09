@@ -1695,6 +1695,7 @@ DitchProject? parseRuntimeProject(Object? value) {
 class CommandCenterScreen extends StatefulWidget {
   const CommandCenterScreen({
     this.connectRuntimeOnStart = true,
+    this.runtimeClient,
     this.initialProjects = const [],
     this.editionSurface = const CommunityEditionSurface(),
     this.deploymentEnvironment = ditchDeploymentEnvironment,
@@ -1703,6 +1704,7 @@ class CommandCenterScreen extends StatefulWidget {
   });
 
   final bool connectRuntimeOnStart;
+  final DitchRuntimeClient? runtimeClient;
   final List<DitchProject> initialProjects;
   final EditionSurface editionSurface;
   final String deploymentEnvironment;
@@ -1728,7 +1730,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
   final _idleComposerKey = GlobalKey<AgentComposerState>();
   final _composerKeys = <String, GlobalKey<AgentComposerState>>{};
   int _composerFocusGeneration = 0;
-  final _runtimeClient = DitchRuntimeClient();
+  late final _runtimeClient = widget.runtimeClient ?? DitchRuntimeClient();
   final _presentation = CommandCenterController();
   int _nextAgentSessionId = 1;
   int _nextAttentionId = 1;
@@ -1748,6 +1750,8 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
   bool _productUpdateChecking = false;
   String? _runtimeInstanceId;
   bool _runtimeReconnectScheduled = false;
+  bool _runtimeConnecting = false;
+  int _runtimeConnectionRetries = 0;
   bool _runtimeHomeMismatchReported = false;
   bool _runtimeCodexHomeMatches = true;
   bool _runtimeSupportsPersistence = true;
@@ -2148,10 +2152,14 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
     return session;
   }
 
-  Future<void> _connectRuntime() async {
+  Future<void> _connectRuntime({bool retrying = false}) async {
+    if (_runtimeConnecting || !mounted) return;
+    if (!retrying) _runtimeConnectionRetries = 0;
+    _runtimeConnecting = true;
     _presentation.connecting(reconnecting: _runtimeInstanceId != null);
     try {
       await _ensureRuntimeStarted();
+      if (!mounted) return;
       final status = await _runtimeClient.runtimeStatus();
       _codexBinary = status.codexBinary;
       final instanceId = status.instanceId;
@@ -2182,6 +2190,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
         await _runtimeEvents?.cancel();
         _scheduleRuntimeReconnect();
       }
+      _runtimeConnectionRetries = 0;
       _presentation.connected();
       if (confirmed.edition == 'commercial') {
         unawaited(_checkForProductUpdate());
@@ -2194,14 +2203,29 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
       unawaited(_refreshNotificationReadiness());
       await _refreshCodexReadiness();
     } on Object catch (error) {
-      _presentation.unavailable(error);
+      if (!mounted) return;
+      // Native startup already retries within its deadline. Retry only a
+      // subsequent connection race, without extending a native startup failure.
+      final startupFailed = error is DitchRuntimeException &&
+          error.code == 'runtime_startup_failed';
+      if (!startupFailed && _runtimeConnectionRetries < 2) {
+        _runtimeConnectionRetries++;
+        _scheduleRuntimeReconnect();
+        return;
+      }
+      final message = error is DitchRuntimeException
+          ? error.message
+          : 'Ditch could not connect to its runtime. Click Retry to try again.';
+      _presentation.unavailable(message);
       _addAttentionRequired(
         kind: AttentionKind.failed,
         icon: Icons.cloud_off_outlined,
         title: 'Runtime not connected',
-        body: '$error',
+        body: message,
         global: true,
       );
+    } finally {
+      _runtimeConnecting = false;
     }
   }
 
@@ -2613,7 +2637,11 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
         return;
       }
       _runtimeReconnectScheduled = false;
-      await _connectRuntime();
+      if (_runtimeConnecting) {
+        _scheduleRuntimeReconnect();
+        return;
+      }
+      await _connectRuntime(retrying: true);
     });
   }
 
@@ -2622,14 +2650,16 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
       final ready = await _applicationChannel.invokeMethod<bool>(
         'runtimeAvailable',
       );
-      if (ready == false) {
-        throw StateError('The supervised runtime is not available.');
+      if (ready != true) {
+        throw const DitchRuntimeException(
+          'runtime_startup_failed',
+          'Ditch Runtime did not become ready. Click Retry to start it again.',
+        );
       }
-      await _runtimeClient.runtimeStatus();
-      return;
-    } on Object catch (error) {
-      throw StateError(
-        'Ditch Runtime is unavailable. Use the status menu to restart it, then retry. $error',
+    } on PlatformException catch (error) {
+      throw DitchRuntimeException(
+        'runtime_startup_failed',
+        error.message ?? 'Ditch Runtime could not start. Click Retry to try again.',
       );
     }
   }
@@ -4568,6 +4598,34 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
         return Scaffold(
           body: LayoutBuilder(
             builder: (context, constraints) {
+              if (widget.connectRuntimeOnStart && !_runtimeSnapshotHydrated) {
+                if (presentation.connection == RuntimeConnectionPhase.unavailable) {
+                  return RuntimeRecoveryView(
+                    socketPath: _runtimeClient.socketPath,
+                    error: presentation.connectionError,
+                    onRetry: _connectRuntime,
+                    onOpenActivityMonitor: () => _applicationChannel
+                        .invokeMethod<bool>('openActivityMonitor'),
+                    onQuit: () => _applicationChannel.invokeMethod<bool>('quitUI'),
+                  );
+                }
+                if (presentation.connection != RuntimeConnectionPhase.connected) {
+                  return const Center(
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        SizedBox(
+                          width: 24,
+                          height: 24,
+                          child: CircularProgressIndicator(),
+                        ),
+                        SizedBox(height: 16),
+                        Text('Starting runtime'),
+                      ],
+                    ),
+                  );
+                }
+              }
               if (_projects.isEmpty) {
                 return CodexOnboardingView(
                   introduced: _onboardingIntroduced,
@@ -6593,7 +6651,7 @@ class DitchToolbar extends StatelessWidget {
     final tokens = context.ditch;
     final connectionStatus = switch (connection) {
       RuntimeConnectionPhase.connected => null,
-      RuntimeConnectionPhase.connecting => ('Connecting', tokens.waiting),
+      RuntimeConnectionPhase.connecting => ('Starting runtime', tokens.waiting),
       RuntimeConnectionPhase.reconnecting => ('Reconnecting', tokens.waiting),
       RuntimeConnectionPhase.unavailable => (
         'Runtime unavailable',
