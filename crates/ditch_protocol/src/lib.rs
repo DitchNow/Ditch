@@ -271,6 +271,7 @@ pub enum ClientRequest {
     },
     CommercialBillingManagement,
     CheckCommercialRelease,
+    CheckCommunityRelease,
     CurrentCommercialRelease,
     RemoteControlStatus,
     EnsureRemoteMachineIdentity,

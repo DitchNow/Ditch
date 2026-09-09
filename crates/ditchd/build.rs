@@ -7,6 +7,7 @@ fn main() {
         "DITCH_COMMUNITY_REVISION",
         "DITCH_COMMUNITY_BUILD_SEQUENCE",
         "DITCH_RELEASE_MANIFEST_PUBLIC_KEY_SEC1_B64",
+        "DITCH_COMMUNITY_RELEASE_MANIFEST_PUBLIC_KEY_SEC1_B64",
         "DITCH_APPLE_TEAM_ID",
     ] {
         println!("cargo:rerun-if-env-changed={name}");

@@ -6,6 +6,29 @@ import XCTest
 
 class RunnerTests: XCTestCase {
 
+  func testAuthorizedUpdatePathsBindCommunityAndCommercialToTheirOwnRelease() {
+    let id = "11111111-1111-4111-8111-111111111111"
+    for origin in ["https://relay.ditchnow.nl", "https://ditch-remote-relay-staging.matin-1a7.workers.dev"] {
+      for edition in ["community", "commercial"] {
+        let appcast = URL(string: "\(origin)/v1/\(edition)/releases/\(id)/appcast")!
+        let artifact = URL(string: "\(origin)/v1/\(edition)/releases/\(id)/artifact/ditch.dmg")!
+        XCTAssertTrue(AppDelegate.authorizedUpdatePathsMatch(
+          edition: edition, releaseID: id, appcastURL: appcast, artifactURL: artifact))
+        for otherEdition in [edition == "community" ? "commercial" : "community", "unknown"] {
+          XCTAssertFalse(AppDelegate.authorizedUpdatePathsMatch(
+            edition: otherEdition, releaseID: id, appcastURL: appcast, artifactURL: artifact))
+        }
+        XCTAssertFalse(AppDelegate.authorizedUpdatePathsMatch(
+          edition: edition, releaseID: UUID().uuidString.lowercased(), appcastURL: appcast, artifactURL: artifact))
+        XCTAssertFalse(AppDelegate.authorizedUpdatePathsMatch(
+          edition: edition, releaseID: id, appcastURL: URL(string: "\(origin)/community/appcast.xml")!, artifactURL: artifact))
+        XCTAssertFalse(AppDelegate.authorizedUpdatePathsMatch(
+          edition: edition, releaseID: id, appcastURL: appcast,
+          artifactURL: URL(string: "\(origin)/v1/\(edition)/releases/\(id)/artifact/")!))
+      }
+    }
+  }
+
   func testCommercialUpdateExpiryAcceptsRelayMillisecondsAndWholeSeconds() {
     let now = ISO8601DateFormatter().date(from: "2026-09-09T14:00:00Z")!
     for (timestamp, seconds) in [

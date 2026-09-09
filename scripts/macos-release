@@ -150,7 +150,7 @@ load_release_trust_environment() {
     key=${line%%=*}
     value=${line#*=}
     case "$key" in
-      DITCH_SPARKLE_PUBLIC_ED_KEY|DITCH_RELEASE_MANIFEST_PUBLIC_KEY_SEC1_B64|DITCH_APPLE_TEAM_ID|DITCH_COMMUNITY_BUILD_SEQUENCE)
+      DITCH_SPARKLE_PUBLIC_ED_KEY|DITCH_RELEASE_MANIFEST_PUBLIC_KEY_SEC1_B64|DITCH_COMMUNITY_RELEASE_MANIFEST_PUBLIC_KEY_SEC1_B64|DITCH_APPLE_TEAM_ID|DITCH_COMMUNITY_BUILD_SEQUENCE)
         [ -n "$value" ] || { echo "error: $key is empty in $file" >&2; exit 1; }
         export "$key=$value"
         ;;

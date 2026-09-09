@@ -68,7 +68,7 @@ if [ -f "$release_environment_file" ]; then
     key=${line%%=*}
     value=${line#*=}
     case "$key" in
-      DITCH_SPARKLE_PUBLIC_ED_KEY|DITCH_RELEASE_MANIFEST_PUBLIC_KEY_SEC1_B64|DITCH_APPLE_TEAM_ID|DITCH_COMMUNITY_BUILD_SEQUENCE) ;;
+      DITCH_SPARKLE_PUBLIC_ED_KEY|DITCH_RELEASE_MANIFEST_PUBLIC_KEY_SEC1_B64|DITCH_COMMUNITY_RELEASE_MANIFEST_PUBLIC_KEY_SEC1_B64|DITCH_APPLE_TEAM_ID|DITCH_COMMUNITY_BUILD_SEQUENCE) ;;
       *) echo "error: unsupported variable $key in $release_environment_file" >&2; exit 1 ;;
     esac
     [ -n "$value" ] || { echo "error: $key is empty in $release_environment_file" >&2; exit 1; }
@@ -129,22 +129,24 @@ configure_release_verification() {
   for key in \
     DITCH_SPARKLE_PUBLIC_ED_KEY \
     DITCH_RELEASE_MANIFEST_PUBLIC_KEY_SEC1_B64 \
+    DITCH_COMMUNITY_RELEASE_MANIFEST_PUBLIC_KEY_SEC1_B64 \
     DITCH_APPLE_TEAM_ID \
     DITCH_COMMUNITY_BUILD_SEQUENCE
   do
     eval "value=\${$key:-}"
     [ -n "$value" ] && configured=$((configured + 1))
   done
-  if [ "$configured" -ne 0 ] && [ "$configured" -ne 4 ]; then
+  if [ "$configured" -ne 0 ] && [ "$configured" -ne 5 ]; then
     echo "error: release verification configuration is incomplete" >&2
-    echo "Set all four public DITCH release verification values in $release_environment_file." >&2
+    echo "Set all five public DITCH release verification values in $release_environment_file." >&2
     exit 1
   fi
-  if [ "$configured" -eq 4 ]; then
+  if [ "$configured" -eq 5 ]; then
     umask 022
     printf '%s\n' \
       "DITCH_SPARKLE_PUBLIC_ED_KEY = $DITCH_SPARKLE_PUBLIC_ED_KEY" \
       "DITCH_RELEASE_MANIFEST_PUBLIC_KEY_SEC1_B64 = $DITCH_RELEASE_MANIFEST_PUBLIC_KEY_SEC1_B64" \
+      "DITCH_COMMUNITY_RELEASE_MANIFEST_PUBLIC_KEY_SEC1_B64 = $DITCH_COMMUNITY_RELEASE_MANIFEST_PUBLIC_KEY_SEC1_B64" \
       "DITCH_APPLE_TEAM_ID = $DITCH_APPLE_TEAM_ID" \
       "DITCH_COMMUNITY_BUILD_SEQUENCE = $DITCH_COMMUNITY_BUILD_SEQUENCE" \
       > "$release_verification_config"
@@ -190,9 +192,10 @@ validate_release_verification() {
   }
   sparkle_key=$(release_value DITCH_SPARKLE_PUBLIC_ED_KEY)
   manifest_key=$(release_value DITCH_RELEASE_MANIFEST_PUBLIC_KEY_SEC1_B64)
+  community_manifest_key=$(release_value DITCH_COMMUNITY_RELEASE_MANIFEST_PUBLIC_KEY_SEC1_B64)
   team_id=$(release_value DITCH_APPLE_TEAM_ID)
   build_sequence=$(release_value DITCH_COMMUNITY_BUILD_SEQUENCE)
-  for value in "$sparkle_key" "$manifest_key" "$team_id" "$build_sequence"; do
+  for value in "$sparkle_key" "$manifest_key" "$community_manifest_key" "$team_id" "$build_sequence"; do
     [ -n "$value" ] || {
       echo "error: $release_verification_config contains an empty release verification value" >&2
       exit 1
@@ -213,6 +216,11 @@ validate_release_verification() {
   esac
   sparkle_bytes=$(printf '%s' "$sparkle_key" | openssl base64 -d -A 2>/dev/null | wc -c | tr -d ' ')
   [ "$sparkle_bytes" -eq 32 ] || { echo "error: DITCH_SPARKLE_PUBLIC_ED_KEY must decode to 32 bytes" >&2; exit 1; }
+  community_manifest_bytes=$(printf '%s' "$community_manifest_key" | openssl base64 -d -A 2>/dev/null | wc -c | tr -d ' ')
+  [ "$community_manifest_bytes" -eq 33 ] || [ "$community_manifest_bytes" -eq 65 ] || {
+    echo "error: DITCH_COMMUNITY_RELEASE_MANIFEST_PUBLIC_KEY_SEC1_B64 must be a compressed or uncompressed P-256 public key" >&2
+    exit 1
+  }
   manifest_bytes=$(printf '%s' "$manifest_key" | openssl base64 -d -A 2>/dev/null | wc -c | tr -d ' ')
   [ "$manifest_bytes" -eq 33 ] || [ "$manifest_bytes" -eq 65 ] || {
     echo "error: DITCH_RELEASE_MANIFEST_PUBLIC_KEY_SEC1_B64 must be a compressed or uncompressed P-256 public key" >&2
