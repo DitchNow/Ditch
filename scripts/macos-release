@@ -721,6 +721,22 @@ verify_release() {
   actual_build=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$app/Contents/Info.plist")
   [ "$actual_version" = "$version" ] || { echo "error: built app version is $actual_version, expected $version" >&2; exit 1; }
   [ "$actual_build" = "$build" ] || { echo "error: built app build is $actual_build, expected $build" >&2; exit 1; }
+  environment_plist="$app/Contents/Resources/DitchEnvironment.plist"
+  actual_environment=$(/usr/libexec/PlistBuddy -c 'Print :DeploymentEnvironment' "$environment_plist")
+  actual_edition=$(/usr/libexec/PlistBuddy -c 'Print :Edition' "$environment_plist")
+  actual_release_sequence=$(/usr/libexec/PlistBuddy -c 'Print :ReleaseSequence' "$environment_plist")
+  [ "$actual_environment" = "$environment" ] || { echo "error: built app environment is $actual_environment, expected $environment" >&2; exit 1; }
+  [ "$actual_edition" = commercial ] || { echo "error: built app edition is $actual_edition, expected commercial" >&2; exit 1; }
+  [ "$actual_release_sequence" = "$build" ] || { echo "error: built app release sequence is $actual_release_sequence, expected $build" >&2; exit 1; }
+  helper="$app/Contents/Library/LoginItems/The Ditch Runtime.app"
+  for executable in \
+    "$app/Contents/MacOS/ditch_cli" \
+    "$helper/Contents/MacOS/ditchd" \
+    "$helper/Contents/MacOS/ditch_cli"
+  do
+    [ -x "$executable" ] || { echo "error: built app is missing executable nested code: $executable" >&2; exit 1; }
+    codesign --verify --strict "$executable"
+  done
   rg -q "releases/$release_id/artifact/$artifact_name" "$appcast" || {
     echo "error: appcast enclosure is not bound to this immutable release" >&2
     exit 1

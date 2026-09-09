@@ -44,9 +44,12 @@ class _RemoteSettingsDialogState extends State<RemoteSettingsDialog> {
   Map<String, dynamic>? _entitlement;
   Map<String, dynamic>? _pairing;
   Timer? _timer;
+  Timer? _entitlementRetryTimer;
   bool _busy = false;
   bool _billingBusy = false;
+  bool _refreshing = false;
   String? _error;
+  String? _errorCode;
   String? _billingError;
 
   @override
@@ -62,7 +65,15 @@ class _RemoteSettingsDialogState extends State<RemoteSettingsDialog> {
   @override
   void dispose() {
     _timer?.cancel();
+    _entitlementRetryTimer?.cancel();
     super.dispose();
+  }
+
+  void _scheduleEntitlementRetry() {
+    _entitlementRetryTimer?.cancel();
+    _entitlementRetryTimer = Timer(const Duration(seconds: 2), () {
+      if (mounted) unawaited(_refresh());
+    });
   }
 
   Future<Map<String, dynamic>> _requestLocalOrRemote(
@@ -81,6 +92,8 @@ class _RemoteSettingsDialogState extends State<RemoteSettingsDialog> {
   }
 
   Future<void> _refresh() async {
+    if (_refreshing) return;
+    if (mounted) setState(() => _refreshing = true);
     Map<String, dynamic>? entitlement;
     Object? entitlementError;
     try {
@@ -103,14 +116,30 @@ class _RemoteSettingsDialogState extends State<RemoteSettingsDialog> {
         _error = entitlementError == null
             ? null
             : _friendlyHostedServiceError(entitlementError);
+        _errorCode = entitlementError is DitchRuntimeException
+            ? entitlementError.code
+            : entitlementError == null
+            ? null
+            : 'commercial_entitlement_unavailable';
+        _refreshing = false;
+        if (_errorCode == 'commercial_entitlement_loading') {
+          _scheduleEntitlementRetry();
+        }
       });
     } on Object catch (error) {
       if (mounted) {
         setState(() {
           _entitlement = entitlement;
-          _error = entitlementError == null
-              ? '$error'
-              : _friendlyHostedServiceError(entitlementError);
+          _status = null;
+          final reportedError = entitlementError ?? error;
+          _error = _friendlyHostedServiceError(reportedError);
+          _errorCode = reportedError is DitchRuntimeException
+              ? reportedError.code
+              : 'commercial_entitlement_unavailable';
+          _refreshing = false;
+          if (_errorCode == 'commercial_entitlement_loading') {
+            _scheduleEntitlementRetry();
+          }
         });
       }
     }
@@ -129,12 +158,14 @@ class _RemoteSettingsDialogState extends State<RemoteSettingsDialog> {
         _pairing = (response['RemotePairing'] as Map?)?.cast<String, dynamic>();
         _busy = false;
         _error = null;
+        _errorCode = null;
       });
     } on Object catch (error) {
       if (mounted) {
         setState(() {
           _busy = false;
-          _error = '$error';
+          _error = _friendlyHostedServiceError(error);
+          _errorCode = error is DitchRuntimeException ? error.code : null;
         });
       }
     }
@@ -158,7 +189,12 @@ class _RemoteSettingsDialogState extends State<RemoteSettingsDialog> {
         setState(() => _pairing = next);
       }
     } on Object catch (error) {
-      if (mounted) setState(() => _error = '$error');
+      if (mounted) {
+        setState(() {
+          _error = _friendlyHostedServiceError(error);
+          _errorCode = error is DitchRuntimeException ? error.code : null;
+        });
+      }
     }
   }
 
@@ -185,7 +221,8 @@ class _RemoteSettingsDialogState extends State<RemoteSettingsDialog> {
       if (mounted) {
         setState(() {
           _busy = false;
-          _error = '$error';
+          _error = _friendlyHostedServiceError(error);
+          _errorCode = error is DitchRuntimeException ? error.code : null;
         });
       }
     }
@@ -258,11 +295,21 @@ class _RemoteSettingsDialogState extends State<RemoteSettingsDialog> {
   }
 
   String _friendlyHostedServiceError(Object error) {
-    if (error is DitchRuntimeException &&
-        error.code == 'official_build_required') {
-      return 'This source build cannot use DitchNow hosted services. Install an official signed Community or Commercial build to use Remote Control.';
+    if (error is DitchRuntimeException) {
+      return switch (error.code) {
+        'official_build_required' =>
+          'This source build cannot use DitchNow hosted services. Install an official signed Community or Commercial build to use Remote Control.',
+        'commercial_entitlement_loading' =>
+          'Activating Remote Control. This normally takes only a few seconds.',
+        'commercial_entitlement_unavailable' ||
+        'commercial_entitlement_failed' =>
+          'Ditch could not verify Commercial access. Check the connection and try again.',
+        'commercial_entitlement_required' => error.message,
+        _ => error.message,
+      };
     }
-    return '$error';
+    if (error is FormatException) return error.message;
+    return 'Remote Control is temporarily unavailable. Try again.';
   }
 
   @override
@@ -270,14 +317,17 @@ class _RemoteSettingsDialogState extends State<RemoteSettingsDialog> {
     final license = _entitlement == null
         ? null
         : DitchCurrentLicense.fromEntitlement(_entitlement!);
-    final legacyExpired =
-        license == null &&
-        _error?.contains('Commercial subscription expired') == true;
-    final hostedAccessUnavailable =
-        legacyExpired ||
+    final confirmedEntitlementRequired =
         (license != null &&
             license.status != 'active' &&
-            license.status != 'over_limit');
+            license.status != 'over_limit') ||
+        (license == null && _errorCode == 'commercial_entitlement_required');
+    final entitlementMismatch =
+        license != null &&
+        (license.status == 'active' || license.status == 'over_limit') &&
+        _errorCode == 'commercial_entitlement_required';
+    final remoteReady =
+        !confirmedEntitlementRequired && _status != null && _error == null;
     final billingManagementAvailable =
         _entitlement?['billing_management_available'] == true;
     final renewalAvailable = _entitlement?['renewal_available'] == true;
@@ -292,7 +342,7 @@ class _RemoteSettingsDialogState extends State<RemoteSettingsDialog> {
       ),
       content: SizedBox(
         width: 580,
-        child: hostedAccessUnavailable
+        child: confirmedEntitlementRequired
             ? Column(
                 mainAxisSize: MainAxisSize.min,
                 children: [
@@ -304,9 +354,9 @@ class _RemoteSettingsDialogState extends State<RemoteSettingsDialog> {
                     const SizedBox(height: 12),
                   ],
                   Text(
-                    legacyExpired
-                        ? 'Commercial subscription expired.'
-                        : '${license?.displayName ?? 'Current license'} is ${license?.status ?? 'inactive'}.',
+                    license == null
+                        ? 'Commercial access is required.'
+                        : '${license.displayName} is ${license.status}.',
                     key: const Key('remote-current-license'),
                     style: Theme.of(context).textTheme.titleSmall,
                   ),
@@ -353,8 +403,27 @@ class _RemoteSettingsDialogState extends State<RemoteSettingsDialog> {
                   ],
                   if (_error == null)
                     const Center(child: CircularProgressIndicator())
-                  else
-                    SelectableText(_error!),
+                  else ...[
+                    if (_errorCode == 'commercial_entitlement_loading') ...[
+                      const Center(child: CircularProgressIndicator()),
+                      const SizedBox(height: 12),
+                    ],
+                    SelectableText(
+                      entitlementMismatch
+                          ? 'Ditch is synchronizing Commercial access with the local runtime. Try again in a moment.'
+                          : _error!,
+                      key: const Key('remote-transient-error'),
+                    ),
+                    const SizedBox(height: 12),
+                    Align(
+                      alignment: Alignment.center,
+                      child: OutlinedButton(
+                        key: const Key('retry-remote-control'),
+                        onPressed: _refreshing ? null : _refresh,
+                        child: const Text('Retry'),
+                      ),
+                    ),
+                  ],
                 ],
               )
             : SingleChildScrollView(
@@ -397,21 +466,24 @@ class _RemoteSettingsDialogState extends State<RemoteSettingsDialog> {
                       ),
                     ...devices.map((raw) {
                       final device = raw.cast<Object?, Object?>();
+                      final deviceId =
+                          device['device_id']?.toString() ?? 'Unavailable';
+                      final deviceState =
+                          device['state']?.toString() ?? 'unknown';
                       return ListTile(
                         leading: const Icon(Icons.phone_iphone),
                         title: Text(device['name']?.toString() ?? 'iPhone'),
                         subtitle: Text(
-                          device['state']?.toString() ?? 'unknown',
+                          'Unique identifier: $deviceId\nStatus: $deviceState',
                         ),
+                        isThreeLine: true,
                         trailing:
                             widget.sshAlias == null &&
                                 device['state'] == 'active'
                             ? TextButton(
                                 onPressed: _busy
                                     ? null
-                                    : () => _revoke(
-                                        device['device_id'].toString(),
-                                      ),
+                                    : () => _revoke(deviceId),
                                 child: const Text('Revoke'),
                               )
                             : null,
@@ -427,13 +499,13 @@ class _RemoteSettingsDialogState extends State<RemoteSettingsDialog> {
               ),
       ),
       actions: [
-        if (!hostedAccessUnavailable && billingManagementAvailable)
+        if (!confirmedEntitlementRequired && billingManagementAvailable)
           TextButton(
             key: const Key('manage-commercial-billing'),
             onPressed: _billingBusy ? null : _openBillingManagement,
             child: const Text('Manage Billing'),
           ),
-        if (_pairing == null && !hostedAccessUnavailable)
+        if (_pairing == null && remoteReady)
           FilledButton.icon(
             key: const Key('connect-iphone'),
             onPressed: _busy || _status?['configured'] != true

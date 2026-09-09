@@ -16,6 +16,11 @@ dist/
 *.log
 *.swp
 
+# Local macOS release convenience wrappers.
+/production.sh
+/register_staging_build.sh
+/staging.sh
+
 apps/macos/macos/Flutter/ephemeral/
 apps/macos/macos/Pods/
 apps/macos/pubspec_overrides.yaml

@@ -63,8 +63,10 @@ class _ExpiredCommercialClient extends DitchRuntimeClient {
 }
 
 class _ActiveCommercialClient extends DitchRuntimeClient {
-  _ActiveCommercialClient()
+  _ActiveCommercialClient({this.devices = const []})
     : super(socketPath: '/tmp/ditch-active-commercial.sock');
+
+  final List<Object> devices;
 
   @override
   Future<Map<String, dynamic>> request(Object body) async {
@@ -106,11 +108,37 @@ class _ActiveCommercialClient extends DitchRuntimeClient {
           'configured': true,
           'online': true,
           'machine_name': 'Test Mac',
-          'devices': <Object>[],
+          'devices': devices,
         },
       };
     }
     throw StateError('Unexpected request: $body');
+  }
+}
+
+class _EntitlementMismatchClient extends _ActiveCommercialClient {
+  @override
+  Future<Map<String, dynamic>> request(Object body) async {
+    if (body == 'RemoteControlStatus') {
+      throw const DitchRuntimeException(
+        'commercial_entitlement_required',
+        'Commercial subscription expired. Local and SSH Ditch continue to work.',
+      );
+    }
+    return super.request(body);
+  }
+}
+
+class _UnavailableEntitlementClient extends DitchRuntimeClient {
+  _UnavailableEntitlementClient()
+    : super(socketPath: '/tmp/ditch-unavailable-commercial.sock');
+
+  @override
+  Future<Map<String, dynamic>> request(Object body) async {
+    throw const DitchRuntimeException(
+      'commercial_entitlement_unavailable',
+      'private transport detail',
+    );
   }
 }
 
@@ -200,6 +228,7 @@ void main() {
     expect(find.byKey(const Key('remote-current-license')), findsOneWidget);
     expect(find.text('Local and SSH Ditch continue to work.'), findsOneWidget);
     expect(find.text('Renew'), findsOneWidget);
+    expect(find.byKey(const Key('connect-iphone')), findsNothing);
   });
 
   testWidgets('staging Remote Control keeps test mode visible', (tester) async {
@@ -220,6 +249,91 @@ void main() {
     expect(find.byKey(const Key('remote-staging-environment')), findsOneWidget);
     expect(find.text('TEST MODE'), findsOneWidget);
     expect(find.text(relayOrigin), findsOneWidget);
+    expect(find.byKey(const Key('connect-iphone')), findsOneWidget);
+  });
+
+  testWidgets(
+    'active Relay entitlement never renders a contradictory expired error',
+    (tester) async {
+      await tester.pumpWidget(
+        MaterialApp(
+          home: RemoteSettingsDialog(client: _EntitlementMismatchClient()),
+        ),
+      );
+      await tester.pump();
+      await tester.pump();
+
+      expect(
+        find.text(
+          'Ditch is synchronizing Commercial access with the local runtime. Try again in a moment.',
+        ),
+        findsOneWidget,
+      );
+      expect(
+        find.textContaining('commercial_entitlement_required'),
+        findsNothing,
+      );
+      expect(find.byKey(const Key('connect-iphone')), findsNothing);
+      expect(find.byKey(const Key('retry-remote-control')), findsOneWidget);
+    },
+  );
+
+  testWidgets('transient entitlement failures are friendly and retryable', (
+    tester,
+  ) async {
+    await tester.pumpWidget(
+      MaterialApp(
+        home: RemoteSettingsDialog(
+          client: _UnavailableEntitlementClient(),
+          deploymentEnvironment: 'staging',
+          relayOrigin:
+              'https://ditch-remote-relay-staging.matin-1a7.workers.dev',
+        ),
+      ),
+    );
+    await tester.pump();
+    await tester.pump();
+
+    expect(
+      find.text(
+        'Ditch could not verify Commercial access. Check the connection and try again.',
+      ),
+      findsOneWidget,
+    );
+    expect(find.textContaining('private transport detail'), findsNothing);
+    expect(find.byKey(const Key('remote-staging-environment')), findsOneWidget);
+    expect(find.byKey(const Key('retry-remote-control')), findsOneWidget);
+    expect(find.byKey(const Key('connect-iphone')), findsNothing);
+  });
+
+  testWidgets('Remote Control shows each iPhone name and unique identifier', (
+    tester,
+  ) async {
+    const deviceId = '11111111-1111-4111-8111-111111111111';
+    await tester.pumpWidget(
+      MaterialApp(
+        home: RemoteSettingsDialog(
+          client: _ActiveCommercialClient(
+            devices: const [
+              {
+                'device_id': deviceId,
+                'name': 'Matin’s iPhone',
+                'state': 'active',
+              },
+            ],
+          ),
+        ),
+      ),
+    );
+    await tester.pump();
+    await tester.pump();
+
+    expect(find.text('Matin’s iPhone'), findsOneWidget);
+    expect(
+      find.text('Unique identifier: $deviceId\nStatus: active'),
+      findsOneWidget,
+    );
+    expect(find.text('Revoke'), findsOneWidget);
   });
 
   testWidgets('renewal opens only the Relay-provided billing URL', (

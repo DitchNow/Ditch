@@ -26,6 +26,30 @@ expected_bundle_id=${DITCH_BUNDLE_ID:-ai.theditch.app}
   exit 1
 }
 
+environment_plist="$app/Contents/Resources/DitchEnvironment.plist"
+[ -f "$environment_plist" ] || { echo "error: app is missing DitchEnvironment.plist" >&2; exit 1; }
+actual_edition=$(/usr/libexec/PlistBuddy -c 'Print :Edition' "$environment_plist")
+[ "$actual_edition" = commercial ] || {
+  echo "error: Commercial DMG contains a $actual_edition app" >&2
+  exit 1
+}
+if [ -n "${DITCH_DEPLOYMENT_ENVIRONMENT:-}" ]; then
+  actual_environment=$(/usr/libexec/PlistBuddy -c 'Print :DeploymentEnvironment' "$environment_plist")
+  [ "$actual_environment" = "$DITCH_DEPLOYMENT_ENVIRONMENT" ] || {
+    echo "error: app environment $actual_environment does not match $DITCH_DEPLOYMENT_ENVIRONMENT" >&2
+    exit 1
+  }
+fi
+
+helper="$app/Contents/Library/LoginItems/The Ditch Runtime.app"
+for executable in \
+  "$app/Contents/MacOS/ditch_cli" \
+  "$helper/Contents/MacOS/ditchd" \
+  "$helper/Contents/MacOS/ditch_cli"
+do
+  [ -x "$executable" ] || { echo "error: missing executable nested code: $executable" >&2; exit 1; }
+done
+
 if [ -n "${DITCH_CODESIGN_IDENTITY:-}" ]; then
   sign_release_code() {
     codesign --force --timestamp --options runtime \
@@ -36,7 +60,6 @@ if [ -n "${DITCH_CODESIGN_IDENTITY:-}" ]; then
   # supply Sparkle with ad-hoc signatures, and the Xcode build phase adds the
   # cross-built macOS runtimes after Xcode's normal signing traversal.
   sparkle="$app/Contents/Frameworks/Sparkle.framework/Versions/B"
-  helper="$app/Contents/Library/LoginItems/The Ditch Runtime.app"
   for nested in \
     "$sparkle/Autoupdate" \
     "$sparkle/Updater.app" \

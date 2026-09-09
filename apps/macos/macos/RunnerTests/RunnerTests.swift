@@ -77,4 +77,56 @@ class RunnerTests: XCTestCase {
     XCTAssertFalse(paths.contains { $0.contains("/Documents/") })
   }
 
+  func testRuntimeIdentityRequiresTheExactEditionEnvironmentAndBuild() {
+    let expected = AppDelegate.DeploymentConfiguration(
+      environment: "staging",
+      edition: "commercial",
+      relayOrigin: "https://staging.example.test",
+      allowedUpdateHosts: ["staging.example.test"],
+      buildIdentifier: "0.1.1-abcdef1234567890",
+      buildNumber: "110",
+      releaseSequence: 110,
+      communityRevision: String(repeating: "a", count: 40))
+    let matching = AppDelegate.RunningRuntimeStatus(
+      activeSessionCount: 0,
+      edition: "commercial",
+      deploymentEnvironment: "staging",
+      buildIdentifier: "0.1.1-abcdef1234567890",
+      buildNumber: "110",
+      releaseSequence: 110,
+      communityRevision: String(repeating: "a", count: 40))
+
+    XCTAssertTrue(matching.matches(expected))
+    XCTAssertFalse(
+      AppDelegate.RunningRuntimeStatus(
+        activeSessionCount: 0,
+        edition: "commercial",
+        deploymentEnvironment: "production",
+        buildIdentifier: matching.buildIdentifier,
+        buildNumber: matching.buildNumber,
+        releaseSequence: matching.releaseSequence,
+        communityRevision: matching.communityRevision
+      ).matches(expected))
+    XCTAssertFalse(
+      AppDelegate.RunningRuntimeStatus(
+        activeSessionCount: 0,
+        edition: "community",
+        deploymentEnvironment: matching.deploymentEnvironment,
+        buildIdentifier: matching.buildIdentifier,
+        buildNumber: matching.buildNumber,
+        releaseSequence: matching.releaseSequence,
+        communityRevision: matching.communityRevision
+      ).matches(expected))
+    XCTAssertFalse(
+      AppDelegate.RunningRuntimeStatus(
+        activeSessionCount: 0,
+        edition: matching.edition,
+        deploymentEnvironment: matching.deploymentEnvironment,
+        buildIdentifier: matching.buildIdentifier,
+        buildNumber: "111",
+        releaseSequence: 111,
+        communityRevision: matching.communityRevision
+      ).matches(expected))
+  }
+
 }

@@ -13,6 +13,8 @@ use ditch_remote::{MachineIdentity, canonical_request};
 use rand_core::{OsRng, RngCore};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap, VecDeque};
+#[cfg(target_os = "macos")]
+use std::process::Command;
 use std::sync::{
     Arc, Mutex,
     mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError},
@@ -26,6 +28,7 @@ use uuid::Uuid;
 const HEARTBEAT_INTERVAL: StdDuration = StdDuration::from_secs(20);
 const PROJECTION_ACK_TIMEOUT: StdDuration = StdDuration::from_secs(30);
 const MAX_INCREMENTAL_RECORDS: usize = 32;
+const MAX_MACHINE_NAME_CHARS: usize = 120;
 
 pub(super) struct RemoteController {
     relay_origin: Option<String>,
@@ -96,13 +99,6 @@ fn has_remote_control_entitlement(state: &Arc<Mutex<RuntimeState>>) -> bool {
     })
 }
 
-fn entitlement_required() -> ServerResponse {
-    protocol_error(
-        "commercial_entitlement_required",
-        "Commercial subscription expired. Local and SSH Ditch continue to work.",
-    )
-}
-
 pub(super) fn entitlement_changed(state: Arc<Mutex<RuntimeState>>, active: bool) {
     if active {
         start_connection(state);
@@ -117,8 +113,8 @@ pub(super) fn entitlement_changed(state: Arc<Mutex<RuntimeState>>, active: bool)
 }
 
 pub(super) fn status(state: Arc<Mutex<RuntimeState>>) -> ServerResponse {
-    if !has_remote_control_entitlement(&state) {
-        return entitlement_required();
+    if let Some(response) = super::edition::require_remote_control_entitlement(&state) {
+        return response;
     }
     let should_reconcile = state
         .lock()
@@ -144,8 +140,8 @@ pub(super) fn status(state: Arc<Mutex<RuntimeState>>) -> ServerResponse {
 }
 
 pub(super) fn ensure_machine_identity(state: Arc<Mutex<RuntimeState>>) -> ServerResponse {
-    if !has_remote_control_entitlement(&state) {
-        return entitlement_required();
+    if let Some(response) = super::edition::require_remote_control_entitlement(&state) {
+        return response;
     }
     let (origin, identity, name) = {
         let mut guard = state
@@ -314,8 +310,8 @@ fn active_devices_from_response(value: &Value) -> Result<Vec<RemoteDeviceRecord>
 }
 
 pub(super) fn create_pairing(state: Arc<Mutex<RuntimeState>>) -> ServerResponse {
-    if !has_remote_control_entitlement(&state) {
-        return entitlement_required();
+    if let Some(response) = super::edition::require_remote_control_entitlement(&state) {
+        return response;
     }
     let (origin, identity, installation_identity, machine_name) = {
         let mut state = state
@@ -361,8 +357,8 @@ pub(super) fn create_pairing(state: Arc<Mutex<RuntimeState>>) -> ServerResponse 
 }
 
 pub(super) fn get_pairing(state: Arc<Mutex<RuntimeState>>, pairing_id: Uuid) -> ServerResponse {
-    if !has_remote_control_entitlement(&state) {
-        return entitlement_required();
+    if let Some(response) = super::edition::require_remote_control_entitlement(&state) {
+        return response;
     }
     let (origin, identity) = match remote_identity(&state) {
         Ok(value) => value,
@@ -388,8 +384,8 @@ pub(super) fn get_pairing(state: Arc<Mutex<RuntimeState>>, pairing_id: Uuid) -> 
 }
 
 pub(super) fn confirm_pairing(state: Arc<Mutex<RuntimeState>>, pairing_id: Uuid) -> ServerResponse {
-    if !has_remote_control_entitlement(&state) {
-        return entitlement_required();
+    if let Some(response) = super::edition::require_remote_control_entitlement(&state) {
+        return response;
     }
     let (origin, identity) = match remote_identity(&state) {
         Ok(value) => value,
@@ -545,10 +541,7 @@ fn ensure_identity(state: &mut RuntimeState) -> Result<MachineIdentity, String> 
             .as_ref()
             .filter(|value| value.machine_id == machine_id)
             .and_then(|value| value.owner_id),
-        name: existing
-            .as_ref()
-            .map(|value| value.name.clone())
-            .unwrap_or_else(machine_name),
+        name: machine_name(),
         signing_public_key: identity.signing_public_key(),
         agreement_public_key: identity.agreement_public_key(),
         key_version: 1,
@@ -720,11 +713,49 @@ fn uuid_field(value: &Value, key: &str) -> Result<Uuid, String> {
         .and_then(|value| Uuid::parse_str(value).ok())
         .ok_or_else(|| format!("relay omitted {key}"))
 }
-fn machine_name() -> String {
-    std::env::var("DITCH_MACHINE_NAME")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
+pub(super) fn machine_name() -> String {
+    preferred_machine_name(
+        std::env::var("DITCH_MACHINE_NAME").ok().as_deref(),
+        system_computer_name().as_deref(),
+    )
+}
+
+fn preferred_machine_name(override_name: Option<&str>, system_name: Option<&str>) -> String {
+    override_name
+        .and_then(normalize_machine_name)
+        .or_else(|| system_name.and_then(normalize_machine_name))
         .unwrap_or_else(|| "This Mac".to_owned())
+}
+
+fn normalize_machine_name(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let value = value
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(MAX_MACHINE_NAME_CHARS)
+        .collect::<String>();
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_owned())
+}
+
+#[cfg(target_os = "macos")]
+fn system_computer_name() -> Option<String> {
+    let output = Command::new("/usr/sbin/scutil")
+        .args(["--get", "ComputerName"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8(output.stdout).ok()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn system_computer_name() -> Option<String> {
+    None
 }
 
 pub(super) fn start_connection(state: Arc<Mutex<RuntimeState>>) {
@@ -1744,9 +1775,9 @@ fn remote_error_code(error: &ditch_remote::RemoteError) -> &'static str {
 #[cfg(test)]
 mod relay_origin_tests {
     use super::{
-        ProjectionAckOutcome, ProjectionSnapshot, ProjectionTransport,
+        MAX_MACHINE_NAME_CHARS, ProjectionAckOutcome, ProjectionSnapshot, ProjectionTransport,
         active_devices_from_response, configured_relay_origin, machine_device_path,
-        machine_devices_path,
+        machine_devices_path, preferred_machine_name,
     };
     use ditch_remote::ProjectProjection;
     use serde_json::{Value, json};
@@ -1835,6 +1866,34 @@ mod relay_origin_tests {
         assert_eq!(
             configured_relay_origin(Some("   "), PRODUCTION_RELAY_ORIGIN).as_deref(),
             Ok(PRODUCTION_RELAY_ORIGIN)
+        );
+    }
+
+    #[test]
+    fn machine_name_prefers_an_explicit_normalized_override() {
+        assert_eq!(
+            preferred_machine_name(Some("  Studio Mac  \n"), Some("System Mac")),
+            "Studio Mac"
+        );
+    }
+
+    #[test]
+    fn machine_name_uses_the_system_name_and_has_a_safe_fallback() {
+        assert_eq!(
+            preferred_machine_name(Some("  "), Some("  Metin’s MacBook Pro\n")),
+            "Metin’s MacBook Pro"
+        );
+        assert_eq!(preferred_machine_name(None, None), "This Mac");
+    }
+
+    #[test]
+    fn machine_name_respects_the_relay_contract_limit() {
+        let long_name = "m".repeat(MAX_MACHINE_NAME_CHARS + 1);
+        assert_eq!(
+            preferred_machine_name(None, Some(&long_name))
+                .chars()
+                .count(),
+            MAX_MACHINE_NAME_CHARS
         );
     }
 

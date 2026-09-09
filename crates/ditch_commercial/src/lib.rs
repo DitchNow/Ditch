@@ -5,10 +5,12 @@ use chrono::{DateTime, Utc};
 use ditch_identity::InstallationIdentity;
 pub use ditch_identity::InstallationIdentitySummary;
 use ditch_remote::MachineIdentity;
+use ditch_upgrade::{EntitlementSummary, HttpUpgradeBackend, UpgradeBackend};
 use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
+use std::fmt;
 use url::Url;
 
 pub const CONFIGURED_RELAY_ORIGIN: &str = match option_env!("DITCH_RELAY_ORIGIN") {
@@ -164,37 +166,67 @@ impl CommercialCapabilityRegistry {
 }
 
 #[derive(Deserialize)]
-struct EntitlementResponse {
-    #[serde(default = "community_plan")]
-    plan: String,
-    status: String,
-    #[serde(default)]
-    valid_until: Option<DateTime<Utc>>,
-    capabilities: serde_json::Map<String, serde_json::Value>,
-}
-
-fn community_plan() -> String {
-    "community".to_owned()
-}
-
-#[derive(Deserialize)]
-struct CapabilityState {
-    enabled: bool,
-}
-
-#[derive(Deserialize)]
 struct BillingManagementResponse {
     billing_management_url: String,
 }
 
-fn register(identity: &InstallationIdentity) -> Result<(), String> {
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RefreshedCommercialEntitlement {
+    pub capability: CommercialEntitlement,
+    pub summary: EntitlementSummary,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EntitlementRefreshStage {
+    MachineRegistration,
+    OwnerBootstrap,
+    EntitlementRequest,
+}
+
+impl EntitlementRefreshStage {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::MachineRegistration => "machine_registration",
+            Self::OwnerBootstrap => "owner_bootstrap",
+            Self::EntitlementRequest => "entitlement_request",
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct EntitlementRefreshError {
+    stage: EntitlementRefreshStage,
+    detail: String,
+}
+
+impl EntitlementRefreshError {
+    fn new(stage: EntitlementRefreshStage, detail: impl Into<String>) -> Self {
+        Self {
+            stage,
+            detail: detail.into(),
+        }
+    }
+
+    pub const fn stage(&self) -> EntitlementRefreshStage {
+        self.stage
+    }
+}
+
+impl fmt::Display for EntitlementRefreshError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{} failed: {}", self.stage.as_str(), self.detail)
+    }
+}
+
+impl std::error::Error for EntitlementRefreshError {}
+
+fn register(identity: &InstallationIdentity, machine_name: &str) -> Result<(), String> {
     let summary = identity.summary();
     let signing_public_key = summary.signing_public_key;
     let agreement_public_key = identity.agreement_public_key();
-    let name = "The Ditch on macOS";
     let canonical = format!(
         "DITCH-MACHINE-REGISTER-1\n{}\n{}\n{}\n{}",
-        summary.installation_id, name, signing_public_key, agreement_public_key
+        summary.installation_id, machine_name, signing_public_key, agreement_public_key
     );
     let response = ureq::post(&format!(
         "{}/v1/machines/register",
@@ -204,7 +236,7 @@ fn register(identity: &InstallationIdentity) -> Result<(), String> {
     .send_json(serde_json::json!({
         "protocol_version": 1,
         "machine_id": summary.installation_id,
-        "name": name,
+        "name": machine_name,
         "signing_public_key": signing_public_key,
         "agreement_public_key": agreement_public_key,
         "proof": identity.sign(canonical.as_bytes()),
@@ -263,39 +295,59 @@ fn signed_request(
 /// installation identity and never creates a second machine/license owner.
 pub fn refresh_entitlement(
     identity: &InstallationIdentity,
-) -> Result<CommercialEntitlement, String> {
-    register(identity)?;
-    let _: serde_json::Value = signed_request(identity, "POST", "/v1/commercial/bootstrap", b"")?
-        .into_json()
-        .map_err(|error| error.to_string())?;
-    let response: EntitlementResponse =
-        signed_request(identity, "GET", "/v1/commercial/entitlement", b"")?
-            .into_json()
-            .map_err(|error| error.to_string())?;
-    let status = match response.status.as_str() {
+    machine_name: &str,
+) -> Result<RefreshedCommercialEntitlement, EntitlementRefreshError> {
+    register(identity, machine_name).map_err(|error| {
+        EntitlementRefreshError::new(EntitlementRefreshStage::MachineRegistration, error)
+    })?;
+    let bootstrap =
+        signed_request(identity, "POST", "/v1/commercial/bootstrap", b"").map_err(|error| {
+            EntitlementRefreshError::new(EntitlementRefreshStage::OwnerBootstrap, error)
+        })?;
+    let _: serde_json::Value = bootstrap.into_json().map_err(|error| {
+        EntitlementRefreshError::new(EntitlementRefreshStage::OwnerBootstrap, error.to_string())
+    })?;
+    let summary = HttpUpgradeBackend::official()
+        .and_then(|backend| backend.entitlement(identity))
+        .map_err(|error| {
+            EntitlementRefreshError::new(
+                EntitlementRefreshStage::EntitlementRequest,
+                error.to_string(),
+            )
+        })?;
+    Ok(refreshed_entitlement_from_summary(summary, Utc::now()))
+}
+
+fn refreshed_entitlement_from_summary(
+    summary: EntitlementSummary,
+    refreshed_at: DateTime<Utc>,
+) -> RefreshedCommercialEntitlement {
+    let status = match summary.status.as_str() {
         "active" => CommercialEntitlementStatus::Active,
         "over_limit" => CommercialEntitlementStatus::OverLimit,
         "expired" => CommercialEntitlementStatus::Expired,
         "refunded" => CommercialEntitlementStatus::Refunded,
         _ => CommercialEntitlementStatus::Inactive,
     };
-    let capabilities = response
-        .capabilities
-        .into_iter()
-        .filter_map(|(id, value)| {
-            serde_json::from_value::<CapabilityState>(value)
-                .ok()
-                .filter(|state| state.enabled)
-                .map(|_| id)
-        })
-        .collect();
-    Ok(CommercialEntitlement {
-        plan: response.plan,
+    let capabilities = if summary.active {
+        BTreeSet::from([CommercialCapabilityId::REMOTE_CONTROL.as_str().to_owned()])
+    } else {
+        BTreeSet::new()
+    };
+    let capability = CommercialEntitlement {
+        plan: summary
+            .plan
+            .clone()
+            .unwrap_or_else(|| "community".to_owned()),
         status,
         capabilities,
-        valid_until: response.valid_until,
-        refreshed_at: Utc::now(),
-    })
+        valid_until: summary.expires_at,
+        refreshed_at,
+    };
+    RefreshedCommercialEntitlement {
+        capability,
+        summary,
+    }
 }
 
 pub fn configured_relay_origin() -> Result<&'static str, String> {
@@ -365,6 +417,7 @@ mod tests {
     use super::*;
     use chrono::Duration;
     use ditch_identity::{FileIdentityStore, IdentityStore};
+    use ditch_upgrade::CurrentLicenseSummary;
     use std::fs;
     use uuid::Uuid;
 
@@ -386,6 +439,40 @@ mod tests {
         assert!(!expired.active_at(now));
         assert!(active.allows(CommercialCapabilityId::REMOTE_CONTROL, now));
         assert!(!CommercialEntitlement::inactive(now).active_at(now));
+    }
+
+    #[test]
+    fn public_summary_and_private_capability_are_one_snapshot() {
+        let now = Utc::now();
+        let summary = EntitlementSummary {
+            active: true,
+            plan: Some("commercial_lifetime".to_owned()),
+            status: "active".to_owned(),
+            expires_at: None,
+            mac_slots: 2,
+            iphone_slots: 2,
+            billing_management_available: true,
+            renewal_available: false,
+            current_license: CurrentLicenseSummary {
+                edition: "commercial".to_owned(),
+                status: "active".to_owned(),
+                display_name: "Ditch Commercial".to_owned(),
+                plans: Vec::new(),
+            },
+        };
+
+        let refreshed = refreshed_entitlement_from_summary(summary.clone(), now);
+
+        assert_eq!(refreshed.summary, summary);
+        assert_eq!(
+            refreshed.capability.status,
+            CommercialEntitlementStatus::Active
+        );
+        assert!(
+            refreshed
+                .capability
+                .allows(CommercialCapabilityId::REMOTE_CONTROL, now)
+        );
     }
 
     #[test]
