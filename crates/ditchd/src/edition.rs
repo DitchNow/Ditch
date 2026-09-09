@@ -24,6 +24,13 @@ pub fn after_broadcast(_state: &mut RuntimeState) {}
 
 pub fn start(_state: Arc<Mutex<RuntimeState>>) {}
 
+/// Community keeps the provider-neutral upgrade endpoint implemented by the
+/// shared runtime. Commercial overrides it so capability gating and the UI
+/// consume the same refreshed entitlement snapshot.
+pub fn commercial_entitlement(_state: Arc<Mutex<RuntimeState>>) -> Option<ServerResponse> {
+    None
+}
+
 pub fn handle_request(_request: ClientRequest, _state: Arc<Mutex<RuntimeState>>) -> ServerResponse {
     protocol_error(
         "unsupported_request",

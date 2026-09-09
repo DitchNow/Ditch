@@ -31,6 +31,7 @@ final class StatusHost: NSObject, NSApplicationDelegate, UNUserNotificationCente
   private var activeAttentionIds = Set<String>()
   private var notifiedAttentionIds = Set<String>()
   private var lastRuntimeStatus: RuntimeStatus?
+  private var expectedRuntimeIdentity: RuntimeBuildIdentity?
   private var lastStartAttempt = Date.distantPast
   private var appPath = ""
   private var helperDirectory = ""
@@ -51,6 +52,12 @@ final class StatusHost: NSObject, NSApplicationDelegate, UNUserNotificationCente
     restoreRuntimeEnvironment()
     logFilePath = StatusHost.defaultLogFilePath()
     appPath = StatusHost.parentAppPath()
+    guard let expectedRuntimeIdentity = RuntimeBuildIdentity.load(appPath: appPath) else {
+      log("bundled runtime identity configuration is missing or invalid")
+      NSApp.terminate(nil)
+      return
+    }
+    self.expectedRuntimeIdentity = expectedRuntimeIdentity
     helperDirectory = Bundle.main.executableURL?
       .deletingLastPathComponent()
       .path ?? URL(fileURLWithPath: CommandLine.arguments[0]).deletingLastPathComponent().path
@@ -233,7 +240,9 @@ final class StatusHost: NSObject, NSApplicationDelegate, UNUserNotificationCente
       guard let self else {
         return
       }
-      let status = self.runtimeStatus()
+      let status = self.runtimeStatus().flatMap { status in
+        self.runtimeMatchesExpectedIdentity(status) ? status : nil
+      }
       DispatchQueue.main.async {
         self.refreshInFlight = false
         self.applyRuntimeStatus(status)
@@ -698,11 +707,23 @@ final class StatusHost: NSObject, NSApplicationDelegate, UNUserNotificationCente
     DispatchQueue.global(qos: .utility).async { [weak self] in
       guard let self else { return }
       if let status = self.runtimeStatus() {
-        DispatchQueue.main.async {
-          self.runtimeStartInFlight = false
-          self.applyRuntimeStatus(status)
+        if self.runtimeMatchesExpectedIdentity(status) {
+          DispatchQueue.main.async {
+            self.runtimeStartInFlight = false
+            self.applyRuntimeStatus(status)
+          }
+          return
         }
-        return
+        self.log(
+          "rejecting mismatched runtime edition=\(status.edition) environment=\(status.deploymentEnvironment) build=\(status.buildIdentifier).\(status.buildNumber) sequence=\(status.releaseSequence)")
+        if status.activeSessionCount > 0 {
+          DispatchQueue.main.async {
+            self.runtimeStartInFlight = false
+            self.applyRuntimeStatus(nil)
+          }
+          return
+        }
+        _ = self.runDitchCli(arguments: ["runtime", "stop"])
       }
 
       if !self.runtimeThreadStarted {
@@ -721,8 +742,12 @@ final class StatusHost: NSObject, NSApplicationDelegate, UNUserNotificationCente
       var status: RuntimeStatus?
       for _ in 0..<20 {
         Thread.sleep(forTimeInterval: 0.1)
-        status = self.runtimeStatus()
-        if status != nil { break }
+        if let candidate = self.runtimeStatus(),
+          self.runtimeMatchesExpectedIdentity(candidate)
+        {
+          status = candidate
+          break
+        }
       }
       DispatchQueue.main.async {
         self.runtimeStartInFlight = false
@@ -757,7 +782,12 @@ final class StatusHost: NSObject, NSApplicationDelegate, UNUserNotificationCente
       let pid = status["pid"] as? Int,
       let activeSessionCount = status["active_session_count"] as? Int,
       let attentionCount = status["attention_count"] as? Int,
-      let instanceId = status["instance_id"] as? String
+      let instanceId = status["instance_id"] as? String,
+      let edition = status["edition"] as? String,
+      let deploymentEnvironment = status["deployment_environment"] as? String,
+      let buildIdentifier = status["build_identifier"] as? String,
+      let buildNumber = status["build_number"] as? String,
+      let releaseSequence = status["release_sequence"] as? Int
     else {
       return nil
     }
@@ -767,7 +797,18 @@ final class StatusHost: NSObject, NSApplicationDelegate, UNUserNotificationCente
       attentionCount: attentionCount,
       unreadAttentionCount: status["unread_attention_count"] as? Int ?? attentionCount,
       instanceId: instanceId,
-      codexHome: status["codex_home"] as? String)
+      codexHome: status["codex_home"] as? String,
+      edition: edition,
+      deploymentEnvironment: deploymentEnvironment,
+      buildIdentifier: buildIdentifier,
+      buildNumber: buildNumber,
+      releaseSequence: releaseSequence,
+      communityRevision: status["community_revision"] as? String)
+  }
+
+  private func runtimeMatchesExpectedIdentity(_ status: RuntimeStatus) -> Bool {
+    guard let expectedRuntimeIdentity else { return false }
+    return expectedRuntimeIdentity.matches(status)
   }
 
   private func runDitchCli(arguments: [String]) -> CommandOutput {
@@ -1158,6 +1199,59 @@ private struct RuntimeStatus {
   let unreadAttentionCount: Int
   let instanceId: String
   let codexHome: String?
+  let edition: String
+  let deploymentEnvironment: String
+  let buildIdentifier: String
+  let buildNumber: String
+  let releaseSequence: Int
+  let communityRevision: String?
+}
+
+private struct RuntimeBuildIdentity {
+  let edition: String
+  let deploymentEnvironment: String
+  let buildIdentifier: String
+  let buildNumber: String
+  let releaseSequence: Int
+  let communityRevision: String
+
+  static func load(appPath: String) -> RuntimeBuildIdentity? {
+    guard !appPath.isEmpty else { return nil }
+    let url = URL(fileURLWithPath: appPath)
+      .appendingPathComponent("Contents/Resources/DitchEnvironment.plist")
+    guard let data = try? Data(contentsOf: url),
+      let propertyList = try? PropertyListSerialization.propertyList(
+        from: data, options: [], format: nil),
+      let values = propertyList as? [String: Any],
+      let edition = values["Edition"] as? String,
+      let deploymentEnvironment = values["DeploymentEnvironment"] as? String,
+      let buildIdentifier = values["BuildIdentifier"] as? String,
+      let buildNumber = values["BuildNumber"] as? String,
+      let releaseSequence = values["ReleaseSequence"] as? NSNumber,
+      let communityRevision = values["CommunityRevision"] as? String,
+      ["community", "commercial"].contains(edition),
+      ["staging", "production"].contains(deploymentEnvironment),
+      !buildIdentifier.isEmpty,
+      !buildNumber.isEmpty,
+      !communityRevision.isEmpty
+    else { return nil }
+    return RuntimeBuildIdentity(
+      edition: edition,
+      deploymentEnvironment: deploymentEnvironment,
+      buildIdentifier: buildIdentifier,
+      buildNumber: buildNumber,
+      releaseSequence: releaseSequence.intValue,
+      communityRevision: communityRevision)
+  }
+
+  func matches(_ status: RuntimeStatus) -> Bool {
+    status.edition == edition
+      && status.deploymentEnvironment == deploymentEnvironment
+      && status.buildIdentifier == buildIdentifier
+      && status.buildNumber == buildNumber
+      && status.releaseSequence == releaseSequence
+      && status.communityRevision == communityRevision
+  }
 }
 
 private struct CommandOutput {

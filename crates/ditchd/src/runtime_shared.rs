@@ -1586,6 +1586,9 @@ fn handle_request(request: ClientRequest, state: Arc<Mutex<RuntimeState>>) -> Se
             }
         }
         ClientRequest::CommercialEntitlement => {
+            if let Some(response) = edition::commercial_entitlement(Arc::clone(&state)) {
+                return response;
+            }
             let installation = state
                 .lock()
                 .expect("runtime state lock should not be poisoned")

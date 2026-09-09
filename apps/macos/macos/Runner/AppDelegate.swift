@@ -12,7 +12,7 @@ import UserNotifications
 /// Terminating this process must never stop The Ditch Runtime or its agents.
 @main
 class AppDelegate: FlutterAppDelegate, SPUUpdaterDelegate {
-  private struct DeploymentConfiguration {
+  struct DeploymentConfiguration {
     let environment: String
     let edition: String
     let relayOrigin: String
@@ -88,7 +88,7 @@ class AppDelegate: FlutterAppDelegate, SPUUpdaterDelegate {
     }
   }
 
-  private struct RunningRuntimeStatus {
+  struct RunningRuntimeStatus {
     let activeSessionCount: Int
     let edition: String
     let deploymentEnvironment: String

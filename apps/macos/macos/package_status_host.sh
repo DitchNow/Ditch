@@ -294,7 +294,11 @@ fi
 # and exact byte size here; `cp` itself already exits nonzero on write failure.
 test -x "$MAIN_MACOS/ditch_cli"
 test -x "$HELPER_MACOS/ditchd"
+test -x "$HELPER_MACOS/ditch_cli"
+test -x "$MAIN_MACOS/ditchd-remote-$HOST_REMOTE_TARGET"
+test -x "$HELPER_MACOS/ditchd-remote-$HOST_REMOTE_TARGET"
 test "$(stat -f %z "$DITCH_CLI_SOURCE")" = "$(stat -f %z "$MAIN_MACOS/ditch_cli")"
+test "$(stat -f %z "$DITCH_CLI_SOURCE")" = "$(stat -f %z "$HELPER_MACOS/ditch_cli")"
 
 # Every executable inside a notarized app must carry a hardened signature.
 # During an Archive, use the identity selected by Xcode; local unsigned builds
@@ -308,6 +312,16 @@ fi
 /usr/bin/codesign --force --sign "$SIGNING_IDENTITY" --options runtime "$HELPER_MACOS/ditchd-remote-$HOST_REMOTE_TARGET"
 /usr/bin/codesign --force --sign "$SIGNING_IDENTITY" --options runtime "$HELPER_MACOS/ditch_cli"
 /usr/bin/codesign --force --sign "$SIGNING_IDENTITY" --options runtime "$HELPER_APP"
+for SIGNED_CODE in \
+  "$MAIN_MACOS/ditch_cli" \
+  "$MAIN_MACOS/ditchd-remote-$HOST_REMOTE_TARGET" \
+  "$HELPER_MACOS/ditchd" \
+  "$HELPER_MACOS/ditch_cli" \
+  "$HELPER_MACOS/ditchd-remote-$HOST_REMOTE_TARGET" \
+  "$HELPER_APP"
+do
+  /usr/bin/codesign --verify --strict "$SIGNED_CODE"
+done
 
 rm -rf "$TARGET_BUILD_DIR/$CONTENTS_FOLDER_PATH/Library/LoginItems/The Ditch Status.app"
 rm -f "$TARGET_BUILD_DIR/$CONTENTS_FOLDER_PATH/MacOS/ditch-status-host"
