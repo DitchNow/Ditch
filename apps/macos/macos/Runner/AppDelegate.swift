@@ -107,6 +107,17 @@ class AppDelegate: FlutterAppDelegate, SPUUpdaterDelegate {
     }
   }
 
+  static func validatedCommercialUpdateExpiry(_ rawExpiry: String, now: Date = Date()) -> Date? {
+    let formatter = ISO8601DateFormatter()
+    formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    // Relay emits milliseconds; also accept whole-second RFC 3339 timestamps.
+    let expiry = formatter.date(from: rawExpiry)
+      ?? ISO8601DateFormatter().date(from: rawExpiry)
+    guard let expiry, expiry > now, expiry <= now.addingTimeInterval(24 * 60 * 60)
+    else { return nil }
+    return expiry
+  }
+
   private struct AuthorizedUpdateContext {
     let releaseID: String
     let appcastURL: URL
@@ -643,9 +654,7 @@ class AppDelegate: FlutterAppDelegate, SPUUpdaterDelegate {
               CharacterSet.alphanumerics.contains($0) || "-_.".unicodeScalars.contains($0)
             }),
             let rawExpiry = arguments["expires_at"] as? String,
-            let expiry = ISO8601DateFormatter().date(from: rawExpiry),
-            expiry > Date(),
-            expiry <= Date().addingTimeInterval(24 * 60 * 60)
+            let expiry = Self.validatedCommercialUpdateExpiry(rawExpiry)
         else {
           result(FlutterError(
             code: "invalid_update_session",

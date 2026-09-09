@@ -6,6 +6,41 @@ import XCTest
 
 class RunnerTests: XCTestCase {
 
+  func testCommercialUpdateExpiryAcceptsRelayMillisecondsAndWholeSeconds() {
+    let now = ISO8601DateFormatter().date(from: "2026-09-09T14:00:00Z")!
+    for (timestamp, seconds) in [
+      ("2026-09-09T14:30:00Z", 1800.0),
+      ("2026-09-09T14:30:00.000Z", 1800.0),
+      ("2026-09-09T14:30:00.123Z", 1800.123),
+      ("2026-09-09T16:30:00.123+02:00", 1800.123),
+    ] {
+      let expiry = AppDelegate.validatedCommercialUpdateExpiry(timestamp, now: now)
+      XCTAssertNotNil(expiry, timestamp)
+      if let expiry {
+        XCTAssertEqual(expiry.timeIntervalSince(now), seconds, accuracy: 0.001, timestamp)
+      }
+    }
+  }
+
+  func testCommercialUpdateExpiryRejectsMalformedAndExpiredPermissions() {
+    let now = ISO8601DateFormatter().date(from: "2026-09-09T14:00:00Z")!
+    for timestamp in [
+      "", "not-a-date", "1788964200000",
+      "2026-09-09T13:59:59Z", "2026-09-09T13:59:59.999Z",
+      "2026-09-09T14:00:00Z", "2026-09-09T14:00:00.000Z",
+    ] {
+      XCTAssertNil(AppDelegate.validatedCommercialUpdateExpiry(timestamp, now: now), timestamp)
+    }
+  }
+
+  func testCommercialUpdateExpiryPreservesThe24HourLimit() {
+    let now = ISO8601DateFormatter().date(from: "2026-09-09T14:00:00Z")!
+    XCTAssertNotNil(AppDelegate.validatedCommercialUpdateExpiry("2026-09-10T14:00:00Z", now: now))
+    XCTAssertNotNil(AppDelegate.validatedCommercialUpdateExpiry("2026-09-10T14:00:00.000Z", now: now))
+    XCTAssertNil(AppDelegate.validatedCommercialUpdateExpiry("2026-09-10T14:00:01Z", now: now))
+    XCTAssertNil(AppDelegate.validatedCommercialUpdateExpiry("2026-09-10T14:00:00.001Z", now: now))
+  }
+
   func testComposerConfigurationDisablesRichTextAndGraphics() {
     let textView = NSTextView()
     textView.isRichText = true

@@ -5519,7 +5519,38 @@ class _DitchUpdateDialogState extends State<DitchUpdateDialog> {
       _error = null;
     });
     try {
-      await startAuthorizedCommercialUpdate(release);
+      // Discovery permissions expire. Obtain a freshly verified release and
+      // session for every install attempt, including retries.
+      final freshRelease = await widget.client.checkCommercialRelease();
+      if (!mounted) return;
+      final arguments = authorizedCommercialUpdateArguments(freshRelease);
+      final manifest = (freshRelease['manifest'] as Map)
+          .cast<String, dynamic>();
+      final sequence = (manifest['release_sequence'] as num?)?.toInt();
+      if (sequence == null) {
+        throw const FormatException(
+          'The Relay returned incomplete update metadata.',
+        );
+      }
+      if (sequence <= _runtime!.releaseSequence) {
+        setState(() {
+          _release = null;
+          _installing = false;
+          _message = 'Ditch is up to date for ${_license!.displayName}.';
+        });
+        return;
+      }
+      final selectedManifest = release['manifest'] as Map;
+      if (arguments['release_id'] != selectedManifest['release_id']) {
+        setState(() {
+          _release = freshRelease;
+          _installing = false;
+          _message =
+              'Ditch ${arguments['version']}.${arguments['build']} is now available. Click Install Update to install this version.';
+        });
+        return;
+      }
+      await startAuthorizedCommercialUpdate(freshRelease);
       if (!mounted) return;
       setState(() {
         _installing = false;
@@ -5530,12 +5561,12 @@ class _DitchUpdateDialogState extends State<DitchUpdateDialog> {
       if (!mounted) return;
       setState(() {
         _installing = false;
-        _error = _friendlyError(error);
+        _error = _friendlyError(error, action: 'start installation');
       });
     }
   }
 
-  String _friendlyError(Object error) {
+  String _friendlyError(Object error, {String action = 'check for updates'}) {
     if (error is DitchRuntimeException) {
       return switch (error.code) {
         'official_build_required' ||
@@ -5549,12 +5580,19 @@ class _DitchUpdateDialogState extends State<DitchUpdateDialog> {
         _ => error.message,
       };
     }
-    if (error is PlatformException &&
-        error.code == 'update_verification_not_configured') {
-      return 'This source build has no official update verification key. Install an official signed Community build to receive Ditch updates.';
+    if (error is PlatformException) {
+      return switch (error.code) {
+        'update_verification_not_configured' =>
+          'This source build has no official update verification key. Install an official signed Community build to receive Ditch updates.',
+        'invalid_update_session' =>
+          'Ditch could not start installation because the download permission is invalid or expired. Click Install Update to request fresh permission and try again.',
+        'update_already_in_progress' =>
+          'An update is already in progress. Follow the update window to continue.',
+        _ => 'Ditch could not $action. Please try again.',
+      };
     }
     if (error is FormatException) return error.message;
-    return 'Ditch could not check for updates. $error';
+    return 'Ditch could not $action. Please try again.';
   }
 
   @override
