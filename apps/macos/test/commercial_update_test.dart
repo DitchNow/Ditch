@@ -13,14 +13,16 @@ Map<String, dynamic> _release({
   required String bearer,
   String id = _releaseId,
   int build = 113,
+  String edition = 'commercial',
   String expiresAt = '2026-09-09T14:30:00.123Z',
 }) => {
   'manifest': {
+    'edition': edition,
     'release_id': id,
     'appcast_url':
-        'https://relay.example.test/v1/commercial/releases/$id/appcast',
+        'https://relay.example.test/v1/$edition/releases/$id/appcast',
     'artifact_url':
-        'https://relay.example.test/v1/commercial/releases/$id/artifact/ditch.dmg',
+        'https://relay.example.test/v1/$edition/releases/$id/artifact/ditch.dmg',
     'artifact_size': 4096,
     'version': '0.1.0',
     'build': '$build',
@@ -31,13 +33,19 @@ Map<String, dynamic> _release({
 };
 
 class _UpdateClient extends DitchRuntimeClient {
-  _UpdateClient() : super(socketPath: '/tmp/ditch-update-test.sock');
+  _UpdateClient({this.status = 'active', this.environment = 'staging'})
+    : super(socketPath: '/tmp/ditch-update-test.sock');
+
+  final String status;
+  final String environment;
+  int communityChecks = 0;
+  bool communityUnavailable = false;
 
   int checks = 0;
   Future<Map<String, dynamic>> Function()? onRefresh;
 
   @override
-  Future<RuntimeStatusDto> runtimeStatus() async => const RuntimeStatusDto(
+  Future<RuntimeStatusDto> runtimeStatus() async => RuntimeStatusDto(
     identity: 'The Ditch Runtime',
     pid: 123,
     socketPath: '/tmp/ditch-update-test.sock',
@@ -48,7 +56,7 @@ class _UpdateClient extends DitchRuntimeClient {
     capabilities: {},
     buildVersion: '0.1.0',
     edition: 'commercial',
-    deploymentEnvironment: 'staging',
+    deploymentEnvironment: environment,
     buildIdentifier: 'test-build',
     buildNumber: '112',
     releaseSequence: 112,
@@ -56,10 +64,26 @@ class _UpdateClient extends DitchRuntimeClient {
 
   @override
   Future<Map<String, dynamic>> commercialEntitlement() async => {
-    'active': true,
+    'active': status == 'active' || status == 'over_limit',
     'plan': 'commercial_monthly',
-    'status': 'active',
+    'status': status,
   };
+
+  @override
+  Future<Map<String, dynamic>> checkCommunityRelease() async {
+    communityChecks++;
+    if (communityUnavailable) {
+      throw DitchRuntimeException(
+        'commercial_release_unavailable',
+        'release_unavailable',
+      );
+    }
+    return _release(
+      edition: 'community',
+      bearer:
+          'community-permission-$communityChecks-with-at-least-32-characters',
+    );
+  }
 
   @override
   Future<Map<String, dynamic>> checkCommercialRelease() async {
@@ -81,6 +105,7 @@ Future<void> _openUpdate(
   _UpdateClient client,
   List<MethodCall> installs, {
   PlatformException? installError,
+  bool expectRelease = true,
 }) async {
   tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(_application, (
     call,
@@ -105,7 +130,9 @@ Future<void> _openUpdate(
   await tester.pumpAndSettle();
   await tester.tap(find.byKey(const Key('check-ditch-update')));
   await tester.pumpAndSettle();
-  expect(find.text('Ditch 0.1.0.113 is available.'), findsOneWidget);
+  if (expectRelease) {
+    expect(find.text('Ditch 0.1.0.113 is available.'), findsOneWidget);
+  }
 }
 
 Future<void> _install(WidgetTester tester) async {
@@ -114,6 +141,57 @@ Future<void> _install(WidgetTester tester) async {
 }
 
 void main() {
+  for (final environment in ['staging', 'production']) {
+    for (final status in ['inactive', 'expired', 'active', 'over_limit']) {
+      testWidgets(
+        '$environment $status selects and refreshes the authorized update route',
+        (tester) async {
+          final client = _UpdateClient(
+            status: status,
+            environment: environment,
+          );
+          final installs = <MethodCall>[];
+          await _openUpdate(tester, client, installs);
+          await _install(tester);
+          final paid = status == 'active' || status == 'over_limit';
+          expect(client.checks, paid ? 2 : 0);
+          expect(client.communityChecks, paid ? 0 : 2);
+          expect(installs, hasLength(1));
+          final arguments = installs.single.arguments as Map;
+          expect(arguments['edition'], paid ? 'commercial' : 'community');
+          expect(
+            arguments['authorization_bearer'],
+            contains(paid ? 'permission-2-' : 'community-permission-2-'),
+          );
+          expect(
+            arguments['appcast_url'],
+            contains('/v1/${paid ? 'commercial' : 'community'}/releases/'),
+          );
+        },
+      );
+    }
+  }
+
+  testWidgets(
+    'no published Community update shows a message without launching Sparkle',
+    (tester) async {
+      final client = _UpdateClient(
+        status: 'inactive',
+        environment: 'production',
+      )..communityUnavailable = true;
+      final installs = <MethodCall>[];
+      await _openUpdate(tester, client, installs, expectRelease: false);
+      expect(client.communityChecks, 1);
+      expect(client.checks, 0);
+      expect(installs, isEmpty);
+      expect(
+        find.text('No compatible Community update is currently available.'),
+        findsOneWidget,
+      );
+      expect(find.byKey(const Key('install-ditch-update')), findsNothing);
+    },
+  );
+
   testWidgets('install replaces the expired discovery permission', (
     tester,
   ) async {

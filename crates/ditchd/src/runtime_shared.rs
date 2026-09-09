@@ -5,9 +5,9 @@ use ditch_core::{
     AgentRun, AgentState, AppPaths, AttentionKind, CodexLaunchMode, Project,
     ProjectExecutionTarget, ProjectGitPolicy, ProjectId,
 };
-use ditch_identity::{FileIdentityStore, IdentityStore, InstallationIdentity};
 #[cfg(target_os = "macos")]
 use ditch_identity::MacOsIdentityStore;
+use ditch_identity::{FileIdentityStore, IdentityStore, InstallationIdentity};
 use ditch_protocol::{
     AgentChatMessage, AgentChatRole, AgentModel, ClientRequest, CodexInstallation, CodexReadiness,
     Envelope, HealthResponse, HostIdentityStatus, ProjectDirectory, ProjectFile, ProjectFileEntry,
@@ -277,8 +277,7 @@ impl RuntimeState {
             FileIdentityStore::new(&legacy_identity_path).load_or_create()
         };
         #[cfg(not(target_os = "macos"))]
-        let installation_identity =
-            FileIdentityStore::new(&legacy_identity_path).load_or_create();
+        let installation_identity = FileIdentityStore::new(&legacy_identity_path).load_or_create();
         let installation_identity = Arc::new(installation_identity.map_err(io::Error::other)?);
         Ok(Self {
             paths,
@@ -627,7 +626,9 @@ fn forward_remote_event(state: &Arc<Mutex<RuntimeState>>, alias: &str, event: Se
             state
                 .remote_permission_hosts
                 .insert(request.id, alias.to_owned());
-            state.pending_permissions.insert(request.id, request.clone());
+            state
+                .pending_permissions
+                .insert(request.id, request.clone());
             state.broadcast(ServerEvent::PermissionRequested(request));
         }
         ServerEvent::ProjectTerminalOutput { terminal_id, data } => {
@@ -1628,13 +1629,15 @@ fn handle_request(request: ClientRequest, state: Arc<Mutex<RuntimeState>>) -> Se
                 .and_then(|backend| backend.billing_management(&installation))
             {
                 Ok(session) => ServerResponse::CommercialBillingManagement(session),
-                Err(error) => commercial_service_error(
-                    "commercial_billing_management_failed",
-                    error,
-                ),
+                Err(error) => {
+                    commercial_service_error("commercial_billing_management_failed", error)
+                }
             }
         }
         ClientRequest::CheckCommercialRelease => current_commercial_release(state, false),
+        ClientRequest::CheckCommunityRelease => {
+            current_official_release(state, false, ditch_product::Edition::Community)
+        }
         ClientRequest::CurrentCommercialRelease => current_commercial_release(state, true),
         ClientRequest::CheckRemoteProject { project_id } => check_remote_project(state, project_id),
         ClientRequest::ApprovePermission { request_id } => respond_permission_for_target(
@@ -1642,13 +1645,11 @@ fn handle_request(request: ClientRequest, state: Arc<Mutex<RuntimeState>>) -> Se
             request_id,
             codex_app_server::PermissionDecision::ApproveOnce,
         ),
-        ClientRequest::ApprovePermissionForSession { request_id } => {
-            respond_permission_for_target(
-                state,
-                request_id,
-                codex_app_server::PermissionDecision::ApproveForSession,
-            )
-        }
+        ClientRequest::ApprovePermissionForSession { request_id } => respond_permission_for_target(
+            state,
+            request_id,
+            codex_app_server::PermissionDecision::ApproveForSession,
+        ),
         ClientRequest::DenyPermission { request_id, .. } => respond_permission_for_target(
             state,
             request_id,
@@ -1668,6 +1669,18 @@ fn current_commercial_release(
     state: Arc<Mutex<RuntimeState>>,
     require_idle_runtime: bool,
 ) -> ServerResponse {
+    current_official_release(
+        state,
+        require_idle_runtime,
+        ditch_product::Edition::Commercial,
+    )
+}
+
+fn current_official_release(
+    state: Arc<Mutex<RuntimeState>>,
+    require_idle_runtime: bool,
+    edition: ditch_product::Edition,
+) -> ServerResponse {
     let installation = {
         let state = state
             .lock()
@@ -1681,12 +1694,20 @@ fn current_commercial_release(
         state.installation_identity.clone()
     };
     let verified = HttpUpgradeBackend::official()
-        .and_then(|backend| backend.current_release(&installation))
+        .and_then(|backend| backend.current_release_for_edition(&installation, edition))
         .and_then(|release| {
-            let public_key = option_env!("DITCH_RELEASE_MANIFEST_PUBLIC_KEY_SEC1_B64")
+            let configured_key = match edition {
+                ditch_product::Edition::Commercial => {
+                    option_env!("DITCH_RELEASE_MANIFEST_PUBLIC_KEY_SEC1_B64")
+                }
+                ditch_product::Edition::Community => {
+                    option_env!("DITCH_COMMUNITY_RELEASE_MANIFEST_PUBLIC_KEY_SEC1_B64")
+                }
+            };
+            let public_key = configured_key
                 .ok_or_else(|| {
                     ditch_upgrade::UpgradeError::InvalidResponse(
-                        "this source build is not configured for official Commercial artifacts"
+                        "this source build is not configured for official release artifacts"
                             .to_owned(),
                     )
                 })
@@ -1719,7 +1740,7 @@ fn current_commercial_release(
                         "installed release sequence is invalid".to_owned(),
                     )
                 })?;
-            ReleaseVerifier::new(&public_key, team_id)?.verify_manifest(
+            ReleaseVerifier::for_edition(&public_key, team_id, edition)?.verify_manifest(
                 &release,
                 Utc::now(),
                 community_build,
@@ -5494,7 +5515,7 @@ fn commercial_release_error(error: UpgradeError) -> ServerResponse {
         UpgradeError::Digest | UpgradeError::Size => "commercial_release_artifact_invalid",
         UpgradeError::ApplicationIdentity => "commercial_release_identity_invalid",
         UpgradeError::InvalidResponse(message)
-            if message.contains("not configured for official Commercial artifacts")
+            if message.contains("not configured for official release artifacts")
                 || message.contains("Apple Team ID is not configured") =>
         {
             "commercial_release_verification_not_configured"

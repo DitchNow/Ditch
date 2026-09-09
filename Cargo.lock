@@ -413,6 +413,7 @@ dependencies = [
  "chrono",
  "ditch_core",
  "ditch_identity",
+ "ditch_product",
  "ditch_protocol",
  "ditch_ssh",
  "ditch_store",

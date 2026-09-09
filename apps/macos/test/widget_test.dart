@@ -42,6 +42,20 @@ class _CurrentLicenseClient extends DitchRuntimeClient {
     : super(socketPath: '/tmp/ditch-current-license.sock');
 
   final Map<String, dynamic> entitlement;
+  int communityChecks = 0;
+
+  @override
+  Future<Map<String, dynamic>> checkCommunityRelease() async {
+    communityChecks++;
+    return {
+      'manifest': {
+        'edition': 'community',
+        'release_sequence': 108,
+        'version': '0.1.0',
+        'build': '108',
+      },
+    };
+  }
 
   @override
   Future<RuntimeStatusDto> runtimeStatus() async => const RuntimeStatusDto(
@@ -215,6 +229,7 @@ class _RelayUpgradeClient extends _CommercialOffersClient {
   @override
   Future<Map<String, dynamic>> currentCommercialRelease() async => {
     'manifest': {
+      'edition': 'commercial',
       'release_id': '11111111-1111-4111-8111-111111111111',
       'appcast_url':
           'https://relay.ditchnow.nl/v1/commercial/releases/11111111-1111-4111-8111-111111111111/appcast',
@@ -555,7 +570,7 @@ void main() {
     expect(find.byKey(const Key('ditch-current-license')), findsOneWidget);
   });
 
-  testWidgets('Community update checks use the signed public Sparkle channel', (
+  testWidgets('Community update checks discover a release through Relay', (
     tester,
   ) async {
     final nativeCalls = <MethodCall>[];
@@ -565,7 +580,6 @@ void main() {
         nativeCalls.add(call);
         return switch (call.method) {
           'appVersion' => {'version': '0.1.0', 'build': '107'},
-          'checkCommunityUpdate' => true,
           _ => null,
         };
       },
@@ -599,18 +613,17 @@ void main() {
 
     expect(
       nativeCalls.where((call) => call.method == 'checkCommunityUpdate'),
-      hasLength(1),
+      isEmpty,
     );
-    expect(
-      find.text('Sparkle is checking the official Community update channel.'),
-      findsOneWidget,
-    );
+    expect(client.communityChecks, 1);
+    expect(find.text('Ditch 0.1.0.108 is available.'), findsOneWidget);
   });
 
   test('authorized update binds every signed release field to native code', () {
     final expiresAt = DateTime.utc(2026, 1, 1).toIso8601String();
     final arguments = authorizedCommercialUpdateArguments({
       'manifest': {
+        'edition': 'commercial',
         'release_id': '11111111-1111-4111-8111-111111111111',
         'appcast_url': 'https://relay.example.test/release/appcast',
         'artifact_url': 'https://relay.example.test/release/artifact/ditch.dmg',
@@ -623,6 +636,7 @@ void main() {
     });
 
     expect(arguments, {
+      'edition': 'commercial',
       'release_id': '11111111-1111-4111-8111-111111111111',
       'appcast_url': 'https://relay.example.test/release/appcast',
       'artifact_url': 'https://relay.example.test/release/artifact/ditch.dmg',

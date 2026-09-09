@@ -111,6 +111,7 @@ Map<String, Object> authorizedCommercialUpdateArguments(
   Map<String, dynamic> release,
 ) {
   final manifest = (release['manifest'] as Map?)?.cast<String, dynamic>();
+  final edition = manifest?['edition']?.toString();
   final releaseId = manifest?['release_id']?.toString();
   final appcastUrl = manifest?['appcast_url']?.toString();
   final artifactUrl = manifest?['artifact_url']?.toString();
@@ -118,7 +119,8 @@ Map<String, Object> authorizedCommercialUpdateArguments(
   final version = manifest?['version']?.toString();
   final build = manifest?['build']?.toString();
   final channel = manifest?['channel']?.toString();
-  if (releaseId == null ||
+  if ((edition != 'commercial' && edition != 'community') ||
+      releaseId == null ||
       releaseId.isEmpty ||
       appcastUrl == null ||
       appcastUrl.isEmpty ||
@@ -142,10 +144,11 @@ Map<String, Object> authorizedCommercialUpdateArguments(
       expiresAt == null ||
       expiresAt.isEmpty) {
     throw const FormatException(
-      'Relay did not authorize an authenticated Commercial update session.',
+      'Relay did not authorize an authenticated update session.',
     );
   }
   return {
+    'edition': edition!,
     'release_id': releaseId,
     'appcast_url': appcastUrl,
     'artifact_url': artifactUrl,
@@ -1660,6 +1663,11 @@ class DitchRuntimeClient {
     return (response['CommercialRelease'] as Map).cast<String, dynamic>();
   }
 
+  Future<Map<String, dynamic>> checkCommunityRelease() async {
+    final response = await request('CheckCommunityRelease');
+    return (response['CommercialRelease'] as Map).cast<String, dynamic>();
+  }
+
   Future<Map<String, dynamic>> checkCommercialRelease() async {
     final response = await request('CheckCommercialRelease');
     return (response['CommercialRelease'] as Map).cast<String, dynamic>();
@@ -2206,7 +2214,8 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
       if (!mounted) return;
       // Native startup already retries within its deadline. Retry only a
       // subsequent connection race, without extending a native startup failure.
-      final startupFailed = error is DitchRuntimeException &&
+      final startupFailed =
+          error is DitchRuntimeException &&
           error.code == 'runtime_startup_failed';
       if (!startupFailed && _runtimeConnectionRetries < 2) {
         _runtimeConnectionRetries++;
@@ -2659,7 +2668,8 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
     } on PlatformException catch (error) {
       throw DitchRuntimeException(
         'runtime_startup_failed',
-        error.message ?? 'Ditch Runtime could not start. Click Retry to try again.',
+        error.message ??
+            'Ditch Runtime could not start. Click Retry to try again.',
       );
     }
   }
@@ -4599,17 +4609,20 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
           body: LayoutBuilder(
             builder: (context, constraints) {
               if (widget.connectRuntimeOnStart && !_runtimeSnapshotHydrated) {
-                if (presentation.connection == RuntimeConnectionPhase.unavailable) {
+                if (presentation.connection ==
+                    RuntimeConnectionPhase.unavailable) {
                   return RuntimeRecoveryView(
                     socketPath: _runtimeClient.socketPath,
                     error: presentation.connectionError,
                     onRetry: _connectRuntime,
                     onOpenActivityMonitor: () => _applicationChannel
                         .invokeMethod<bool>('openActivityMonitor'),
-                    onQuit: () => _applicationChannel.invokeMethod<bool>('quitUI'),
+                    onQuit: () =>
+                        _applicationChannel.invokeMethod<bool>('quitUI'),
                   );
                 }
-                if (presentation.connection != RuntimeConnectionPhase.connected) {
+                if (presentation.connection !=
+                    RuntimeConnectionPhase.connected) {
                   return const Center(
                     child: Column(
                       mainAxisSize: MainAxisSize.min,
@@ -5520,54 +5533,49 @@ class _DitchUpdateDialogState extends State<DitchUpdateDialog> {
       _error = null;
     });
     try {
-      if (license.isCommercial &&
-          (license.status == 'active' || license.status == 'over_limit')) {
-        final release = await widget.client.checkCommercialRelease();
-        final manifest = (release['manifest'] as Map?)?.cast<String, dynamic>();
-        final sequence = (manifest?['release_sequence'] as num?)?.toInt();
-        if (sequence == null) {
-          throw const FormatException(
-            'The Relay returned incomplete update metadata.',
-          );
-        }
-        if (!mounted) return;
-        setState(() {
-          if (sequence > runtime.releaseSequence) {
-            _release = release;
-            final version = manifest?['version']?.toString() ?? 'new';
-            final build = manifest?['build']?.toString();
-            _message = build == null
-                ? 'Ditch $version is available.'
-                : 'Ditch $version.$build is available.';
-          } else {
-            _message = 'Ditch is up to date for ${license.displayName}.';
-          }
-          _checking = false;
-        });
-        return;
-      }
-
-      final started = await _applicationChannel.invokeMethod<bool>(
-        'checkCommunityUpdate',
-      );
-      if (started != true) {
+      final release = await _checkSelectedRelease();
+      final manifest = (release['manifest'] as Map?)?.cast<String, dynamic>();
+      final sequence = (manifest?['release_sequence'] as num?)?.toInt();
+      if (sequence == null) {
         throw const FormatException(
-          'The Community update check could not be started.',
+          'The Relay returned incomplete update metadata.',
         );
       }
       if (!mounted) return;
       setState(() {
+        if (sequence > runtime.releaseSequence) {
+          _release = release;
+          final version = manifest?['version']?.toString() ?? 'new';
+          final build = manifest?['build']?.toString();
+          _message = build == null
+              ? 'Ditch $version is available.'
+              : 'Ditch $version.$build is available.';
+        } else {
+          _message = 'Ditch is up to date for ${license.displayName}.';
+        }
         _checking = false;
-        _message = 'Sparkle is checking the official Community update channel.';
       });
     } on Object catch (error) {
       if (!mounted) return;
       setState(() {
         _checking = false;
-        _error = _friendlyError(error);
+        if (error is DitchRuntimeException &&
+            error.code == 'commercial_release_unavailable') {
+          _message = _friendlyError(error);
+        } else {
+          _error = _friendlyError(error);
+        }
       });
     }
   }
+
+  bool get _usesCommercialUpdates =>
+      _license?.isCommercial == true &&
+      (_license?.status == 'active' || _license?.status == 'over_limit');
+
+  Future<Map<String, dynamic>> _checkSelectedRelease() => _usesCommercialUpdates
+      ? widget.client.checkCommercialRelease()
+      : widget.client.checkCommunityRelease();
 
   Future<void> _installCommercialUpdate() async {
     final release = _release;
@@ -5579,7 +5587,7 @@ class _DitchUpdateDialogState extends State<DitchUpdateDialog> {
     try {
       // Discovery permissions expire. Obtain a freshly verified release and
       // session for every install attempt, including retries.
-      final freshRelease = await widget.client.checkCommercialRelease();
+      final freshRelease = await _checkSelectedRelease();
       if (!mounted) return;
       final arguments = authorizedCommercialUpdateArguments(freshRelease);
       final manifest = (freshRelease['manifest'] as Map)
@@ -5632,7 +5640,7 @@ class _DitchUpdateDialogState extends State<DitchUpdateDialog> {
         'commercial_entitlement_official_build_required' =>
           'This source build cannot use DitchNow hosted services. Install an official signed Community build to check prices, licenses, and hosted updates.',
         'commercial_release_unavailable' =>
-          'No compatible Commercial update is currently available.',
+          'No compatible ${_usesCommercialUpdates ? 'Commercial' : 'Community'} update is currently available.',
         'commercial_entitlement_failed' =>
           'Ditch could not load the current license from the Relay.',
         _ => error.message,

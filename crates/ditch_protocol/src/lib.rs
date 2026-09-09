@@ -271,6 +271,7 @@ pub enum ClientRequest {
     },
     CommercialBillingManagement,
     CheckCommercialRelease,
+    CheckCommunityRelease,
     CurrentCommercialRelease,
     ApprovePermission {
         request_id: Uuid,

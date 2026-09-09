@@ -423,6 +423,8 @@ pub struct CommercialUpdateSession {
     pub expires_at: DateTime<Utc>,
 }
 
+/// Shared signed release envelope. The existing type and wire name are retained
+/// for compatibility; the verifier binds the manifest to the requested edition.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SignedCommercialRelease {
     pub manifest: CommercialReleaseManifest,
@@ -1032,6 +1034,23 @@ impl UpgradeBackend for HttpUpgradeBackend {
         &self,
         installation: &InstallationIdentity,
     ) -> Result<SignedCommercialRelease, UpgradeError> {
+        self.current_release_for_edition(installation, Edition::Commercial)
+    }
+}
+
+fn release_edition_path(edition: Edition) -> &'static str {
+    match edition {
+        Edition::Community => "community",
+        Edition::Commercial => "commercial",
+    }
+}
+
+impl HttpUpgradeBackend {
+    pub fn current_release_for_edition(
+        &self,
+        installation: &InstallationIdentity,
+        edition: Edition,
+    ) -> Result<SignedCommercialRelease, UpgradeError> {
         #[derive(Deserialize)]
         struct CurrentResponse {
             release: RelayRelease,
@@ -1044,14 +1063,18 @@ impl UpgradeBackend for HttpUpgradeBackend {
             release_id: Option<Uuid>,
             signature_metadata: serde_json::Value,
         }
-        let activate_path = format!(
-            "/v1/commercial/devices/{}/activate",
-            installation.installation_id()
-        );
-        let _: serde_json::Value = self.signed_json(installation, "POST", &activate_path, b"")?;
+        if edition == Edition::Commercial {
+            let activate_path = format!(
+                "/v1/commercial/devices/{}/activate",
+                installation.installation_id()
+            );
+            let _: serde_json::Value =
+                self.signed_json(installation, "POST", &activate_path, b"")?;
+        }
+        let edition_path = release_edition_path(edition);
         let channel = expected_release_channel(DEPLOYMENT_ENVIRONMENT)?;
         let path = format!(
-            "/v1/commercial/releases/current?channel={channel}&community_version={}&community_build={}",
+            "/v1/{edition_path}/releases/current?channel={channel}&community_version={}&community_build={}",
             option_env!("DITCH_APP_VERSION").unwrap_or(env!("CARGO_PKG_VERSION")),
             option_env!("DITCH_BUILD_NUMBER").unwrap_or("0")
         );
@@ -1068,15 +1091,14 @@ impl UpgradeBackend for HttpUpgradeBackend {
             })
             .map_err(|_| {
                 UpgradeError::InvalidResponse(
-                    "Relay release metadata does not contain a signed Commercial manifest"
-                        .to_owned(),
+                    "Relay release metadata does not contain a signed official manifest".to_owned(),
                 )
             })?;
         match (release.manifest.release_id, release_id) {
             (Some(manifest_id), Some(relay_id)) if manifest_id == relay_id => {}
             (Some(_), Some(_)) => {
                 return Err(UpgradeError::InvalidResponse(
-                    "Relay release ID does not match the signed Commercial manifest".to_owned(),
+                    "Relay release ID does not match the signed official manifest".to_owned(),
                 ));
             }
             _ => {
@@ -1088,7 +1110,7 @@ impl UpgradeBackend for HttpUpgradeBackend {
         }
         let session = response.update_session.ok_or_else(|| {
             UpgradeError::InvalidResponse(
-                "Relay did not provide an authenticated Commercial update session".to_owned(),
+                "Relay did not provide an authenticated official update session".to_owned(),
             )
         })?;
         if session.expires_at <= Utc::now()
@@ -1101,7 +1123,7 @@ impl UpgradeBackend for HttpUpgradeBackend {
                 .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
         {
             return Err(UpgradeError::InvalidResponse(
-                "Relay returned an invalid Commercial update session".to_owned(),
+                "Relay returned an invalid official update session".to_owned(),
             ));
         }
         release.update_session = Some(session);
@@ -1110,6 +1132,7 @@ impl UpgradeBackend for HttpUpgradeBackend {
 }
 
 pub struct ReleaseVerifier {
+    expected_edition: Edition,
     manifest_public_key: VerifyingKey,
     expected_team_id: String,
     expected_channel: &'static str,
@@ -1123,6 +1146,18 @@ impl ReleaseVerifier {
         manifest_public_key_sec1: &[u8],
         expected_team_id: impl Into<String>,
     ) -> Result<Self, UpgradeError> {
+        Self::for_edition(
+            manifest_public_key_sec1,
+            expected_team_id,
+            Edition::Commercial,
+        )
+    }
+
+    pub fn for_edition(
+        manifest_public_key_sec1: &[u8],
+        expected_team_id: impl Into<String>,
+        expected_edition: Edition,
+    ) -> Result<Self, UpgradeError> {
         let expected_channel = expected_release_channel(DEPLOYMENT_ENVIRONMENT)?;
         let expected_origin = HttpUpgradeBackend::official()?.origin;
         let community_version =
@@ -1132,6 +1167,7 @@ impl ReleaseVerifier {
             })?;
         let community_revision = option_env!("DITCH_COMMUNITY_REVISION").map(str::to_owned);
         Ok(Self {
+            expected_edition,
             manifest_public_key: VerifyingKey::from_sec1_bytes(manifest_public_key_sec1)
                 .map_err(|_| UpgradeError::ManifestSignature)?,
             expected_team_id: expected_team_id.into(),
@@ -1158,9 +1194,9 @@ impl ReleaseVerifier {
             .verify(&release.manifest.canonical_bytes()?, &signature)
             .map_err(|_| UpgradeError::ManifestSignature)?;
         let manifest = &release.manifest;
-        if manifest.edition != Edition::Commercial {
+        if manifest.edition != self.expected_edition {
             return Err(UpgradeError::InvalidResponse(
-                "authorized artifact is not Commercial".to_owned(),
+                "authorized artifact edition does not match the requested update".to_owned(),
             ));
         }
         if manifest.release_id.is_none() {
@@ -1236,10 +1272,11 @@ impl ReleaseVerifier {
                 "Commercial release metadata has an invalid format".to_owned(),
             ));
         }
-        if self
-            .community_revision
-            .as_deref()
-            .is_some_and(|revision| revision != manifest.community_revision)
+        if self.expected_edition == Edition::Commercial
+            && self
+                .community_revision
+                .as_deref()
+                .is_some_and(|revision| revision != manifest.community_revision)
         {
             return Err(UpgradeError::Incompatible);
         }
@@ -1283,6 +1320,19 @@ impl ReleaseVerifier {
         {
             return Err(UpgradeError::InvalidResponse(
                 "authorized appcast URL must use the configured Ditch Relay origin".to_owned(),
+            ));
+        }
+        let edition = release_edition_path(self.expected_edition);
+        let release_id = manifest.release_id.expect("release ID was checked above");
+        let prefix = format!("/v1/{edition}/releases/{release_id}");
+        if appcast.path() != format!("{prefix}/appcast")
+            || !url.path().starts_with(&format!("{prefix}/artifact/"))
+            || url.path().ends_with('/')
+            || appcast.query().is_some()
+            || url.query().is_some()
+        {
+            return Err(UpgradeError::InvalidResponse(
+                "release URLs do not match the authorized edition and release ID".to_owned(),
             ));
         }
         Ok(())
@@ -1451,8 +1501,9 @@ mod tests {
         bytes: &[u8],
         sequence: u64,
     ) -> SignedCommercialRelease {
+        let release_id = Uuid::new_v4();
         let manifest = CommercialReleaseManifest {
-            release_id: Some(Uuid::new_v4()),
+            release_id: Some(release_id),
             edition: Edition::Commercial,
             channel: Some(
                 expected_release_channel(DEPLOYMENT_ENVIRONMENT)
@@ -1469,8 +1520,12 @@ mod tests {
             artifact_size: bytes.len() as u64,
             bundle_id: CANONICAL_BUNDLE_ID.to_owned(),
             team_id: "DITCHNOW1".to_owned(),
-            appcast_url: format!("{CONFIGURED_UPGRADE_API_ORIGIN}/v1/commercial/appcast/token"),
-            artifact_url: format!("{CONFIGURED_UPGRADE_API_ORIGIN}/authorized/example.dmg"),
+            appcast_url: format!(
+                "{CONFIGURED_UPGRADE_API_ORIGIN}/v1/commercial/releases/{release_id}/appcast"
+            ),
+            artifact_url: format!(
+                "{CONFIGURED_UPGRADE_API_ORIGIN}/v1/commercial/releases/{release_id}/artifact/example.dmg"
+            ),
             published_at: Some(Utc::now()),
             expires_at: Some(Utc::now() + Duration::minutes(5)),
         };
@@ -1725,6 +1780,71 @@ mod tests {
             "/v1/commercial/offers/opaque%2Foffer%3Frevision=2/checkout"
         );
         assert!(HttpUpgradeBackend::commercial_offer_checkout_path(" padded ").is_err());
+    }
+
+    #[test]
+    fn community_updates_verify_with_their_own_key_and_environment() {
+        let signing = SigningKey::random(&mut OsRng);
+        let commercial_signing = SigningKey::random(&mut OsRng);
+        for (environment, origin) in [
+            (
+                "staging",
+                "https://ditch-remote-relay-staging.matin-1a7.workers.dev",
+            ),
+            ("production", "https://relay.ditchnow.nl"),
+        ] {
+            let mut verifier = ReleaseVerifier::for_edition(
+                VerifyingKey::from(&signing)
+                    .to_encoded_point(false)
+                    .as_bytes(),
+                "DITCHNOW1",
+                Edition::Community,
+            )
+            .unwrap();
+            verifier.expected_origin = Url::parse(origin).unwrap();
+            verifier.expected_channel = expected_release_channel(environment).unwrap();
+            // Community updates may advance to a new source revision.
+            verifier.community_revision = Some("f".repeat(40));
+            let mut release = signed_release(&signing, b"artifact", 20);
+            release.manifest.edition = Edition::Community;
+            release.manifest.channel = Some(verifier.expected_channel.to_owned());
+            let id = release.manifest.release_id.unwrap();
+            release.manifest.appcast_url = format!("{origin}/v1/community/releases/{id}/appcast");
+            release.manifest.artifact_url =
+                format!("{origin}/v1/community/releases/{id}/artifact/ditch.dmg");
+            resign(&signing, &mut release);
+            verifier
+                .verify_manifest(&release, Utc::now(), 10, 19)
+                .unwrap();
+
+            resign(&commercial_signing, &mut release);
+            assert!(matches!(
+                verifier.verify_manifest(&release, Utc::now(), 10, 19),
+                Err(UpgradeError::ManifestSignature)
+            ));
+            resign(&signing, &mut release);
+            for url in [
+                format!("{origin}/v1/commercial/releases/{id}/appcast"),
+                format!("{origin}/v1/community/releases/{}/appcast", Uuid::new_v4()),
+                format!("https://other.example/v1/community/releases/{id}/appcast"),
+            ] {
+                let mut changed = release.clone();
+                changed.manifest.appcast_url = url;
+                resign(&signing, &mut changed);
+                assert!(
+                    verifier
+                        .verify_manifest(&changed, Utc::now(), 10, 19)
+                        .is_err()
+                );
+            }
+            release.manifest.edition = Edition::Commercial;
+            resign(&signing, &mut release);
+            assert!(
+                verifier
+                    .verify_manifest(&release, Utc::now(), 10, 19)
+                    .is_err()
+            );
+        }
     }
 
     #[test]
