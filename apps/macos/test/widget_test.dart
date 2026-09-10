@@ -116,6 +116,34 @@ class _ActiveCommercialClient extends DitchRuntimeClient {
   }
 }
 
+class _CommunityLicenseClient extends _ActiveCommercialClient {
+  @override
+  Future<Map<String, dynamic>> request(Object body) async {
+    if (body == 'CommercialEntitlement') {
+      return {
+        'CommercialEntitlement': {
+          'active': false,
+          'plan': null,
+          'status': 'inactive',
+          'current_license': {
+            'edition': 'community',
+            'status': 'active',
+            'display_name': 'Ditch Community',
+            'plans': [],
+          },
+        },
+      };
+    }
+    if (body == 'RemoteControlStatus') {
+      throw const DitchRuntimeException(
+        'commercial_entitlement_required',
+        'Commercial access is required.',
+      );
+    }
+    return super.request(body);
+  }
+}
+
 class _EntitlementMismatchClient extends _ActiveCommercialClient {
   @override
   Future<Map<String, dynamic>> request(Object body) async {
@@ -209,7 +237,8 @@ void main() {
     expect(find.byKey(const Key('settings-version')), findsOneWidget);
     expect(find.text('v0.1.0.106'), findsOneWidget);
     expect(find.byKey(const Key('settings-upgrade-ditch')), findsOneWidget);
-    expect(find.text('Upgrade Ditch'), findsOneWidget);
+    expect(find.text('App Updates'), findsOneWidget);
+    expect(find.text('License & Plans'), findsOneWidget);
     expect(calls.where((call) => call.method == 'appVersion'), hasLength(1));
   });
 
@@ -230,6 +259,33 @@ void main() {
     expect(find.text('Renew'), findsOneWidget);
     expect(find.byKey(const Key('connect-iphone')), findsNothing);
   });
+
+  for (final environment in ['staging', 'production']) {
+    testWidgets(
+      '$environment Community license exposes plans instead of a synchronization dead end',
+      (tester) async {
+        await tester.pumpWidget(
+          MaterialApp(
+            home: RemoteSettingsDialog(
+              client: _CommunityLicenseClient(),
+              deploymentEnvironment: environment,
+            ),
+          ),
+        );
+        await tester.pumpAndSettle();
+        expect(
+          find.text('Commercial access is required for Remote Control.'),
+          findsOneWidget,
+        );
+        expect(find.text('View Plans'), findsOneWidget);
+        expect(find.textContaining('synchronizing'), findsNothing);
+        expect(find.byKey(const Key('retry-remote-control')), findsNothing);
+        await tester.tap(find.text('View Plans'));
+        await tester.pumpAndSettle();
+        expect(find.text('License & Plans'), findsOneWidget);
+      },
+    );
+  }
 
   testWidgets('staging Remote Control keeps test mode visible', (tester) async {
     const relayOrigin =

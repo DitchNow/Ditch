@@ -1,0 +1,46 @@
+--- a/scripts/publish-commercial-dmg.sh
++++ b/scripts/publish-commercial-dmg.sh
+@@ -83,7 +83,7 @@
+     public_key=${public_line%%=*}
+     public_value=${public_line#*=}
+     case "$public_key" in
+-      DITCH_DEPLOYMENT_ENVIRONMENT|DITCH_RELAY_ORIGIN|DITCH_UPDATE_ALLOWED_HOSTS|DITCH_SPARKLE_PUBLIC_ED_KEY|DITCH_RELEASE_MANIFEST_PUBLIC_KEY_SEC1_B64|DITCH_APPLE_TEAM_ID|DITCH_COMMUNITY_BUILD_SEQUENCE)
++      DITCH_DEPLOYMENT_ENVIRONMENT|DITCH_RELAY_ORIGIN|DITCH_UPDATE_ALLOWED_HOSTS|DITCH_SPARKLE_PUBLIC_ED_KEY|DITCH_RELEASE_MANIFEST_PUBLIC_KEY_SEC1_B64|DITCH_COMMUNITY_RELEASE_MANIFEST_PUBLIC_KEY_SEC1_B64|DITCH_APPLE_TEAM_ID|DITCH_COMMUNITY_BUILD_SEQUENCE)
+         [ -n "$public_value" ] || fail "$public_key is empty in $public_file"
+         export "$public_key=$public_value"
+         ;;
+@@ -279,6 +279,7 @@
+ unset DITCH_OFFICIAL_BUILD_CREDENTIAL_FILE DITCH_WRANGLER
+ unset DITCH_DEPLOYMENT_ENVIRONMENT DITCH_RELAY_ORIGIN DITCH_UPDATE_ALLOWED_HOSTS
+ unset DITCH_SPARKLE_PUBLIC_ED_KEY DITCH_RELEASE_MANIFEST_PUBLIC_KEY_SEC1_B64
++unset DITCH_COMMUNITY_RELEASE_MANIFEST_PUBLIC_KEY_SEC1_B64
+ unset DITCH_APPLE_TEAM_ID DITCH_COMMUNITY_BUILD_SEQUENCE
+ 
+ load_public_environment "$client_workspace/apps/macos/config/.env.$environment"
+--- a/scripts/test-commercial-dmg-publisher.mjs
++++ b/scripts/test-commercial-dmg-publisher.mjs
+@@ -55,6 +55,7 @@
+     };
+     assert.equal(e.DITCH_DEPLOYMENT_ENVIRONMENT, target);
+     assert.equal(e.DITCH_RELEASE_MANIFEST_SIGNING_KEY_B64, 'manifest-' + target);
++    assert.equal(e.DITCH_COMMUNITY_RELEASE_MANIFEST_PUBLIC_KEY_SEC1_B64, 'community-public-' + target);
+     json(e.DITCH_COMMERCIAL_MANIFEST_OUTPUT, { manifest, signature: 'fixture-signature' });
+   } else if (tool === 'curl') {
+     const url = args.at(-1);
+@@ -128,7 +129,7 @@
+     put(path.join(client, '.gitignore'), '.env.release-secrets.*\n');
+     assert.equal(spawnSync('git', ['init', '-q', client]).status, 0);
+     put(path.join(config, '.env.' + target), `DITCH_DEPLOYMENT_ENVIRONMENT=${target}\nDITCH_RELAY_ORIGIN=https://${target}.example.test\nDITCH_UPDATE_ALLOWED_HOSTS=${target}.example.test\n`);
+-    put(path.join(config, '.env.release.' + target), `DITCH_SPARKLE_PUBLIC_ED_KEY=public-${target}\nDITCH_RELEASE_MANIFEST_PUBLIC_KEY_SEC1_B64=manifest-public\nDITCH_APPLE_TEAM_ID=HH3KSCHUQF\nDITCH_COMMUNITY_BUILD_SEQUENCE=102\n`);
++    put(path.join(config, '.env.release.' + target), `DITCH_SPARKLE_PUBLIC_ED_KEY=public-${target}\nDITCH_RELEASE_MANIFEST_PUBLIC_KEY_SEC1_B64=manifest-public\nDITCH_COMMUNITY_RELEASE_MANIFEST_PUBLIC_KEY_SEC1_B64=community-public-${target}\nDITCH_APPLE_TEAM_ID=HH3KSCHUQF\nDITCH_COMMUNITY_BUILD_SEQUENCE=102\n`);
+     const secrets = {
+       DITCH_CODESIGN_IDENTITY: 'Developer ID Application: Fixture (HH3KSCHUQF)', DITCH_NOTARY_PROFILE: 'notary-fixture',
+       DITCH_RELEASE_MANIFEST_SIGNING_KEY_FILE: path.join(root, 'manifest'),
+@@ -152,6 +153,7 @@
+       PATH: bin + ':' + process.env.PATH, PUBLISH_TEST_ROOT: root, PUBLISH_TEST_ENV: target,
+       // Contaminate the parent environment to verify canonical settings win.
+       CLOUDFLARE_API_TOKEN: 'wrong-target', DITCH_RELEASE_REGISTER_TOKEN: 'wrong-target',
++      DITCH_COMMUNITY_RELEASE_MANIFEST_PUBLIC_KEY_SEC1_B64: 'wrong-target',
+       DITCH_SPARKLE_PRIVATE_KEY_FILE: '/missing/wrong-target-key',
+     } });
+     return { root, client, run, clean: () => fs.rmSync(root, { recursive: true, force: true }) };

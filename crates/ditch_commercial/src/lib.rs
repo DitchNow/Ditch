@@ -318,7 +318,7 @@ pub fn refresh_entitlement(
     Ok(refreshed_entitlement_from_summary(summary, Utc::now()))
 }
 
-fn refreshed_entitlement_from_summary(
+pub fn refreshed_entitlement_from_summary(
     summary: EntitlementSummary,
     refreshed_at: DateTime<Utc>,
 ) -> RefreshedCommercialEntitlement {

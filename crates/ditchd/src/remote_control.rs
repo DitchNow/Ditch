@@ -99,16 +99,26 @@ fn has_remote_control_entitlement(state: &Arc<Mutex<RuntimeState>>) -> bool {
     })
 }
 
-pub(super) fn entitlement_changed(state: Arc<Mutex<RuntimeState>>, active: bool) {
+pub(super) fn entitlement_changed(state: Arc<Mutex<RuntimeState>>) {
+    // Re-read the current snapshot: an older refresh notification can arrive
+    // after an explicit device activation has already updated the entitlement.
+    let active = {
+        let Ok(mut guard) = state.lock() else {
+            return;
+        };
+        let active = guard
+            .edition
+            .commercial_allows(ditch_commercial::CommercialCapabilityId::REMOTE_CONTROL);
+        if !active {
+            guard.edition.remote.authenticated_socket_live = false;
+            if let Some(sender) = guard.edition.remote.projection_wakeup.as_ref() {
+                let _ = sender.try_send(());
+            }
+        }
+        active
+    };
     if active {
         start_connection(state);
-        return;
-    }
-    if let Ok(mut guard) = state.lock() {
-        guard.edition.remote.authenticated_socket_live = false;
-        if let Some(sender) = guard.edition.remote.projection_wakeup.as_ref() {
-            let _ = sender.try_send(());
-        }
     }
 }
 

@@ -289,7 +289,11 @@ class _RemoteSettingsDialogState extends State<RemoteSettingsDialog> {
   Future<void> _viewCommercialPlans() async {
     await showDialog<void>(
       context: context,
-      builder: (context) => CommercialUpgradeDialog(client: widget.client),
+      builder: (context) => CommercialUpgradeDialog(
+        client: widget.client,
+        deploymentEnvironment: widget.deploymentEnvironment,
+        relayOrigin: widget.relayOrigin,
+      ),
     );
     if (mounted) unawaited(_refresh());
   }
@@ -318,13 +322,10 @@ class _RemoteSettingsDialogState extends State<RemoteSettingsDialog> {
         ? null
         : DitchCurrentLicense.fromEntitlement(_entitlement!);
     final confirmedEntitlementRequired =
-        (license != null &&
-            license.status != 'active' &&
-            license.status != 'over_limit') ||
+        (license != null && !license.hasCommercialAccess) ||
         (license == null && _errorCode == 'commercial_entitlement_required');
     final entitlementMismatch =
-        license != null &&
-        (license.status == 'active' || license.status == 'over_limit') &&
+        license?.hasCommercialAccess == true &&
         _errorCode == 'commercial_entitlement_required';
     final remoteReady =
         !confirmedEntitlementRequired && _status != null && _error == null;
@@ -354,8 +355,8 @@ class _RemoteSettingsDialogState extends State<RemoteSettingsDialog> {
                     const SizedBox(height: 12),
                   ],
                   Text(
-                    license == null
-                        ? 'Commercial access is required.'
+                    license == null || !license.isCommercial
+                        ? 'Commercial access is required for Remote Control.'
                         : '${license.displayName} is ${license.status}.',
                     key: const Key('remote-current-license'),
                     style: Theme.of(context).textTheme.titleSmall,

@@ -53,6 +53,7 @@ pub struct State {
     entitlement_readiness: EntitlementReadiness,
     entitlement_refresh_in_flight: bool,
     entitlement_refresh_failures: u32,
+    entitlement_generation: u64,
 }
 
 impl State {
@@ -64,7 +65,18 @@ impl State {
             entitlement_readiness: EntitlementReadiness::Loading,
             entitlement_refresh_in_flight: false,
             entitlement_refresh_failures: 0,
+            entitlement_generation: 0,
         }
+    }
+
+    fn accept_activation(&mut self, summary: ditch_upgrade::EntitlementSummary) -> bool {
+        let entitlement = ditch_commercial::refreshed_entitlement_from_summary(summary, Utc::now());
+        let active = entitlement.capability.active_at(Utc::now());
+        self.entitlement_generation += 1;
+        self.entitlement = Some(entitlement);
+        self.entitlement_readiness = EntitlementReadiness::Ready;
+        self.entitlement_refresh_failures = 0;
+        active
     }
 
     pub fn commercial_allows(&self, capability: CommercialCapabilityId) -> bool {
@@ -134,7 +146,7 @@ fn entitlement_retry_delay(failures: u32) -> Duration {
 }
 
 fn refresh_entitlement_now(state: &Arc<Mutex<RuntimeState>>) -> RefreshOutcome {
-    let installation_identity = {
+    let (installation_identity, generation) = {
         let mut guard = state
             .lock()
             .expect("runtime state lock should not be poisoned");
@@ -142,21 +154,28 @@ fn refresh_entitlement_now(state: &Arc<Mutex<RuntimeState>>) -> RefreshOutcome {
             return RefreshOutcome::AlreadyInFlight;
         }
         guard.edition.entitlement_refresh_in_flight = true;
-        guard.installation_identity.clone()
+        (
+            guard.installation_identity.clone(),
+            guard.edition.entitlement_generation,
+        )
     };
     let machine_name = remote_control::machine_name();
     match ditch_commercial::refresh_entitlement(&installation_identity, &machine_name) {
         Ok(entitlement) => {
-            let active = entitlement.capability.active_at(Utc::now());
             let mut guard = state
                 .lock()
                 .expect("runtime state lock should not be poisoned");
+            // A successful explicit activation supersedes an older in-flight refresh.
+            if guard.edition.entitlement_generation != generation {
+                guard.edition.entitlement_refresh_in_flight = false;
+                return RefreshOutcome::Updated;
+            }
             guard.edition.entitlement = Some(entitlement);
             guard.edition.entitlement_readiness = EntitlementReadiness::Ready;
             guard.edition.entitlement_refresh_in_flight = false;
             guard.edition.entitlement_refresh_failures = 0;
             drop(guard);
-            remote_control::entitlement_changed(Arc::clone(state), active);
+            remote_control::entitlement_changed(Arc::clone(state));
             RefreshOutcome::Updated
         }
         Err(error) => {
@@ -164,6 +183,10 @@ fn refresh_entitlement_now(state: &Arc<Mutex<RuntimeState>>) -> RefreshOutcome {
                 let mut guard = state
                     .lock()
                     .expect("runtime state lock should not be poisoned");
+                if guard.edition.entitlement_generation != generation {
+                    guard.edition.entitlement_refresh_in_flight = false;
+                    return RefreshOutcome::Updated;
+                }
                 guard.edition.entitlement_readiness = EntitlementReadiness::RefreshFailed;
                 guard.edition.entitlement_refresh_in_flight = false;
                 guard.edition.entitlement_refresh_failures =
@@ -210,6 +233,18 @@ pub fn commercial_entitlement(state: Arc<Mutex<RuntimeState>>) -> Option<ServerR
         RefreshOutcome::Failed(_) => entitlement_unavailable(),
         RefreshOutcome::Updated => unreachable!("an updated entitlement must be stored"),
     })
+}
+
+pub fn accept_commercial_entitlement(
+    state: Arc<Mutex<RuntimeState>>,
+    summary: ditch_upgrade::EntitlementSummary,
+) {
+    let mut guard = state
+        .lock()
+        .expect("runtime state lock should not be poisoned");
+    guard.edition.accept_activation(summary);
+    drop(guard);
+    remote_control::entitlement_changed(state);
 }
 
 pub fn require_remote_control_entitlement(
@@ -388,6 +423,38 @@ mod tests {
                 },
             },
         }
+    }
+
+    #[test]
+    fn explicit_activation_updates_capabilities_without_restarting_the_runtime() {
+        let mut state = State::new();
+        state.entitlement_refresh_in_flight = true;
+        state.entitlement_refresh_failures = 3;
+        let old_generation = state.entitlement_generation;
+        assert!(state.accept_activation(refreshed(CommercialEntitlementStatus::Active).summary));
+        assert_eq!(
+            state.remote_control_availability(),
+            CapabilityAvailability::Allowed
+        );
+        assert_ne!(state.entitlement_generation, old_generation);
+        assert_eq!(state.entitlement_refresh_failures, 0);
+        // Keep the real in-flight operation marked until it completes; its old
+        // generation must not overwrite this authoritative activation snapshot.
+        assert!(state.entitlement_refresh_in_flight);
+    }
+
+    #[test]
+    fn active_community_license_does_not_enable_commercial_capabilities() {
+        let mut state = State::new();
+        let mut summary = refreshed(CommercialEntitlementStatus::Inactive).summary;
+        summary.current_license.edition = "community".to_owned();
+        summary.current_license.status = "active".to_owned();
+        summary.plan = None;
+        assert!(!state.accept_activation(summary));
+        assert_eq!(
+            state.remote_control_availability(),
+            CapabilityAvailability::Required(CommercialEntitlementStatus::Inactive)
+        );
     }
 
     #[test]
