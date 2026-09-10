@@ -1,7 +1,14 @@
+mod acceptance;
+pub use acceptance::*;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use uuid::Uuid;
+
+mod skills;
+pub use skills::*;
+mod tasks;
+pub use tasks::*;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 pub struct ProjectId(pub Uuid);
@@ -119,6 +126,10 @@ pub enum AgentApprovalPreset {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Default)]
 pub struct AgentExecutionProfile {
+    #[serde(default)]
+    pub transport: AgentTransport,
+    #[serde(default)]
+    pub skills: Vec<SkillBinding>,
     pub model: Option<String>,
     pub reasoning_effort: Option<String>,
     #[serde(default)]
@@ -207,6 +218,10 @@ impl Project {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Task {
+    #[serde(default)]
+    pub acceptance: TaskAcceptance,
+    #[serde(default)]
+    pub skills: Vec<SkillBinding>,
     pub id: TaskId,
     pub project_id: ProjectId,
     pub title: String,
@@ -214,6 +229,34 @@ pub struct Task {
     pub state: TaskState,
     pub acceptance_criteria: Vec<String>,
     pub created_at: DateTime<Utc>,
+    #[serde(default)]
+    pub condition: TaskCondition,
+    #[serde(default)]
+    pub order_key: i64,
+    #[serde(default)]
+    pub priority: TaskPriority,
+    #[serde(default)]
+    pub creator: TaskActor,
+    #[serde(default)]
+    pub assigned_agent_id: Option<AgentId>,
+    #[serde(default = "initial_task_revision")]
+    pub revision: u64,
+    #[serde(default)]
+    pub updated_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub started_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub submitted_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub completed_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub cancelled_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub archived: bool,
+    #[serde(default)]
+    pub last_reason: Option<String>,
+    #[serde(default)]
+    pub review_summary: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

@@ -30,3 +30,29 @@ pub fn handle_request(_request: ClientRequest, _state: Arc<Mutex<RuntimeState>>)
         "request is not implemented by the Community runtime",
     )
 }
+
+pub fn task_turn_allowed(_state: &RuntimeState, _id: ditch_core::TaskId) -> bool {
+    true
+}
+
+pub fn restricted_agent(_state: &RuntimeState, _id: ditch_core::AgentId) -> bool {
+    false
+}
+
+pub fn report_ready(
+    _state: &RuntimeState,
+    _id: ditch_core::TaskId,
+    _summary: Option<&str>,
+) -> bool {
+    false
+}
+
+pub fn shutdown(_state: &mut RuntimeState) {}
+
+pub fn authorize_client(
+    _stream: &std::os::unix::net::UnixStream,
+    _request: &ClientRequest,
+    _state: &Arc<Mutex<RuntimeState>>,
+) -> Result<(), String> {
+    Ok(())
+}

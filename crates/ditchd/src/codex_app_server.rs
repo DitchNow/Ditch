@@ -1,10 +1,4 @@
-//! Codex App Server transport used exclusively by SSH-hosted projects.
-//!
-//! The desktop runtime never calls this module for local projects. The SSH
-//! daemon starts one stdio App Server process per active turn, translates its
-//! JSON-RPC events into the stable Ditch protocol, and closes the process when
-//! the turn finishes. A later prompt resumes the persisted Codex thread in a
-//! fresh App Server process.
+//! Shared local and SSH Codex App Server adapter. The daemon owns each process.
 
 use chrono::Utc;
 use ditch_core::{
@@ -13,10 +7,9 @@ use ditch_core::{
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::ffi::OsString;
-use std::io::{self, BufRead, BufReader, Write};
-use std::os::unix::process::CommandExt;
+use std::io::{self, Write};
 use std::path::Path;
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, ChildStdin};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex, Weak};
 use uuid::Uuid;
@@ -35,6 +28,10 @@ pub enum PermissionDecision {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Event {
     ThreadReady(String),
+    Title(String),
+    ProviderUsage(Value),
+    SkillsChanged,
+    AssistantDelta(String),
     TurnStarted,
     Action(String),
     AssistantMessage(String),
@@ -72,6 +69,11 @@ pub struct SpawnedTurn {
 }
 
 pub struct Launch<'a> {
+    pub restricted: bool,
+    pub protected_roots: Vec<std::path::PathBuf>,
+    pub remote: bool,
+    pub extra_roots: &'a [std::path::PathBuf],
+    pub on_spawn: Option<&'a dyn Fn(i32) -> io::Result<()>>,
     pub binary: &'a str,
     pub cwd: &'a Path,
     pub project_id: ProjectId,
@@ -79,7 +81,6 @@ pub struct Launch<'a> {
     pub prompt: &'a str,
     pub resume_thread: Option<&'a str>,
     pub execution_profile: &'a AgentExecutionProfile,
-    pub path: Option<OsString>,
     pub codex_home: Option<OsString>,
 }
 
@@ -127,78 +128,116 @@ impl ActiveTurn {
 }
 
 pub fn spawn_turn(launch: Launch<'_>, events: Sender<Event>) -> io::Result<SpawnedTurn> {
-    let mut command = Command::new(launch.binary);
-    command.process_group(0);
-    command.arg("app-server");
-    command.current_dir(launch.cwd);
-    command.env("TERM", "xterm-256color");
-    if let Some(path) = launch.path {
-        command.env("PATH", path);
+    let home = launch.codex_home.as_ref().map(std::path::Path::new);
+    let mut client =
+        crate::app_server_client::Client::open(launch.binary, launch.cwd, home, launch.on_spawn)?;
+    client.set_roots(launch.extra_roots)?;
+    // Discovery must happen in the same process that will load the thread.
+    if !launch.execution_profile.skills.is_empty() {
+        let catalog = client.call(
+            "skills/list",
+            json!({"cwds":[launch.cwd],"forceReload":true}),
+        )?;
+        for skill in &launch.execution_profile.skills {
+            let found = catalog["data"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .flat_map(|entry| entry["skills"].as_array().into_iter().flatten())
+                .any(|entry| {
+                    entry["path"].as_str() == skill.path.to_str() && entry["enabled"] == true
+                });
+            if !found {
+                return Err(io::Error::other(format!(
+                    "Selected skill {} is unavailable to this App Server",
+                    skill.name
+                )));
+            }
+        }
     }
-    if let Some(codex_home) = launch.codex_home {
-        command.env("CODEX_HOME", codex_home);
-    }
-    command
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-
-    let mut child = command.spawn()?;
-    let stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| io::Error::other("missing App Server stdin"))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| io::Error::other("missing App Server stdout"))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| io::Error::other("missing App Server stderr"))?;
-    let writer = Arc::new(Mutex::new(stdin));
-    let pending = Arc::new(Mutex::new(HashMap::new()));
-
-    write_message(
-        &writer,
-        &json!({
-            "id": INITIALIZE_ID,
-            "method": "initialize",
-            "params": {
-                "clientInfo": {
-                    "name": "the_ditch_ssh",
-                    "title": "The Ditch SSH",
-                    "version": env!("CARGO_PKG_VERSION")
+    let (approval_policy, sandbox, mut sandbox_policy) =
+        execution_policy(launch.execution_profile, launch.cwd, launch.remote);
+    let mut thread_params = json!({
+        "cwd": launch.cwd, "approvalPolicy": approval_policy, "approvalsReviewer":"user",
+        "sandbox":sandbox, "serviceName":"the_ditch",
+        "config":{"features":{"multi_agent":false,"collab":false},"web_search":"live","tools":{"web_search":true},"sandbox_workspace_write":{"writable_roots":[launch.cwd],"exclude_slash_tmp":true,"exclude_tmpdir_env_var":true,"network_access":true}}
+    });
+    if launch.restricted {
+        let config = client.call("config/read", json!({"includeLayers":false}))?;
+        let mut disabled = serde_json::Map::new();
+        if let Some(servers) = config["config"]["mcp_servers"].as_object() {
+            for name in servers.keys() {
+                disabled.insert(name.clone(), json!({"enabled":false}));
+            }
+        }
+        thread_params["config"]["mcp_servers"] = json!(disabled);
+        thread_params["config"]["features"] =
+            json!({"multi_agent":false,"collab":false,"apps":false});
+        if !launch.remote {
+            let scope_name = format!("task_scope_{}", launch.agent_id.0.simple());
+            let mut filesystem = serde_json::Map::new();
+            for path in [
+                Path::new(launch.binary).to_path_buf(),
+                std::fs::canonicalize(launch.binary)?,
+            ] {
+                if let Some(parent) = path.parent() {
+                    filesystem.insert(parent.to_string_lossy().into_owned(), json!("read"));
                 }
             }
-        }),
-    )?;
-    write_message(&writer, &json!({"method": "initialized", "params": {}}))?;
-
-    let (approval_policy, sandbox) = remote_policy(launch.execution_profile);
-    let mut thread_params = json!({
-        "cwd": launch.cwd.to_string_lossy(),
-        "approvalPolicy": approval_policy,
-        "approvalsReviewer": "user",
-        "sandbox": sandbox,
-        "serviceName": "the_ditch_ssh",
-        "config": {
-            "web_search": "live",
-            "tools": {"web_search": true}
+            filesystem.insert(":minimal".into(), json!("read"));
+            filesystem.insert(launch.cwd.to_string_lossy().into_owned(), json!("write"));
+            for root in launch
+                .execution_profile
+                .skills
+                .iter()
+                .filter_map(|skill| skill.path.parent())
+            {
+                filesystem.insert(root.to_string_lossy().into_owned(), json!("read"));
+            }
+            for name in [".git", ".codex", ".agents"] {
+                filesystem.insert(
+                    launch.cwd.join(name).to_string_lossy().into_owned(),
+                    json!("read"),
+                );
+            }
+            if let Ok(executable) = std::env::current_exe()
+                && let Some(bundle) = executable
+                    .ancestors()
+                    .filter(|p| p.extension().is_some_and(|e| e == "app"))
+                    .last()
+            {
+                filesystem.insert(bundle.to_string_lossy().into_owned(), json!("deny"));
+            }
+            for root in &launch.protected_roots {
+                filesystem.insert(root.to_string_lossy().into_owned(), json!("deny"));
+            }
+            thread_params["config"]["permissions"] =
+                json!({scope_name.clone():{"filesystem":filesystem,"network":{"enabled":true}}});
+            thread_params.as_object_mut().unwrap().remove("sandbox");
+            thread_params["config"]["default_permissions"] = json!(scope_name);
+            sandbox_policy = json!({"inheritPermissions":scope_name});
         }
-    });
-    if let Some(model) = launch.execution_profile.model.as_deref() {
-        thread_params["model"] = Value::String(model.to_owned());
+        sandbox_policy["outputSchema"] = json!({"type":"object","additionalProperties":false,
+        "required":["summary","changes","checks","remaining_work"],"properties":{
+            "summary":{"type":"string"},"changes":{"type":"array","items":{"type":"string"}},
+            "checks":{"type":"array","items":{"type":"string"}},"remaining_work":{"type":"array","items":{"type":"string"}}
+        }});
     }
-    let thread_request = if let Some(thread_id) = launch.resume_thread {
-        thread_params["threadId"] = Value::String(thread_id.to_owned());
-        json!({"id": THREAD_ID, "method": "thread/resume", "params": thread_params})
+    if let Some(model) = launch.execution_profile.model.as_deref() {
+        thread_params["model"] = json!(model);
+    }
+    let method = if let Some(thread_id) = launch.resume_thread {
+        thread_params["threadId"] = json!(thread_id);
+        "thread/resume"
     } else {
-        json!({"id": THREAD_ID, "method": "thread/start", "params": thread_params})
+        "thread/start"
     };
-    write_message(&writer, &thread_request)?;
-
-    let child = Arc::new(Mutex::new(child));
+    client.send(&json!({"id":THREAD_ID,"method":method,"params":thread_params}))?;
+    let child = client.child.take().unwrap();
+    let writer = client.writer.take().expect("App Server input");
+    let incoming = client.incoming.take().unwrap();
+    let pending = Arc::new(Mutex::new(HashMap::new()));
+    let skills = launch.execution_profile.skills.clone();
     let reader_writer = Arc::downgrade(&writer);
     let reader_pending = Arc::clone(&pending);
     let prompt = launch.prompt.to_owned();
@@ -209,37 +248,28 @@ pub fn spawn_turn(launch: Launch<'_>, events: Sender<Event>) -> io::Result<Spawn
     let agent_id = launch.agent_id;
     let reader_events = events.clone();
     std::thread::spawn(move || {
-        for line in BufReader::new(stdout).lines() {
-            match line {
-                Ok(line) => handle_line(
-                    &line,
-                    &reader_writer,
-                    &reader_pending,
-                    &reader_events,
-                    project_id,
-                    agent_id,
-                    &cwd,
-                    &prompt,
-                    model.as_deref(),
-                    effort.as_deref(),
-                    approval_policy,
-                ),
-                Err(error) => {
-                    let _ = reader_events.send(Event::Failed(format!(
-                        "Failed to read Codex App Server output: {error}"
-                    )));
-                    break;
-                }
+        let mut gate = TurnEventGate::default();
+        for line in incoming {
+            if let Ok(value) = serde_json::from_str::<Value>(&line)
+                && !gate.accept(&value)
+            {
+                continue;
             }
-        }
-    });
-
-    std::thread::spawn(move || {
-        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-            let line = line.trim();
-            if !line.is_empty() {
-                let _ = events.send(Event::Diagnostic(line.to_owned()));
-            }
+            handle_line(
+                &line,
+                &reader_writer,
+                &reader_pending,
+                &reader_events,
+                project_id,
+                agent_id,
+                &cwd,
+                &prompt,
+                model.as_deref(),
+                effort.as_deref(),
+                approval_policy,
+                &sandbox_policy,
+                &skills,
+            );
         }
     });
 
@@ -247,6 +277,91 @@ pub fn spawn_turn(launch: Launch<'_>, events: Sender<Event>) -> io::Result<Spawn
         child,
         control: ActiveTurn { writer, pending },
     })
+}
+
+#[derive(Default)]
+struct TurnEventGate {
+    thread_response: bool,
+    thread: Option<String>,
+    turn: Option<String>,
+}
+impl TurnEventGate {
+    fn accept(&mut self, value: &Value) -> bool {
+        if value.get("method").is_none() {
+            match value.get("id").and_then(Value::as_i64) {
+                Some(THREAD_ID) => {
+                    if self.thread_response {
+                        return false;
+                    }
+                    self.thread_response = true;
+                    self.thread = value
+                        .pointer("/result/thread/id")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned);
+                }
+                Some(TURN_ID) => {
+                    if self.thread.is_none() {
+                        return false;
+                    }
+                    self.turn = value
+                        .pointer("/result/turn/id")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned);
+                }
+                _ => {}
+            }
+            return true;
+        }
+        let method = value["method"].as_str().unwrap_or("");
+        if (method.starts_with("turn/") || method.starts_with("item/")) && self.thread.is_none() {
+            return false;
+        }
+        if let Some(thread) = value.pointer("/params/threadId").and_then(Value::as_str)
+            && self.thread.as_deref() != Some(thread)
+        {
+            return false;
+        }
+        let turn = value
+            .pointer("/params/turnId")
+            .or_else(|| value.pointer("/params/turn/id"))
+            .and_then(Value::as_str);
+        if let (Some(expected), Some(actual)) = (&self.turn, turn)
+            && expected != actual
+        {
+            return false;
+        }
+        if method == "turn/started" {
+            self.turn = turn.map(str::to_owned);
+        }
+        true
+    }
+}
+
+pub fn execution_policy(
+    profile: &AgentExecutionProfile,
+    cwd: &Path,
+    remote: bool,
+) -> (&'static str, &'static str, Value) {
+    if remote {
+        let (approval, sandbox) = remote_policy(profile);
+        return (approval, sandbox, json!({"type":"dangerFullAccess"}));
+    }
+    match profile.approval {
+        ditch_core::AgentApprovalPreset::FullAccess => (
+            "never",
+            "danger-full-access",
+            json!({"type":"dangerFullAccess"}),
+        ),
+        _ => (
+            if profile.approval == ditch_core::AgentApprovalPreset::Ask {
+                "untrusted"
+            } else {
+                "never"
+            },
+            "workspace-write",
+            json!({"type":"workspaceWrite","writableRoots":[cwd],"networkAccess":true,"excludeSlashTmp":true,"excludeTmpdirEnvVar":true}),
+        ),
+    }
 }
 
 fn remote_policy(_: &AgentExecutionProfile) -> (&'static str, &'static str) {
@@ -270,6 +385,8 @@ fn handle_line(
     model: Option<&str>,
     effort: Option<&str>,
     approval_policy: &str,
+    sandbox_policy: &Value,
+    skills: &[ditch_core::SkillBinding],
 ) {
     let Ok(value) = serde_json::from_str::<Value>(line) else {
         let text = line.trim();
@@ -279,13 +396,15 @@ fn handle_line(
         return;
     };
 
-    if value.get("id").and_then(Value::as_i64) == Some(INITIALIZE_ID) {
+    if value.get("method").is_none()
+        && value.get("id").and_then(Value::as_i64) == Some(INITIALIZE_ID)
+    {
         if let Some(error) = rpc_error(&value) {
             let _ = events.send(Event::Failed(error));
         }
         return;
     }
-    if value.get("id").and_then(Value::as_i64) == Some(THREAD_ID) {
+    if value.get("method").is_none() && value.get("id").and_then(Value::as_i64) == Some(THREAD_ID) {
         if let Some(error) = rpc_error(&value) {
             let _ = events.send(Event::Failed(error));
             return;
@@ -306,8 +425,42 @@ fn handle_line(
             "cwd": cwd.to_string_lossy(),
             "approvalPolicy": approval_policy,
             "approvalsReviewer": "user",
-            "sandboxPolicy": {"type": "dangerFullAccess"}
+            "sandboxPolicy": sandbox_policy
         });
+        if let Some(expected) = sandbox_policy.get("inheritPermissions") {
+            if value["result"]["activePermissionProfile"]["id"] != *expected {
+                let _ = events.send(Event::Failed(
+                    "App Server did not confirm the restricted execution profile".into(),
+                ));
+                return;
+            }
+            params.as_object_mut().unwrap().remove("sandboxPolicy");
+        }
+        if let Some(schema) = sandbox_policy.get("outputSchema") {
+            params["outputSchema"] = schema.clone();
+            if let Some(policy) = params
+                .get_mut("sandboxPolicy")
+                .and_then(Value::as_object_mut)
+            {
+                policy.remove("outputSchema");
+            }
+        }
+        for skill in skills {
+            let matches = crate::skill_files::read_tree(skill.path.parent().unwrap_or(cwd))
+                .and_then(|f| crate::skill_files::validate_files(&f))
+                .is_ok_and(|v| v.0 == skill.content_hash);
+            if !matches {
+                let _ = events.send(Event::Failed(format!(
+                    "Selected skill {} changed immediately before the turn; no turn was sent",
+                    skill.name
+                )));
+                return;
+            }
+            params["input"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({"type":"skill","name":skill.name,"path":skill.path}));
+        }
         if let Some(model) = model {
             params["model"] = Value::String(model.to_owned());
         }
@@ -324,7 +477,7 @@ fn handle_line(
         }
         return;
     }
-    if value.get("id").and_then(Value::as_i64) == Some(TURN_ID) {
+    if value.get("method").is_none() && value.get("id").and_then(Value::as_i64) == Some(TURN_ID) {
         if let Some(error) = rpc_error(&value) {
             let _ = events.send(Event::Failed(error));
         }
@@ -336,6 +489,43 @@ fn handle_line(
     };
     let params = value.get("params").unwrap_or(&Value::Null);
     match method {
+        "skills/changed" => {
+            let _ = events.send(Event::SkillsChanged);
+        }
+        "thread/tokenUsage/updated" => {
+            let usage = &params["tokenUsage"];
+            let mut result = serde_json::Map::new();
+            for scope in ["last", "total"] {
+                let mut values = serde_json::Map::new();
+                for key in [
+                    "totalTokens",
+                    "inputTokens",
+                    "cachedInputTokens",
+                    "outputTokens",
+                    "reasoningOutputTokens",
+                ] {
+                    if let Some(number) = usage[scope][key].as_u64() {
+                        values.insert(key.into(), json!(number));
+                    }
+                }
+                result.insert(scope.into(), Value::Object(values));
+            }
+            let _ = events.send(Event::ProviderUsage(Value::Object(result)));
+        }
+        "thread/name/updated" => {
+            if let Some(name) = params
+                .get("threadName")
+                .or_else(|| params.get("name"))
+                .and_then(Value::as_str)
+            {
+                let _ = events.send(Event::Title(name.into()));
+            }
+        }
+        "item/agentMessage/delta" => {
+            if let Some(delta) = params.get("delta").and_then(Value::as_str) {
+                let _ = events.send(Event::AssistantDelta(delta.into()));
+            }
+        }
         "turn/started" => {
             let _ = events.send(Event::TurnStarted);
         }
@@ -422,7 +612,19 @@ fn handle_line(
                 .unwrap_or("Codex App Server warning");
             let _ = events.send(Event::Diagnostic(message.to_owned()));
         }
-        _ => {}
+        _ => {
+            if let Some(id) = value.get("id") {
+                if let Some(writer) = writer.upgrade() {
+                    let _ = write_message(
+                        &writer,
+                        &json!({"id":id,"error":{"code":-32601,"message":"Ditch does not support this interactive request"}}),
+                    );
+                }
+                let _ = events.send(Event::Failed(format!(
+                    "Unsupported interactive App Server request: {method}"
+                )));
+            }
+        }
     }
 }
 
@@ -550,6 +752,22 @@ mod tests {
     use std::sync::mpsc;
     use std::time::Duration;
 
+    #[test]
+    fn event_gate_rejects_stale_and_out_of_order_events() {
+        let mut gate = TurnEventGate::default();
+        assert!(!gate.accept(&json!({"method":"item/completed","params":{}})));
+        assert!(!gate.accept(&json!({"id":TURN_ID,"result":{"turn":{"id":"early"}}})));
+        assert!(gate.accept(&json!({"id":THREAD_ID,"result":{"thread":{"id":"thread"}}})));
+        assert!(!gate.accept(&json!({"id":THREAD_ID,"result":{"thread":{"id":"duplicate"}}})));
+        assert!(gate.accept(&json!({"id":TURN_ID,"result":{"turn":{"id":"turn"}}})));
+        assert!(!gate.accept(&json!({"method":"item/completed","params":{"threadId":"other"}})));
+        assert!(!gate.accept(&json!({"method":"turn/completed","params":{"turnId":"old"}})));
+        assert!(gate.accept(&json!({"id":THREAD_ID,"method":"item/commandExecution/requestApproval","params":{"threadId":"thread","turnId":"turn"}})));
+        assert!(gate.accept(
+            &json!({"method":"turn/completed","params":{"threadId":"thread","turnId":"turn"}})
+        ));
+    }
+
     fn ids() -> (ProjectId, AgentId) {
         (ProjectId::new(), AgentId::new())
     }
@@ -582,6 +800,8 @@ mod tests {
             None,
             None,
             "untrusted",
+            &json!({"type":"dangerFullAccess"}),
+            &[],
         );
         let Event::ApprovalRequested(request) = rx.recv().unwrap() else {
             panic!("expected approval event");
@@ -610,6 +830,8 @@ mod tests {
             None,
             None,
             "untrusted",
+            &json!({"type":"dangerFullAccess"}),
+            &[],
         );
         assert_eq!(
             rx.recv().unwrap(),
@@ -659,6 +881,11 @@ printf '%s\n' '{{"method":"turn/completed","params":{{"turn":{{"id":"turn_remote
         let (tx, rx) = mpsc::channel();
         let spawned = spawn_turn(
             Launch {
+                restricted: false,
+                protected_roots: vec![],
+                remote: true,
+                extra_roots: &[],
+                on_spawn: None,
                 binary: binary.to_str().unwrap(),
                 cwd: &root,
                 project_id,
@@ -666,7 +893,6 @@ printf '%s\n' '{{"method":"turn/completed","params":{{"turn":{{"id":"turn_remote
                 prompt: "Run tests",
                 resume_thread: None,
                 execution_profile: &profile,
-                path: None,
                 codex_home: None,
             },
             tx,

@@ -4,8 +4,11 @@
 // runtime. Edition-specific builds provide statically linked hooks; they do
 // not launch plugins or a second service.
 
+mod acceptance_evidence;
+mod app_server_client;
 mod codex_app_server;
 mod edition;
+mod skill_files;
 mod ssh_remote;
 
 include!("runtime_shared.rs");

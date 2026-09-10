@@ -27,7 +27,10 @@ pub struct DurableAgent {
     pub codex_home: Option<String>,
 }
 
+mod tasks;
+
 pub struct DurableState {
+    pub tasks: Vec<ditch_core::Task>,
     pub projects: Vec<Project>,
     pub agents: Vec<DurableAgent>,
     pub attention: Vec<RuntimeAttention>,
@@ -72,6 +75,7 @@ impl DitchStore {
         )?;
         connection.pragma_update(None, "user_version", 3)?;
         let mut store = Self { connection };
+        store.initialize_tasks()?;
         store.cleanup_polluted_permission_alerts()?;
         store.import_legacy_registry_if_empty(paths)?;
         Ok(store)
@@ -259,6 +263,7 @@ impl DitchStore {
             .query_map([], |row| from_json(&row.get::<_, String>(0)?))?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(DurableState {
+            tasks: self.load_tasks()?,
             projects,
             agents,
             attention,
@@ -298,8 +303,16 @@ impl DitchStore {
     /// Removes only Ditch's persisted state for a project. The project
     /// directory and its `.ditch` metadata are deliberately never touched.
     pub fn delete_project(&mut self, project_id: ProjectId) -> Result<(), StoreError> {
-        let tx = self.connection.transaction()?;
         let id = project_id.0.to_string();
+        let task_count: i64 = self.connection.query_row(
+            "SELECT COUNT(*) FROM tasks WHERE project_id=?1",
+            params![id],
+            |row| row.get(0),
+        )?;
+        if task_count > 0 {
+            return Err(StoreError::InvalidData("This project has tasks. Keep the project registered to preserve task and review history; delete untouched drafts first.".into()));
+        }
+        let tx = self.connection.transaction()?;
         tx.execute(
             "DELETE FROM permission_requests
              WHERE project_id=?1 OR agent_id IN (SELECT id FROM agents WHERE project_id=?1)",
@@ -328,10 +341,10 @@ impl DitchStore {
         codex_home: Option<&str>,
     ) -> Result<(), StoreError> {
         self.connection.execute(
-            "INSERT INTO agents(id,provider,state,launch_mode,project_id,native_session_id,current_prompt,last_visible_action,state_confidence,state_evidence,started_at,updated_at,run_json,terminal_failure,codex_home)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)
-             ON CONFLICT(id) DO UPDATE SET state=excluded.state,native_session_id=excluded.native_session_id,current_prompt=excluded.current_prompt,last_visible_action=excluded.last_visible_action,state_confidence=excluded.state_confidence,state_evidence=excluded.state_evidence,updated_at=excluded.updated_at,run_json=excluded.run_json,terminal_failure=excluded.terminal_failure,codex_home=COALESCE(agents.codex_home,excluded.codex_home)",
-            params![run.id.0.to_string(), to_json(&run.provider)?, to_json(&run.state)?, to_json(&run.launch_mode)?, run.project_id.0.to_string(), run.native_session_id, run.current_prompt, run.last_visible_action, run.state_confidence, run.state_evidence, run.started_at.to_rfc3339(), run.updated_at.to_rfc3339(), to_json(run)?, terminal_failure, codex_home],
+            "INSERT INTO agents(id,provider,state,launch_mode,project_id,native_session_id,current_prompt,last_visible_action,state_confidence,state_evidence,started_at,updated_at,run_json,terminal_failure,codex_home,task_id)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)
+             ON CONFLICT(id) DO UPDATE SET task_id=excluded.task_id,state=excluded.state,native_session_id=excluded.native_session_id,current_prompt=excluded.current_prompt,last_visible_action=excluded.last_visible_action,state_confidence=excluded.state_confidence,state_evidence=excluded.state_evidence,updated_at=excluded.updated_at,run_json=excluded.run_json,terminal_failure=excluded.terminal_failure,codex_home=COALESCE(agents.codex_home,excluded.codex_home)",
+            params![run.id.0.to_string(), to_json(&run.provider)?, to_json(&run.state)?, to_json(&run.launch_mode)?, run.project_id.0.to_string(), run.native_session_id, run.current_prompt, run.last_visible_action, run.state_confidence, run.state_evidence, run.started_at.to_rfc3339(), run.updated_at.to_rfc3339(), to_json(run)?, terminal_failure, codex_home, run.task_id.map(|id| id.0.to_string())],
         )?;
         Ok(())
     }
@@ -560,7 +573,7 @@ fn upsert_agent_tx(
     terminal_failure: Option<&str>,
     codex_home: Option<&str>,
 ) -> Result<(), StoreError> {
-    tx.execute("INSERT INTO agents(id,provider,state,launch_mode,project_id,native_session_id,current_prompt,last_visible_action,state_confidence,state_evidence,started_at,updated_at,run_json,terminal_failure,codex_home) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)", params![run.id.0.to_string(),to_json(&run.provider)?,to_json(&run.state)?,to_json(&run.launch_mode)?,run.project_id.0.to_string(),run.native_session_id,run.current_prompt,run.last_visible_action,run.state_confidence,run.state_evidence,run.started_at.to_rfc3339(),run.updated_at.to_rfc3339(),to_json(run)?,terminal_failure,codex_home])?;
+    tx.execute("INSERT INTO agents(id,provider,state,launch_mode,project_id,native_session_id,current_prompt,last_visible_action,state_confidence,state_evidence,started_at,updated_at,run_json,terminal_failure,codex_home,task_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)", params![run.id.0.to_string(),to_json(&run.provider)?,to_json(&run.state)?,to_json(&run.launch_mode)?,run.project_id.0.to_string(),run.native_session_id,run.current_prompt,run.last_visible_action,run.state_confidence,run.state_evidence,run.started_at.to_rfc3339(),run.updated_at.to_rfc3339(),to_json(run)?,terminal_failure,codex_home,run.task_id.map(|id| id.0.to_string())])?;
     Ok(())
 }
 

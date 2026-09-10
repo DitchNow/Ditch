@@ -9,6 +9,11 @@ import 'package:flutter/services.dart';
 import 'package:xterm/xterm.dart';
 
 import 'application/command_center_controller.dart';
+import 'application/task_board_controller.dart';
+import 'data/task_models.dart';
+import 'task_board.dart';
+import 'skills_directory.dart';
+import 'application/skills_controller.dart';
 import 'data/commercial_models.dart';
 import 'data/runtime_models.dart';
 import 'data/runtime_transport.dart';
@@ -189,6 +194,33 @@ class EditionSettingsSection {
   final String title;
   final String subtitle;
   final Widget Function(DitchRuntimeClient client) dialogBuilder;
+}
+
+/// Edition-owned workspace content and navigation, using shared task/agent links.
+@immutable
+class EditionWorkspace {
+  const EditionWorkspace({
+    required this.id,
+    required this.navigationBuilder,
+    required this.builder,
+  });
+  final String id;
+  final Widget Function(
+    DitchRuntimeClient client,
+    bool selected,
+    VoidCallback open,
+  )
+  navigationBuilder;
+  final Widget Function(
+    DitchRuntimeClient client,
+    void Function(String projectId) openBoard,
+    void Function(String agentId) openAgent,
+  )
+  builder;
+}
+
+abstract interface class EditionWorkspaceProvider {
+  List<EditionWorkspace> workspaces();
 }
 
 abstract interface class EditionSurface {
@@ -554,11 +586,15 @@ class NotificationReadiness {
 }
 
 class AgentExecutionSettings extends ChangeNotifier {
+  bool appServer = false;
+  List<Map<String, dynamic>> launchSkills = [];
   AgentApprovalPreset approval = AgentApprovalPreset.approveForMe;
   String? model;
   List<AgentModelOption> models = const [];
 
   Map<String, dynamic> get protocolValue => {
+    'transport': appServer ? 'AppServer' : 'Legacy',
+    'skills': launchSkills,
     'model': model,
     'reasoning_effort': null,
     'approval': switch (approval) {
@@ -635,6 +671,7 @@ class AgentSession {
     this.hasOlderMessages = false,
     this.nextBeforeSequence,
     this.historyError,
+    this.attachedSkills = const [],
     DateTime? createdAt,
     DateTime? updatedAt,
   }) : createdAt = createdAt ?? DateTime.now(),
@@ -662,6 +699,8 @@ class AgentSession {
   bool hasOlderMessages;
   int? nextBeforeSequence;
   String? historyError;
+  String streamingText = '';
+  List<Map<String, dynamic>> attachedSkills;
 
   String get displayName {
     final override = userTitle?.trim();
@@ -696,6 +735,7 @@ void reconcileAgentSession(List<AgentSession> sessions, AgentSession incoming) {
 
   final existing = matches.first;
   existing.status = incoming.status;
+  existing.attachedSkills = incoming.attachedSkills;
   existing.codexThreadId = incoming.codexThreadId;
   existing.codexTitle = incoming.codexTitle;
   existing.userTitle = incoming.userTitle;
@@ -1729,6 +1769,96 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
   final _composerKeys = <String, GlobalKey<AgentComposerState>>{};
   int _composerFocusGeneration = 0;
   final _runtimeClient = DitchRuntimeClient();
+  late final _tasks = TaskBoardController(request: _runtimeClient.request);
+  EditionWorkspace? _editionWorkspace;
+  bool _showBoard = false;
+  bool _showSkills = false;
+  String? _boardProjectId;
+  List<TaskProjectOption> get _taskProjects => [
+    for (final p in _projects)
+      if (p.id != null) TaskProjectOption(p.id!, p.name, remote: p.isRemote),
+  ];
+  void _openBoard([String? projectId]) {
+    setState(() {
+      _editionWorkspace = null;
+      _showSkills = false;
+      _showBoard = true;
+      _boardProjectId = projectId;
+      _focusedAgentLocalId = null;
+    });
+    unawaited(_tasks.refresh());
+  }
+
+  void _openTaskAgent(String id) {
+    final session = _agentSessionByLocalId(id);
+    if (session == null) {
+      unawaited(_tasks.refresh());
+      return;
+    }
+    setState(() {
+      _editionWorkspace = null;
+      _showSkills = false;
+      _showBoard = false;
+      final project = _projects
+          .where((p) => p.id == session.projectId)
+          .firstOrNull;
+      if (project != null) _selectedProjectKey = _projectKey(project);
+      _expandedAgentLocalId = id;
+      _focusedAgentLocalId = null;
+    });
+    unawaited(_loadAgentMessages(session));
+  }
+
+  Future<void> _chooseTaskForAgent() async {
+    _openBoard(_selectedProject.id);
+    final tasks = _tasks.tasks
+        .where(
+          (t) =>
+              t.projectId == _selectedProject.id &&
+              !t.archived &&
+              !t.running &&
+              t.column != TaskColumn.done &&
+              t.column != TaskColumn.inReview,
+        )
+        .toList();
+    final selected = await showDialog<String>(
+      context: context,
+      builder: (context) => SimpleDialog(
+        title: const Text('Choose a task'),
+        children: [
+          SimpleDialogOption(
+            onPressed: () => Navigator.pop(context, 'create'),
+            child: const Text('Create a new task…'),
+          ),
+          for (final task in tasks)
+            SimpleDialogOption(
+              onPressed: () => Navigator.pop(context, task.id),
+              child: Text(task.title),
+            ),
+        ],
+      ),
+    );
+    if (!mounted || selected == null) return;
+    final task = selected == 'create'
+        ? await showTaskEditor(
+            context,
+            _tasks,
+            _taskProjects,
+            projectId: _selectedProject.id,
+          )
+        : _tasks.task(selected);
+    if (mounted && task != null) {
+      await showTaskInspector(
+        context,
+        _tasks,
+        task,
+        _taskProjects,
+        () => agentExecutionSettings.protocolValue,
+        _openTaskAgent,
+      );
+    }
+  }
+
   final _presentation = CommandCenterController();
   int _nextAgentSessionId = 1;
   int _nextAttentionId = 1;
@@ -2639,6 +2769,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
     if (snapshot is! Map<String, dynamic>) {
       return;
     }
+    _tasks.replaceSnapshot(snapshot);
     final agentsJson = snapshot['agents'];
     final messagesJson = snapshot['messages'];
     if (agentsJson is! List) {
@@ -2685,6 +2816,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
           session.messages
             ..clear()
             ..addAll(existing.messages);
+          session.streamingText = existing.streamingText;
           session.messagesLoaded = existing.messagesLoaded;
           session.messagesLoading = existing.messagesLoading;
           session.hasOlderMessages = existing.hasOlderMessages;
@@ -2823,6 +2955,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
   @override
   void dispose() {
     _applicationChannel.setMethodCallHandler(null);
+    _tasks.dispose();
     _presentation.dispose();
     _runtimeEvents?.cancel();
     _productUpdateTimer?.cancel();
@@ -2890,6 +3023,8 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
     }
 
     setState(() {
+      _showSkills = false;
+      _showBoard = false;
       _selectedProjectKey = _projectKey(_projects[projectIndex]);
       _expandedAgentLocalId = session.localId;
       _focusedAgentLocalId = null;
@@ -3192,14 +3327,22 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
 
     final prompt = await showDialog<String>(
       context: context,
-      builder: (context) =>
-          StartCodexSessionDialog(initialPrompt: _defaultStartPrompt),
+      builder: (context) => StartCodexSessionDialog(
+        initialPrompt: _defaultStartPrompt,
+        skillsController: _tasks.skills,
+        projectId: _selectedProject.id,
+        onTask: () {
+          Navigator.pop(context);
+          unawaited(_chooseTaskForAgent());
+        },
+      ),
     );
     if (prompt == null || prompt.trim().isEmpty) {
       return;
     }
 
     await _startCodexRuntime(prompt.trim());
+    agentExecutionSettings.launchSkills = [];
   }
 
   Future<void> _startCodexRuntime(String prompt) async {
@@ -3716,6 +3859,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
       return;
     }
 
+    _tasks.applyEvent(eventBody);
     final snapshotReplaced = eventBody['SnapshotReplaced'];
     if (snapshotReplaced is Map<String, dynamic>) {
       _hydrateRuntimeSnapshot({'Snapshot': snapshotReplaced});
@@ -3825,6 +3969,14 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
       return;
     }
 
+    if (eventBody['AgentStreamingText'] case final Map stream) {
+      final session = _agentSessionByLocalId(stream['agent_id'] as String);
+      if (session != null) {
+        setState(() => session.streamingText = stream['text'] as String);
+      }
+      return;
+    }
+
     final messageAppended = eventBody['AgentMessageAppended'];
     if (messageAppended != null) {
       final agentId = _agentIdFromRuntimeMessage(messageAppended);
@@ -3905,11 +4057,11 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
     final request = Map<String, dynamic>.from(value);
     final requestId = request['id']?.toString();
     final projectId = request['project_id']?.toString();
-    final isRemoteProject = _projects.any(
-      (project) => project.id == projectId && project.isRemote,
+    final isRegisteredProject = _projects.any(
+      (project) => project.id == projectId,
     );
     if (requestId == null ||
-        !isRemoteProject ||
+        !isRegisteredProject ||
         !_pendingPermissionIds.add(requestId)) {
       return;
     }
@@ -3925,24 +4077,32 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
         final request = _permissionQueue.removeAt(0);
         final requestId = request['id']?.toString();
         if (requestId == null) continue;
+        final remote = _projects.any(
+          (p) => p.id == request['project_id'] && p.isRemote,
+        );
         final command = request['command']?.toString().trim();
         final target = request['target']?.toString().trim();
         final summary =
             request['summary']?.toString().trim() ??
-            'Codex is requesting permission on the SSH host.';
+            'Codex is requesting permission.';
         final action = request['action']?.toString();
         if (!mounted) break;
         final decision = await showDialog<_RemotePermissionDecision>(
           context: context,
           barrierDismissible: false,
           builder: (context) => AlertDialog(
+            scrollable: true,
             icon: const Icon(Icons.security_outlined),
             title: Text(
               action == 'AccessNetwork'
-                  ? 'Allow remote network access?'
+                  ? (remote
+                        ? 'Allow remote network access?'
+                        : 'Allow network access?')
                   : action == 'EditFiles'
-                  ? 'Allow remote file changes?'
-                  : 'Allow remote command?',
+                  ? (remote
+                        ? 'Allow remote file changes?'
+                        : 'Allow file changes?')
+                  : (remote ? 'Allow remote command?' : 'Allow command?'),
             ),
             content: SizedBox(
               width: 560,
@@ -3973,8 +4133,10 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
                     Text('Target: $target'),
                   ],
                   const SizedBox(height: 14),
-                  const Text(
-                    'This action will run with the SSH user’s permissions on the remote machine.',
+                  Text(
+                    remote
+                        ? 'This action will run with the SSH user’s permissions on the remote machine.'
+                        : 'Review the command and target. Approval may expand access beyond the project sandbox and requires exclusive writer access.',
                   ),
                 ],
               ),
@@ -4046,6 +4208,10 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
     }
     final state = agentJson['state']?.toString();
     return AgentSession(
+      attachedSkills:
+          ((agentJson['execution_profile'] as Map?)?['skills'] as List? ?? [])
+              .map((s) => Map<String, dynamic>.from(s as Map))
+              .toList(),
       localId: agentId,
       projectId: agentJson['project_id']?.toString(),
       provider: AgentProvider.codex,
@@ -4611,6 +4777,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
                 _maximumInspectorWidth(constraints.maxWidth, showSidebar),
               );
               final agentsSurface = AgentsSurface(
+                onOpenBoard: () => _openBoard(_selectedProject.id),
                 sessions: _visibleSessions,
                 expandedAgentLocalId: _expandedAgentLocalId,
                 focusedAgentLocalId: _focusedAgentLocalId,
@@ -4855,9 +5022,45 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
                         width: projectSidebarWidth,
                         projects: _projects,
                         remoteHostStatus: _remoteHostStatus,
-                        selectedIndex: _selectedProjectIndex,
+                        selectedIndex:
+                            (_showBoard ||
+                                _showSkills ||
+                                _editionWorkspace != null)
+                            ? -1
+                            : _selectedProjectIndex,
+                        editionNavigation: [
+                          if (widget.editionSurface is EditionWorkspaceProvider)
+                            for (final item
+                                in (widget.editionSurface
+                                        as EditionWorkspaceProvider)
+                                    .workspaces())
+                              item.navigationBuilder(
+                                _runtimeClient,
+                                _editionWorkspace?.id == item.id,
+                                () => setState(() {
+                                  _editionWorkspace = item;
+                                  _showBoard = false;
+                                  _showSkills = false;
+                                }),
+                              ),
+                        ],
+                        onOpenBoard: () => _openBoard(),
+                        boardSelected: _showBoard,
+                        skillsSelected: _showSkills,
+                        onOpenSkills: () => setState(() {
+                          _editionWorkspace = null;
+                          _showSkills = true;
+                          _showBoard = false;
+                        }),
                         onAddProject: _addProject,
-                        onSelectProject: _selectProject,
+                        onSelectProject: (index) {
+                          setState(() {
+                            _editionWorkspace = null;
+                            _showSkills = false;
+                            _showBoard = false;
+                          });
+                          unawaited(_selectProject(index));
+                        },
                         onRevealProject: (project) =>
                             unawaited(_revealProjectInFinder(project)),
                         onCopyProjectPath: (project) =>
@@ -4897,7 +5100,36 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
                         },
                       ),
                     ],
-                    Expanded(child: body),
+                    Expanded(
+                      child: _editionWorkspace != null
+                          ? _editionWorkspace!.builder(
+                              _runtimeClient,
+                              _openBoard,
+                              _openTaskAgent,
+                            )
+                          : _showSkills
+                          ? SkillsDirectory(
+                              controller: _tasks.skills,
+                              projects: _taskProjects,
+                              connected:
+                                  presentation.connection ==
+                                  RuntimeConnectionPhase.connected,
+                            )
+                          : _showBoard
+                          ? TaskBoard(
+                              key: ValueKey(_boardProjectId),
+                              controller: _tasks,
+                              projects: _taskProjects,
+                              connected:
+                                  presentation.connection ==
+                                  RuntimeConnectionPhase.connected,
+                              initialProjectId: _boardProjectId,
+                              executionProfile: () =>
+                                  agentExecutionSettings.protocolValue,
+                              onOpenAgent: _openTaskAgent,
+                            )
+                          : body,
+                    ),
                   ],
                 );
               }
@@ -7056,6 +7288,7 @@ class _NotificationCenterItem extends StatelessWidget {
 }
 
 class ProjectSidebar extends StatelessWidget {
+  final List<Widget> editionNavigation;
   const ProjectSidebar({
     required this.width,
     required this.projects,
@@ -7068,9 +7301,18 @@ class ProjectSidebar extends StatelessWidget {
     required this.onReconnectRemoteProject,
     required this.onDeleteProject,
     required this.summaryForProject,
+    this.onOpenBoard,
+    this.onOpenSkills,
+    this.editionNavigation = const [],
+    this.skillsSelected = false,
+    this.boardSelected = false,
     super.key,
   });
 
+  final VoidCallback? onOpenBoard;
+  final VoidCallback? onOpenSkills;
+  final bool skillsSelected;
+  final bool boardSelected;
   final double width;
   final List<DitchProject> projects;
   final Map<String, String> remoteHostStatus;
@@ -7097,6 +7339,25 @@ class ProjectSidebar extends StatelessWidget {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
+                ...editionNavigation,
+                if (onOpenBoard != null) ...[
+                  ListTile(
+                    dense: true,
+                    selected: boardSelected,
+                    leading: const Icon(Icons.view_kanban_outlined),
+                    title: const Text('Board'),
+                    onTap: onOpenBoard,
+                  ),
+                  if (onOpenSkills != null)
+                    ListTile(
+                      dense: true,
+                      selected: skillsSelected,
+                      leading: const Icon(Icons.extension_outlined),
+                      title: const Text('Skills'),
+                      onTap: onOpenSkills,
+                    ),
+                  const SizedBox(height: 12),
+                ],
                 Text(
                   'PROJECTS',
                   style: theme.textTheme.labelSmall?.copyWith(
@@ -7357,9 +7618,11 @@ class AgentsSurface extends StatelessWidget {
     this.hasUnreadResult = _neverUnreadAgentResult,
     required this.onFocusAgent,
     required this.onToggleExpanded,
+    this.onOpenBoard,
     super.key,
   });
 
+  final VoidCallback? onOpenBoard;
   final List<AgentSession> sessions;
   final String? expandedAgentLocalId;
   final String? focusedAgentLocalId;
@@ -7400,6 +7663,12 @@ class AgentsSurface extends StatelessWidget {
                       style: Theme.of(context).textTheme.headlineSmall,
                     ),
                   ),
+                  if (onOpenBoard != null)
+                    IconButton(
+                      onPressed: onOpenBoard,
+                      tooltip: 'Project Board — $projectWriteDisclosure',
+                      icon: const Icon(Icons.view_kanban_outlined, size: 20),
+                    ),
                   FilledButton.icon(
                     key: const Key('agents-new-agent-button'),
                     onPressed: onStartCodex,
@@ -7887,7 +8156,16 @@ class ExpandableAgentPanel extends StatelessWidget {
         );
         Widget buildChatPanel() => AgentChatPanel(
           conversationId: session.localId,
-          messages: session.messages,
+          messages: [
+            ...session.messages,
+            if (session.streamingText.isNotEmpty)
+              AgentChatMessage(
+                identity: 'stream-${session.localId}',
+                role: ChatMessageRole.assistant,
+                text: session.streamingText,
+                createdAt: session.updatedAt,
+              ),
+          ],
           viewport: chatViewport!,
           enlarged: enlarged,
           composerKey: composerKey!,
@@ -7949,6 +8227,14 @@ class ExpandableAgentPanel extends StatelessWidget {
                             ),
                     ),
                   ),
+                  if (expanded && session.attachedSkills.isNotEmpty)
+                    Align(
+                      alignment: Alignment.centerLeft,
+                      child: Tooltip(
+                        message: 'Recorded when this thread was launched',
+                        child: SkillChips(skills: session.attachedSkills),
+                      ),
+                    ),
                   if (expanded)
                     Expanded(
                       child: Padding(
@@ -10163,6 +10449,8 @@ class AddProjectKindDialog extends StatelessWidget {
       child: Column(
         mainAxisSize: MainAxisSize.min,
         children: [
+          const Text(projectWriteDisclosure),
+          const SizedBox(height: 12),
           ListTile(
             leading: const Icon(Icons.laptop_mac_outlined),
             title: const Text('Local Project'),
@@ -11222,6 +11510,7 @@ class _AddProjectDialogState extends State<AddProjectDialog> {
         _path.text.trim().isNotEmpty &&
         _gitPolicy != null;
     return AlertDialog(
+      scrollable: true,
       title: const Text('Add Project'),
       content: SizedBox(
         width: 520,
@@ -11288,9 +11577,7 @@ class _AddProjectDialogState extends State<AddProjectDialog> {
             const SizedBox(height: 16),
             const Align(
               alignment: Alignment.centerLeft,
-              child: Text(
-                'Ditch will create and verify:\n.ditch/agents  •  .ditch/hooks  •  .ditch/mcp',
-              ),
+              child: Text(projectWriteDisclosure),
             ),
           ],
         ),
@@ -11320,9 +11607,18 @@ class _AddProjectDialogState extends State<AddProjectDialog> {
 }
 
 class StartCodexSessionDialog extends StatefulWidget {
-  const StartCodexSessionDialog({required this.initialPrompt, super.key});
+  const StartCodexSessionDialog({
+    required this.initialPrompt,
+    this.onTask,
+    this.skillsController,
+    this.projectId,
+    super.key,
+  });
 
   final String initialPrompt;
+  final VoidCallback? onTask;
+  final SkillsController? skillsController;
+  final String? projectId;
 
   @override
   State<StartCodexSessionDialog> createState() =>
@@ -11331,6 +11627,8 @@ class StartCodexSessionDialog extends StatefulWidget {
 
 class _StartCodexSessionDialogState extends State<StartCodexSessionDialog> {
   late final TextEditingController _prompt;
+  bool appServer = agentExecutionSettings.appServer;
+  List<Map<String, dynamic>> selectedSkills = [];
   late final FocusNode _promptFocusNode;
 
   @override
@@ -11358,6 +11656,8 @@ class _StartCodexSessionDialogState extends State<StartCodexSessionDialog> {
     if (prompt.isEmpty) {
       return;
     }
+    agentExecutionSettings.appServer = appServer;
+    agentExecutionSettings.launchSkills = selectedSkills;
     Navigator.of(context).pop(prompt);
   }
 
@@ -11365,22 +11665,63 @@ class _StartCodexSessionDialogState extends State<StartCodexSessionDialog> {
   Widget build(BuildContext context) {
     return AlertDialog(
       title: const Text('Start Codex Session'),
+      scrollable: true,
       content: SizedBox(
         width: 640,
-        child: TextField(
-          controller: _prompt,
-          focusNode: _promptFocusNode,
-          autofocus: true,
-          minLines: 4,
-          maxLines: 8,
-          textInputAction: TextInputAction.newline,
-          decoration: const InputDecoration(
-            labelText: 'Initial prompt',
-            alignLabelWithHint: true,
-          ),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            TextField(
+              controller: _prompt,
+              focusNode: _promptFocusNode,
+              autofocus: true,
+              minLines: 4,
+              maxLines: 8,
+              textInputAction: TextInputAction.newline,
+              decoration: const InputDecoration(
+                labelText: 'Initial prompt',
+                alignLabelWithHint: true,
+              ),
+            ),
+            SwitchListTile(
+              title: const Text('Use App Server'),
+              subtitle: const Text(
+                'Opt-in for interactive approvals and skills. Legacy execution remains available.',
+              ),
+              value: appServer,
+              onChanged: (v) => setState(() => appServer = v),
+            ),
+            if (widget.skillsController != null && widget.projectId != null)
+              SkillChips(
+                skills: selectedSkills,
+                onEdit: () async {
+                  final result = await showSkillPicker(
+                    context,
+                    widget.skillsController!,
+                    widget.projectId!,
+                    selectedSkills,
+                  );
+                  if (result != null && mounted) {
+                    setState(() {
+                      selectedSkills = result;
+                      if (result.isNotEmpty) appServer = true;
+                    });
+                  }
+                },
+              ),
+            if (!appServer && selectedSkills.isNotEmpty)
+              const Text(
+                'Selected skills cannot run through legacy execution.',
+              ),
+          ],
         ),
       ),
       actions: [
+        if (widget.onTask != null)
+          TextButton(
+            onPressed: widget.onTask,
+            child: const Text("Create / select task…"),
+          ),
         TextButton(
           onPressed: () => Navigator.of(context).pop(),
           child: const Text('Cancel'),
