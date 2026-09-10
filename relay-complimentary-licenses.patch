@@ -1,0 +1,1020 @@
+diff --git a/README.md b/README.md
+--- a/README.md
++++ b/README.md
+@@ -110,6 +110,8 @@
+ released-client compatibility. See
+ [Commercial billing, licensing, and artifacts](docs/COMMERCIAL_BILLING.md) for
+ routes, schema, lifecycle policy, setup, and the required staging acceptance.
++Admins can also issue [complimentary Commercial license keys](docs/COMPLIMENTARY_LICENSES.md)
++without a Stripe purchase, with device limits, optional expiry, and revocation.
+ 
+ ## Command delivery lifecycle
+ 
+diff --git a/docs/COMMERCIAL_BILLING.md b/docs/COMMERCIAL_BILLING.md
+--- a/docs/COMMERCIAL_BILLING.md
++++ b/docs/COMMERCIAL_BILLING.md
+@@ -338,6 +338,15 @@
+ 
+ Provider license activation/deactivation, instance names, and activation limits
+ no longer exist.
++
++## Complimentary licenses
++
++Administrators can issue separate payment-independent Commercial grants through
++an authenticated API and command-line tool. These keys use the existing app's
++`/v1/commercial/license/redeem` flow, carry configurable Mac/iPhone limits and an
++optional expiry, and can be revoked without changing any paid products. See
++[Complimentary licenses](COMPLIMENTARY_LICENSES.md) for deployment, issuance,
++recovery of interrupted requests, and revocation instructions.
+ 
+ ## Managed Payments and standard Stripe
+ 
+diff --git a/docs/COMPLIMENTARY_LICENSES.md b/docs/COMPLIMENTARY_LICENSES.md
+new file mode 100644
+--- /dev/null
++++ b/docs/COMPLIMENTARY_LICENSES.md
+@@ -0,0 +1,122 @@
++# Complimentary Commercial licenses
++
++Admins can issue a Ditch key without a Stripe purchase. The recipient enters it in
++**License & Plans → Activate license key**. The existing signed redemption route
++claims the grant for that Owner; normal Mac activation, remote-control authorization,
++and private Commercial update authorization then apply.
++
++Defaults are **2 Macs, 2 iPhones, unlimited SSH remote nodes, and no expiry**.
++Use an absolute UTC expiry for testers. Expiry is measured from the specified date,
++not from redemption. Each key belongs to one Owner after its first claim; it is not
++a reusable coupon for multiple customers. Issue a separate key for each recipient.
++
++## Deploy before issuing
++
++Apply migration `0015_complimentary_licenses.sql` before deploying the new Worker.
++The normal deployment script already applies pending migrations before publishing:
++
++```sh
++npm run check
++./scripts/deploy-cloudflare staging
++# Verify issuance, app redemption, remote control, and revocation in staging.
++./scripts/deploy-cloudflare production
++```
++
++The migration is additive. Existing Stripe keys, purchases, subscriptions, and
++administrative grants are preserved. Complimentary keys are environment-specific;
++a staging key cannot activate production.
++
++## Create a production key
++
++Run from the Relay repository. `--secret-file` takes the file configured as
++`INTERNAL_ADMIN_SECRET_FILE` in that environment's `.env` file, not the secret itself.
++With the current production configuration:
++
++```sh
++node scripts/complimentary-license-admin.mjs issue production \
++  --secret-file ./.secrets/internal_admin_secret \
++  --reason 'Personal use' \
++  --output "$HOME/Desktop/ditch-personal-license.json"
++```
++
++The output file has mode `0600`. Open it and copy **`license.license_key`** into the
++app's activation field. Retain **`license.license_id`** for lookup or revocation.
++Keep this file private; it contains an activation credential. The command does not
++print the key or admin token and refuses to overwrite an existing output file.
++
++A time-limited staging tester example:
++
++```sh
++node scripts/complimentary-license-admin.mjs issue staging \
++  --secret-file ./.secrets/internal_admin_secret.staging \
++  --reason 'Tester: September acceptance' \
++  --mac-slots 1 --ios-slots 1 \
++  --expires-at 2026-10-10T23:59:59Z \
++  --output "$HOME/Desktop/ditch-tester-license.json"
++```
++
++Choose a future expiry. Both device limits must be integers from 1 through 1000.
++A grant adds its capacity to any other active grants or paid products. It does not
++cancel or change an existing subscription. Active complimentary access hides new
++acquisition offers; it does not qualify as a paid Lifetime product for add-ons.
++
++## Recover an interrupted issuance
++
++Before contacting Relay, the command saves the environment and exact request in
++its output file. If the connection fails, the grant may already have been created.
++Repeat the same command and parameters with the saved `request.license_id` supplied
++as `--request-id`, and use a new `--output` filename. The same key is returned.
++Changing the reason, limits, or expiry while reusing that ID returns a conflict.
++There is no automatic retry that could issue a second grant.
++
++## Inspect or revoke
++
++Replace the example UUID with the saved license ID:
++
++```sh
++node scripts/complimentary-license-admin.mjs show production \
++  --secret-file ./.secrets/internal_admin_secret \
++  --license-id 22222222-2222-4222-8222-222222222222
++
++node scripts/complimentary-license-admin.mjs revoke production \
++  --secret-file ./.secrets/internal_admin_secret \
++  --license-id 22222222-2222-4222-8222-222222222222
++```
++
++Show returns metadata (reason, limits, expiry, claim owner, and lifecycle state),
++never the key. `claimed` remains the lifecycle state after time expiry; inspect
++`expires_at` for the deadline. Revocation is permanent and safe to repeat. It
++removes only this grant; other active paid or complimentary sources remain valid.
++Existing device associations are retained. Without another usable source, new
++remote-control operations and Commercial download requests are denied. An already
++received artifact cannot be recalled. The app refreshes its local entitlement
++through its existing synchronization flow.
++
++## HTTP contract and storage
++
++All admin routes require `Authorization: Bearer <INTERNAL_ADMIN_SECRET>` and return
++`Cache-Control: no-store`. Admin credentials never belong in the Mac app.
++
++- `POST /v1/internal/commercial/complimentary-licenses` accepts a UUID v4 `license_id`,
++  a nonempty `reason` (maximum 500 characters), optional `mac_slots`/`ios_slots`, and
++  nullable `expires_at` (Unix milliseconds). New issuance returns 201, an identical
++  retry returns 200, changed details return 409. Successful responses include the
++  key. A revoked grant cannot be retrieved by replaying issuance.
++- `GET /v1/internal/commercial/complimentary-licenses/{id}` returns metadata only.
++- `POST /v1/internal/commercial/complimentary-licenses/{id}/revoke` revokes a grant.
++- Existing `POST /v1/commercial/license/redeem` accepts either a complimentary key
++  or a verified purchase key. Complimentary lookup never bypasses the paid key's
++  original purchase verification. Recognized expired/revoked keys fail closed.
++
++D1 stores HMAC lookup values and AES-GCM ciphertext bound to license ID and
++environment, never plaintext keys. Issuance, claim, and revocation have transactional
++audit events; notes are stored only in the grant metadata. A conditional claim and
++an immutable-owner trigger prevent two owners from sharing the grant. Durable source
++revisions prevent older entitlement projections from hiding a revocation. Expiry
++refreshes permissions at the next deadline while retaining any remaining paid access.
++
++Claimed complimentary owners can also obtain a stable owner recovery key through
++the existing authenticated `/v1/commercial/license` endpoint. This does not add the
++currently missing owner-key display/recovery UI to the Mac app. The complimentary
++activation key itself is a single-owner claim credential, not a way to move an
++already-owned Mac into someone else's Owner.
+diff --git a/migrations/0015_complimentary_licenses.sql b/migrations/0015_complimentary_licenses.sql
+new file mode 100644
+--- /dev/null
++++ b/migrations/0015_complimentary_licenses.sql
+@@ -0,0 +1,75 @@
++PRAGMA foreign_keys = ON;
++
++-- Durable administrative grants, independent of payment-provider records.
++CREATE TABLE complimentary_licenses (
++  id TEXT PRIMARY KEY,
++  environment TEXT NOT NULL CHECK(environment IN ('test','staging','production')),
++  license_hash TEXT NOT NULL UNIQUE,
++  license_prefix TEXT NOT NULL,
++  license_last4 TEXT NOT NULL,
++  key_ciphertext TEXT NOT NULL,
++  key_iv TEXT NOT NULL,
++  reason TEXT NOT NULL CHECK(length(reason) BETWEEN 1 AND 500),
++  mac_slots INTEGER NOT NULL CHECK(mac_slots BETWEEN 1 AND 1000),
++  ios_slots INTEGER NOT NULL CHECK(ios_slots BETWEEN 1 AND 1000),
++  expires_at INTEGER,
++  state TEXT NOT NULL CHECK(state IN ('unclaimed','claimed','revoked')),
++  claimed_owner_id TEXT REFERENCES owners(id),
++  claimed_at INTEGER,
++  created_at INTEGER NOT NULL,
++  updated_at INTEGER NOT NULL,
++  revoked_at INTEGER,
++  CHECK(expires_at IS NULL OR expires_at > created_at),
++  CHECK((claimed_owner_id IS NULL AND claimed_at IS NULL) OR (claimed_owner_id IS NOT NULL AND claimed_at IS NOT NULL)),
++  CHECK(state != 'unclaimed' OR claimed_owner_id IS NULL),
++  CHECK(state != 'claimed' OR claimed_owner_id IS NOT NULL),
++  CHECK((state='revoked') = (revoked_at IS NOT NULL))
++);
++CREATE INDEX complimentary_licenses_owner ON complimentary_licenses(claimed_owner_id,environment,state);
++CREATE TRIGGER complimentary_license_owner_immutable
++BEFORE UPDATE OF claimed_owner_id ON complimentary_licenses
++WHEN OLD.claimed_owner_id IS NOT NULL AND NEW.claimed_owner_id IS NOT OLD.claimed_owner_id
++BEGIN SELECT RAISE(ABORT,'license_already_claimed'); END;
++CREATE TRIGGER complimentary_license_revocation_final
++BEFORE UPDATE OF state ON complimentary_licenses
++WHEN OLD.state='revoked' AND NEW.state!='revoked'
++BEGIN SELECT RAISE(ABORT,'license_invalid'); END;
++
++-- Audit transitions atomically with their source mutation; retries create no duplicates.
++-- The license ID correlates these records without logging the secret or recipient notes.
++CREATE TRIGGER complimentary_license_issued_audit AFTER INSERT ON complimentary_licenses
++BEGIN
++  INSERT INTO audit_events(id,request_id,kind,detail_code,created_at)
++    VALUES('complimentary-issued:' || NEW.id,NEW.id,'complimentary_license_issued',NEW.id,NEW.created_at);
++END;
++CREATE TRIGGER complimentary_license_claimed_audit AFTER UPDATE OF claimed_owner_id ON complimentary_licenses
++WHEN OLD.claimed_owner_id IS NULL AND NEW.claimed_owner_id IS NOT NULL
++BEGIN
++  INSERT INTO audit_events(id,owner_id,request_id,kind,detail_code,created_at)
++    VALUES('complimentary-claimed:' || NEW.id,NEW.claimed_owner_id,NEW.id,'complimentary_license_claimed',NEW.id,NEW.updated_at);
++END;
++CREATE TRIGGER complimentary_license_revoked_audit AFTER UPDATE OF state ON complimentary_licenses
++WHEN OLD.state!='revoked' AND NEW.state='revoked'
++BEGIN
++  INSERT INTO audit_events(id,owner_id,request_id,kind,detail_code,created_at)
++    VALUES('complimentary-revoked:' || NEW.id,NEW.claimed_owner_id,NEW.id,'complimentary_license_revoked',NEW.id,NEW.updated_at);
++END;
++
++-- Detect stale derived entitlements without rebuilding them on every remote-control request.
++ALTER TABLE owner_entitlements ADD COLUMN complimentary_revision INTEGER NOT NULL DEFAULT 0;
++CREATE TABLE complimentary_owner_revisions (
++  owner_id TEXT PRIMARY KEY REFERENCES owners(id) ON DELETE CASCADE,
++  revision INTEGER NOT NULL
++);
++CREATE TRIGGER complimentary_license_claim_revision AFTER UPDATE OF claimed_owner_id ON complimentary_licenses
++WHEN OLD.claimed_owner_id IS NULL AND NEW.claimed_owner_id IS NOT NULL
++BEGIN
++  INSERT INTO complimentary_owner_revisions(owner_id,revision) VALUES(NEW.claimed_owner_id,1)
++    ON CONFLICT(owner_id) DO UPDATE SET revision=revision+1;
++END;
++CREATE TRIGGER complimentary_license_revoke_revision AFTER UPDATE OF state ON complimentary_licenses
++WHEN OLD.state!='revoked' AND NEW.state='revoked' AND NEW.claimed_owner_id IS NOT NULL
++BEGIN
++  INSERT INTO complimentary_owner_revisions(owner_id,revision) VALUES(NEW.claimed_owner_id,1)
++    ON CONFLICT(owner_id) DO UPDATE SET revision=revision+1;
++END;
+diff --git a/package.json b/package.json
+--- a/package.json
++++ b/package.json
+@@ -6,7 +6,7 @@
+   "scripts": {
+     "dev": "wrangler dev --env=''",
+     "typecheck": "tsc --noEmit",
+-    "test": "vitest run && vitest run --config vitest.node.config.ts",
++    "test": "vitest run && vitest run --config vitest.node.config.ts && node --test scripts/test-complimentary-license-admin.mjs",
+     "test:watch": "vitest",
+     "migrate:local": "wrangler d1 migrations apply DB --local --env=''",
+     "deploy:staging": "./scripts/deploy-cloudflare staging",
+diff --git a/scripts/complimentary-license-admin.mjs b/scripts/complimentary-license-admin.mjs
+new file mode 100644
+--- /dev/null
++++ b/scripts/complimentary-license-admin.mjs
+@@ -0,0 +1,108 @@
++#!/usr/bin/env node
++import { randomUUID } from 'node:crypto';
++import { readFile, open } from 'node:fs/promises';
++import { resolve } from 'node:path';
++import { pathToFileURL } from 'node:url';
++
++const origins = {
++  staging: 'https://ditch-remote-relay-staging.matin-1a7.workers.dev',
++  production: 'https://relay.ditchnow.nl',
++};
++const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
++export const help = `Usage:
++  node scripts/complimentary-license-admin.mjs issue staging|production \\
++    --secret-file /path/to/admin-secret --reason 'Personal use' --output /path/to/license.json \\
++    [--mac-slots 2] [--ios-slots 2] [--expires-at 2026-12-31T23:59:59Z] [--request-id UUID]
++  node scripts/complimentary-license-admin.mjs show staging|production --secret-file FILE --license-id UUID
++  node scripts/complimentary-license-admin.mjs revoke staging|production --secret-file FILE --license-id UUID
++
++The secret file must contain only that environment's INTERNAL_ADMIN_SECRET.
++Defaults: 2 Macs, 2 iPhones, unlimited SSH hosts, no expiry. Keys are bound to one owner.
++Issue saves a private JSON receipt and key; it never overwrites a file or prints the key.
++On an uncertain result, retry identical details with the receipt's license_id as --request-id
++and a new output file. Show returns metadata only; revoke permanently ends this grant.
++`;
++
++export function parseOptions(args) {
++  const [action, environment, ...rest] = args;
++  if (!['issue','show','revoke'].includes(action) || !Object.hasOwn(origins, environment)) throw new Error('Specify issue|show|revoke and staging|production. Use --help for usage.');
++  const allowed = new Set(action === 'issue'
++    ? ['--secret-file','--reason','--output','--mac-slots','--ios-slots','--expires-at','--request-id']
++    : ['--secret-file','--license-id']);
++  const options = {};
++  for (let i = 0; i < rest.length; i += 2) {
++    const flag = rest[i], value = rest[i + 1];
++    if (!allowed.has(flag) || Object.hasOwn(options, flag) || !value || value.startsWith('--')) throw new Error('Invalid, duplicate, or missing option. Use --help for usage.');
++    options[flag] = value;
++  }
++  if (!options['--secret-file']) throw new Error('--secret-file is required.');
++  const id = options[action === 'issue' ? '--request-id' : '--license-id'] ?? (action === 'issue' ? randomUUID() : '');
++  if (!uuid.test(id)) throw new Error('A lowercase UUID v4 is required for the license/request ID.');
++  let body;
++  if (action === 'issue') {
++    const reason = options['--reason']?.trim();
++    if (!reason || reason.length > 500 || !options['--output']) throw new Error('--reason (1–500 characters) and --output are required.');
++    const slots = (flag) => {
++      const value = options[flag] ?? '2';
++      if (!/^[1-9]\d*$/.test(value) || Number(value) > 1000) throw new Error('Device limits must be integers between 1 and 1000.');
++      return Number(value);
++    };
++    let expiresAt = null;
++    if (options['--expires-at']) {
++      const value = options['--expires-at'];
++      expiresAt = Date.parse(value);
++      if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/.test(value) || !Number.isSafeInteger(expiresAt)
++        || new Date(expiresAt).toISOString() !== value.replace(/Z$/, value.includes('.') ? 'Z' : '.000Z')) throw new Error('--expires-at must be a valid UTC ISO timestamp, e.g. 2026-12-31T23:59:59Z.');
++    }
++    body = { license_id: id, reason, mac_slots: slots('--mac-slots'), ios_slots: slots('--ios-slots'), expires_at: expiresAt };
++  }
++  return { action, environment, origin: origins[environment], id, options, body };
++}
++
++export async function run(args, { fetchImpl = fetch, stdout = (value) => process.stdout.write(value), stderr = (value) => process.stderr.write(value) } = {}) {
++  if (args.length === 1 && ['--help','-h'].includes(args[0])) { stdout(help); return; }
++  const config = parseOptions(args);
++  const secret = (await readFile(config.options['--secret-file'], 'utf8')).trim();
++  if (secret.length < 16 || /\s/.test(secret)) throw new Error('The secret file must contain only the admin token.');
++  const base = `${config.origin}/v1/internal/commercial/complimentary-licenses`;
++  const url = config.action === 'issue' ? base : `${base}/${config.id}${config.action === 'revoke' ? '/revoke' : ''}`;
++  const receipt = { environment: config.environment, request: config.body };
++  let output;
++  try {
++    if (config.action === 'issue') {
++      // Reserve and persist the request before sending it so a lost response is recoverable.
++      output = await open(config.options['--output'], 'wx', 0o600);
++      await output.writeFile(`${JSON.stringify(receipt, null, 2)}\n`);
++      await output.sync();
++      stderr(`Issuing ${config.environment} license ${config.id}. Request saved to ${config.options['--output']}.\n`);
++    }
++    const response = await fetchImpl(url, {
++      method: config.action === 'show' ? 'GET' : 'POST',
++      headers: { Authorization: `Bearer ${secret}`, 'Content-Type': 'application/json' },
++      redirect: 'error', signal: AbortSignal.timeout(30_000),
++      ...(config.body ? { body: JSON.stringify(config.body) } : {}),
++    });
++    if (!response.ok) {
++      const failure = await response.json().catch(() => null);
++      const code = failure?.error?.code;
++      throw new Error(`Relay returned HTTP ${response.status}${typeof code === 'string' && /^[a-z_]+$/.test(code) ? ` (${code})` : ''}.`);
++    }
++    const result = await response.json();
++    if (config.action === 'issue') {
++      if (result.license_id !== config.id || result.environment !== config.environment || typeof result.license_key !== 'string' || !/^DITCH-(?:[A-Z2-9]{5}-){5}[A-Z2-9]{5}$/.test(result.license_key)) throw new Error('Relay returned an unexpected license response. Retry the saved request.');
++      // Write from position zero; retain the original request for an exact retry.
++      const bytes = Buffer.from(`${JSON.stringify({ ...receipt, license: result }, null, 2)}\n`);
++      await output.write(bytes, 0, bytes.length, 0);
++      await output.truncate(bytes.length);
++      await output.sync();
++      stdout(`License saved to ${config.options['--output']}. Paste license.license_key into License & Plans.\n`);
++    } else {
++      stdout(`${JSON.stringify(result, null, 2)}\n`);
++    }
++  } finally {
++    await output?.close();
++  }
++}
++if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
++  run(process.argv.slice(2)).catch((error) => { console.error(`error: ${error.message}`); process.exitCode = 1; });
++}
+diff --git a/scripts/test-complimentary-license-admin.mjs b/scripts/test-complimentary-license-admin.mjs
+new file mode 100644
+--- /dev/null
++++ b/scripts/test-complimentary-license-admin.mjs
+@@ -0,0 +1,71 @@
++import { test } from 'node:test';
++import assert from 'node:assert/strict';
++import { mkdtemp, writeFile, readFile, stat, rm } from 'node:fs/promises';
++import { tmpdir } from 'node:os';
++import { join } from 'node:path';
++import { parseOptions, run } from './complimentary-license-admin.mjs';
++const id = '22222222-2222-4222-8222-222222222222';
++const fakeKey = `DITCH-${Array(6).fill('ABCDE').join('-')}`;
++const base = ['issue','production','--secret-file','secret','--reason','Personal use','--output','out'];
++test('strict environment and input validation', () => {
++  assert.equal(parseOptions(base).origin, 'https://relay.ditchnow.nl');
++  assert.equal(parseOptions([base[0], 'staging', ...base.slice(2)]).origin, 'https://ditch-remote-relay-staging.matin-1a7.workers.dev');
++  for (const extra of [['--mac-slots','0'],['--mac-slots','1.5'],['--ios-slots','1001'],['--expires-at','2026-02-30T00:00:00Z'],['--expires-at','tomorrow'],['--request-id','invalid'],['--url','https://evil.test']]) assert.throws(() => parseOptions([...base, ...extra]));
++  assert.throws(() => parseOptions(['issue','https://evil.test',...base.slice(2)]));
++  assert.throws(() => parseOptions([...base,'--reason','duplicate']));
++  assert.equal(parseOptions([...base,'--expires-at','2026-12-31T23:59:59Z']).body.expires_at, Date.parse('2026-12-31T23:59:59Z'));
++});
++test('secure receipt, explicit environment, no secret in console, no overwrite', async () => {
++  const dir = await mkdtemp(join(tmpdir(), 'ditch-license-cli-'));
++  try {
++    const secret = join(dir,'secret'), output = join(dir,'license.json');
++    await writeFile(secret,'test-only-admin-secret\n',{mode:0o600});
++    const args = ['issue','production','--secret-file',secret,'--reason','Personal use','--output',output,'--request-id',id];
++    const messages = [];
++    const io = { stdout: (v) => messages.push(v), stderr: (v) => messages.push(v) };
++    let calls = 0;
++    const fetchImpl = async (url, request) => {
++      calls++;
++      assert.equal(url,'https://relay.ditchnow.nl/v1/internal/commercial/complimentary-licenses');
++      assert.equal(request.headers.Authorization,'Bearer test-only-admin-secret');
++      assert.equal(request.redirect,'error');
++      const receipt = JSON.parse(await readFile(output,'utf8'));
++      assert.deepEqual(receipt.request,JSON.parse(request.body));
++      return Response.json({ license_id:id, environment:'production', license_key:fakeKey }, {status:201});
++    };
++    await run(args, { ...io, fetchImpl });
++    assert.equal((await stat(output)).mode & 0o777, 0o600);
++    assert.equal(JSON.parse(await readFile(output,'utf8')).license.license_key, fakeKey);
++    assert(!messages.join('').includes(fakeKey));
++    assert(!messages.join('').includes('test-only-admin-secret'));
++    await assert.rejects(run(args,{...io,fetchImpl}),/EEXIST/);
++    assert.equal(calls,1);
++  } finally { await rm(dir,{recursive:true,force:true}); }
++});
++test('failed request retains the ID and exact parameters for recovery', async () => {
++  const dir = await mkdtemp(join(tmpdir(),'ditch-license-cli-'));
++  try {
++    const secret = join(dir,'secret'), output = join(dir,'license.json');
++    await writeFile(secret,'test-only-admin-secret');
++    await assert.rejects(run(['issue','staging','--secret-file',secret,'--reason','Tester','--output',output,'--request-id',id], {
++      stdout:()=>{},stderr:()=>{},fetchImpl:async()=>Response.json({error:{code:'unauthorized'}},{status:401}),
++    }),/HTTP 401 \(unauthorized\)/);
++    const receipt = JSON.parse(await readFile(output,'utf8'));
++    assert.equal(receipt.request.license_id,id);
++    assert.equal(receipt.environment,'staging');
++    assert.equal(receipt.license,undefined);
++  } finally { await rm(dir,{recursive:true,force:true}); }
++});
++test('show and revoke use authenticated metadata routes', async () => {
++  const dir = await mkdtemp(join(tmpdir(),'ditch-license-cli-'));
++  try {
++    const secret = join(dir,'secret');await writeFile(secret,'test-only-admin-secret');
++    for (const action of ['show','revoke']) await run([action,'staging','--secret-file',secret,'--license-id',id],{
++      stdout:()=>{},stderr:()=>{},fetchImpl:async(url,request)=>{
++        assert.equal(url,`https://ditch-remote-relay-staging.matin-1a7.workers.dev/v1/internal/commercial/complimentary-licenses/${id}${action==='revoke'?'/revoke':''}`);
++        assert.equal(request.method,action==='revoke'?'POST':'GET');
++        return Response.json({license_id:id,state:action==='revoke'?'revoked':'unclaimed'});
++      },
++    });
++  } finally { await rm(dir,{recursive:true,force:true}); }
++});
+diff --git a/src/apns.ts b/src/apns.ts
+--- a/src/apns.ts
++++ b/src/apns.ts
+@@ -1,3 +1,5 @@
++import { AuthError } from "./auth";
++import { requireRemoteControl } from "./billing/entitlements";
+ import { base64url, decodeBase64url } from "./crypto";
+ import type { Env, PushJob } from "./types";
+ 
+@@ -53,6 +55,14 @@
+   for (const message of batch.messages) {
+     const job = message.body;
+     if (job.kind !== "attention" || job.expiresAt <= now) { message.ack(); continue; }
++    // Source expiry can change capacity without ending a separate paid license.
++    // Refresh stale authorization before selecting recipients from its projection.
++    try { await requireRemoteControl(env, job.ownerId); }
++    catch (error) {
++      if (error instanceof AuthError && ["commercial_required","entitlement_expired"].includes(error.code)) message.ack();
++      else message.retry();
++      continue;
++    }
+     const devices = await env.DB.prepare(`SELECT p.device_id,p.apns_token FROM push_devices p JOIN devices d ON d.id=p.device_id
+       JOIN device_activations a ON a.owner_id=d.owner_id AND a.device_id=d.id AND a.device_kind='ios' AND a.state='active'
+       JOIN owner_entitlements e ON e.owner_id=d.owner_id AND e.capability='remote_control' AND e.status IN ('active','over_limit')
+diff --git a/src/billing/catalog.ts b/src/billing/catalog.ts
+--- a/src/billing/catalog.ts
++++ b/src/billing/catalog.ts
+@@ -182,7 +182,9 @@
+       AND commercial_offer_id IS NOT NULL AND state='pending' LIMIT 1`).bind(ownerId, env.BILLING_MODE).first();
+   const activeMonthly = subscriptions.results.some((row) => isCommercialEntitlementUsable({ status: row.status as NormalizedSubscriptionStatus, endsAt: row.ends_at }, now));
+   const hasActiveLifetime = purchases.results.some((row) => row.purchase_type === "commercial_lifetime" && row.status === "paid" && row.license_revoked === 0);
+-  return { hasActiveCommercial: activeMonthly || hasActiveLifetime, hasActiveLifetime,
++  const complimentary = await env.DB.prepare(`SELECT 1 ok FROM complimentary_licenses WHERE claimed_owner_id=? AND environment=?
++    AND state='claimed' AND (expires_at IS NULL OR expires_at>?) LIMIT 1`).bind(ownerId, env.ENVIRONMENT, now).first();
++  return { hasActiveCommercial: activeMonthly || hasActiveLifetime || !!complimentary, hasActiveLifetime,
+     hasMonthlyHistory: subscriptions.results.length > 0, hasPendingMonthlyCheckout: !!pendingMonthly };
+ }
+ 
+diff --git a/src/billing/commercial.ts b/src/billing/commercial.ts
+--- a/src/billing/commercial.ts
++++ b/src/billing/commercial.ts
+@@ -3,6 +3,7 @@
+ import { bodyObject, json, requiredString, requestId } from "../http";
+ import type { Env, Principal } from "../types";
+ import { activateDesktopMac, deactivatePaidResource, reconcileOwnerEntitlements, snapshot } from "./entitlements";
++import { claimComplimentaryLicense } from "./complimentary";
+ import { claimDitchLicense, ensureOwnerLicenseKey, recoverOwnerWithLicenseKey, revealDitchLicense } from "./licenses";
+ import { providerFor, type PurchaseType } from "./provider";
+ import { reconcileCheckoutSession } from "./webhooks";
+@@ -182,7 +183,7 @@
+   const body = await bodyObject(request);
+   const rawKey = requiredString(body, "license_key", 256);
+   try {
+-    await claimDitchLicense(env, rawKey, ownerId);
++    if (!await claimComplimentaryLicense(env, rawKey, ownerId)) await claimDitchLicense(env, rawKey, ownerId);
+     const result = await reconcileOwnerEntitlements(env, ownerId);
+     console.log(JSON.stringify({ event: "license_claimed", owner_id: ownerId }));
+     return json({ protocol_version: 1, state: "claimed", entitlement: result }, 200, requestId(request));
+diff --git a/src/billing/complimentary.ts b/src/billing/complimentary.ts
+new file mode 100644
+--- /dev/null
++++ b/src/billing/complimentary.ts
+@@ -0,0 +1,109 @@
++import { AuthError, rateLimit } from "../auth";
++import { bodyObject, json, requestId, requiredString } from "../http";
++import { requireInternal } from "../releases";
++import type { Env } from "../types";
++import { reconcileOwnerEntitlements } from "./entitlements";
++import { ensureOwnerLicenseKey, generateLicenseKey, licenseHash, licenseInternals } from "./licenses";
++
++const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
++interface ComplimentaryLicense {
++  id: string; environment: string; license_hash: string; license_prefix: string; license_last4: string;
++  key_ciphertext: string; key_iv: string; reason: string; mac_slots: number; ios_slots: number;
++  expires_at: number | null; state: "unclaimed" | "claimed" | "revoked"; claimed_owner_id: string | null;
++  claimed_at: number | null; created_at: number; updated_at: number; revoked_at: number | null;
++}
++function context(env: Env, id: string): string { return `DITCH-COMPLIMENTARY-LICENSE-1\0${env.ENVIRONMENT}\0${id}`; }
++function slots(value: unknown): number {
++  if (!Number.isSafeInteger(value) || Number(value) < 1 || Number(value) > 1000) throw new AuthError("validation_failed");
++  return Number(value);
++}
++function metadata(row: ComplimentaryLicense) {
++  return { license_id: row.id, environment: row.environment, prefix: row.license_prefix, last4: row.license_last4,
++    reason: row.reason, mac_slots: row.mac_slots, ios_slots: row.ios_slots, remote_node_slots: null,
++    expires_at: row.expires_at, state: row.state, claimed_owner_id: row.claimed_owner_id,
++    claimed_at: row.claimed_at, created_at: row.created_at, revoked_at: row.revoked_at };
++}
++async function find(env: Env, id: string): Promise<ComplimentaryLicense | null> {
++  if (!UUID.test(id)) throw new AuthError("validation_failed");
++  return env.DB.prepare("SELECT * FROM complimentary_licenses WHERE id=? AND environment=?")
++    .bind(id, env.ENVIRONMENT).first<ComplimentaryLicense>();
++}
++
++export async function issueComplimentaryLicense(request: Request, env: Env): Promise<Response> {
++  requireInternal(request, env);
++  await rateLimit(env, "complimentary-license-issue", 30, 60_000);
++  const body = await bodyObject(request);
++  if (Object.keys(body).some((key) => !["license_id","reason","mac_slots","ios_slots","expires_at"].includes(key))) throw new AuthError("validation_failed");
++  const id = requiredString(body, "license_id", 36);
++  const reason = requiredString(body, "reason", 500).trim();
++  if (!reason) throw new AuthError("validation_failed");
++  const macSlots = slots(body.mac_slots === undefined ? 2 : body.mac_slots);
++  const iosSlots = slots(body.ios_slots === undefined ? 2 : body.ios_slots);
++  const expiresAt = body.expires_at === undefined || body.expires_at === null ? null : body.expires_at;
++  if (expiresAt !== null && (!Number.isSafeInteger(expiresAt) || Number(expiresAt) > 8_640_000_000_000_000)) throw new AuthError("validation_failed");
++  let row = await find(env, id);
++  let created = false;
++  if (!row) {
++    const now = Date.now();
++    if (expiresAt !== null && Number(expiresAt) <= now) throw new AuthError("validation_failed");
++    const rawKey = generateLicenseKey();
++    const encrypted = await licenseInternals.encryptForDisplay(rawKey, env.DITCH_LICENSE_PEPPER, context(env, id));
++    const result = await env.DB.prepare(`INSERT INTO complimentary_licenses(id,environment,license_hash,license_prefix,license_last4,
++        key_ciphertext,key_iv,reason,mac_slots,ios_slots,expires_at,state,created_at,updated_at)
++      VALUES(?,?,?,?,?,?,?,?,?,?,?,'unclaimed',?,?) ON CONFLICT(id) DO NOTHING`)
++      .bind(id, env.ENVIRONMENT, await licenseHash(env, rawKey), rawKey.split("-").slice(0,2).join("-"), rawKey.slice(-4),
++        encrypted.ciphertext, encrypted.iv, reason, macSlots, iosSlots, expiresAt, now, now).run();
++    created = result.meta.changes > 0;
++    row = await find(env, id);
++  }
++  if (!row || row.reason !== reason || row.mac_slots !== macSlots || row.ios_slots !== iosSlots || row.expires_at !== expiresAt) {
++    throw new AuthError("complimentary_license_conflict");
++  }
++  if (row.state === "revoked") throw new AuthError("license_invalid");
++  const rawKey = await licenseInternals.decryptForDisplay(row.key_ciphertext, row.key_iv, env.DITCH_LICENSE_PEPPER, context(env, id));
++  if (await licenseHash(env, rawKey) !== row.license_hash) throw new Error("complimentary_license_integrity_failed");
++  return json({ ...metadata(row), license_key: rawKey }, created ? 201 : 200, requestId(request));
++}
++
++export async function getComplimentaryLicense(request: Request, env: Env, id: string): Promise<Response> {
++  requireInternal(request, env);
++  const row = await find(env, id);
++  if (!row) throw new AuthError("license_invalid");
++  return json(metadata(row), 200, requestId(request));
++}
++
++// A false result means this is not a complimentary key; use the existing paid-key path.
++// Recognized but expired/revoked/claimed keys never fall through to another key type.
++export async function claimComplimentaryLicense(env: Env, rawKey: string, ownerId: string, now = Date.now()): Promise<boolean> {
++  const hash = await licenseHash(env, rawKey);
++  const row = await env.DB.prepare("SELECT * FROM complimentary_licenses WHERE license_hash=? AND environment=?")
++    .bind(hash, env.ENVIRONMENT).first<ComplimentaryLicense>();
++  if (!row) return false;
++  if (row.state === "revoked" || (row.expires_at !== null && row.expires_at <= now)) throw new AuthError("license_invalid");
++  if (row.claimed_owner_id !== null && row.claimed_owner_id !== ownerId) throw new AuthError("license_already_claimed");
++  const claimed = await env.DB.prepare(`UPDATE complimentary_licenses
++    SET state='claimed',claimed_owner_id=?,claimed_at=COALESCE(claimed_at,?),updated_at=?
++    WHERE id=? AND environment=? AND state IN ('unclaimed','claimed')
++      AND (claimed_owner_id IS NULL OR claimed_owner_id=?) AND (expires_at IS NULL OR expires_at>?)
++      AND EXISTS(SELECT 1 FROM owners WHERE id=? AND state='active') RETURNING id`)
++    .bind(ownerId, now, now, row.id, env.ENVIRONMENT, ownerId, now, ownerId).first();
++  if (!claimed) {
++    const current = await find(env, row.id);
++    if (current?.state === "revoked" || (current?.expires_at != null && current.expires_at <= now)) throw new AuthError("license_invalid");
++    throw new AuthError("license_already_claimed");
++  }
++  await reconcileOwnerEntitlements(env, ownerId, now);
++  await ensureOwnerLicenseKey(env, ownerId, now);
++  return true;
++}
++
++export async function revokeComplimentaryLicense(request: Request, env: Env, id: string): Promise<Response> {
++  requireInternal(request, env);
++  if (!await find(env, id)) throw new AuthError("license_invalid");
++  const now = Date.now();
++  await env.DB.prepare(`UPDATE complimentary_licenses SET state='revoked',revoked_at=?,updated_at=?
++    WHERE id=? AND environment=? AND state!='revoked'`).bind(now, now, id, env.ENVIRONMENT).run();
++  const row = (await find(env, id))!;
++  if (row.claimed_owner_id) await reconcileOwnerEntitlements(env, row.claimed_owner_id, now);
++  return json(metadata(row), 200, requestId(request));
++}
+diff --git a/src/billing/entitlements.ts b/src/billing/entitlements.ts
+--- a/src/billing/entitlements.ts
++++ b/src/billing/entitlements.ts
+@@ -41,6 +41,8 @@
+ }
+ 
+ export async function reconcileOwnerEntitlements(env: Env, ownerId: string, now = Date.now()): Promise<RemoteControlSnapshot> {
++  const revision = await env.DB.prepare("SELECT revision FROM complimentary_owner_revisions WHERE owner_id=?")
++    .bind(ownerId).first<{revision:number}>();
+   const subscriptions = await env.DB.prepare(`SELECT id,quantity,status,ends_at,created_at FROM billing_subscription_sources
+     WHERE owner_id=? AND provider_mode=? AND product_type='commercial_monthly'`)
+     .bind(ownerId, env.BILLING_MODE).all<SubscriptionRow>();
+@@ -48,8 +50,16 @@
+     WHERE owner_id=? AND provider_mode=? AND purchase_type IN ('commercial_lifetime','lifetime_extra_pair') AND license_revoked=0`)
+     .bind(ownerId, env.BILLING_MODE).all<PurchaseRow>();
+   const administrative = await env.DB.prepare(`SELECT id,source_id,mac_slots,ios_slots,remote_node_slots,valid_from,valid_until,status,created_at
+-    FROM billing_entitlements WHERE owner_id=? AND capability='remote_control' AND source_type='administrative'`)
++    FROM billing_entitlements WHERE owner_id=? AND capability='remote_control' AND source_type='administrative'
++      AND source_id NOT LIKE 'complimentary:%'`)
+     .bind(ownerId).all<AdministrativeRow>();
++  // Complimentary grants are authoritative rows, never inferred from an old entitlement projection.
++  const complimentary = await env.DB.prepare(`SELECT 'complimentary:' || id id,'complimentary:' || id source_id,
++      mac_slots,ios_slots,NULL remote_node_slots,claimed_at valid_from,expires_at valid_until,
++      CASE WHEN state='claimed' THEN 'active' ELSE 'inactive' END status,created_at
++    FROM complimentary_licenses WHERE claimed_owner_id=? AND environment=?`)
++    .bind(ownerId, env.ENVIRONMENT).all<AdministrativeRow>();
++  administrative.results.push(...complimentary.results);
+   const previous = await env.DB.prepare("SELECT status FROM owner_entitlements WHERE owner_id=? AND capability='remote_control'")
+     .bind(ownerId).first<{status:CommercialStatus}>();
+ 
+@@ -57,7 +67,9 @@
+   const activeLifetime = purchases.results.filter((row) => row.purchase_type === "commercial_lifetime" && row.status === "paid");
+   const lifetimePresent = activeLifetime.length > 0;
+   const activeAddons = purchases.results.filter((row) => row.purchase_type === "lifetime_extra_pair" && row.status === "paid" && lifetimePresent);
+-  const activeAdministrative = administrative.results.filter((row) => row.status === "active" && (row.valid_until == null || row.valid_until > now));
++  // Webhook callers may supply an older provider event time; it must not resurrect a gift.
++  const administrativeNow = Math.max(now, Date.now());
++  const activeAdministrative = administrative.results.filter((row) => row.status === "active" && row.valid_from <= administrativeNow && (row.valid_until == null || row.valid_until > administrativeNow));
+   const macSlots = activeSubscriptions.reduce((sum, row) => sum + row.quantity, 0)
+     + activeLifetime.reduce((sum, row) => sum + row.quantity * 2, 0)
+     + activeAddons.reduce((sum, row) => sum + row.quantity, 0)
+@@ -75,9 +87,10 @@
+   const counts = await activationCounts(env, ownerId);
+   const status: CommercialStatus = !enabled ? (sourceCount ? "expired" : "inactive")
+     : counts.macs > macSlots || counts.ios > iosSlots ? "over_limit" : "active";
+-  const finiteEnds = activeSubscriptions.map((row) => row.ends_at).filter((value): value is number => value != null);
+-  const validUntil = activeLifetime.length || activeSubscriptions.some((row) => row.ends_at == null) || !finiteEnds.length
+-    ? null : Math.max(...finiteEnds);
++  // Refresh at the next source expiry even when another source still grants access.
++  const finiteEnds = [...activeSubscriptions.map((row) => row.ends_at), ...activeAdministrative.map((row) => row.valid_until)]
++    .filter((value): value is number => value != null);
++  const validUntil = finiteEnds.length ? Math.min(...finiteEnds) : null;
+   const firstSource = [...subscriptions.results, ...purchases.results, ...administrative.results].reduce((minimum, row) => Math.min(minimum, row.created_at), now);
+   const statements: D1PreparedStatement[] = [
+     env.DB.prepare("DELETE FROM billing_entitlements WHERE owner_id=? AND capability='remote_control'").bind(ownerId),
+@@ -96,7 +109,7 @@
+       .bind(`purchase:${row.id}`, ownerId, row.id, sourceStatus(contributes, row.status), slots, slots, row.created_at, row.created_at, now));
+   }
+   for (const row of administrative.results) {
+-    const active = row.status === "active" && (row.valid_until == null || row.valid_until > now);
++    const active = row.status === "active" && row.valid_from <= administrativeNow && (row.valid_until == null || row.valid_until > administrativeNow);
+     statements.push(env.DB.prepare(`INSERT INTO billing_entitlements(id,owner_id,capability,source_type,source_id,status,mac_slots,ios_slots,remote_node_slots,valid_from,valid_until,created_at,updated_at)
+       VALUES(?,?,'remote_control','administrative',?,?,?,?,?,?,?,?,?)`)
+       .bind(row.id, ownerId, row.source_id, sourceStatus(active, active ? "active" : "expired"), row.mac_slots, row.ios_slots,
+@@ -106,10 +119,10 @@
+     env.DB.prepare(`INSERT INTO remote_control_limits(owner_id,mac_slots,ios_slots,remote_node_slots,updated_at) VALUES(?,?,?,?,?)
+       ON CONFLICT(owner_id) DO UPDATE SET mac_slots=excluded.mac_slots,ios_slots=excluded.ios_slots,remote_node_slots=excluded.remote_node_slots,updated_at=excluded.updated_at`)
+       .bind(ownerId, macSlots, iosSlots, remoteNodeSlots, now),
+-    env.DB.prepare(`INSERT INTO owner_entitlements(owner_id,capability,status,valid_from,valid_until,created_at,updated_at)
+-      VALUES(?,'remote_control',?,?,?,?,?) ON CONFLICT(owner_id,capability) DO UPDATE SET status=excluded.status,
+-      valid_from=excluded.valid_from,valid_until=excluded.valid_until,updated_at=excluded.updated_at`)
+-      .bind(ownerId, status, firstSource, validUntil, now, now),
++    env.DB.prepare(`INSERT INTO owner_entitlements(owner_id,capability,status,valid_from,valid_until,created_at,updated_at,complimentary_revision)
++      VALUES(?,'remote_control',?,?,?,?,?,?) ON CONFLICT(owner_id,capability) DO UPDATE SET status=excluded.status,
++      valid_from=excluded.valid_from,valid_until=excluded.valid_until,updated_at=excluded.updated_at,complimentary_revision=excluded.complimentary_revision`)
++      .bind(ownerId, status, firstSource, validUntil, now, now, revision?.revision ?? 0),
+   );
+   if (previous?.status !== status) {
+     statements.push(env.DB.prepare(`INSERT INTO audit_events(id,owner_id,request_id,kind,detail_code,created_at)
+@@ -139,7 +152,8 @@
+     JOIN remote_control_limits l ON l.owner_id=e.owner_id WHERE e.owner_id=? AND e.capability='remote_control'`)
+     .bind(ownerId).first<{status:CommercialStatus;mac_slots:number;ios_slots:number;remote_node_slots:number|null}>();
+   const counts = await activationCounts(env, ownerId);
+-  const plans = await env.DB.prepare(`SELECT DISTINCT CASE WHEN source_type='administrative' THEN 'administrative'
++  const plans = await env.DB.prepare(`SELECT DISTINCT CASE WHEN source_type='administrative' AND source_id LIKE 'complimentary:%' THEN 'complimentary'
++      WHEN source_type='administrative' THEN 'administrative'
+       WHEN source_type='subscription' THEN 'commercial_monthly'
+       WHEN source_id IN (SELECT id FROM billing_purchase_sources WHERE purchase_type='commercial_lifetime') THEN 'commercial_lifetime'
+       ELSE 'lifetime_extra_pair' END plan
+@@ -160,8 +174,21 @@
+ 
+ export async function requireRemoteControl(env: Env, ownerId: string | null, allowOverLimit = true): Promise<void> {
+   if (!ownerId) throw new AuthError("commercial_required");
+-  const row = await env.DB.prepare("SELECT status,valid_until FROM owner_entitlements WHERE owner_id=? AND capability='remote_control'")
+-    .bind(ownerId).first<{status:CommercialStatus;valid_until:number|null}>();
++  // Rebuild only after a source change or the next expiry. Claim/revoke and revision
++  // changes are atomic, so an older concurrent reconciliation cannot hide a revocation.
++  const current = () => env.DB.prepare(`SELECT e.status,e.valid_until,e.complimentary_revision,
++      COALESCE(r.revision,0) source_revision FROM owner_entitlements e
++      LEFT JOIN complimentary_owner_revisions r ON r.owner_id=e.owner_id
++      WHERE e.owner_id=? AND e.capability='remote_control'`)
++    .bind(ownerId).first<{status:CommercialStatus;valid_until:number|null;complimentary_revision:number;source_revision:number}>();
++  const stale = (row: Awaited<ReturnType<typeof current>>) => row != null &&
++    (row.complimentary_revision !== row.source_revision || (row.valid_until != null && row.valid_until <= Date.now()));
++  let row = await current();
++  for (let attempt = 0; stale(row) && attempt < 3; attempt++) {
++    await reconcileOwnerEntitlements(env, ownerId);
++    row = await current();
++  }
++  if (stale(row)) throw new AuthError("commercial_required");
+   if (!row || row.status === "inactive") throw new AuthError("commercial_required");
+   if (row.status === "expired" || (row.valid_until != null && row.valid_until <= Date.now())) throw new AuthError("entitlement_expired");
+   if (row.status === "over_limit" && !allowOverLimit) throw new AuthError("device_not_licensed");
+diff --git a/src/billing/licenses.ts b/src/billing/licenses.ts
+--- a/src/billing/licenses.ts
++++ b/src/billing/licenses.ts
+@@ -61,7 +61,7 @@
+   return `DITCH-OWNER-LICENSE-1\0${ownerId}`;
+ }
+ 
+-async function paidCommercialSourceExists(env: Env, ownerId: string, now: number): Promise<boolean> {
++async function commercialLicenseSourceExists(env: Env, ownerId: string, now: number): Promise<boolean> {
+   const subscriptions = await env.DB.prepare(`SELECT status,ends_at FROM billing_subscription_sources
+     WHERE owner_id=? AND provider_mode=? AND product_type='commercial_monthly'`)
+     .bind(ownerId, env.BILLING_MODE).all<{status:NormalizedSubscriptionStatus;ends_at:number|null}>();
+@@ -69,7 +69,9 @@
+   const purchase = await env.DB.prepare(`SELECT 1 ok FROM billing_purchase_sources
+     WHERE owner_id=? AND provider_mode=? AND purchase_type='commercial_lifetime' AND status='paid' AND license_revoked=0 LIMIT 1`)
+     .bind(ownerId, env.BILLING_MODE).first();
+-  return Boolean(purchase);
++  if (purchase) return true;
++  return Boolean(await env.DB.prepare(`SELECT 1 ok FROM complimentary_licenses WHERE claimed_owner_id=? AND environment=?
++    AND state='claimed' AND (expires_at IS NULL OR expires_at>?) LIMIT 1`).bind(ownerId, env.ENVIRONMENT, now).first());
+ }
+ 
+ async function ownerLicenseFromRow(env: Env, row: OwnerLicenseRow): Promise<OwnerLicenseKey> {
+@@ -83,7 +85,7 @@
+   const existing = await env.DB.prepare("SELECT * FROM owner_license_keys WHERE owner_id=?")
+     .bind(ownerId).first<OwnerLicenseRow>();
+   if (existing) return ownerLicenseFromRow(env, existing);
+-  if (!await paidCommercialSourceExists(env, ownerId, now)) throw new AuthError("commercial_required");
++  if (!await commercialLicenseSourceExists(env, ownerId, now)) throw new AuthError("commercial_required");
+ 
+   const rawKey = generateLicenseKey();
+   const groups = rawKey.split("-");
+diff --git a/src/worker.ts b/src/worker.ts
+--- a/src/worker.ts
++++ b/src/worker.ts
+@@ -11,6 +11,7 @@
+ import { reconcileOwnerEntitlements, requireCommercialMachineAccess, requireIosActivation, requireMachineActivation, requireRemoteControl } from "./billing/entitlements";
+ import { handleStripeWebhook } from "./billing/webhooks";
+ import { reconcileBilling } from "./billing/reconciliation";
++import { issueComplimentaryLicense, getComplimentaryLicense, revokeComplimentaryLicense } from "./billing/complimentary";
+ import { revokeDitchLicenseInternal } from "./billing/licenses";
+ import { claimRemoteNodeEnrollment, createRemoteNodeEnrollment } from "./enrollment";
+ import { commercialReleaseCapabilities, consumeDownloadGrant, createDownloadGrant, currentCommercialRelease, publishCommercialRelease, serveCommercialReleaseObject } from "./releases";
+@@ -397,6 +398,10 @@
+   const communityReleaseRevoke = pathMatch(url.pathname, /^\/v1\/internal\/community\/releases\/([^/]+)\/revoke$/);
+   if (communityReleaseRevoke && request.method === "POST") return revokeCommunityRelease(request, env, communityReleaseRevoke[1]!);
+   if (url.pathname === "/v1/internal/billing/reconcile" && request.method === "POST") return reconcileBilling(request, env);
++  if (url.pathname === "/v1/internal/commercial/complimentary-licenses" && request.method === "POST") return issueComplimentaryLicense(request, env);
++  const complimentary = pathMatch(url.pathname, /^\/v1\/internal\/commercial\/complimentary-licenses\/([^/]+)(\/revoke)?$/);
++  if (complimentary && !complimentary[2] && request.method === "GET") return getComplimentaryLicense(request, env, complimentary[1]!);
++  if (complimentary && complimentary[2] && request.method === "POST") return revokeComplimentaryLicense(request, env, complimentary[1]!);
+   const license = pathMatch(url.pathname, /^\/v1\/internal\/commercial\/licenses\/([^/]+)\/revoke$/);
+   if (license && request.method === "POST") return revokeDitchLicenseInternal(request, env, license[1]!);
+   const download = pathMatch(url.pathname, /^\/v1\/commercial\/download-grants\/([^/]+)$/);
+@@ -428,7 +433,7 @@
+       if (caught instanceof AuthError) {
+         console.log(JSON.stringify({ event: caught.code === "rate_limited" ? "rate_limit_hit" : "auth_or_policy_reject", request_id: id, code: caught.code }));
+         const status = caught.code === "rate_limited" ? 429
+-          : ["machine_offline", "pairing_expired", "pairing_used", "pairing_rejected", "command_duplicate", "approval_stale", "integration_conflict", "ios_slot_unavailable", "mac_slot_unavailable", "license_already_claimed", "release_conflict", "official_build_conflict", "attestation_key_conflict", "assertion_replayed", "attestation_challenge_used"].includes(caught.code) ? 409
++          : ["machine_offline", "pairing_expired", "pairing_used", "pairing_rejected", "command_duplicate", "approval_stale", "integration_conflict", "ios_slot_unavailable", "mac_slot_unavailable", "license_already_claimed", "complimentary_license_conflict", "release_conflict", "official_build_conflict", "attestation_key_conflict", "assertion_replayed", "attestation_challenge_used"].includes(caught.code) ? 409
+           : ["invalid_request", "validation_failed", "unsupported_protocol", "command_expired", "license_invalid"].includes(caught.code) ? 400
+           : caught.code === "range_not_satisfiable" ? 416
+           : ["download_grant_expired", "attestation_challenge_expired"].includes(caught.code) ? 410
+@@ -444,6 +449,7 @@
+           commercial_required: "Commercial authorization is required.", entitlement_expired: "Commercial authorization has expired.",
+           device_not_licensed: "This device is not licensed.", ios_slot_unavailable: "No iOS activation slot is available.",
+           mac_slot_unavailable: "No Mac activation slot is available.", action_not_allowed: "This action is not allowed.",
++          complimentary_license_conflict: "This license ID was already used with different grant details.",
+           license_invalid: "The license could not be validated.", license_already_claimed: "The license is already claimed.",
+           download_grant_expired: "The download grant is no longer valid.", release_unavailable: "The requested release is unavailable.",
+           release_conflict: "The release conflicts with an existing registration.", range_not_satisfiable: "The requested byte range is not satisfiable.",
+diff --git a/test/apns.test.ts b/test/apns.test.ts
+--- a/test/apns.test.ts
++++ b/test/apns.test.ts
+@@ -56,6 +56,29 @@
+     expect(await env.DB.prepare("SELECT invalidated_at FROM push_devices WHERE device_id='device'").first<{invalidated_at:number}>()).toMatchObject({ invalidated_at: expect.any(Number) });
+   });
+ 
++  it.each([false, true])("refreshes an expired grant before push delivery, preserving other paid access (%s)", async (paid) => {
++    const runtime = await fakeEnv();
++    const now = Date.now();
++    await env.DB.batch([
++      env.DB.prepare("INSERT INTO owners(id,created_at,state) VALUES('owner',?,'active')").bind(now),
++      env.DB.prepare("INSERT INTO devices(id,owner_id,name,platform,signing_public_key,agreement_public_key,state,created_at) VALUES('device','owner','Phone','ios','sign','agree','active',?)").bind(now),
++      env.DB.prepare("INSERT INTO owner_entitlements(owner_id,capability,status,valid_from,valid_until,created_at,updated_at) VALUES('owner','remote_control','active',?,?,?,?)").bind(now - 2000, now - 1, now, now),
++      env.DB.prepare("INSERT INTO remote_control_limits(owner_id,mac_slots,ios_slots,remote_node_slots,updated_at) VALUES('owner',2,2,NULL,?)").bind(now),
++      env.DB.prepare("INSERT INTO device_activations(id,owner_id,device_kind,device_id,state,activated_at,created_at,updated_at) VALUES('apns-ios','owner','ios','device','active',?,?,?)").bind(now, now, now),
++      env.DB.prepare("INSERT INTO push_devices(device_id,environment,apns_token,updated_at) VALUES('device','sandbox',?,?)").bind("c".repeat(64), now),
++    ]);
++    if (paid) await env.DB.prepare(`INSERT INTO stripe_purchases(id,owner_id,provider_mode,provider_checkout_session_id,
++      provider_customer_id,provider_price_id,purchase_type,quantity,status,provider_updated_at,created_at,updated_at)
++      VALUES('paid','owner','test','cs_paid','cus_paid','price_paid','commercial_lifetime',1,'paid',?,?,?)`).bind(now, now, now).run();
++    const send = vi.fn(async () => new Response(null, { status: 200 }));
++    vi.stubGlobal("fetch", send);
++    const message = batch(job);
++    await consumePushBatch(message.value, runtime);
++    expect(send).toHaveBeenCalledTimes(paid ? 1 : 0);
++    expect(message.ack).toHaveBeenCalledOnce();
++    expect(message.retry).not.toHaveBeenCalled();
++  });
++
+   it("retries APNs 429 and 5xx responses instead of dropping attention", async () => {
+     const runtime = await fakeEnv();
+     const now = Date.now();
+diff --git a/test/complimentary.test.ts b/test/complimentary.test.ts
+new file mode 100644
+--- /dev/null
++++ b/test/complimentary.test.ts
+@@ -0,0 +1,177 @@
++import { SELF, env } from "cloudflare:test";
++import { beforeEach, describe, expect, it } from "vitest";
++import { FakePrincipal, resetDatabase } from "./support/harness";
++import { claimComplimentaryLicense } from "../src/billing/complimentary";
++import { reconcileOwnerEntitlements, requireMachineActivation, requireRemoteControl } from "../src/billing/entitlements";
++
++const BASE = "/v1/internal/commercial/complimentary-licenses";
++const SECRET = "fixture-admin-secret";
++interface Issued { license_id: string; license_key: string; mac_slots: number; ios_slots: number; expires_at: number | null }
++function admin(path = BASE, body?: unknown, secret: string | null = SECRET, method = body === undefined ? "GET" : "POST") {
++  return SELF.fetch(`https://relay.test${path}`, { method, headers: { "Content-Type": "application/json", ...(secret === null ? {} : { Authorization: `Bearer ${secret}` }) },
++    ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
++}
++function grant(overrides: Record<string,unknown> = {}) { return { license_id: crypto.randomUUID(), reason: "Customer support gift", ...overrides }; }
++async function issue(overrides: Record<string,unknown> = {}): Promise<Issued> {
++  const response = await admin(BASE, grant(overrides));
++  expect(response.status).toBe(201);
++  expect(response.headers.get("cache-control")).toBe("no-store");
++  return response.json<Issued>();
++}
++async function owner() {
++  const machine = await FakePrincipal.create("machine", crypto.randomUUID());
++  expect((await machine.registerMachine()).status).toBe(201);
++  const response = await machine.request("/v1/commercial/bootstrap", { method: "POST" });
++  expect(response.status).toBe(200);
++  return { machine, id: (await response.json<{owner_id:string}>()).owner_id };
++}
++function redeem(machine: FakePrincipal, key: string) {
++  return machine.request("/v1/commercial/license/redeem", { method: "POST", body: { license_key: key } });
++}
++async function paidLifetime(ownerId: string) {
++  const now = Date.now();
++  await env.DB.prepare(`INSERT INTO stripe_purchases(id,owner_id,provider_mode,provider_checkout_session_id,
++      provider_customer_id,provider_price_id,purchase_type,quantity,status,provider_updated_at,created_at,updated_at)
++    VALUES(?,?,'test',?,'cus_paid','price_paid','commercial_lifetime',1,'paid',?,?,?)`)
++    .bind(crypto.randomUUID(), ownerId, `cs_${crypto.randomUUID()}`, now, now, now).run();
++}
++async function expire(id: string) {
++  await env.DB.prepare("UPDATE complimentary_licenses SET created_at=?,expires_at=? WHERE id=?")
++    .bind(Date.now() - 2000, Date.now() - 1000, id).run();
++  // Move the cached deadline too, as it would look when the real clock passes expiry.
++  await env.DB.prepare(`UPDATE owner_entitlements SET valid_until=? WHERE owner_id=
++    (SELECT claimed_owner_id FROM complimentary_licenses WHERE id=?)`).bind(Date.now() - 1000, id).run();
++}
++beforeEach(resetDatabase);
++
++describe("complimentary license administration and activation", () => {
++  it.each([null, "wrong-secret"])("requires admin authorization for every operation (%s)", async (secret) => {
++    const id = crypto.randomUUID();
++    expect((await admin(BASE, grant({ license_id: id }), secret)).status).toBe(401);
++    expect((await admin(`${BASE}/${id}`, undefined, secret)).status).toBe(401);
++    expect((await admin(`${BASE}/${id}/revoke`, {}, secret)).status).toBe(401);
++    expect(await env.DB.prepare("SELECT count(*) n FROM complimentary_licenses").first()).toEqual({ n: 0 });
++  });
++  it("does not allow a signed customer to issue licenses", async () => {
++    const { machine } = await owner();
++    expect((await machine.request(BASE, { method: "POST", body: grant() })).status).toBe(401);
++  });
++  it.each([
++    { reason: " " }, { reason: "x".repeat(501) }, { license_id: "bad" }, { mac_slots: 0 }, { mac_slots: 1001 },
++    { ios_slots: -1 }, { ios_slots: 1.5 }, { mac_slots: "2" }, { mac_slots: null }, { expires_at: 0 },
++    { expires_at: "tomorrow" }, { expires_at: 1.5 }, { expires_at: 9e15 }, { unknown: true },
++  ])("rejects invalid grant details %j", async (overrides) => {
++    expect((await admin(BASE, grant(overrides))).status).toBe(400);
++    expect(await env.DB.prepare("SELECT count(*) n FROM complimentary_licenses").first()).toEqual({ n: 0 });
++  });
++  it("issues encrypted, auditable keys and safely retries an identical issuance", async () => {
++    const body = grant();
++    const results = await Promise.all([admin(BASE, body), admin(BASE, body)]);
++    expect(results.map((r) => r.status).sort()).toEqual([200, 201]);
++    const [a,b] = await Promise.all(results.map((r) => r.json<Issued>()));
++    expect(a!.license_key).toMatch(/^DITCH-(?:[A-Z2-9]{5}-){5}[A-Z2-9]{5}$/);
++    expect(b!.license_key).toBe(a!.license_key);
++    expect(a).toMatchObject({ mac_slots: 2, ios_slots: 2, expires_at: null });
++    const row = await env.DB.prepare("SELECT * FROM complimentary_licenses").first();
++    expect(JSON.stringify(row)).not.toContain(a!.license_key);
++    expect(await env.DB.prepare("SELECT count(*) n FROM audit_events WHERE kind='complimentary_license_issued'").first()).toEqual({ n: 1 });
++    const metadata = await (await admin(`${BASE}/${a!.license_id}`)).json();
++    expect(metadata).not.toHaveProperty("license_key");
++    expect(metadata).not.toHaveProperty("key_ciphertext");
++    expect((await admin(BASE, { ...body, mac_slots: 3 })).status).toBe(409);
++    expect((await admin(BASE, { ...body, reason: "Different recipient" })).status).toBe(409);
++  });
++  it("redeems in the existing app flow without Stripe and activates the Mac", async () => {
++    const key = await issue({ mac_slots: 1, ios_slots: 3 });
++    const { machine, id } = await owner();
++    const result = await redeem(machine, key.license_key.toLowerCase());
++    expect(result.status).toBe(200);
++    expect(await result.json()).toMatchObject({ state: "claimed", entitlement: { plan: "complimentary", status: "active",
++      capabilities: { remote_control: { enabled: true, macs: { allowed: 1 }, ios: { allowed: 3 }, remote_nodes: { allowed: null } } } } });
++    expect((await machine.request(`/v1/commercial/devices/${machine.id}/activate`, { method: "POST" })).status).toBe(200);
++    await expect(requireMachineActivation(env, id, machine.id)).resolves.toBe("desktop_mac");
++    expect((await redeem(machine, key.license_key)).status).toBe(200);
++    expect((await reconcileOwnerEntitlements(env, id)).capabilities.remote_control.macs.allowed).toBe(1);
++    expect(await env.DB.prepare("SELECT count(*) n FROM stripe_purchases").first()).toEqual({ n: 0 });
++    expect(await env.DB.prepare("SELECT count(*) n FROM stripe_subscriptions").first()).toEqual({ n: 0 });
++    expect(await env.DB.prepare("SELECT count(*) n FROM audit_events WHERE kind='complimentary_license_claimed'").first()).toEqual({ n: 1 });
++    expect((await (await machine.request("/v1/commercial/offers")).json<{offers:unknown[]}>()).offers).toEqual([]);
++    const recovery = await machine.request("/v1/commercial/license");
++    expect(recovery.status).toBe(200);
++    const recoveryKey = (await recovery.json<{license_key:string}>()).license_key;
++    const second = await FakePrincipal.create("machine", crypto.randomUUID());
++    expect((await second.registerMachine()).status).toBe(201);
++    expect((await second.request("/v1/commercial/license/recover", { method: "POST", body: { license_key: recoveryKey } })).status).toBe(200);
++    expect((await second.request(`/v1/commercial/devices/${second.id}/activate`, { method: "POST" })).status).toBe(409);
++  });
++  it("allows exactly one owner to win competing claims and never grants the loser access", async () => {
++    const key = await issue();
++    const [a,b] = await Promise.all([owner(), owner()]);
++    const results = await Promise.all([redeem(a.machine, key.license_key), redeem(b.machine, key.license_key)]);
++    expect(results.map((r) => r.status).sort()).toEqual([200,409]);
++    const loser = results[0]!.status === 409 ? a : b;
++    expect((await reconcileOwnerEntitlements(env, loser.id)).capabilities.remote_control.enabled).toBe(false);
++    await expect(env.DB.prepare("UPDATE complimentary_licenses SET claimed_owner_id=?").bind(loser.id).run()).rejects.toThrow("license_already_claimed");
++  });
++  it("keeps revocation authoritative during competing redemption", async () => {
++    const key = await issue();
++    const { machine, id } = await owner();
++    await Promise.all([redeem(machine, key.license_key), admin(`${BASE}/${key.license_id}/revoke`, {})]);
++    expect((await reconcileOwnerEntitlements(env, id)).capabilities.remote_control.enabled).toBe(false);
++    await expect(requireRemoteControl(env, id)).rejects.toThrow();
++  });
++  it("rejects unknown keys and keys from another environment", async () => {
++    const key = await issue();
++    const { machine, id } = await owner();
++    expect((await redeem(machine, "DITCH-UNKNOWN")).status).toBe(400);
++    expect(await claimComplimentaryLicense({ ...env, ENVIRONMENT: "production" }, key.license_key, id)).toBe(false);
++    expect((await reconcileOwnerEntitlements({ ...env, ENVIRONMENT: "production" }, id)).capabilities.remote_control.enabled).toBe(false);
++  });
++  it("revokes unclaimed keys and denies issuance replay after revocation", async () => {
++    const body = grant();
++    const key = await (await admin(BASE, body)).json<Issued>();
++    expect((await admin(`${BASE}/${key.license_id}/revoke`, {})).status).toBe(200);
++    expect((await admin(`${BASE}/${key.license_id}/revoke`, {})).status).toBe(200);
++    expect((await admin(BASE, body)).status).toBe(400);
++    const { machine } = await owner();
++    expect((await redeem(machine, key.license_key)).status).toBe(400);
++    expect(await env.DB.prepare("SELECT count(*) n FROM audit_events WHERE kind='complimentary_license_revoked'").first()).toEqual({ n: 1 });
++    await expect(env.DB.prepare("UPDATE complimentary_licenses SET state='unclaimed',revoked_at=NULL").run()).rejects.toThrow("license_invalid");
++  });
++  it("removes access on revocation, including an already activated Mac", async () => {
++    const key = await issue();
++    const { machine, id } = await owner();
++    expect((await redeem(machine, key.license_key)).status).toBe(200);
++    expect((await machine.request(`/v1/commercial/devices/${machine.id}/activate`, { method: "POST" })).status).toBe(200);
++    expect((await admin(`${BASE}/${key.license_id}/revoke`, {})).status).toBe(200);
++    // Simulate an older concurrent reconciliation writing its pre-revocation snapshot.
++    await env.DB.prepare("UPDATE owner_entitlements SET status='active',valid_until=NULL,complimentary_revision=1 WHERE owner_id=?").bind(id).run();
++    await expect(requireMachineActivation(env, id, machine.id)).rejects.toThrow("entitlement_expired");
++    expect((await redeem(machine, key.license_key)).status).toBe(400);
++    expect((await reconcileOwnerEntitlements(env, id)).capabilities.remote_control.enabled).toBe(false);
++  });
++  it("expires claimed and unclaimed grants even when an old projection says active", async () => {
++    const key = await issue({ expires_at: Date.now() + 60_000 });
++    const { machine, id } = await owner();
++    expect((await redeem(machine, key.license_key)).status).toBe(200);
++    await expire(key.license_id);
++    await expect(requireRemoteControl(env, id)).rejects.toThrow("entitlement_expired");
++    expect((await redeem(machine, key.license_key)).status).toBe(400);
++    const unused = await issue();
++    await expire(unused.license_id);
++    expect((await redeem(machine, unused.license_key)).status).toBe(400);
++  });
++  it.each(["revoke","expire"])("preserves paid Lifetime access when a complimentary grant ends (%s)", async (operation) => {
++    const key = await issue();
++    const { machine, id } = await owner();
++    await paidLifetime(id);
++    expect((await redeem(machine, key.license_key)).status).toBe(200);
++    expect((await reconcileOwnerEntitlements(env, id)).capabilities.remote_control.macs.allowed).toBe(4);
++    if (operation === "revoke") expect((await admin(`${BASE}/${key.license_id}/revoke`, {})).status).toBe(200);
++    else await expire(key.license_id);
++    await expect(requireRemoteControl(env, id)).resolves.toBeUndefined();
++    expect(await reconcileOwnerEntitlements(env, id)).toMatchObject({ plan: "commercial_lifetime", status: "active",
++      capabilities: { remote_control: { enabled: true, macs: { allowed: 2 } } } });
++    expect(await env.DB.prepare("SELECT status FROM stripe_purchases").first()).toEqual({ status: "paid" });
++  });
++});
+diff --git a/test/support/harness.ts b/test/support/harness.ts
+--- a/test/support/harness.ts
++++ b/test/support/harness.ts
+@@ -88,5 +88,5 @@
+ 
+ export async function resetDatabase(): Promise<void> {
+   await env.DB.exec("DELETE FROM socket_tickets;");
+-  await env.DB.exec("DELETE FROM owner_license_keys; DELETE FROM licenses; DELETE FROM stripe_webhook_events; DELETE FROM stripe_subscriptions; DELETE FROM stripe_purchases; DELETE FROM stripe_checkout_intents; DELETE FROM commercial_offer_mappings; DELETE FROM commercial_price_mappings; DELETE FROM commercial_catalog_snapshots; DELETE FROM stripe_customers; DELETE FROM community_update_sessions; DELETE FROM community_releases; DELETE FROM commercial_update_sessions; DELETE FROM commercial_download_grants; DELETE FROM commercial_releases; DELETE FROM official_build_sessions; DELETE FROM app_attest_challenges; DELETE FROM app_attest_keys; DELETE FROM official_builds; DELETE FROM machine_enrollment_intents; DELETE FROM device_activations; DELETE FROM billing_entitlements; DELETE FROM owner_entitlements; DELETE FROM remote_control_limits; DELETE FROM billing_license_claims; DELETE FROM billing_subscriptions; DELETE FROM billing_purchases; DELETE FROM billing_webhook_events; DELETE FROM checkout_intents; DELETE FROM billing_customers; DELETE FROM notification_dedup; DELETE FROM projection_epoch_history; DELETE FROM audit_events; DELETE FROM command_audit; DELETE FROM attention; DELETE FROM sessions; DELETE FROM projects; DELETE FROM machine_projection_state; DELETE FROM push_devices; DELETE FROM pairings; DELETE FROM machine_devices; DELETE FROM devices; DELETE FROM machines; DELETE FROM owners; DELETE FROM replay_nonces; DELETE FROM socket_tickets; DELETE FROM rate_limits;");
++  await env.DB.exec("DELETE FROM complimentary_owner_revisions; DELETE FROM complimentary_licenses; DELETE FROM owner_license_keys; DELETE FROM licenses; DELETE FROM stripe_webhook_events; DELETE FROM stripe_subscriptions; DELETE FROM stripe_purchases; DELETE FROM stripe_checkout_intents; DELETE FROM commercial_offer_mappings; DELETE FROM commercial_price_mappings; DELETE FROM commercial_catalog_snapshots; DELETE FROM stripe_customers; DELETE FROM community_update_sessions; DELETE FROM community_releases; DELETE FROM commercial_update_sessions; DELETE FROM commercial_download_grants; DELETE FROM commercial_releases; DELETE FROM official_build_sessions; DELETE FROM app_attest_challenges; DELETE FROM app_attest_keys; DELETE FROM official_builds; DELETE FROM machine_enrollment_intents; DELETE FROM device_activations; DELETE FROM billing_entitlements; DELETE FROM owner_entitlements; DELETE FROM remote_control_limits; DELETE FROM billing_license_claims; DELETE FROM billing_subscriptions; DELETE FROM billing_purchases; DELETE FROM billing_webhook_events; DELETE FROM checkout_intents; DELETE FROM billing_customers; DELETE FROM notification_dedup; DELETE FROM projection_epoch_history; DELETE FROM audit_events; DELETE FROM command_audit; DELETE FROM attention; DELETE FROM sessions; DELETE FROM projects; DELETE FROM machine_projection_state; DELETE FROM push_devices; DELETE FROM pairings; DELETE FROM machine_devices; DELETE FROM devices; DELETE FROM machines; DELETE FROM owners; DELETE FROM replay_nonces; DELETE FROM socket_tickets; DELETE FROM rate_limits;");
+ }
