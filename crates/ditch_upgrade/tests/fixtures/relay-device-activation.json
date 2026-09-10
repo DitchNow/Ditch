@@ -1,0 +1,16 @@
+{
+  "protocol_version": 1,
+  "state": "active",
+  "entitlement": {
+    "plan": "complimentary",
+    "status": "active",
+    "capabilities": {
+      "remote_control": {
+        "enabled": true,
+        "macs": { "allowed": 2, "active": 1 },
+        "ios": { "allowed": 2, "active": 0 },
+        "remote_nodes": { "allowed": null, "active": 0 }
+      }
+    }
+  }
+}

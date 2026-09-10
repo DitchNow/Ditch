@@ -1615,8 +1615,7 @@ fn handle_request(request: ClientRequest, state: Arc<Mutex<RuntimeState>>) -> Se
                     edition::accept_commercial_entitlement(Arc::clone(&state), entitlement.clone());
                     ServerResponse::CommercialEntitlement(entitlement)
                 }
-                Err(UpgradeError::Relay { code, message }) => protocol_error(code, message),
-                Err(error) => commercial_service_error("commercial_activation_failed", error),
+                Err(error) => commercial_activation_error(error),
             }
         }
         ClientRequest::RedeemCommercialLicense { mut license_key } => {
@@ -5509,6 +5508,19 @@ fn protocol_error(code: impl Into<String>, message: impl Into<String>) -> Server
     })
 }
 
+fn commercial_activation_error(error: UpgradeError) -> ServerResponse {
+    match error {
+        UpgradeError::Relay { code, message } => protocol_error(code, message),
+        UpgradeError::Network(message) => {
+            protocol_error("commercial_activation_network_failed", message)
+        }
+        UpgradeError::InvalidResponse(message) => {
+            protocol_error("commercial_activation_invalid_response", message)
+        }
+        error => protocol_error("commercial_activation_failed", error.to_string()),
+    }
+}
+
 fn commercial_service_error(default_code: &'static str, error: UpgradeError) -> ServerResponse {
     match error {
         UpgradeError::Relay { code, message } if code == "official_build_required" => {
@@ -5569,6 +5581,33 @@ impl ProjectRootKey for Project {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn activation_errors_distinguish_transport_response_and_relay_failures() {
+        for (error, expected) in [
+            (
+                UpgradeError::Network("connection failed".to_owned()),
+                "commercial_activation_network_failed",
+            ),
+            (
+                UpgradeError::InvalidResponse("missing field".to_owned()),
+                "commercial_activation_invalid_response",
+            ),
+            (
+                UpgradeError::Relay {
+                    code: "mac_slot_unavailable".to_owned(),
+                    message: "No slot available".to_owned(),
+                },
+                "mac_slot_unavailable",
+            ),
+            (UpgradeError::Rejected, "commercial_activation_failed"),
+        ] {
+            let ServerResponse::Error(error) = commercial_activation_error(error) else {
+                panic!("expected an activation error");
+            };
+            assert_eq!(error.code, expected);
+        }
+    }
 
     #[test]
     fn remote_folder_browser_lists_directories_and_not_files() {

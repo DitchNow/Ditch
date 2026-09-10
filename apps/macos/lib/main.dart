@@ -6106,8 +6106,12 @@ class _CommercialUpgradeDialogState extends State<CommercialUpgradeDialog> {
           'This Ditch build is not configured to verify official Commercial releases. Install an official build and try again.',
         'commercial_release_network_failed' =>
           'Ditch could not reach the Relay to authorize the Commercial download. Check your connection and try again.',
+        'commercial_activation_network_failed' =>
+          'Ditch could not reach Relay to activate this Mac. Check your connection and try again.',
+        'commercial_activation_invalid_response' =>
+          'Relay responded, but Ditch could not read the activation result. This Mac may already be activated. Please report this error to DitchNow.',
         'commercial_activation_failed' =>
-          'Ditch could not activate this Mac. Check the connection and try again.',
+          'Ditch could not confirm activation on this Mac. Please try again.',
         'device_not_licensed' ||
         'mac_slot_unavailable' ||
         'commercial_device_not_licensed' =>
