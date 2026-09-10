@@ -266,6 +266,7 @@ pub enum ClientRequest {
         offer_id: String,
     },
     CommercialEntitlement,
+    ActivateCommercialDevice,
     RedeemCommercialLicense {
         license_key: String,
     },
@@ -273,6 +274,7 @@ pub enum ClientRequest {
     CheckCommercialRelease,
     CheckCommunityRelease,
     CurrentCommercialRelease,
+    CurrentCommunityRelease,
     ApprovePermission {
         request_id: Uuid,
     },

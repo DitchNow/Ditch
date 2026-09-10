@@ -1602,6 +1602,23 @@ fn handle_request(request: ClientRequest, state: Arc<Mutex<RuntimeState>>) -> Se
                 Err(error) => commercial_service_error("commercial_entitlement_failed", error),
             }
         }
+        ClientRequest::ActivateCommercialDevice => {
+            let installation = state
+                .lock()
+                .expect("runtime state lock should not be poisoned")
+                .installation_identity
+                .clone();
+            match HttpUpgradeBackend::official()
+                .and_then(|backend| backend.activate_commercial_device(&installation))
+            {
+                Ok(entitlement) => {
+                    edition::accept_commercial_entitlement(Arc::clone(&state), entitlement.clone());
+                    ServerResponse::CommercialEntitlement(entitlement)
+                }
+                Err(UpgradeError::Relay { code, message }) => protocol_error(code, message),
+                Err(error) => commercial_service_error("commercial_activation_failed", error),
+            }
+        }
         ClientRequest::RedeemCommercialLicense { mut license_key } => {
             let installation = state
                 .lock()
@@ -1639,6 +1656,9 @@ fn handle_request(request: ClientRequest, state: Arc<Mutex<RuntimeState>>) -> Se
             current_official_release(state, false, ditch_product::Edition::Community)
         }
         ClientRequest::CurrentCommercialRelease => current_commercial_release(state, true),
+        ClientRequest::CurrentCommunityRelease => {
+            current_official_release(state, true, ditch_product::Edition::Community)
+        }
         ClientRequest::CheckRemoteProject { project_id } => check_remote_project(state, project_id),
         ClientRequest::ApprovePermission { request_id } => respond_permission_for_target(
             state,

@@ -1658,6 +1658,27 @@ class DitchRuntimeClient {
         .cast<String, dynamic>();
   }
 
+  Future<Map<String, dynamic>> activateCommercialDevice() async {
+    final response = await request('ActivateCommercialDevice');
+    return (response['CommercialEntitlement'] as Map).cast<String, dynamic>();
+  }
+
+  Future<Map<String, dynamic>> currentCommunityRelease() async {
+    final response = await request('CurrentCommunityRelease');
+    return (response['CommercialRelease'] as Map).cast<String, dynamic>();
+  }
+
+  Future<Map<String, dynamic>> releaseForLicense(
+    DitchCurrentLicense license, {
+    bool forInstallation = false,
+  }) => license.hasCommercialAccess
+      ? forInstallation
+            ? currentCommercialRelease()
+            : checkCommercialRelease()
+      : forInstallation
+      ? currentCommunityRelease()
+      : checkCommunityRelease();
+
   Future<Map<String, dynamic>> currentCommercialRelease() async {
     final response = await request('CurrentCommercialRelease');
     return (response['CommercialRelease'] as Map).cast<String, dynamic>();
@@ -2069,27 +2090,31 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
   }
 
   Future<void> _checkForProductUpdate() async {
-    if (_productUpdateChecking || _runtimeStatus?.edition != 'commercial') {
+    if (_productUpdateChecking || _runtimeStatus == null) {
       return;
     }
     _productUpdateChecking = true;
     try {
-      final release = await _runtimeClient.checkCommercialRelease();
+      final license = DitchCurrentLicense.fromEntitlement(
+        await _runtimeClient.commercialEntitlement(),
+      );
+      final release = await _runtimeClient.releaseForLicense(license);
       final manifest = (release['manifest'] as Map?)?.cast<String, dynamic>();
       final sequence = (manifest?['release_sequence'] as num?)?.toInt();
-      if (sequence == null ||
+      if (manifest?['release_id'] is! String ||
+          sequence == null ||
           sequence <= (_runtimeStatus?.releaseSequence ?? 0)) {
         return;
       }
       final version = manifest?['version']?.toString() ?? 'new';
       final build = manifest?['build']?.toString();
       final notice = AttentionEvent(
-        id: 'attention-product-update-$sequence',
+        id: 'attention-product-update-${manifest?['release_id']}',
         kind: AttentionKind.completed,
         icon: Icons.system_update_alt,
         title: 'Ditch $version is available',
         body:
-            'A verified ${_runtimeStatus?.edition ?? 'Ditch'} update${build == null ? '' : ' (build $build)'} is ready. Click Install to update without changing projects, sessions, or SSH configuration.',
+            'A verified ${manifest?['edition'] ?? 'Ditch'} update${build == null ? '' : ' (build $build)'} is ready. Click Install to update without changing projects, sessions, or SSH configuration.',
         createdAt: DateTime.now(),
         action: AttentionAction.installProductUpdate,
       );
@@ -2114,7 +2139,20 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
 
   Future<void> _installProductUpdate(AttentionEvent event) async {
     try {
-      final release = await _runtimeClient.currentCommercialRelease();
+      final license = DitchCurrentLicense.fromEntitlement(
+        await _runtimeClient.commercialEntitlement(),
+      );
+      final release = await _runtimeClient.releaseForLicense(
+        license,
+        forInstallation: true,
+      );
+      final releaseId = (release['manifest'] as Map?)?['release_id'];
+      if (event.id != 'attention-product-update-$releaseId') {
+        _markAttentionIdsRead({event.id});
+        throw const FormatException(
+          'The available update changed. Open App Updates to review it.',
+        );
+      }
       await startAuthorizedCommercialUpdate(release);
       _markAttentionIdsRead({event.id});
       if (mounted) {
@@ -2200,7 +2238,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
       }
       _runtimeConnectionRetries = 0;
       _presentation.connected();
-      if (confirmed.edition == 'commercial') {
+      {
         unawaited(_checkForProductUpdate());
         _productUpdateTimer ??= Timer.periodic(
           const Duration(hours: 6),
@@ -2522,9 +2560,20 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
     final settingsSections = [
       ...editionSections,
       EditionSettingsSection(
+        id: 'license-plans',
+        icon: Icons.verified_outlined,
+        title: 'License & Plans',
+        subtitle: 'Commercial plans, license activation, and billing',
+        dialogBuilder: (client) => CommercialUpgradeDialog(
+          client: client,
+          deploymentEnvironment: widget.deploymentEnvironment,
+          relayOrigin: widget.relayOrigin,
+        ),
+      ),
+      EditionSettingsSection(
         id: 'upgrade-ditch',
         icon: Icons.system_update_alt,
-        title: 'Upgrade Ditch',
+        title: 'App Updates',
         subtitle: 'Check for updates for your current license',
         dialogBuilder: (client) => DitchUpdateDialog(
           client: client,
@@ -5569,13 +5618,14 @@ class _DitchUpdateDialogState extends State<DitchUpdateDialog> {
     }
   }
 
-  bool get _usesCommercialUpdates =>
-      _license?.isCommercial == true &&
-      (_license?.status == 'active' || _license?.status == 'over_limit');
+  bool get _usesCommercialUpdates => _license?.hasCommercialAccess == true;
 
-  Future<Map<String, dynamic>> _checkSelectedRelease() => _usesCommercialUpdates
-      ? widget.client.checkCommercialRelease()
-      : widget.client.checkCommunityRelease();
+  Future<Map<String, dynamic>> _checkSelectedRelease({
+    bool forInstallation = false,
+  }) => widget.client.releaseForLicense(
+    _license!,
+    forInstallation: forInstallation,
+  );
 
   Future<void> _installCommercialUpdate() async {
     final release = _release;
@@ -5667,7 +5717,7 @@ class _DitchUpdateDialogState extends State<DitchUpdateDialog> {
     final busy = _loading || _checking || _installing;
     return AlertDialog(
       icon: const Icon(Icons.system_update_alt),
-      title: const Text('Upgrade Ditch'),
+      title: const Text('App Updates'),
       content: SizedBox(
         width: 520,
         child: Column(
@@ -5709,6 +5759,10 @@ class _DitchUpdateDialogState extends State<DitchUpdateDialog> {
                         padding: const EdgeInsets.only(left: 40, bottom: 4),
                         child: Text(plan.displayName),
                       ),
+                    ),
+                  if (_runtime != null)
+                    Text(
+                      'Installed app: ${_runtime!.edition == 'commercial' ? 'Commercial' : 'Community'}',
                     ),
                   if (_installedVersion != null)
                     Text(
@@ -5783,6 +5837,8 @@ class _CommercialUpgradeDialogState extends State<CommercialUpgradeDialog> {
   final _licenseController = TextEditingController();
   CommercialOfferCatalog? _catalog;
   Map<String, dynamic>? _entitlement;
+  RuntimeStatusDto? _installedRuntime;
+  String? _runtimeError;
   bool _loading = true;
   bool _busy = false;
   bool _finishing = false;
@@ -5820,6 +5876,14 @@ class _CommercialUpgradeDialogState extends State<CommercialUpgradeDialog> {
         _installationStatus = null;
       });
     }
+    RuntimeStatusDto? runtime;
+    _runtimeError = null;
+    try {
+      runtime = await widget.client.runtimeStatus();
+    } on Object {
+      _runtimeError =
+          'Ditch could not identify the installed app. Retry before activating Commercial.';
+    }
     CommercialOfferCatalog? catalog;
     Map<String, dynamic>? entitlement;
     try {
@@ -5836,6 +5900,7 @@ class _CommercialUpgradeDialogState extends State<CommercialUpgradeDialog> {
     }
     if (mounted) {
       setState(() {
+        _installedRuntime = runtime;
         _catalog = catalog;
         _entitlement = entitlement;
         _loading = false;
@@ -5914,7 +5979,7 @@ class _CommercialUpgradeDialogState extends State<CommercialUpgradeDialog> {
             _actionError = null;
           });
           if (baseline['active'] != true && entitlement['active'] == true) {
-            await _startCommercialInstallation();
+            await _completeCommercialActivation();
           } else {
             await _loadCommercialState();
           }
@@ -6029,7 +6094,7 @@ class _CommercialUpgradeDialogState extends State<CommercialUpgradeDialog> {
 
   Future<void> _retryDeferredCommercialInstallation() async {
     if (!mounted || !_waitingForAgents || _busy) return;
-    await _startCommercialInstallation(automaticRetry: true);
+    await _completeCommercialActivation(automaticRetry: true);
   }
 
   String _commercialInstallationErrorMessage(Object error) {
@@ -6038,9 +6103,13 @@ class _CommercialUpgradeDialogState extends State<CommercialUpgradeDialog> {
         'commercial_release_unavailable' =>
           'Commercial is active, but no compatible Commercial build has been published for this environment yet. Your purchase is safe. Try again after a release is published.',
         'commercial_release_verification_not_configured' =>
-          'This Ditch build is not configured to verify official Commercial releases. Install an official staging build and try again.',
+          'This Ditch build is not configured to verify official Commercial releases. Install an official build and try again.',
         'commercial_release_network_failed' =>
           'Ditch could not reach the Relay to authorize the Commercial download. Check your connection and try again.',
+        'commercial_activation_failed' =>
+          'Ditch could not activate this Mac. Check the connection and try again.',
+        'device_not_licensed' ||
+        'mac_slot_unavailable' ||
         'commercial_device_not_licensed' =>
           'This Mac could not be activated for the Commercial license. Check the available Mac slots and try again.',
         'commercial_release_authorization_expired' =>
@@ -6052,7 +6121,7 @@ class _CommercialUpgradeDialogState extends State<CommercialUpgradeDialog> {
         'commercial_release_signature_invalid' ||
         'commercial_release_artifact_invalid' ||
         'commercial_release_identity_invalid' =>
-          'Ditch could not verify the Commercial release, so nothing was installed. Please report this staging release to DitchNow.',
+          'Ditch could not verify the Commercial release, so nothing was installed. Please report this release to DitchNow.',
         'commercial_release_rejected' =>
           'The Relay did not authorize this Commercial release for the current installation. Your purchase is unchanged; try again or check the license status.',
         _ => 'Commercial installation could not start: ${error.message}',
@@ -6061,7 +6130,7 @@ class _CommercialUpgradeDialogState extends State<CommercialUpgradeDialog> {
     if (error is PlatformException) {
       return switch (error.code) {
         'update_verification_not_configured' =>
-          'This Ditch build is missing its public Sparkle verification key. Install an official staging build and try again.',
+          'This Ditch build is missing its public Sparkle verification key. Install an official build and try again.',
         'invalid_update_feed' =>
           'The Commercial release returned an invalid secure update feed.',
         'unauthorized_update_host' =>
@@ -6076,7 +6145,7 @@ class _CommercialUpgradeDialogState extends State<CommercialUpgradeDialog> {
     return 'The secure updater could not be started. Please try again.';
   }
 
-  Future<void> _startCommercialInstallation({
+  Future<void> _completeCommercialActivation({
     bool automaticRetry = false,
   }) async {
     if (!automaticRetry) _stopDeferredInstallRetry();
@@ -6088,6 +6157,44 @@ class _CommercialUpgradeDialogState extends State<CommercialUpgradeDialog> {
       });
     }
     try {
+      final runtime = await widget.client.runtimeStatus();
+      // Once activation succeeded, waiting for agents must not repeatedly
+      // consume Relay activation requests. The eventual release request still
+      // revalidates device access before authorizing any download.
+      final entitlement =
+          automaticRetry &&
+              runtime.edition == 'community' &&
+              _entitlement != null
+          ? _entitlement!
+          : await widget.client.activateCommercialDevice();
+      if (!mounted) return;
+      setState(() {
+        _installedRuntime = runtime;
+        _runtimeError = null;
+        _entitlement = entitlement;
+      });
+      if (!DitchCurrentLicense.fromEntitlement(
+            entitlement,
+          ).hasCommercialAccess ||
+          entitlement['active'] != true) {
+        throw const FormatException(
+          'Relay has not confirmed Commercial access for this Mac.',
+        );
+      }
+      if (runtime.edition == 'commercial') {
+        _stopDeferredInstallRetry();
+        setState(() {
+          _busy = false;
+          _installationStatus =
+              'Commercial is active on this Mac. Remote Control is ready.';
+        });
+        return;
+      }
+      if (runtime.edition != 'community') {
+        throw const FormatException(
+          'Ditch could not identify the installed app edition.',
+        );
+      }
       await _installAuthorizedRelease();
       _stopDeferredInstallRetry();
       if (mounted) {
@@ -6140,7 +6247,7 @@ class _CommercialUpgradeDialogState extends State<CommercialUpgradeDialog> {
         _entitlement = entitlement;
       });
       if (entitlement['active'] == true) {
-        await _startCommercialInstallation();
+        await _completeCommercialActivation();
       } else {
         setState(
           () => _actionError =
@@ -6436,7 +6543,7 @@ class _CommercialUpgradeDialogState extends State<CommercialUpgradeDialog> {
         .toList(growable: false);
     return AlertDialog(
       icon: const Icon(Icons.phone_iphone),
-      title: const Text('Remote Control'),
+      title: const Text('License & Plans'),
       content: SizedBox(
         width: 580,
         child: SingleChildScrollView(
@@ -6461,6 +6568,17 @@ class _CommercialUpgradeDialogState extends State<CommercialUpgradeDialog> {
                   onOpenRelay: _openRelayOrigin,
                 ),
                 const SizedBox(height: 12),
+              ],
+              if (_installedRuntime != null)
+                Text(
+                  'Installed app: ${_installedRuntime!.edition == 'commercial' ? 'Commercial' : 'Community'}',
+                ),
+              if (_runtimeError != null) ...[
+                Text(_runtimeError!),
+                TextButton(
+                  onPressed: _busy ? null : _loadCommercialState,
+                  child: const Text('Retry'),
+                ),
               ],
               if (_loading)
                 const Center(child: CircularProgressIndicator())
@@ -6490,11 +6608,19 @@ class _CommercialUpgradeDialogState extends State<CommercialUpgradeDialog> {
                   Align(
                     alignment: Alignment.centerLeft,
                     child: FilledButton(
-                      key: const Key('install-commercial-build'),
-                      onPressed: _busy ? null : _startCommercialInstallation,
+                      key: Key(
+                        _installedRuntime?.edition == 'commercial'
+                            ? 'activate-commercial-device'
+                            : 'install-commercial-build',
+                      ),
+                      onPressed: _busy || _installedRuntime == null
+                          ? null
+                          : _completeCommercialActivation,
                       child: Text(
                         _waitingForAgents
                             ? 'Check again'
+                            : _installedRuntime?.edition == 'commercial'
+                            ? 'Activate on this Mac'
                             : 'Install Commercial',
                       ),
                     ),

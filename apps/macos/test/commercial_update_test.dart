@@ -100,6 +100,20 @@ class _UpdateClient extends DitchRuntimeClient {
   }
 }
 
+class _RouteClient extends DitchRuntimeClient {
+  _RouteClient() : super(socketPath: '/tmp/unused-update-route.sock');
+  final commands = <Object>[];
+  @override
+  Future<Map<String, dynamic>> request(Object body) async {
+    commands.add(body);
+    return {
+      'CommercialRelease': _release(
+        bearer: 'fresh-authorized-session-at-least-32-characters',
+      ),
+    };
+  }
+}
+
 Future<void> _openUpdate(
   WidgetTester tester,
   _UpdateClient client,
@@ -141,6 +155,36 @@ Future<void> _install(WidgetTester tester) async {
 }
 
 void main() {
+  test(
+    'manual and background updates share license routing and idle installation requests',
+    () async {
+      for (final edition in ['community', 'commercial']) {
+        for (final status in ['active', 'over_limit', 'inactive', 'expired']) {
+          final license = DitchCurrentLicense.fromEntitlement({
+            'current_license': {
+              'edition': edition,
+              'status': status,
+              'display_name': 'Ditch',
+              'plans': [],
+            },
+          });
+          final paid =
+              edition == 'commercial' &&
+              ['active', 'over_limit'].contains(status);
+          final client = _RouteClient();
+          await client.releaseForLicense(license);
+          await client.releaseForLicense(license, forInstallation: true);
+          expect(
+            client.commands,
+            paid
+                ? ['CheckCommercialRelease', 'CurrentCommercialRelease']
+                : ['CheckCommunityRelease', 'CurrentCommunityRelease'],
+          );
+        }
+      }
+    },
+  );
+
   for (final environment in ['staging', 'production']) {
     for (final status in ['inactive', 'expired', 'active', 'over_limit']) {
       testWidgets(

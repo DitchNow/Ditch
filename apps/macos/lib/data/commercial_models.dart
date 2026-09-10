@@ -462,6 +462,9 @@ class DitchCurrentLicense {
   final List<DitchLicensePlan> plans;
 
   bool get isCommercial => edition == 'commercial';
+
+  bool get hasCommercialAccess =>
+      isCommercial && (status == 'active' || status == 'over_limit');
 }
 
 String _requiredString(Object? value, String field) {

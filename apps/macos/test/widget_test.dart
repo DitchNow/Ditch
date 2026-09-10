@@ -84,7 +84,46 @@ class _CommercialOffersClient extends DitchRuntimeClient {
     this.initiallyActive = false,
     this.status,
     this.catalog,
+    this.installedEdition = 'community',
+    this.environment = 'staging',
+    this.activeAgents = 0,
   }) : super(socketPath: '/tmp/ditch-commercial-offers.sock');
+
+  final String installedEdition;
+  final String environment;
+  final int activeAgents;
+  int activationCalls = 0;
+  bool failActivation = false;
+
+  @override
+  Future<RuntimeStatusDto> runtimeStatus() async => RuntimeStatusDto(
+    identity: 'The Ditch Runtime',
+    pid: 123,
+    socketPath: '/tmp/ditch-license.sock',
+    activeSessionCount: activeAgents,
+    attentionCount: 0,
+    unreadAttentionCount: 0,
+    instanceId: 'license-test',
+    capabilities: {},
+    buildVersion: '0.1.0',
+    edition: installedEdition,
+    deploymentEnvironment: environment,
+    buildIdentifier: 'test-build',
+    buildNumber: '112',
+    releaseSequence: 112,
+  );
+
+  @override
+  Future<Map<String, dynamic>> activateCommercialDevice() async {
+    activationCalls++;
+    if (failActivation) {
+      throw const DitchRuntimeException(
+        'mac_slot_unavailable',
+        'No Mac slot is available.',
+      );
+    }
+    return commercialEntitlement();
+  }
 
   final bool initiallyActive;
   final String? status;
@@ -141,6 +180,9 @@ class _RelayUpgradeClient extends _CommercialOffersClient {
     this.entitlementActivates = true,
     this.failCheckout = false,
     super.initiallyActive = false,
+    super.installedEdition,
+    super.environment,
+    super.activeAgents,
   }) : _active = initiallyActive;
 
   final bool entitlementActivates;
@@ -149,6 +191,7 @@ class _RelayUpgradeClient extends _CommercialOffersClient {
   bool _checkoutCreated = false;
   final selectedOffers = <String>[];
   String? redeemedLicense;
+  int commercialReleaseCalls = 0;
 
   @override
   Future<CommercialOfferCatalog> commercialOffers() async {
@@ -227,28 +270,31 @@ class _RelayUpgradeClient extends _CommercialOffersClient {
   };
 
   @override
-  Future<Map<String, dynamic>> currentCommercialRelease() async => {
-    'manifest': {
-      'edition': 'commercial',
-      'release_id': '11111111-1111-4111-8111-111111111111',
-      'appcast_url':
-          'https://relay.ditchnow.nl/v1/commercial/releases/11111111-1111-4111-8111-111111111111/appcast',
-      'artifact_url':
-          'https://relay.ditchnow.nl/v1/commercial/releases/11111111-1111-4111-8111-111111111111/artifact/ditch.dmg',
-      'artifact_size': 4096,
-      'version': '1.2.3',
-      'build': '123',
-      'channel': 'stable',
-    },
-    'signature': 'test-signature',
-    'update_session': {
-      'bearer': 'a-secure-test-bearer-with-at-least-32-characters',
-      'expires_at': DateTime.now()
-          .toUtc()
-          .add(const Duration(minutes: 5))
-          .toIso8601String(),
-    },
-  };
+  Future<Map<String, dynamic>> currentCommercialRelease() async {
+    commercialReleaseCalls++;
+    return {
+      'manifest': {
+        'edition': 'commercial',
+        'release_id': '11111111-1111-4111-8111-111111111111',
+        'appcast_url':
+            'https://relay.ditchnow.nl/v1/commercial/releases/11111111-1111-4111-8111-111111111111/appcast',
+        'artifact_url':
+            'https://relay.ditchnow.nl/v1/commercial/releases/11111111-1111-4111-8111-111111111111/artifact/ditch.dmg',
+        'artifact_size': 4096,
+        'version': '1.2.3',
+        'build': '123',
+        'channel': 'stable',
+      },
+      'signature': 'test-signature',
+      'update_session': {
+        'bearer': 'a-secure-test-bearer-with-at-least-32-characters',
+        'expires_at': DateTime.now()
+            .toUtc()
+            .add(const Duration(minutes: 5))
+            .toIso8601String(),
+      },
+    };
+  }
 }
 
 class _ReleasedCheckoutClient extends _RelayUpgradeClient {
@@ -484,7 +530,8 @@ void main() {
     expect(find.byKey(const Key('settings-version')), findsOneWidget);
     expect(find.text('v0.1.0.106'), findsOneWidget);
     expect(find.byKey(const Key('settings-upgrade-ditch')), findsOneWidget);
-    expect(find.text('Upgrade Ditch'), findsOneWidget);
+    expect(find.text('App Updates'), findsOneWidget);
+    expect(find.text('License & Plans'), findsOneWidget);
     expect(calls.where((call) => call.method == 'appVersion'), hasLength(1));
   });
 
@@ -781,7 +828,7 @@ void main() {
     );
     await tester.pumpAndSettle();
 
-    expect(find.text('Remote Control'), findsOneWidget);
+    expect(find.text('License & Plans'), findsOneWidget);
     expect(find.text('TEST MODE'), findsNothing);
     expect(
       find.byKey(const Key('commercial-staging-relay-link')),
@@ -1321,6 +1368,8 @@ void main() {
       await tester.pumpAndSettle();
 
       expect(client.selectedOffers, [checkout.$1]);
+      expect(client.activationCalls, 1);
+      expect(client.commercialReleaseCalls, 1);
       expect(
         calls.where((call) => call.method == 'openURL').single.arguments,
         'https://payments.example.test/ditch/${checkout.$1}',
@@ -1331,6 +1380,106 @@ void main() {
       );
     });
   }
+
+  for (final environment in ['staging', 'production']) {
+    for (final redeem in [false, true]) {
+      testWidgets(
+        '$environment Commercial app ${redeem ? 'redemption' : 'purchase'} activates without replacing the app or stopping agents',
+        (tester) async {
+          final client = _RelayUpgradeClient(
+            installedEdition: 'commercial',
+            environment: environment,
+            activeAgents: 2,
+          );
+          final calls = <MethodCall>[];
+          tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+            const MethodChannel('the_ditch/application'),
+            (call) async {
+              calls.add(call);
+              return true;
+            },
+          );
+          addTearDown(
+            () =>
+                tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+                  const MethodChannel('the_ditch/application'),
+                  null,
+                ),
+          );
+          await tester.pumpWidget(
+            MaterialApp(
+              home: CommercialUpgradeDialog(
+                client: client,
+                deploymentEnvironment: environment,
+              ),
+            ),
+          );
+          await tester.pumpAndSettle();
+          expect(find.text('Installed app: Commercial'), findsOneWidget);
+          if (redeem) {
+            final field = find.byKey(const Key('commercial-license-key'));
+            await tester.ensureVisible(field);
+            await tester.enterText(field, 'existing-license');
+            final button = find.byKey(const Key('activate-commercial-license'));
+            await tester.ensureVisible(button);
+            await tester.tap(button);
+          } else {
+            final button = find.byKey(
+              const Key('commercial-offer-action-offer_monthly_standard'),
+            );
+            await tester.ensureVisible(button);
+            await tester.tap(button);
+          }
+          await tester.pumpAndSettle();
+          expect(client.activationCalls, 1);
+          expect(client.commercialReleaseCalls, 0);
+          expect(
+            calls.where((c) => c.method == 'installCommercialUpdate'),
+            isEmpty,
+          );
+          expect(
+            find.text(
+              'Commercial is active on this Mac. Remote Control is ready.',
+            ),
+            findsOneWidget,
+          );
+          expect(
+            find.byKey(const Key('install-commercial-build')),
+            findsNothing,
+          );
+        },
+      );
+    }
+  }
+
+  testWidgets(
+    'activation slot failure preserves the paid license and offers retry without installing',
+    (tester) async {
+      final client = _RelayUpgradeClient(
+        initiallyActive: true,
+        installedEdition: 'commercial',
+      )..failActivation = true;
+      await tester.pumpWidget(
+        MaterialApp(home: CommercialUpgradeDialog(client: client)),
+      );
+      await tester.pumpAndSettle();
+      await tester.tap(find.byKey(const Key('activate-commercial-device')));
+      await tester.pumpAndSettle();
+      expect(
+        find.textContaining('Check the available Mac slots'),
+        findsOneWidget,
+      );
+      expect(find.text('Commercial active'), findsOneWidget);
+      client.failActivation = false;
+      await tester.tap(find.byKey(const Key('activate-commercial-device')));
+      await tester.pumpAndSettle();
+      expect(client.activationCalls, 2);
+      expect(
+        find.text('Commercial is active on this Mac. Remote Control is ready.'),
+        findsOneWidget,
+      );
+    },
+  );
 
   test('lifetime add-on checkout remains a Ditch Relay offer', () async {
     final client = _RelayContractClient();
@@ -1521,6 +1670,7 @@ void main() {
       find.textContaining('secure Commercial installer is ready'),
       findsOneWidget,
     );
+    expect(client.activationCalls, 1);
   });
 
   testWidgets(

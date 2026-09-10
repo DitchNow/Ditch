@@ -1046,6 +1046,22 @@ fn release_edition_path(edition: Edition) -> &'static str {
 }
 
 impl HttpUpgradeBackend {
+    pub fn activate_commercial_device(
+        &self,
+        installation: &InstallationIdentity,
+    ) -> Result<EntitlementSummary, UpgradeError> {
+        #[derive(Deserialize)]
+        struct ActivationResponse {
+            entitlement: EntitlementSummary,
+        }
+        let path = format!(
+            "/v1/commercial/devices/{}/activate",
+            installation.installation_id()
+        );
+        let response: ActivationResponse = self.signed_json(installation, "POST", &path, b"")?;
+        Ok(response.entitlement)
+    }
+
     pub fn current_release_for_edition(
         &self,
         installation: &InstallationIdentity,
@@ -1064,12 +1080,7 @@ impl HttpUpgradeBackend {
             signature_metadata: serde_json::Value,
         }
         if edition == Edition::Commercial {
-            let activate_path = format!(
-                "/v1/commercial/devices/{}/activate",
-                installation.installation_id()
-            );
-            let _: serde_json::Value =
-                self.signed_json(installation, "POST", &activate_path, b"")?;
+            self.activate_commercial_device(installation)?;
         }
         let edition_path = release_edition_path(edition);
         let channel = expected_release_channel(DEPLOYMENT_ENVIRONMENT)?;

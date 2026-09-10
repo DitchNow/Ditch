@@ -31,6 +31,14 @@ pub fn commercial_entitlement(_state: Arc<Mutex<RuntimeState>>) -> Option<Server
     None
 }
 
+// The Community runtime has no proprietary capabilities to enable. Its UI
+// receives the authoritative activation summary and offers the Commercial app.
+pub fn accept_commercial_entitlement(
+    _state: Arc<Mutex<RuntimeState>>,
+    _summary: ditch_upgrade::EntitlementSummary,
+) {
+}
+
 pub fn handle_request(_request: ClientRequest, _state: Arc<Mutex<RuntimeState>>) -> ServerResponse {
     protocol_error(
         "unsupported_request",
