@@ -3,7 +3,7 @@
 use chrono::{DateTime, Utc};
 use ditch_core::{AgentResumeBlockReason, AgentRun, AgentState, AppPaths, Project, ProjectId};
 use ditch_protocol::{AgentChatMessage, AgentMessagePage, RuntimeAttention, SequencedAgentMessage};
-use rusqlite::{Connection, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use std::collections::HashSet;
 use std::fs;
 use std::io;
@@ -75,6 +75,35 @@ impl DitchStore {
         store.cleanup_polluted_permission_alerts()?;
         store.import_legacy_registry_if_empty(paths)?;
         Ok(store)
+    }
+
+    pub fn operation_outcome(
+        &self,
+        id: uuid::Uuid,
+    ) -> Result<Option<(String, Option<String>)>, StoreError> {
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT request_hash,response_json FROM runtime_operations WHERE id=?1",
+                params![id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?)
+    }
+
+    pub fn reserve_operation(&mut self, id: uuid::Uuid, hash: &str) -> Result<bool, StoreError> {
+        Ok(self.connection.execute(
+            "INSERT OR IGNORE INTO runtime_operations(id,request_hash,created_at) VALUES(?1,?2,?3)",
+            params![id.to_string(), hash, Utc::now().to_rfc3339()],
+        )? == 1)
+    }
+
+    pub fn finish_operation(&mut self, id: uuid::Uuid, response: &str) -> Result<(), StoreError> {
+        self.connection.execute(
+            "UPDATE runtime_operations SET response_json=?2 WHERE id=?1",
+            params![id.to_string(), response],
+        )?;
+        Ok(())
     }
 
     /// Runs a statically linked edition/capability store operation on the one
@@ -349,6 +378,30 @@ impl DitchStore {
         Ok(())
     }
 
+    /// Forward pagination for reconnect backfill; transcript sequence is durable.
+    pub fn agent_messages_after(
+        &self,
+        agent_id: ditch_core::AgentId,
+        after: u64,
+    ) -> Result<Vec<SequencedAgentMessage>, StoreError> {
+        let mut stmt = self.connection.prepare("SELECT sequence,message_json FROM agent_messages WHERE agent_id=?1 AND sequence>?2 ORDER BY sequence LIMIT 201")?;
+        let rows = stmt
+            .query_map(
+                params![
+                    agent_id.0.to_string(),
+                    i64::try_from(after).unwrap_or(i64::MAX)
+                ],
+                |row| {
+                    Ok(SequencedAgentMessage {
+                        sequence: row.get::<_, i64>(0)? as u64,
+                        message: from_json(&row.get::<_, String>(1)?)?,
+                    })
+                },
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     pub fn list_agent_messages(
         &self,
         agent_id: ditch_core::AgentId,
@@ -479,6 +532,11 @@ impl DitchStore {
 
     pub fn reconcile_active_agents(&mut self) -> Result<usize, StoreError> {
         let state = self.load()?;
+        for item in &state.attention {
+            if item.kind == ditch_core::AttentionKind::ApprovalRequired {
+                self.dismiss_attention(item.id)?;
+            }
+        }
         let mut count = 0;
         for mut agent in state.agents {
             if matches!(
@@ -1152,6 +1210,13 @@ CREATE TABLE IF NOT EXISTS permission_requests (
   command TEXT,
   created_at TEXT NOT NULL,
   expires_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS runtime_operations (
+  id TEXT PRIMARY KEY,
+  request_hash TEXT NOT NULL,
+  response_json TEXT,
+  created_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS app_settings (

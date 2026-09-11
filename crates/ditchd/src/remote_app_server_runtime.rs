@@ -187,6 +187,18 @@ fn start_remote_app_server_session(
     ServerResponse::AgentStarted(run)
 }
 
+struct RemoteLaunchReservation {
+    state: Arc<Mutex<RuntimeState>>,
+    agent_id: AgentId,
+}
+impl Drop for RemoteLaunchReservation {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.remote_launching.remove(&self.agent_id);
+        }
+    }
+}
+
 fn prompt_remote_app_server_agent(
     state: Arc<Mutex<RuntimeState>>,
     agent_id: AgentId,
@@ -194,7 +206,7 @@ fn prompt_remote_app_server_agent(
     execution_profile: AgentExecutionProfile,
 ) -> ServerResponse {
     let (project_id, project_root, thread_id) = {
-        let state = state
+        let mut state = state
             .lock()
             .expect("runtime state lock should not be poisoned");
         if !state.remote_runtime {
@@ -206,7 +218,7 @@ fn prompt_remote_app_server_agent(
         let Some(record) = state.agents.get(&agent_id) else {
             return protocol_error("agent_not_found", "agent session was not found");
         };
-        if state.children.contains_key(&agent_id) {
+        if state.children.contains_key(&agent_id) || state.remote_launching.contains(&agent_id) {
             return protocol_error("agent_busy", "agent session is already working");
         }
         let Some(thread_id) = record.run.native_session_id.clone() else {
@@ -215,7 +227,28 @@ fn prompt_remote_app_server_agent(
                 "Codex App Server never created a thread for this agent",
             );
         };
-        (record.run.project_id, record.project_root.clone(), thread_id)
+        if record.run.origin_codex_home
+            != state
+                .codex_home
+                .as_ref()
+                .map(|path| path.to_string_lossy().into_owned())
+        {
+            return protocol_error(
+                "codex_home_mismatch",
+                "Resume this session with its original Codex home",
+            );
+        }
+        let target = (
+            record.run.project_id,
+            record.project_root.clone(),
+            thread_id,
+        );
+        state.remote_launching.insert(agent_id);
+        target
+    };
+    let _reservation = RemoteLaunchReservation {
+        state: state.clone(),
+        agent_id,
     };
     let execution_profile = guarded_remote_profile(execution_profile);
     let Some(binary) = active_codex_binary(&state) else {
@@ -304,27 +337,71 @@ fn attach_remote_app_server_turn(
     child: Arc<Mutex<Child>>,
     events: mpsc::Receiver<codex_app_server::Event>,
 ) {
-    let event_state = Arc::clone(&state);
     thread::spawn(move || {
-        for event in events {
-            if handle_remote_app_server_event(&event_state, agent_id, run_id, event) {
+        let mut terminal = false;
+        let mut cleanup_started = None;
+        let mut output_closed = false;
+        loop {
+            match events.recv_timeout(Duration::from_millis(25)) {
+                Ok(codex_app_server::Event::OutputClosed) => output_closed = true,
+                Ok(event) => {
+                    if !terminal {
+                        terminal = handle_remote_app_server_event(&state, agent_id, run_id, event);
+                        if terminal {
+                            cleanup_started = Some(Instant::now());
+                        }
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => output_closed = true,
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+            }
+            let exited = child.lock().unwrap().try_wait();
+            if let Ok(Some(status)) = exited {
+                if output_closed {
+                    if !terminal {
+                        record_terminal_failure(
+                            &state,
+                            agent_id,
+                            "Codex App Server exited before completing its turn".to_owned(),
+                            Some(run_id),
+                        );
+                    }
+                    finish_agent(&state, agent_id, Some(run_id), status.code());
+                    break;
+                }
+                cleanup_started.get_or_insert_with(Instant::now);
+            }
+            if output_closed && !terminal {
+                record_terminal_failure(
+                    &state,
+                    agent_id,
+                    "Codex App Server output disconnected before turn completion".to_owned(),
+                    Some(run_id),
+                );
+                let mut guard = state.lock().unwrap();
+                guard.app_server_turns.remove(&agent_id);
+                terminal = true;
+                cleanup_started = Some(Instant::now());
+            }
+            if cleanup_started.is_some_and(|at| at.elapsed() > Duration::from_secs(2)) {
+                // This is our own process group, retained until output was drained.
+                let mut process = child.lock().unwrap();
+                if matches!(process.try_wait(), Ok(None)) {
+                    unsafe {
+                        libc::kill(-(process.id() as i32), libc::SIGKILL);
+                    }
+                }
+                drop(process);
+                let code = child
+                    .lock()
+                    .unwrap()
+                    .wait()
+                    .ok()
+                    .and_then(|status| status.code());
+                finish_agent(&state, agent_id, Some(run_id), code);
                 break;
             }
         }
-    });
-    thread::spawn(move || {
-        let code = loop {
-            match child
-                .lock()
-                .expect("child lock should not be poisoned")
-                .try_wait()
-            {
-                Ok(Some(status)) => break status.code(),
-                Ok(None) => thread::sleep(Duration::from_millis(25)),
-                Err(_) => break None,
-            }
-        };
-        finish_agent(&state, agent_id, Some(run_id), code);
     });
 }
 
@@ -335,6 +412,31 @@ fn handle_remote_app_server_event(
     event: codex_app_server::Event,
 ) -> bool {
     match event {
+        codex_app_server::Event::OutputClosed => return true,
+        codex_app_server::Event::PermissionResolved(id) => {
+            let mut state = state.lock().unwrap();
+            if !is_current_run(&state, agent_id, run_id) {
+                return true;
+            }
+            state.app_server_permission_agents.remove(&id);
+            state.pending_permissions.remove(&id);
+            resolve_permission_attention(&mut state, id);
+            let waiting = state
+                .pending_permissions
+                .values()
+                .any(|request| request.agent_id == Some(agent_id));
+            if !waiting
+                && let Some(record) = state.agents.get_mut(&agent_id)
+                && record.run.state == AgentState::AwaitingApproval
+            {
+                record.run.state = AgentState::Working;
+                record.run.updated_at = Utc::now();
+                record.run.last_visible_action = Some("Agent request resolved".into());
+                let run = record.run.clone();
+                state.persist_agent(agent_id);
+                state.broadcast(ServerEvent::AgentChanged(run));
+            }
+        }
         codex_app_server::Event::ThreadReady(thread_id) => {
             let mut state = state
                 .lock()
@@ -363,13 +465,9 @@ fn handle_remote_app_server_event(
             text,
             Some(run_id),
         ),
-        codex_app_server::Event::ToolMessage(text) => append_message(
-            state,
-            agent_id,
-            AgentChatRole::Tool,
-            text,
-            Some(run_id),
-        ),
+        codex_app_server::Event::ToolMessage(text) => {
+            append_message(state, agent_id, AgentChatRole::Tool, text, Some(run_id))
+        }
         codex_app_server::Event::ApprovalRequested(request) => {
             let mut state = state
                 .lock()
@@ -380,7 +478,9 @@ fn handle_remote_app_server_event(
             state
                 .app_server_permission_agents
                 .insert(request.id, agent_id);
-            state.pending_permissions.insert(request.id, request.clone());
+            state
+                .pending_permissions
+                .insert(request.id, request.clone());
             let Some(record) = state.agents.get_mut(&agent_id) else {
                 return true;
             };
@@ -390,6 +490,22 @@ fn handle_remote_app_server_event(
             let run = record.run.clone();
             state.persist_agent(agent_id);
             state.broadcast(ServerEvent::AgentChanged(run));
+            let attention = RuntimeAttention {
+                id: request.id,
+                kind: AttentionKind::ApprovalRequired,
+                agent_id: Some(agent_id),
+                project_id: Some(request.project_id),
+                project_name: None,
+                agent_name: None,
+                title: "Agent needs permission".into(),
+                body: "Review the pending request to continue this turn.".into(),
+                created_at: request.created_at,
+                read_at: None,
+            };
+            if state.store.upsert_attention(&attention).is_ok() {
+                state.attention.push(attention.clone());
+                state.broadcast(ServerEvent::AttentionRaised(attention));
+            }
             state.broadcast(ServerEvent::PermissionRequested(request));
         }
         codex_app_server::Event::TurnCompleted { status, error } => {
@@ -403,12 +519,7 @@ fn handle_remote_app_server_event(
                 return true;
             }
             state.app_server_turns.remove(&agent_id);
-            state
-                .app_server_permission_agents
-                .retain(|_, owner| *owner != agent_id);
-            state
-                .pending_permissions
-                .retain(|_, request| request.agent_id != Some(agent_id));
+            clear_agent_permissions(&mut state, agent_id);
             let Some(record) = state.agents.get_mut(&agent_id) else {
                 return true;
             };
@@ -447,12 +558,7 @@ fn handle_remote_app_server_event(
                 .lock()
                 .expect("runtime state lock should not be poisoned");
             state.app_server_turns.remove(&agent_id);
-            state
-                .app_server_permission_agents
-                .retain(|_, owner| *owner != agent_id);
-            state
-                .pending_permissions
-                .retain(|_, request| request.agent_id != Some(agent_id));
+            clear_agent_permissions(&mut state, agent_id);
             return true;
         }
     }
@@ -502,21 +608,18 @@ fn respond_permission_for_target(
         };
     }
 
-    let (agent_id, control) = {
+    let (agent_id, control, run_id) = {
         let state = state
             .lock()
             .expect("runtime state lock should not be poisoned");
-        let Some(agent_id) = state
-            .app_server_permission_agents
-            .get(&request_id)
-            .copied()
-        else {
+        let Some(agent_id) = state.app_server_permission_agents.get(&request_id).copied() else {
             return protocol_error("permission_not_found", "approval request expired");
         };
         let Some(control) = state.app_server_turns.get(&agent_id).cloned() else {
             return protocol_error("permission_not_found", "Codex turn is no longer active");
         };
-        (agent_id, control)
+        let run_id = state.children.get(&agent_id).map(|child| child.run_id);
+        (agent_id, control, run_id)
     };
     if let Err(error) = control.respond(request_id, decision) {
         return protocol_error("permission_response_failed", error.to_string());
@@ -524,10 +627,24 @@ fn respond_permission_for_target(
     let mut state = state
         .lock()
         .expect("runtime state lock should not be poisoned");
+    if state.children.get(&agent_id).map(|child| child.run_id) != run_id
+        || !state.pending_permissions.contains_key(&request_id)
+    {
+        return ServerResponse::Accepted;
+    }
     state.app_server_permission_agents.remove(&request_id);
     state.pending_permissions.remove(&request_id);
+    resolve_permission_attention(&mut state, request_id);
+    let still_waiting = state
+        .pending_permissions
+        .values()
+        .any(|request| request.agent_id == Some(agent_id));
     if let Some(record) = state.agents.get_mut(&agent_id) {
-        record.run.state = AgentState::Working;
+        record.run.state = if still_waiting {
+            AgentState::AwaitingApproval
+        } else {
+            AgentState::Working
+        };
         record.run.last_visible_action = Some(
             match decision {
                 codex_app_server::PermissionDecision::ApproveOnce => "Permission granted once",
@@ -542,6 +659,83 @@ fn respond_permission_for_target(
         let run = record.run.clone();
         state.persist_agent(agent_id);
         state.broadcast(ServerEvent::AgentChanged(run));
+    }
+    ServerResponse::Accepted
+}
+
+fn resolve_permission_attention(state: &mut RuntimeState, id: uuid::Uuid) {
+    state.attention.retain(|item| item.id != id);
+    let _ = state.store.dismiss_attention(id);
+    state.broadcast(ServerEvent::PermissionResolved { request_id: id });
+    state.broadcast(ServerEvent::AttentionDismissed { attention_id: id });
+}
+
+fn clear_agent_permissions(state: &mut RuntimeState, agent_id: AgentId) {
+    let ids = state
+        .pending_permissions
+        .values()
+        .filter(|request| request.agent_id == Some(agent_id))
+        .map(|request| request.id)
+        .collect::<Vec<_>>();
+    for id in ids {
+        state.app_server_permission_agents.remove(&id);
+        state.pending_permissions.remove(&id);
+        resolve_permission_attention(state, id);
+    }
+}
+
+fn answer_agent_questions(
+    state: Arc<Mutex<RuntimeState>>,
+    request_id: Uuid,
+    answers: std::collections::BTreeMap<String, Vec<String>>,
+) -> ServerResponse {
+    let remote = {
+        let guard = state.lock().unwrap();
+        guard
+            .remote_permission_hosts
+            .get(&request_id)
+            .cloned()
+            .map(|alias| (alias, guard.remote_connections.clone()))
+    };
+    if let Some((alias, connections)) = remote {
+        return connections
+            .request(
+                &alias,
+                ClientRequest::AnswerAgentQuestions {
+                    request_id,
+                    answers,
+                },
+            )
+            .unwrap_or_else(|error| protocol_error("remote_unavailable", error.to_string()));
+    }
+    let mut guard = state.lock().unwrap();
+    let Some(agent_id) = guard.app_server_permission_agents.get(&request_id).copied() else {
+        return protocol_error("permission_not_found", "Question expired");
+    };
+    let Some(control) = guard.app_server_turns.get(&agent_id).cloned() else {
+        return protocol_error("permission_not_found", "Turn ended");
+    };
+    if let Err(error) = control.answer(request_id, answers) {
+        return protocol_error("invalid_answers", error.to_string());
+    }
+    guard.app_server_permission_agents.remove(&request_id);
+    guard.pending_permissions.remove(&request_id);
+    resolve_permission_attention(&mut guard, request_id);
+    let waiting = guard
+        .pending_permissions
+        .values()
+        .any(|request| request.agent_id == Some(agent_id));
+    if let Some(record) = guard.agents.get_mut(&agent_id) {
+        record.run.state = if waiting {
+            AgentState::AwaitingApproval
+        } else {
+            AgentState::Working
+        };
+        record.run.updated_at = Utc::now();
+        record.run.last_visible_action = Some("Answer sent to Codex".into());
+        let run = record.run.clone();
+        guard.persist_agent(agent_id);
+        guard.broadcast(ServerEvent::AgentChanged(run));
     }
     ServerResponse::Accepted
 }

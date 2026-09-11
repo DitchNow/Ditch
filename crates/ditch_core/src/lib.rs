@@ -86,6 +86,7 @@ pub enum AttentionKind {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum PermissionActionKind {
+    AnswerQuestion,
     EditFiles,
     RunCommand,
     InstallDependencies,
@@ -255,6 +256,8 @@ pub struct AgentRun {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PermissionRequest {
+    #[serde(default)]
+    pub questions: Vec<AgentQuestion>,
     pub id: Uuid,
     pub project_id: ProjectId,
     pub agent_id: Option<AgentId>,
@@ -264,6 +267,26 @@ pub struct PermissionRequest {
     pub command: Option<String>,
     pub created_at: DateTime<Utc>,
     pub expires_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AgentQuestion {
+    pub id: String,
+    pub header: String,
+    pub question: String,
+    #[serde(default)]
+    pub options: Vec<AgentQuestionOption>,
+    #[serde(default, rename = "isOther")]
+    pub is_other: bool,
+    #[serde(default, rename = "isSecret")]
+    pub is_secret: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AgentQuestionOption {
+    pub label: String,
+    #[serde(default)]
+    pub description: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
