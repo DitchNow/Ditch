@@ -45,6 +45,7 @@ pub trait CommercialStoreExt {
     fn remote_devices(&self) -> Result<Vec<RemoteDeviceRecord>, StoreError>;
     fn delete_remote_device(&mut self, device_id: Uuid) -> Result<(), StoreError>;
     fn replace_remote_devices(&mut self, devices: &[RemoteDeviceRecord]) -> Result<(), StoreError>;
+    fn recent_remote_commands(&self) -> Result<Vec<(Uuid, Uuid)>, StoreError>;
     fn begin_remote_command(
         &mut self,
         command_id: Uuid,
@@ -177,6 +178,21 @@ impl CommercialStoreExt for DitchStore {
                 insert_device(transaction, device)?;
             }
             Ok(())
+        })
+    }
+
+    fn recent_remote_commands(&self) -> Result<Vec<(Uuid, Uuid)>, StoreError> {
+        self.with_extension_connection(NAMESPACE, |connection| {
+            let mut query = connection.prepare("SELECT command_id,device_id FROM remote_command_outcomes WHERE received_at>? AND command_type NOT LIKE 'query.%' ORDER BY received_at DESC LIMIT 64")?;
+            let rows = query.query_map(params![(Utc::now()-chrono::Duration::minutes(15)).to_rfc3339()], |row| {
+                let command: String = row.get(0)?; let device: String = row.get(1)?;
+                Ok((command, device))
+            })?;
+            let mut result = Vec::new();
+            for row in rows { let (command, device) = row?;
+                if let (Ok(command), Ok(device)) = (Uuid::parse_str(&command), Uuid::parse_str(&device)) { result.push((command,device)); }
+            }
+            Ok(result)
         })
     }
 

@@ -88,6 +88,8 @@ pub enum RemoteCommandType {
     IntegrationApply,
     #[serde(rename = "query.session_transcript")]
     QuerySessionTranscript,
+    #[serde(rename = "query.approval")]
+    QueryApproval,
     #[serde(rename = "query.session_review")]
     QuerySessionReview,
 }
@@ -98,7 +100,8 @@ impl RemoteCommandType {
             Self::SessionStart
             | Self::SessionPrompt
             | Self::QuerySessionTranscript
-            | Self::QuerySessionReview => ConfirmationClass::None,
+            | Self::QuerySessionReview
+            | Self::QueryApproval => ConfirmationClass::None,
             Self::SessionStop
             | Self::AttentionExecute
             | Self::AttentionAcknowledge
@@ -527,6 +530,10 @@ impl IdentityStore for MemoryIdentityStore {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ProjectProjection {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_host: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_status: Option<String>,
     pub project_id: Uuid,
     pub name: String,
     pub status: String,
@@ -583,6 +590,8 @@ pub enum TrustedActionType {
     Acknowledge,
     Snooze,
     RespondApproval,
+    Deny,
+    Answer,
     ApplyIntegration,
 }
 
@@ -626,6 +635,8 @@ impl RemoteProjector {
             .max()
             .unwrap_or(project.created_at);
         ProjectProjection {
+            target_host: None,
+            target_status: None,
             project_id: project.id.0,
             name: project.name.clone(),
             status: if running > 0 {
@@ -696,15 +707,39 @@ impl RemoteProjector {
             .into(),
             summary: truncate(&item.title, 160),
             state: "open".into(),
-            remote_actions: vec![RemoteAction {
-                // Action descriptors must be stable trusted domain data. A fresh
-                // random ID on every reconciliation would make harmless retries
-                // appear to be distinct executable actions to a phone.
-                action_id: item.id,
-                action_type: TrustedActionType::Acknowledge,
-                label: "Acknowledge".into(),
-                confirmation_class: ConfirmationClass::ContextConfirmation,
-            }],
+            remote_actions: {
+                let mut actions = vec![RemoteAction {
+                    // Action descriptors must be stable trusted domain data. A fresh
+                    // random ID on every reconciliation would make harmless retries
+                    // appear to be distinct executable actions to a phone.
+                    action_id: item.id,
+                    action_type: if item.kind == AttentionKind::ApprovalRequired {
+                        TrustedActionType::RespondApproval
+                    } else {
+                        TrustedActionType::Acknowledge
+                    },
+                    label: if item.kind == AttentionKind::ApprovalRequired {
+                        "Review approval"
+                    } else {
+                        "Acknowledge"
+                    }
+                    .into(),
+                    confirmation_class: if item.kind == AttentionKind::ApprovalRequired {
+                        ConfirmationClass::DeviceOwnerAuthentication
+                    } else {
+                        ConfirmationClass::ContextConfirmation
+                    },
+                }];
+                if item.kind == AttentionKind::ApprovalRequired {
+                    actions.push(RemoteAction {
+                        action_id: item.id,
+                        action_type: TrustedActionType::Deny,
+                        label: "Deny".into(),
+                        confirmation_class: ConfirmationClass::DeviceOwnerAuthentication,
+                    });
+                }
+                actions
+            },
             projection_version: version,
         }
     }

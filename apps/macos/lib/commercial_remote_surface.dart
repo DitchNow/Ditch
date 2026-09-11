@@ -23,14 +23,12 @@ class CommercialEditionSurface implements EditionSurface {
 class RemoteSettingsDialog extends StatefulWidget {
   const RemoteSettingsDialog({
     required this.client,
-    this.sshAlias,
     this.deploymentEnvironment = ditchDeploymentEnvironment,
     this.relayOrigin = ditchRelayOrigin,
     super.key,
   });
 
   final DitchRuntimeClient client;
-  final String? sshAlias;
   final String deploymentEnvironment;
   final String relayOrigin;
 
@@ -76,21 +74,6 @@ class _RemoteSettingsDialogState extends State<RemoteSettingsDialog> {
     });
   }
 
-  Future<Map<String, dynamic>> _requestLocalOrRemote(
-    Object local,
-    String remoteName,
-    Map<String, dynamic> remoteBody,
-  ) {
-    final alias = widget.sshAlias;
-    return widget.client.request(
-      alias == null
-          ? local
-          : {
-              remoteName: {'alias': alias, ...remoteBody},
-            },
-    );
-  }
-
   Future<void> _refresh() async {
     if (_refreshing) return;
     if (mounted) setState(() => _refreshing = true);
@@ -102,11 +85,7 @@ class _RemoteSettingsDialogState extends State<RemoteSettingsDialog> {
       entitlementError = error;
     }
     try {
-      final response = await _requestLocalOrRemote(
-        'RemoteControlStatus',
-        'RemoteMachineControlStatus',
-        const {},
-      );
+      final response = await widget.client.request('RemoteControlStatus');
       if (!mounted) return;
       setState(() {
         _entitlement = entitlement;
@@ -148,11 +127,7 @@ class _RemoteSettingsDialogState extends State<RemoteSettingsDialog> {
   Future<void> _connect() async {
     setState(() => _busy = true);
     try {
-      final response = await _requestLocalOrRemote(
-        'CreateRemotePairing',
-        'CreateRemoteMachinePairing',
-        const {},
-      );
+      final response = await widget.client.request('CreateRemotePairing');
       if (!mounted) return;
       setState(() {
         _pairing = (response['RemotePairing'] as Map?)?.cast<String, dynamic>();
@@ -175,13 +150,9 @@ class _RemoteSettingsDialogState extends State<RemoteSettingsDialog> {
     final id = _pairing?['pairing_id']?.toString();
     if (id == null || _busy) return;
     try {
-      final response = await _requestLocalOrRemote(
-        {
-          'GetRemotePairing': {'pairing_id': id},
-        },
-        'GetRemoteMachinePairing',
-        {'pairing_id': id},
-      );
+      final response = await widget.client.request({
+        'GetRemotePairing': {'pairing_id': id},
+      });
       if (!mounted) return;
       final next = (response['RemotePairing'] as Map?)?.cast<String, dynamic>();
       if (next != null) {
@@ -203,13 +174,9 @@ class _RemoteSettingsDialogState extends State<RemoteSettingsDialog> {
     if (id == null) return;
     setState(() => _busy = true);
     try {
-      await _requestLocalOrRemote(
-        {
-          'ConfirmRemotePairing': {'pairing_id': id},
-        },
-        'ConfirmRemoteMachinePairing',
-        {'pairing_id': id},
-      );
+      await widget.client.request({
+        'ConfirmRemotePairing': {'pairing_id': id},
+      });
       if (mounted) {
         setState(() {
           _pairing = null;
@@ -231,13 +198,9 @@ class _RemoteSettingsDialogState extends State<RemoteSettingsDialog> {
   Future<void> _cancel() async {
     final id = _pairing?['pairing_id']?.toString();
     if (id != null) {
-      await _requestLocalOrRemote(
-        {
-          'CancelRemotePairing': {'pairing_id': id},
-        },
-        'CancelRemoteMachinePairing',
-        {'pairing_id': id},
-      );
+      await widget.client.request({
+        'CancelRemotePairing': {'pairing_id': id},
+      });
     }
     if (mounted) setState(() => _pairing = null);
   }
@@ -336,11 +299,7 @@ class _RemoteSettingsDialogState extends State<RemoteSettingsDialog> {
         (_status?['devices'] as List?)?.whereType<Map>().toList() ?? const [];
     return AlertDialog(
       icon: const Icon(Icons.phone_iphone),
-      title: Text(
-        widget.sshAlias == null
-            ? 'Remote Control'
-            : 'Enroll ${widget.sshAlias}',
-      ),
+      title: Text('Remote Control'),
       content: SizedBox(
         width: 580,
         child: confirmedEntitlementRequired
@@ -447,9 +406,7 @@ class _RemoteSettingsDialogState extends State<RemoteSettingsDialog> {
                             : Icons.cloud_off_outlined,
                       ),
                       title: Text(
-                        _status?['machine_name']?.toString() ??
-                            widget.sshAlias ??
-                            'This Mac',
+                        _status?['machine_name']?.toString() ?? 'This Mac',
                       ),
                       subtitle: Text(
                         _status?['online'] == true ? 'Online' : 'Offline',
@@ -478,9 +435,7 @@ class _RemoteSettingsDialogState extends State<RemoteSettingsDialog> {
                           'Unique identifier: $deviceId\nStatus: $deviceState',
                         ),
                         isThreeLine: true,
-                        trailing:
-                            widget.sshAlias == null &&
-                                device['state'] == 'active'
+                        trailing: device['state'] == 'active'
                             ? TextButton(
                                 onPressed: _busy
                                     ? null

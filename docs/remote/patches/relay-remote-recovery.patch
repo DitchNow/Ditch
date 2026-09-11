@@ -1,0 +1,548 @@
+diff --git a/contracts/remote-v1/REMOTE_PROTOCOL_V1.md b/contracts/remote-v1/REMOTE_PROTOCOL_V1.md
+--- a/contracts/remote-v1/REMOTE_PROTOCOL_V1.md
++++ b/contracts/remote-v1/REMOTE_PROTOCOL_V1.md
+@@ -154,6 +154,7 @@
+ integration.apply
+ query.session_transcript
+ query.session_review
++query.approval
+ ```
+ 
+ There is no generic RPC. `shell.execute`, `pty.write`, `run_command`,
+@@ -256,3 +257,37 @@
+ pairs another. Loss of all machines and phones has no v1 recovery path. Remote
+ identity deletion never deletes local projects. Disabling Remote Control closes
+ the machine socket and revokes remote authorization while local Ditch continues.
++
++
++### Mac-mediated SSH recovery (SSH runtime protocol 4)
++
++The only control path is Mobile -> Relay -> Mac ditchd -> SSH -> remote ditchd.
++Mobile pairs with the Mac and retains its existing encrypted Mac channel. SSH
++hosts are execution targets of Mac-managed projects, never separately paired
++Mobile machines. They neither enroll in Relay nor publish their own projections.
++Legacy remote-node enrollment endpoints and SSH-node Mobile access are retired.
++
++Mac projections include local and configured SSH projects, agents and attention.
++All Mobile envelopes retain the paired Mac machine ID. Project records may include
++`target_host` (an SSH alias) and `target_status` (`online`, `offline`, `reconnecting`,
++`unknown`). Omission means local execution. Agent state remains last known when a
++host is disconnected; target availability is reported separately.
++
++`query.approval` takes encrypted `{attention_id}` and returns encrypted request
++details through the Mac. Approval decisions and typed question answers use the
++same owning-runtime dispatch as desktop. `attention.execute` accepts an `answers`
++map from question IDs to answer arrays; action/request identity must still be live.
++
++Mobile control requires the Mac runtime online. A disconnected SSH target reports
++`remote_unavailable`; an unconfirmed mutation reports `operation_outcome_unknown`.
++The same command ID and body may recover a receipt, but never resend a mutation.
++Reusing an ID for a different payload is `operation_conflict`. Rejoin reads session
++state and transcript without submitting a prompt. No automatic offline work queue.
++
++Neither remote-host key discovery nor the discarded bound-enrollment migration
++is part of this extension. Relay migration `0017_mac_ssh_targets.sql` adds only
++nullable SSH target metadata to Mac-owned project projections. Existing Mac/device
++encryption, pairing and authorization remain. The Mac retries delivery of saved
++mutation results from the last 15 minutes after Relay reconnect (up to 64 recent
++receipts), re-encrypting for authorized devices. This never resubmits agent work;
++older uncertain operations remain inspectable through session rejoin.
+diff --git a/contracts/remote-v1/manifest.json b/contracts/remote-v1/manifest.json
+--- a/contracts/remote-v1/manifest.json
++++ b/contracts/remote-v1/manifest.json
+@@ -2,19 +2,19 @@
+   "protocol_version": 1,
+   "package_version": "1.0.0",
+   "canonical_owner": "The Ditch macOS repository",
+-  "source_snapshot_date": "2026-08-26",
+-  "bundle_sha256": "d1162ca9816ddbed512f19f80d0567608081bf0a0620d950026961ca0a528d36",
++  "source_snapshot_date": "2026-09-11",
++  "bundle_sha256": "3b08430915120edde6112ca0086915171824a61b0545d4f7b57e89e30513b1c3",
+   "files": {
+-    "REMOTE_PROTOCOL_V1.md": "8b8d5c2ba3ed025aaac1b4d6a53033c312addc94438be43650e9734bd7cf0c93",
++    "REMOTE_PROTOCOL_V1.md": "fe332091444205983ca09fb05ac5e9c2ba26efd6625bc5ffe017f4506927d9ea",
+     "fixtures/crypto-v1.json": "53c71f10411542b3f654dfb3925b8bb41dde31505d6a8eaa584f40ab085dd95a",
+     "fixtures/v1.json": "a4ee41d0005bbf9a984f11c544a0b9b1f07a43d529812b651c7fd66e95ddfa12",
+     "openapi-v1.yaml": "ea2a9c663cc0015ae15352d4a9a1a79ea86517892f2dd9a2a09e1128a2423716",
+     "package.json": "7bc06591a283fb241a8dc06c86f4521cc97fda73043eda6cd5d7dd3fe52b8fc1",
+-    "schemas/command.schema.json": "f63433619dd553c692fd10fe81df5e0e17237fe51aa51fb59e8728c6a0df7a2b",
++    "schemas/command.schema.json": "1f8107786046ca942826b44139a701abbbedcf8543a40d4624f01bc6680f4024",
+     "schemas/encrypted-payload.schema.json": "1cb3e30cb4c391f7a8a6a204ff22c780a5876392005420d797bd6eec263ea228",
+     "schemas/error.schema.json": "52c76efc381ede1817d0d3bbfd62f5a589f7b4455e1550e45dd993a868ab4721",
+     "schemas/pairing-qr.schema.json": "fa98c1eba06e8a51f5ee4d9b1c31a7530d10e97123271480a39e5cf6a95f884a",
+-    "schemas/projection.schema.json": "424e6345597568bd182767b37b945560a08f13114e6d60e6354143d6c2942380",
++    "schemas/projection.schema.json": "031cc64dbf86bb81f6739b782ef85698cb7c691672b9be28b8ff5d404857b88a",
+     "schemas/ws-envelope.schema.json": "5b1aa6c779faeaf406558e243d5824a411926e1f1deb11f300e20799dfb6b1e8"
+   }
+ }
+diff --git a/contracts/remote-v1/schemas/command.schema.json b/contracts/remote-v1/schemas/command.schema.json
+--- a/contracts/remote-v1/schemas/command.schema.json
++++ b/contracts/remote-v1/schemas/command.schema.json
+@@ -1 +1 @@
+-{"$schema":"https://json-schema.org/draft/2020-12/schema","$id":"https://theditch.dev/remote/v1/command.schema.json","title":"RemoteCommand","type":"object","additionalProperties":false,"required":["protocol_version","command_id","idempotency_key","owner_id","machine_id","device_id","type","created_at","expires_at","confirmation_class","payload"],"properties":{"protocol_version":{"const":1},"command_id":{"type":"string","format":"uuid"},"idempotency_key":{"type":"string","minLength":16,"maxLength":128},"owner_id":{"type":"string","format":"uuid"},"machine_id":{"type":"string","format":"uuid"},"device_id":{"type":"string","format":"uuid"},"type":{"enum":["session.start","session.prompt","session.stop","session.force_kill","approval.respond","attention.execute","attention.acknowledge","attention.snooze","integration.apply","query.session_transcript","query.session_review"]},"created_at":{"type":"integer"},"expires_at":{"type":"integer"},"confirmation_class":{"enum":["none","context_confirmation","device_owner_authentication","desktop_only"]},"payload":{"$ref":"encrypted-payload.schema.json"}}}
++{"$schema":"https://json-schema.org/draft/2020-12/schema","$id":"https://theditch.dev/remote/v1/command.schema.json","title":"RemoteCommand","type":"object","additionalProperties":false,"required":["protocol_version","command_id","idempotency_key","owner_id","machine_id","device_id","type","created_at","expires_at","confirmation_class","payload"],"properties":{"protocol_version":{"const":1},"command_id":{"type":"string","format":"uuid"},"idempotency_key":{"type":"string","minLength":16,"maxLength":128},"owner_id":{"type":"string","format":"uuid"},"machine_id":{"type":"string","format":"uuid"},"device_id":{"type":"string","format":"uuid"},"type":{"enum":["session.start","session.prompt","session.stop","session.force_kill","approval.respond","attention.execute","attention.acknowledge","attention.snooze","integration.apply","query.session_transcript","query.session_review","query.approval"]},"created_at":{"type":"integer"},"expires_at":{"type":"integer"},"confirmation_class":{"enum":["none","context_confirmation","device_owner_authentication","desktop_only"]},"payload":{"$ref":"encrypted-payload.schema.json"}}}
+diff --git a/contracts/remote-v1/schemas/projection.schema.json b/contracts/remote-v1/schemas/projection.schema.json
+--- a/contracts/remote-v1/schemas/projection.schema.json
++++ b/contracts/remote-v1/schemas/projection.schema.json
+@@ -43,6 +43,8 @@
+         "projection_version"
+       ],
+       "properties": {
++        "target_host": { "type": "string", "maxLength": 128 },
++        "target_status": { "enum": ["online", "offline", "reconnecting", "unknown"] },
+         "project_id": { "type": "string", "format": "uuid" },
+         "name": { "type": "string", "maxLength": 200 },
+         "status": { "type": "string", "maxLength": 40 },
+diff --git a/migrations/0017_mac_ssh_targets.sql b/migrations/0017_mac_ssh_targets.sql
+new file mode 100644
+--- /dev/null
++++ b/migrations/0017_mac_ssh_targets.sql
+@@ -0,0 +1,3 @@
++-- SSH targets are metadata on projects owned by a Mac, not Relay machines.
++ALTER TABLE projects ADD COLUMN target_host TEXT;
++ALTER TABLE projects ADD COLUMN target_status TEXT CHECK(target_status IS NULL OR target_status IN ('online','offline','reconnecting','unknown'));
+diff --git a/src/auth.ts b/src/auth.ts
+--- a/src/auth.ts
++++ b/src/auth.ts
+@@ -28,7 +28,7 @@
+   catch { throw new AuthError("invalid_signature"); }
+ 
+   const table = type === "machine" ? "machines" : "devices";
+-  const row = await env.DB.prepare(`SELECT id,owner_id,signing_public_key,state FROM ${table} WHERE id=?`).bind(id).first<{
++  const row = await env.DB.prepare(`SELECT id,owner_id,signing_public_key,state FROM ${table} WHERE id=? ${type === "machine" ? "AND machine_type='desktop_mac'" : ""}`).bind(id).first<{
+     id: string; owner_id: string | null; signing_public_key: string; state: string;
+   }>();
+   if (!row) throw new AuthError("unauthorized");
+@@ -64,7 +64,7 @@
+ 
+ export async function requireMachineOwner(env: Env, principal: Principal, machineId: string): Promise<void> {
+   if (!principal.ownerId) throw new AuthError("unauthorized");
+-  const machine = await env.DB.prepare("SELECT 1 ok FROM machines WHERE id=? AND owner_id=? AND state='active'")
++  const machine = await env.DB.prepare("SELECT 1 ok FROM machines WHERE id=? AND owner_id=? AND state='active' AND machine_type='desktop_mac'")
+     .bind(machineId, principal.ownerId).first();
+   if (!machine) throw new AuthError("unauthorized");
+ }
+diff --git a/src/enrollment.ts b/src/enrollment.ts
+deleted file mode 100644
+--- a/src/enrollment.ts
++++ /dev/null
+@@ -1,88 +0,0 @@
+-import { AuthError, rateLimit } from "./auth";
+-import { randomToken, sha256, validateP256AgreementKey, verifyP256 } from "./crypto";
+-import { bodyObject, json, requiredString, requestId } from "./http";
+-import type { Env, Principal } from "./types";
+-import { requireMachineActivation, requireRemoteControl } from "./billing/entitlements";
+-
+-const ENROLLMENT_TTL_MS = 5 * 60_000;
+-
+-export async function createRemoteNodeEnrollment(request: Request, env: Env, principal: Principal): Promise<Response> {
+-  if (principal.type !== "machine" || !principal.ownerId) throw new AuthError("unauthorized");
+-  await rateLimit(env, `remote-node-enrollment:${principal.id}`, 10, 60_000);
+-  if (await requireMachineActivation(env, principal.ownerId, principal.id) !== "desktop_mac") throw new AuthError("device_not_licensed");
+-  const token = randomToken(32);
+-  const enrollmentId = crypto.randomUUID();
+-  const now = Date.now();
+-  const expiresAt = now + ENROLLMENT_TTL_MS;
+-  await env.DB.prepare(`INSERT INTO machine_enrollment_intents(id,owner_id,sponsor_machine_id,token_hash,state,expires_at,created_at)
+-    VALUES(?,?,?,?,'pending',?,?)`).bind(enrollmentId, principal.ownerId, principal.id, await sha256(token), expiresAt, now).run();
+-  return json({ protocol_version: 1, enrollment_id: enrollmentId, token, expires_at: expiresAt }, 201, requestId(request));
+-}
+-
+-export async function claimRemoteNodeEnrollment(request: Request, env: Env, enrollmentId: string): Promise<Response> {
+-  const id = requestId(request);
+-  await rateLimit(env, `remote-node-claim:${enrollmentId}:${request.headers.get("CF-Connecting-IP") ?? "unknown"}`, 10, 60_000);
+-  const body = await bodyObject(request);
+-  if (body.protocol_version !== 1) throw new AuthError("unsupported_protocol");
+-  const token = requiredString(body, "token", 96);
+-  const machineId = requiredString(body, "machine_id", 36);
+-  const name = requiredString(body, "name", 120);
+-  const signing = requiredString(body, "signing_public_key", 256);
+-  const agreement = requiredString(body, "agreement_public_key", 256);
+-  const proof = requiredString(body, "proof", 256);
+-  const tokenHash = await sha256(token);
+-  const canonical = ["DITCH-REMOTE-NODE-ENROLL-1", enrollmentId, machineId, name, signing, agreement, tokenHash].join("\n");
+-  if (!await verifyP256(signing, canonical, proof) || !await validateP256AgreementKey(agreement)) throw new AuthError("invalid_signature");
+-  const enrollment = await env.DB.prepare(`SELECT owner_id,sponsor_machine_id,state,expires_at,token_hash,claimed_machine_id
+-    FROM machine_enrollment_intents WHERE id=?`).bind(enrollmentId)
+-    .first<{owner_id:string;sponsor_machine_id:string;state:string;expires_at:number;token_hash:string;claimed_machine_id:string|null}>();
+-  if (!enrollment || enrollment.token_hash !== tokenHash) throw new AuthError("pairing_rejected");
+-  if (enrollment.state === "consumed") {
+-    if (enrollment.claimed_machine_id !== machineId) throw new AuthError("pairing_used");
+-    const existing = await env.DB.prepare("SELECT signing_public_key,agreement_public_key FROM machines WHERE id=? AND owner_id=? AND machine_type='ssh_remote_node'")
+-      .bind(machineId, enrollment.owner_id).first<{signing_public_key:string;agreement_public_key:string}>();
+-    if (!existing || existing.signing_public_key !== signing || existing.agreement_public_key !== agreement) throw new AuthError("pairing_used");
+-    return json({ protocol_version: 1, owner_id: enrollment.owner_id, machine_id: machineId, machine_type: "ssh_remote_node", state: "consumed" }, 200, id);
+-  }
+-  if (enrollment.state !== "pending") throw new AuthError("pairing_used");
+-  if (enrollment.expires_at <= Date.now()) {
+-    await env.DB.prepare("UPDATE machine_enrollment_intents SET state='expired' WHERE id=? AND state='pending'").bind(enrollmentId).run();
+-    throw new AuthError("pairing_expired");
+-  }
+-  await requireRemoteControl(env, enrollment.owner_id);
+-  await requireMachineActivation(env, enrollment.owner_id, enrollment.sponsor_machine_id);
+-  const now = Date.now();
+-  try {
+-    await env.DB.batch([
+-      env.DB.prepare(`INSERT INTO machines(id,owner_id,name,signing_public_key,agreement_public_key,key_version,state,created_at,machine_type)
+-        SELECT ?,owner_id,?,?,?,1,'active',?,'ssh_remote_node' FROM machine_enrollment_intents
+-        WHERE id=? AND token_hash=? AND state='pending' AND expires_at>?`)
+-        .bind(machineId, name, signing, agreement, now, enrollmentId, tokenHash, now),
+-      env.DB.prepare(`INSERT INTO device_activations(id,owner_id,device_kind,machine_id,state,activated_at,created_at,updated_at)
+-        SELECT ?,owner_id,'ssh_remote_node',?,'active',?,?,? FROM machine_enrollment_intents
+-        WHERE id=? AND token_hash=? AND state='pending' AND expires_at>?`)
+-        .bind(crypto.randomUUID(), machineId, now, now, now, enrollmentId, tokenHash, now),
+-      env.DB.prepare(`INSERT INTO machine_devices(owner_id,machine_id,device_id,state,created_at)
+-        SELECT i.owner_id,?,md.device_id,'active',? FROM machine_enrollment_intents i
+-        JOIN machine_devices md ON md.owner_id=i.owner_id AND md.machine_id=i.sponsor_machine_id AND md.state='active'
+-        JOIN device_activations a ON a.owner_id=md.owner_id AND a.device_id=md.device_id AND a.device_kind='ios' AND a.state='active'
+-        WHERE i.id=? AND i.token_hash=? AND i.state='pending' AND i.expires_at>?`)
+-        .bind(machineId, now, enrollmentId, tokenHash, now),
+-      env.DB.prepare(`UPDATE machine_enrollment_intents SET state='consumed',consumed_at=?,claimed_machine_id=?
+-        WHERE id=? AND token_hash=? AND state='pending' AND expires_at>?`).bind(now, machineId, enrollmentId, tokenHash, now),
+-      env.DB.prepare(`INSERT INTO audit_events(id,owner_id,machine_id,request_id,kind,created_at)
+-        SELECT ?,owner_id,?,?,'remote_node_enrolled',? FROM machine_enrollment_intents WHERE id=? AND claimed_machine_id=?`)
+-        .bind(crypto.randomUUID(), machineId, id, now, enrollmentId, machineId),
+-    ]);
+-  } catch (error) {
+-    if (String(error).includes("UNIQUE")) throw new AuthError("pairing_used");
+-    throw error;
+-  }
+-  const bound = await env.DB.prepare("SELECT owner_id,machine_type,signing_public_key,agreement_public_key FROM machines WHERE id=?")
+-    .bind(machineId).first<{owner_id:string;machine_type:string;signing_public_key:string;agreement_public_key:string}>();
+-  if (!bound || bound.owner_id !== enrollment.owner_id || bound.machine_type !== "ssh_remote_node" || bound.signing_public_key !== signing || bound.agreement_public_key !== agreement) {
+-    throw new AuthError("pairing_rejected");
+-  }
+-  console.log(JSON.stringify({ event: "remote_node_enrolled", owner_id: enrollment.owner_id, machine_id: machineId }));
+-  return json({ protocol_version: 1, owner_id: enrollment.owner_id, machine_id: machineId, machine_type: "ssh_remote_node", state: "consumed" }, 200, id);
+-}
+diff --git a/src/machine_hub.ts b/src/machine_hub.ts
+--- a/src/machine_hub.ts
++++ b/src/machine_hub.ts
+@@ -79,6 +79,9 @@
+   }
+ 
+   private async deviceAuthorization(ownerId: string, machineId: string, deviceId: string): Promise<"active" | "device_revoked" | "device_not_licensed" | "entitlement_expired" | "commercial_required" | "unauthorized"> {
++    const target = await this.env.DB.prepare("SELECT 1 ok FROM machines WHERE id=? AND owner_id=? AND machine_type='desktop_mac' AND state='active'")
++      .bind(machineId, ownerId).first();
++    if (!target) return "unauthorized";
+     const device = await this.env.DB.prepare("SELECT state FROM devices WHERE id=? AND owner_id=?")
+       .bind(deviceId, ownerId).first<{state:string}>();
+     if (device?.state !== "active") return "device_revoked";
+@@ -98,6 +101,9 @@
+ 
+   private async machineAuthorization(ownerId: string, machineId: string, meta?: SocketAttachment): Promise<boolean> {
+     try {
++      const target = await this.env.DB.prepare("SELECT 1 ok FROM machines WHERE id=? AND owner_id=? AND machine_type='desktop_mac' AND state='active'")
++        .bind(machineId, ownerId).first();
++      if (!target) return false;
+       await requireMachineActivation(this.env, ownerId, machineId);
+       const mode = this.env.OFFICIAL_BUILD_ENFORCEMENT ?? "disabled";
+       if (!meta?.officialBuildId || !meta.officialBuildAuthMethod) return mode !== "enforced";
+@@ -385,8 +391,8 @@
+       this.env.DB.prepare("DELETE FROM attention WHERE owner_id=? AND machine_id=? AND projection_epoch=?").bind(meta.ownerId, meta.machineId, epoch),
+       this.env.DB.prepare("DELETE FROM sessions WHERE owner_id=? AND machine_id=? AND projection_epoch=?").bind(meta.ownerId, meta.machineId, epoch),
+       this.env.DB.prepare("DELETE FROM projects WHERE owner_id=? AND machine_id=? AND projection_epoch=?").bind(meta.ownerId, meta.machineId, epoch),
+-      this.env.DB.prepare(`INSERT INTO projects(owner_id,machine_id,projection_epoch,project_id,name,status,running_count,waiting_count,ready_count,failed_count,attention_count,last_activity_at,projection_version)
+-        SELECT p.owner_id,p.machine_id,?,p.project_id,p.name,p.status,p.running_count,p.waiting_count,p.ready_count,p.failed_count,p.attention_count,p.last_activity_at,p.projection_version
++      this.env.DB.prepare(`INSERT INTO projects(owner_id,machine_id,projection_epoch,project_id,name,status,target_host,target_status,running_count,waiting_count,ready_count,failed_count,attention_count,last_activity_at,projection_version)
++        SELECT p.owner_id,p.machine_id,?,p.project_id,p.name,p.status,p.target_host,p.target_status,p.running_count,p.waiting_count,p.ready_count,p.failed_count,p.attention_count,p.last_activity_at,p.projection_version
+         FROM projects p JOIN machine_projection_state ps ON ps.owner_id=p.owner_id AND ps.machine_id=p.machine_id AND ps.active_epoch=p.projection_epoch
+         WHERE p.owner_id=? AND p.machine_id=?`).bind(epoch, meta.ownerId, meta.machineId),
+       this.env.DB.prepare(`INSERT INTO sessions(owner_id,machine_id,projection_epoch,project_id,session_id,title,provider_name,status,semantic_phase,needs_user,attention_count,changed_file_count,validation_summary,integration_readiness,last_activity_at,projection_version)
+@@ -453,9 +459,9 @@
+   }
+ 
+   private projectionStatements(meta: SocketAttachment, epoch: string, kind: string, record: Record<string, unknown>): D1PreparedStatement[] {
+-    if (kind === "project") return [this.env.DB.prepare(`INSERT INTO projects(owner_id,machine_id,projection_epoch,project_id,name,status,running_count,waiting_count,ready_count,failed_count,attention_count,last_activity_at,projection_version)
+-      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(owner_id,machine_id,projection_epoch,project_id) DO UPDATE SET name=excluded.name,status=excluded.status,running_count=excluded.running_count,waiting_count=excluded.waiting_count,ready_count=excluded.ready_count,failed_count=excluded.failed_count,attention_count=excluded.attention_count,last_activity_at=excluded.last_activity_at,projection_version=excluded.projection_version`)
+-      .bind(meta.ownerId, meta.machineId, epoch, record.project_id, record.name, record.status, record.running_count ?? 0, record.waiting_count ?? 0, record.ready_count ?? 0, record.failed_count ?? 0, record.attention_count ?? 0, record.last_activity_at, record.projection_version)];
++    if (kind === "project") return [this.env.DB.prepare(`INSERT INTO projects(owner_id,machine_id,projection_epoch,project_id,name,status,target_host,target_status,running_count,waiting_count,ready_count,failed_count,attention_count,last_activity_at,projection_version)
++      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(owner_id,machine_id,projection_epoch,project_id) DO UPDATE SET name=excluded.name,status=excluded.status,target_host=excluded.target_host,target_status=excluded.target_status,running_count=excluded.running_count,waiting_count=excluded.waiting_count,ready_count=excluded.ready_count,failed_count=excluded.failed_count,attention_count=excluded.attention_count,last_activity_at=excluded.last_activity_at,projection_version=excluded.projection_version`)
++      .bind(meta.ownerId, meta.machineId, epoch, record.project_id, record.name, record.status, record.target_host ?? null, record.target_status ?? null, record.running_count ?? 0, record.waiting_count ?? 0, record.ready_count ?? 0, record.failed_count ?? 0, record.attention_count ?? 0, record.last_activity_at, record.projection_version)];
+     if (kind === "session") return [this.env.DB.prepare(`INSERT INTO sessions(owner_id,machine_id,projection_epoch,project_id,session_id,title,provider_name,status,semantic_phase,needs_user,attention_count,changed_file_count,validation_summary,integration_readiness,last_activity_at,projection_version)
+       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(owner_id,machine_id,projection_epoch,session_id) DO UPDATE SET project_id=excluded.project_id,title=excluded.title,provider_name=excluded.provider_name,status=excluded.status,semantic_phase=excluded.semantic_phase,needs_user=excluded.needs_user,attention_count=excluded.attention_count,changed_file_count=excluded.changed_file_count,validation_summary=excluded.validation_summary,integration_readiness=excluded.integration_readiness,last_activity_at=excluded.last_activity_at,projection_version=excluded.projection_version`)
+       .bind(meta.ownerId, meta.machineId, epoch, record.project_id, record.session_id, record.title, record.provider_name, record.status, record.semantic_phase ?? null, record.needs_user ? 1 : 0, record.attention_count ?? 0, record.changed_file_count ?? null, record.validation_summary ?? null, record.integration_readiness ?? null, record.last_activity_at, record.projection_version)];
+diff --git a/src/pairing.ts b/src/pairing.ts
+--- a/src/pairing.ts
++++ b/src/pairing.ts
+@@ -63,7 +63,7 @@
+   const pairing = await env.DB.prepare(`SELECT p.state,p.secret_hash,p.expires_at,p.claimed_device_id,p.claimed_name,p.claimed_platform,
+       p.claimed_signing_public_key,p.claimed_agreement_public_key,p.claim_attempts,
+       m.owner_id,m.agreement_public_key machine_agreement_public_key,m.id machine_id
+-      FROM pairings p JOIN machines m ON m.id=p.machine_id WHERE p.id=?`)
++      FROM pairings p JOIN machines m ON m.id=p.machine_id WHERE p.id=? AND m.machine_type='desktop_mac'`)
+     .bind(pairingId).first<{state:string;secret_hash:string;expires_at:number;claimed_device_id:string|null;claimed_name:string|null;claimed_platform:string|null;claimed_signing_public_key:string|null;claimed_agreement_public_key:string|null;claim_attempts:number;owner_id:string|null;machine_agreement_public_key:string;machine_id:string}>();
+   if (!pairing) throw new AuthError("pairing_rejected");
+   if (pairing.expires_at <= Date.now()) {
+diff --git a/src/types.ts b/src/types.ts
+--- a/src/types.ts
++++ b/src/types.ts
+@@ -92,4 +92,5 @@
+   "approval.respond", "attention.execute", "attention.acknowledge",
+   "attention.snooze", "integration.apply", "query.session_transcript",
+   "query.session_review",
++  "query.approval",
+ ]);
+diff --git a/src/validation.ts b/src/validation.ts
+--- a/src/validation.ts
++++ b/src/validation.ts
+@@ -48,7 +48,7 @@
+ }
+ 
+ const projectionKeys = {
+-  project: ["project_id", "name", "status", "running_count", "waiting_count", "ready_count", "failed_count", "attention_count", "last_activity_at", "projection_version"],
++  project: ["target_host", "target_status", "project_id", "name", "status", "running_count", "waiting_count", "ready_count", "failed_count", "attention_count", "last_activity_at", "projection_version"],
+   session: ["session_id", "project_id", "title", "provider_name", "status", "semantic_phase", "needs_user", "attention_count", "changed_file_count", "validation_summary", "integration_readiness", "last_activity_at", "projection_version"],
+   attention: ["attention_id", "project_id", "session_id", "type", "severity", "summary", "state", "remote_actions", "projection_version"],
+   delete: ["entity", "id"],
+@@ -124,6 +124,8 @@
+   text(record[idKey], 36, true);
+   integer(record.projection_version, 1);
+   if (kind === "project") {
++    if (record.target_host != null) text(record.target_host, 128);
++    if (record.target_status != null && !["online", "offline", "reconnecting", "unknown"].includes(String(record.target_status))) throw new AuthError("validation_failed");
+     text(record.name, 200); text(record.status, 40); integer(record.last_activity_at);
+     for (const key of ["running_count", "waiting_count", "ready_count", "failed_count", "attention_count"]) integer(record[key], 0);
+   } else if (kind === "session") {
+@@ -141,7 +143,7 @@
+       const item = action as Record<string, unknown>;
+       exactKeys(item, ["action_id", "type", "label", "confirmation_class"]);
+       text(item.action_id, 36, true); text(item.label, 80);
+-      if (!["acknowledge", "snooze", "respond_approval", "apply_integration"].includes(String(item.type))) throw new AuthError("validation_failed");
++      if (!["acknowledge", "snooze", "respond_approval", "deny", "answer", "apply_integration"].includes(String(item.type))) throw new AuthError("validation_failed");
+       if (!["none", "context_confirmation", "device_owner_authentication", "desktop_only"].includes(String(item.confirmation_class))) throw new AuthError("validation_failed");
+     }
+   }
+diff --git a/src/worker.ts b/src/worker.ts
+--- a/src/worker.ts
++++ b/src/worker.ts
+@@ -13,7 +13,6 @@
+ import { reconcileBilling } from "./billing/reconciliation";
+ import { issueComplimentaryLicense, getComplimentaryLicense, revokeComplimentaryLicense } from "./billing/complimentary";
+ import { revokeDitchLicenseInternal } from "./billing/licenses";
+-import { claimRemoteNodeEnrollment, createRemoteNodeEnrollment } from "./enrollment";
+ import { commercialReleaseCapabilities, consumeDownloadGrant, createDownloadGrant, currentCommercialRelease, publishCommercialRelease, serveCommercialReleaseObject } from "./releases";
+ import { createAttestationChallenge, createOfficialBuildSession, createSessionChallenge, exchangeEmbeddedBuildCredential, officialBuildCapabilities, registerAttestation, registerOfficialBuild, requireOfficialBuild, revokeOfficialBuild } from "./official_builds";
+ import { communityReleaseCapabilities, currentCommunityRelease, publishCommunityRelease, revokeCommunityRelease, serveCommunityReleaseObject } from "./community_releases";
+@@ -58,6 +57,9 @@
+       role:"machine"|"device";connection_epoch:string;official_build_id:string|null;app_attest_key_id:string|null;
+       official_build_auth_method:"embedded_credential"|"app_attest"|null}>();
+   if (!row) throw new AuthError("unauthorized");
++  const target = await env.DB.prepare("SELECT 1 ok FROM machines WHERE id=? AND owner_id=? AND machine_type='desktop_mac' AND state='active'")
++    .bind(row.machine_id, row.owner_id).first();
++  if (!target) throw new AuthError("unauthorized");
+   const state = await env.DB.prepare(`SELECT state FROM ${row.principal_type === "machine" ? "machines" : "devices"} WHERE id=? AND owner_id=?`)
+     .bind(row.principal_id, row.owner_id).first<{state:string}>();
+   if (state?.state !== "active") throw new AuthError(row.principal_type === "machine" ? "machine_revoked" : "device_revoked");
+@@ -230,7 +232,6 @@
+   if (path === "/v1/commercial/devices" && request.method === "GET") return listCommercialDevices(request, env, principal);
+   if (path === "/v1/commercial/customer-portal" && request.method === "POST") return customerPortal(request, env, principal);
+   if (path === "/v1/commercial/releases/current" && request.method === "GET") return currentCommercialRelease(request, env, principal, officialBuild);
+-  if (path === "/v1/commercial/remote-nodes/enrollment" && request.method === "POST") return createRemoteNodeEnrollment(request, env, principal);
+   let commercialMatch = pathMatch(path, /^\/v1\/commercial\/devices\/([^/]+)\/activate$/);
+   if (commercialMatch && request.method === "POST") return activateCommercialDevice(request, env, principal, commercialMatch[1]!);
+   commercialMatch = pathMatch(path, /^\/v1\/commercial\/devices\/([^/]+)\/deactivate$/);
+@@ -253,9 +254,9 @@
+       ? await env.DB.prepare(`SELECT m.id,m.name,m.machine_type,m.state,m.last_seen_at,m.key_version FROM machines m
+           JOIN machine_devices md ON md.owner_id=m.owner_id AND md.machine_id=m.id
+           JOIN device_activations a ON a.owner_id=m.owner_id AND a.machine_id=m.id AND a.state='active'
+-          WHERE m.owner_id=? AND m.state!='revoked' AND md.device_id=? AND md.state='active' ORDER BY m.created_at`)
++          WHERE m.owner_id=? AND m.machine_type='desktop_mac' AND m.state!='revoked' AND md.device_id=? AND md.state='active' ORDER BY m.created_at`)
+           .bind(principal.ownerId, principal.id).all()
+-      : await env.DB.prepare("SELECT id,name,machine_type,state,last_seen_at,key_version FROM machines WHERE owner_id=? AND state!='revoked' ORDER BY created_at")
++      : await env.DB.prepare("SELECT id,name,machine_type,state,last_seen_at,key_version FROM machines WHERE owner_id=? AND machine_type='desktop_mac' AND state!='revoked' ORDER BY created_at")
+           .bind(principal.ownerId).all();
+     return json({ protocol_version: 1, machines: rows.results }, 200, requestId(request));
+   }
+@@ -290,9 +291,9 @@
+   match = pathMatch(path, /^\/v1\/machines\/([^/]+)\/projects$/);
+   if (match && request.method === "GET") {
+     await requireCommercialMachineAccess(env, principal, match[1]!);
+-    const rows = await env.DB.prepare(`SELECT p.project_id,p.name,p.status,p.running_count,p.waiting_count,p.ready_count,p.failed_count,p.attention_count,p.last_activity_at,p.projection_version
++    const rows = await env.DB.prepare(`SELECT p.project_id,p.name,p.status,p.target_host,p.target_status,p.running_count,p.waiting_count,p.ready_count,p.failed_count,p.attention_count,p.last_activity_at,p.projection_version
+       FROM projects p JOIN machine_projection_state ps ON ps.owner_id=p.owner_id AND ps.machine_id=p.machine_id AND ps.active_epoch=p.projection_epoch
+-      WHERE p.owner_id=? AND p.machine_id=? ORDER BY p.last_activity_at DESC`)
++      WHERE p.owner_id=? AND EXISTS (SELECT 1 FROM machines target WHERE target.id=p.machine_id AND target.machine_type='desktop_mac') AND p.machine_id=? ORDER BY p.last_activity_at DESC`)
+       .bind(principal.ownerId, match[1]).all();
+     const presence = await hub(env, match[1]!).fetch("https://hub/presence").then((value) => value.json());
+     return json({ protocol_version: 1, presence, projects: rows.results }, 200, requestId(request));
+@@ -326,12 +327,12 @@
+           FROM sessions s JOIN machine_projection_state ps ON ps.owner_id=s.owner_id AND ps.machine_id=s.machine_id AND ps.active_epoch=s.projection_epoch
+           JOIN machine_devices md ON md.owner_id=s.owner_id AND md.machine_id=s.machine_id
+           JOIN device_activations ma ON ma.owner_id=s.owner_id AND ma.machine_id=s.machine_id AND ma.state='active'
+-          WHERE s.owner_id=? AND s.project_id=? AND md.device_id=? AND md.state='active' ORDER BY s.last_activity_at DESC`)
++          WHERE s.owner_id=? AND EXISTS (SELECT 1 FROM machines target WHERE target.id=s.machine_id AND target.machine_type='desktop_mac') AND s.project_id=? AND md.device_id=? AND md.state='active' ORDER BY s.last_activity_at DESC`)
+           .bind(principal.ownerId, match[1], principal.id).all()
+       : await env.DB.prepare(`SELECT s.session_id,s.project_id,s.machine_id,s.title,s.provider_name,s.status,s.semantic_phase,s.needs_user,s.attention_count,s.changed_file_count,s.validation_summary,s.integration_readiness,s.last_activity_at,s.projection_version
+           FROM sessions s JOIN machine_projection_state ps ON ps.owner_id=s.owner_id AND ps.machine_id=s.machine_id AND ps.active_epoch=s.projection_epoch
+           JOIN device_activations ma ON ma.owner_id=s.owner_id AND ma.machine_id=s.machine_id AND ma.state='active'
+-          WHERE s.owner_id=? AND s.project_id=? ORDER BY s.last_activity_at DESC`)
++          WHERE s.owner_id=? AND EXISTS (SELECT 1 FROM machines target WHERE target.id=s.machine_id AND target.machine_type='desktop_mac') AND s.project_id=? ORDER BY s.last_activity_at DESC`)
+           .bind(principal.ownerId, match[1]).all();
+     return json({ protocol_version: 1, sessions: rows.results }, 200, requestId(request));
+   }
+@@ -341,18 +342,18 @@
+     await requireRemoteControl(env, principal.ownerId);
+     if (principal.type === "device") await requireIosActivation(env, principal.ownerId, principal.id);
+     const rows = principal.type === "device"
+-      ? await env.DB.prepare(`SELECT p.project_id,p.machine_id,p.name,p.status,p.running_count,p.waiting_count,p.ready_count,p.failed_count,
++      ? await env.DB.prepare(`SELECT p.project_id,p.machine_id,p.name,p.status,p.target_host,p.target_status,p.running_count,p.waiting_count,p.ready_count,p.failed_count,
+           p.attention_count,p.last_activity_at,p.projection_version FROM projects p
+           JOIN machine_projection_state ps ON ps.owner_id=p.owner_id AND ps.machine_id=p.machine_id AND ps.active_epoch=p.projection_epoch
+           JOIN machine_devices md ON md.owner_id=p.owner_id AND md.machine_id=p.machine_id
+           JOIN device_activations ma ON ma.owner_id=p.owner_id AND ma.machine_id=p.machine_id AND ma.state='active'
+-          WHERE p.owner_id=? AND p.project_id=? AND md.device_id=? AND md.state='active' LIMIT 2`)
++          WHERE p.owner_id=? AND EXISTS (SELECT 1 FROM machines target WHERE target.id=p.machine_id AND target.machine_type='desktop_mac') AND p.project_id=? AND md.device_id=? AND md.state='active' LIMIT 2`)
+           .bind(principal.ownerId, match[1], principal.id).all()
+-      : await env.DB.prepare(`SELECT p.project_id,p.machine_id,p.name,p.status,p.running_count,p.waiting_count,p.ready_count,p.failed_count,
++      : await env.DB.prepare(`SELECT p.project_id,p.machine_id,p.name,p.status,p.target_host,p.target_status,p.running_count,p.waiting_count,p.ready_count,p.failed_count,
+           p.attention_count,p.last_activity_at,p.projection_version FROM projects p
+           JOIN machine_projection_state ps ON ps.owner_id=p.owner_id AND ps.machine_id=p.machine_id AND ps.active_epoch=p.projection_epoch
+           JOIN device_activations ma ON ma.owner_id=p.owner_id AND ma.machine_id=p.machine_id AND ma.state='active'
+-          WHERE p.owner_id=? AND p.project_id=? LIMIT 2`)
++          WHERE p.owner_id=? AND EXISTS (SELECT 1 FROM machines target WHERE target.id=p.machine_id AND target.machine_type='desktop_mac') AND p.project_id=? LIMIT 2`)
+           .bind(principal.ownerId, match[1]).all();
+     if (rows.results.length !== 1) throw new AuthError("unauthorized");
+     return json({ protocol_version: 1, project: rows.results[0] }, 200, requestId(request));
+@@ -366,12 +367,12 @@
+           FROM attention a JOIN machine_projection_state ps ON ps.owner_id=a.owner_id AND ps.machine_id=a.machine_id AND ps.active_epoch=a.projection_epoch
+           JOIN machine_devices md ON md.owner_id=a.owner_id AND md.machine_id=a.machine_id
+           JOIN device_activations ma ON ma.owner_id=a.owner_id AND ma.machine_id=a.machine_id AND ma.state='active'
+-          WHERE a.owner_id=? AND a.state!='resolved' AND md.device_id=? AND md.state='active' ORDER BY a.updated_at DESC`)
++          WHERE a.owner_id=? AND EXISTS (SELECT 1 FROM machines target WHERE target.id=a.machine_id AND target.machine_type='desktop_mac') AND a.state!='resolved' AND md.device_id=? AND md.state='active' ORDER BY a.updated_at DESC`)
+           .bind(principal.ownerId, principal.id).all()
+       : await env.DB.prepare(`SELECT a.machine_id,a.project_id,a.session_id,a.attention_id,a.type,a.severity,a.summary,a.state,a.remote_actions_json,a.projection_version,a.updated_at
+           FROM attention a JOIN machine_projection_state ps ON ps.owner_id=a.owner_id AND ps.machine_id=a.machine_id AND ps.active_epoch=a.projection_epoch
+           JOIN device_activations ma ON ma.owner_id=a.owner_id AND ma.machine_id=a.machine_id AND ma.state='active'
+-          WHERE a.owner_id=? AND a.state!='resolved' ORDER BY a.updated_at DESC`)
++          WHERE a.owner_id=? AND EXISTS (SELECT 1 FROM machines target WHERE target.id=a.machine_id AND target.machine_type='desktop_mac') AND a.state!='resolved' ORDER BY a.updated_at DESC`)
+           .bind(principal.ownerId).all();
+     return json({ protocol_version: 1, attention: rows.results }, 200, requestId(request));
+   }
+@@ -414,9 +415,10 @@
+   if (communityAppcast && (request.method === "GET" || request.method === "HEAD")) return serveCommunityReleaseObject(request, env, communityAppcast[1]!, "appcast");
+   const communityArtifact = pathMatch(url.pathname, /^\/v1\/community\/releases\/([^/]+)\/artifact\/([^/]+)$/);
+   if (communityArtifact && (request.method === "GET" || request.method === "HEAD")) return serveCommunityReleaseObject(request, env, communityArtifact[1]!, "artifact", communityArtifact[2]!);
++  if (url.pathname.startsWith("/v1/commercial/remote-nodes/")) {
++    return json({protocol_version:1,error:{code:"unsupported_protocol",message:"SSH agents are controlled through the paired Mac."}}, 410, requestId(request));
++  }
+   if (url.pathname === "/v1/machines/register" && request.method === "POST") return registerMachine(request, env);
+-  const enrollment = pathMatch(url.pathname, /^\/v1\/commercial\/remote-nodes\/enrollments\/([^/]+)\/claim$/);
+-  if (enrollment && request.method === "POST") return claimRemoteNodeEnrollment(request, env, enrollment[1]!);
+   const claim = pathMatch(url.pathname, /^\/v1\/pairings\/([^/]+)\/claim$/);
+   if (claim && request.method === "POST") return claimPairing(request, env, claim[1]!);
+   if (url.pathname === "/v1/socket" && request.method === "GET") return connectSocket(request, env);
+diff --git a/test/commercial.test.ts b/test/commercial.test.ts
+--- a/test/commercial.test.ts
++++ b/test/commercial.test.ts
+@@ -545,17 +545,12 @@
+     expect((await third.request(`/v1/commercial/devices/${third.id}/activate`, { method: "POST" })).status).toBe(403);
+   });
+ 
+-  it("enrolls independent SSH nodes and preserves Commercial artifact isolation", async () => {
++  it("retires direct SSH enrollment and preserves Commercial artifact isolation", async () => {
+     const machine = await FakePrincipal.create("machine", MACHINE);
+     const device = await FakePrincipal.create("device", DEVICE);
+     await seedOwned(machine, device, OWNER);
+-    const enrollment = await (await machine.request("/v1/commercial/remote-nodes/enrollment", { method: "POST" })).json<{enrollment_id:string;token:string}>();
+-    const node = await FakePrincipal.create("machine", "22222222-2222-4222-8222-222222222228");
+-    expect((await SELF.fetch(`https://relay.test/v1/commercial/remote-nodes/enrollments/${enrollment.enrollment_id}/claim`, {
+-      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(await node.enrollmentClaim(enrollment.enrollment_id, enrollment.token)),
+-    })).status).toBe(200);
+-    expect(await env.DB.prepare("SELECT machine_type FROM machines WHERE id=?").bind(node.id).first()).toMatchObject({ machine_type: "ssh_remote_node" });
+-    expect((await device.request("/v1/auth/socket-ticket", { method: "POST", body: { machine_id: node.id, role: "device", connection_epoch: crypto.randomUUID() } })).status).toBe(201);
++    expect((await machine.request("/v1/commercial/remote-nodes/enrollment", { method: "POST" })).status).toBe(410);
++    expect((await SELF.fetch("https://relay.test/v1/commercial/remote-nodes/enrollments/retired/claim", {method:"POST"})).status).not.toBe(200);
+ 
+     await env.COMMERCIAL_ARTIFACTS.put("commercial/stable/ditch.dmg", "artifact-bytes");
+     const releaseId = "33333333-3333-4333-8333-333333333333";
+diff --git a/test/hub_projection.test.ts b/test/hub_projection.test.ts
+--- a/test/hub_projection.test.ts
++++ b/test/hub_projection.test.ts
+@@ -381,3 +381,22 @@
+     machineSocket.close(1000, "done"); phone.close(1000, "done");
+   });
+ });
++
++it("persists SSH availability under the Mac across projection replacement and HTTP refresh", async () => {
++  const machine = await FakePrincipal.create("machine", MACHINE);
++  const device = await FakePrincipal.create("device", DEVICE);
++  await seedOwned(machine, device, OWNER);
++  const ws = await openSocket(machine); await frame(ws,"hello");
++  const epoch = crypto.randomUUID();
++  const projectId = "88888888-8888-4888-8888-888888888883";
++  await sendAndReply(ws, stagedFrame("projection_snapshot_begin",epoch,1,{counts:counts(1,0,0)}),"projection_ack",1);
++  await sendAndReply(ws, stagedFrame("projection_snapshot_record",epoch,2,{kind:"project",record:{...projectRecord(projectId,"Remote work"),target_host:"dev-box",target_status:"reconnecting"}}),"projection_ack",2);
++  await sendAndReply(ws, stagedFrame("projection_snapshot_commit",epoch,3,{counts:counts(1,0,0)}),"projection_ack",3);
++  const response = await (await device.request(`/v1/machines/${MACHINE}/projects`)).json();
++  expect(response).toMatchObject({projects:[{project_id:projectId,target_host:"dev-box",target_status:"reconnecting"}]});
++  const nextEpoch = crypto.randomUUID();
++  await sendAndReply(ws,projection(nextEpoch,1,"full_snapshot",{}),"projection_ack",1);
++  await sendAndReply(ws,projection(nextEpoch,2,"session",sessionRecord("99999999-9999-4999-8999-999999999991",projectId)),"projection_ack",2);
++  expect(await (await device.request(`/v1/machines/${MACHINE}/projects`)).json()).toMatchObject({projects:[{target_host:"dev-box",target_status:"reconnecting"}]});
++  ws.close(1000,"done");
++});
+diff --git a/test/mac_mediated.test.ts b/test/mac_mediated.test.ts
+new file mode 100644
+--- /dev/null
++++ b/test/mac_mediated.test.ts
+@@ -0,0 +1,28 @@
++import { env, SELF } from "cloudflare:test";
++import { beforeEach, expect, it } from "vitest";
++import { FakePrincipal, resetDatabase, seedOwned } from "./support/harness";
++import { validateProjectionRecord } from "../src/validation";
++
++beforeEach(resetDatabase);
++it("retired SSH nodes cannot authenticate, appear in the phone roster, or use an earlier socket ticket", async () => {
++  const mac = await FakePrincipal.create("machine", "22222222-2222-4222-8222-222222222222");
++  const phone = await FakePrincipal.create("device", "11111111-1111-4111-8111-111111111111");
++  await seedOwned(mac, phone, "55555555-5555-4555-8555-555555555555");
++  const ticket = await (await phone.request("/v1/auth/socket-ticket", {method:"POST",body:{machine_id:mac.id,role:"device",connection_epoch:crypto.randomUUID()}})).json<{ticket:string}>();
++  expect((await mac.request("/v1/machines")).status).toBe(200);
++  await env.DB.prepare("UPDATE machines SET machine_type='ssh_remote_node' WHERE id=?").bind(mac.id).run();
++  expect((await mac.request("/v1/machines")).status).toBe(401);
++  const roster = await (await phone.request("/v1/machines")).json<{machines:unknown[]}>();
++  expect(roster.machines).toEqual([]);
++  expect((await phone.request("/v1/auth/socket-ticket", {method:"POST",body:{machine_id:mac.id,role:"device",connection_epoch:crypto.randomUUID()}})).status).not.toBe(201);
++  expect((await SELF.fetch(`https://relay.test/v1/socket?ticket=${ticket.ticket}`,{headers:{Upgrade:"websocket"}})).status).not.toBe(101);
++  expect((await phone.request(`/v1/machines/${mac.id}/projection`)).status).not.toBe(200);
++});
++
++it("accepts target availability as Mac project metadata and rejects arbitrary states", () => {
++  const project = {project_id:"22222222-2222-4222-8222-222222222222",name:"SSH project",status:"running",running_count:1,
++    waiting_count:0,ready_count:0,failed_count:0,attention_count:0,last_activity_at:Date.now(),projection_version:1,
++    target_host:"dev-box",target_status:"reconnecting"};
++  expect(()=>validateProjectionRecord("project",project)).not.toThrow();
++  expect(()=>validateProjectionRecord("project",{...project,target_status:"execute"})).toThrow();
++});
+diff --git a/test/releases.test.ts b/test/releases.test.ts
+--- a/test/releases.test.ts
++++ b/test/releases.test.ts
+@@ -404,7 +404,7 @@
+     expect((await current(machine)).status).toBe(403);
+     await env.DB.prepare("UPDATE device_activations SET state='active',deactivated_at=NULL,updated_at=? WHERE machine_id=?").bind(Date.now(), MACHINE).run();
+     await env.DB.prepare("UPDATE machines SET machine_type='ssh_remote_node' WHERE id=?").bind(MACHINE).run();
+-    expect((await current(machine)).status).toBe(403);
++    expect((await current(machine)).status).toBe(401);
+     await env.DB.prepare("UPDATE machines SET machine_type='desktop_mac' WHERE id=?").bind(MACHINE).run();
+     await env.DB.prepare("UPDATE owner_entitlements SET status='expired' WHERE owner_id=?").bind(OWNER).run();
+     expect((await current(machine)).status).toBe(403);
+diff --git a/test/support/harness.ts b/test/support/harness.ts
+--- a/test/support/harness.ts
++++ b/test/support/harness.ts
+@@ -36,15 +36,6 @@
+     const canonical = ["DITCH-PAIRING-CLAIM-1", pairingId, this.id, name, "ios", signing, agreement, secretHash].join("\n");
+     const proof = base64url(await crypto.subtle.sign({ name: "ECDSA", hash: "SHA-256" }, this.signing.privateKey, encoder.encode(canonical)));
+     return { protocol_version: 1, secret, device_id: this.id, name, platform: "ios", signing_public_key: signing, agreement_public_key: agreement, proof };
+-  }
+-
+-  async enrollmentClaim(enrollmentId: string, token: string, name = "Fake SSH Node"): Promise<Record<string, unknown>> {
+-    const signing = await this.signingPublic();
+-    const agreement = await this.agreementPublic();
+-    const tokenHash = base64url(await crypto.subtle.digest("SHA-256", encoder.encode(token)));
+-    const canonical = ["DITCH-REMOTE-NODE-ENROLL-1", enrollmentId, this.id, name, signing, agreement, tokenHash].join("\n");
+-    const proof = base64url(await crypto.subtle.sign({ name: "ECDSA", hash: "SHA-256" }, this.signing.privateKey, encoder.encode(canonical)));
+-    return { protocol_version: 1, token, machine_id: this.id, name, signing_public_key: signing, agreement_public_key: agreement, proof };
+   }
+ 
+   async request(path: string, init: { method?: string; body?: unknown; timestamp?: number; nonce?: string; mutateAfterSigning?: (request: { path: string; method: string; body: string; headers: Headers }) => void } = {}): Promise<Response> {

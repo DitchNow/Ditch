@@ -12,7 +12,7 @@ pub use ditch_community_protocol::{
 };
 
 pub const PROTOCOL_VERSION: u16 = 1;
-pub const REMOTE_RUNTIME_PROTOCOL_VERSION: u16 = 3;
+pub const REMOTE_RUNTIME_PROTOCOL_VERSION: u16 = 4;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Envelope<T> {
@@ -41,6 +41,20 @@ pub enum ClientRequest {
     Shutdown,
     SubscribeEvents {
         since_sequence: u64,
+    },
+    SubscribeEventsSince {
+        epoch: Uuid,
+        sequence: u64,
+    },
+    ReconnectRemoteHost {
+        alias: String,
+    },
+    GetOperationOutcome {
+        request_id: Uuid,
+    },
+    RejoinAgent {
+        agent_id: AgentId,
+        after_sequence: u64,
     },
     SubscribeAttention,
     ListAgentMessages {
@@ -276,25 +290,6 @@ pub enum ClientRequest {
     CurrentCommercialRelease,
     CurrentCommunityRelease,
     RemoteControlStatus,
-    EnsureRemoteMachineIdentity,
-    RemoteMachineControlStatus {
-        alias: String,
-    },
-    CreateRemoteMachinePairing {
-        alias: String,
-    },
-    GetRemoteMachinePairing {
-        alias: String,
-        pairing_id: Uuid,
-    },
-    ConfirmRemoteMachinePairing {
-        alias: String,
-        pairing_id: Uuid,
-    },
-    CancelRemoteMachinePairing {
-        alias: String,
-        pairing_id: Uuid,
-    },
     CreateRemotePairing,
     GetRemotePairing {
         pairing_id: Uuid,
@@ -309,6 +304,13 @@ pub enum ClientRequest {
         device_id: Uuid,
     },
     DisableRemoteControl,
+    GetPermissionRequest {
+        request_id: Uuid,
+    },
+    AnswerAgentQuestions {
+        request_id: Uuid,
+        answers: std::collections::BTreeMap<String, Vec<String>>,
+    },
     ApprovePermission {
         request_id: Uuid,
     },
@@ -323,6 +325,7 @@ pub enum ClientRequest {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum ServerResponse {
+    PermissionDetails(ditch_core::PermissionRequest),
     Health(HealthResponse),
     RuntimeStatus(RuntimeStatus),
     Snapshot(Snapshot),
@@ -344,6 +347,19 @@ pub enum ServerResponse {
     ProjectCreated(Project),
     AgentStarted(AgentRun),
     AgentMessages(AgentMessagePage),
+    OperationOutcome {
+        request_id: Uuid,
+        state: String,
+        response: Option<serde_json::Value>,
+    },
+    AgentRejoined {
+        epoch: Uuid,
+        agent: AgentRun,
+        messages: Vec<SequencedAgentMessage>,
+        next_sequence: u64,
+        has_more: bool,
+        permissions: Vec<PermissionRequest>,
+    },
     HostIdentity(HostIdentityStatus),
     CommercialOffers(ditch_upgrade::CommercialOfferCatalog),
     CommercialCheckout(ditch_upgrade::CheckoutSession),
@@ -525,6 +541,12 @@ pub struct RemoteDirectory {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Snapshot {
+    #[serde(default)]
+    pub event_epoch: Uuid,
+    #[serde(default)]
+    pub event_sequence: u64,
+    #[serde(default)]
+    pub remote_hosts: Vec<RemoteHostPresence>,
     pub projects: Vec<Project>,
     pub tasks: Vec<Task>,
     pub agents: Vec<AgentRun>,
@@ -578,6 +600,10 @@ pub struct RuntimeStatus {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum ServerEvent {
+    Heartbeat,
+    PermissionResolved {
+        request_id: Uuid,
+    },
     SnapshotReplaced(Snapshot),
     AttentionSnapshotReplaced(Vec<RuntimeAttention>),
     RuntimeStatusChanged(RuntimeStatus),

@@ -43,6 +43,8 @@
         "projection_version"
       ],
       "properties": {
+        "target_host": { "type": "string", "maxLength": 128 },
+        "target_status": { "enum": ["online", "offline", "reconnecting", "unknown"] },
         "project_id": { "type": "string", "format": "uuid" },
         "name": { "type": "string", "maxLength": 200 },
         "status": { "type": "string", "maxLength": 40 },

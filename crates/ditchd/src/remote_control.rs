@@ -36,6 +36,8 @@ pub(super) struct RemoteController {
     authenticated_socket_live: bool,
     connection_started: bool,
     projection_wakeup: Option<SyncSender<()>>,
+    commands_inflight: usize,
+    receipt_replay_inflight: bool,
 }
 
 impl RemoteController {
@@ -59,6 +61,8 @@ impl RemoteController {
             authenticated_socket_live: false,
             connection_started: false,
             projection_wakeup: None,
+            commands_inflight: 0,
+            receipt_replay_inflight: false,
         }
     }
 }
@@ -145,41 +149,6 @@ pub(super) fn status(state: Arc<Mutex<RuntimeState>>) -> ServerResponse {
         .replace_remote_devices(&[])
     {
         return protocol_error("remote_store_failed", error.to_string());
-    }
-    status_from_local_store(state)
-}
-
-pub(super) fn ensure_machine_identity(state: Arc<Mutex<RuntimeState>>) -> ServerResponse {
-    if let Some(response) = super::edition::require_remote_control_entitlement(&state) {
-        return response;
-    }
-    let (origin, identity, name) = {
-        let mut guard = state
-            .lock()
-            .expect("runtime state lock should not be poisoned");
-        let Some(origin) = guard.edition.remote.relay_origin.clone() else {
-            return protocol_error(
-                "remote_relay_unavailable",
-                "The remote relay configuration is invalid.",
-            );
-        };
-        let identity = match ensure_identity(&mut guard) {
-            Ok(identity) => identity,
-            Err(error) => return protocol_error("remote_identity_failed", error),
-        };
-        let name = guard
-            .store
-            .remote_machine()
-            .ok()
-            .flatten()
-            .map(|machine| machine.name)
-            .unwrap_or_else(machine_name);
-        (origin, identity, name)
-    };
-    // Registration publishes public keys only. Owner enrollment remains a
-    // separate, short-lived authorization operation.
-    if let Err(error) = register_machine(&origin, &identity, &name) {
-        return protocol_error("remote_registration_failed", error);
     }
     status_from_local_store(state)
 }
@@ -576,6 +545,12 @@ fn ensure_identity(state: &mut RuntimeState) -> Result<MachineIdentity, String> 
 fn remote_identity(
     state: &Arc<Mutex<RuntimeState>>,
 ) -> Result<(String, MachineIdentity), ServerResponse> {
+    if state.lock().unwrap().remote_runtime {
+        return Err(protocol_error(
+            "wrong_execution_target",
+            "Mobile control requires the Mac runtime",
+        ));
+    }
     let (origin, identity, installation_identity) = {
         let mut state = state
             .lock()
@@ -633,7 +608,10 @@ fn signed_request(
     OsRng.fill_bytes(&mut nonce);
     let nonce = URL_SAFE_NO_PAD.encode(nonce);
     let canonical = canonical_request(method, path, body, timestamp, &nonce, identity.machine_id);
-    let request = ureq::request(method, &format!("{origin}{path}"))
+    let request = ureq::AgentBuilder::new()
+        .timeout(StdDuration::from_secs(15))
+        .build()
+        .request(method, &format!("{origin}{path}"))
         .set("X-Ditch-Protocol", "1")
         .set("X-Ditch-Principal-Type", "machine")
         .set("X-Ditch-Principal-Id", &identity.machine_id.to_string())
@@ -765,11 +743,11 @@ fn system_computer_name() -> Option<String> {
 
 #[cfg(not(target_os = "macos"))]
 fn system_computer_name() -> Option<String> {
-    None
+    std::fs::read_to_string("/etc/hostname").ok()
 }
 
 pub(super) fn start_connection(state: Arc<Mutex<RuntimeState>>) {
-    if !has_remote_control_entitlement(&state) {
+    if state.lock().unwrap().remote_runtime || !has_remote_control_entitlement(&state) {
         return;
     }
     let receiver = {
@@ -831,11 +809,27 @@ impl ProjectionSnapshot {
         let agents = state
             .agents
             .values()
+            .filter(|record| {
+                state
+                    .projects
+                    .values()
+                    .any(|project| project.id == record.run.project_id)
+            })
             .map(|record| record.run.clone())
             .collect::<Vec<_>>();
         let mut records = BTreeMap::new();
         for project in state.projects.values() {
-            let value = RemoteProjector::project(project, &agents, &state.attention, 1);
+            let mut value = RemoteProjector::project(project, &agents, &state.attention, 1);
+            if let Some(alias) = super::ssh_remote::remote_alias(project) {
+                value.target_host = Some(alias.to_owned());
+                value.target_status = Some(
+                    state
+                        .remote_connection_states
+                        .get(alias)
+                        .cloned()
+                        .unwrap_or_else(|| "unknown".into()),
+                );
+            }
             if let Ok(record) = serde_json::to_value(value) {
                 records.insert(("project".to_owned(), project.id.0.to_string()), record);
             }
@@ -846,8 +840,22 @@ impl ProjectionSnapshot {
                 records.insert(("session".to_owned(), run.id.0.to_string()), record);
             }
         }
-        for item in &state.attention {
-            let value = RemoteProjector::attention(item, 1);
+        for item in state.attention.iter().filter(|item| {
+            item.project_id
+                .is_none_or(|id| state.projects.values().any(|project| project.id == id))
+        }) {
+            let mut value = RemoteProjector::attention(item, 1);
+            if let Some(request) = state.pending_permissions.get(&item.id) {
+                if !request.questions.is_empty() {
+                    value.kind = "needs_input".into();
+                    value.remote_actions = vec![ditch_remote::RemoteAction {
+                        action_id: item.id,
+                        action_type: ditch_remote::TrustedActionType::Answer,
+                        label: "Answer questions".into(),
+                        confirmation_class: ConfirmationClass::ContextConfirmation,
+                    }];
+                }
+            }
             if let Ok(record) = serde_json::to_value(value) {
                 records.insert(("attention".to_owned(), item.id.to_string()), record);
             }
@@ -1182,12 +1190,54 @@ fn connection_loop(state: Arc<Mutex<RuntimeState>>, receiver: Receiver<()>) {
     }
 }
 
+fn connect_relay_socket(
+    url: &str,
+) -> Result<tungstenite::WebSocket<MaybeTlsStream<std::net::TcpStream>>, String> {
+    use std::net::ToSocketAddrs;
+    let parsed = Url::parse(url).map_err(|_| "invalid relay URL".to_owned())?;
+    let host = parsed.host_str().ok_or("relay host missing")?.to_owned();
+    let port = parsed.port_or_known_default().ok_or("relay port missing")?;
+    let (tx, rx) = mpsc::sync_channel(1);
+    thread::spawn(move || {
+        let _ = tx.send(
+            (host.as_str(), port)
+                .to_socket_addrs()
+                .map(|addresses| addresses.collect::<Vec<_>>()),
+        );
+    });
+    let addresses = rx
+        .recv_timeout(StdDuration::from_secs(10))
+        .map_err(|_| "relay DNS timed out".to_owned())?
+        .map_err(|error| error.to_string())?;
+    let deadline = Instant::now() + StdDuration::from_secs(10);
+    for address in addresses {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        if let Ok(stream) = std::net::TcpStream::connect_timeout(&address, left) {
+            stream
+                .set_read_timeout(Some(StdDuration::from_secs(10)))
+                .map_err(|error| error.to_string())?;
+            stream
+                .set_write_timeout(Some(StdDuration::from_secs(5)))
+                .map_err(|error| error.to_string())?;
+            return tungstenite::client_tls_with_config(url, stream, None, None)
+                .map(|(socket, _)| socket)
+                .map_err(|_| "relay TLS/WebSocket handshake failed".to_owned());
+        }
+    }
+    Err("relay connection timed out".into())
+}
+
 fn connect_once(state: &Arc<Mutex<RuntimeState>>, receiver: &Receiver<()>) -> Result<(), String> {
     if !has_remote_control_entitlement(state) {
         return Err("commercial entitlement is inactive".to_owned());
     }
     let (origin, identity) =
         remote_identity(state).map_err(|_| "remote identity unavailable".to_owned())?;
+    // Refresh authority independently of whether a desktop settings window is open.
+    reconcile_remote_devices(state)?;
     let epoch = Uuid::new_v4();
     let body = serde_json::to_vec(
         &json!({ "machine_id": identity.machine_id, "role": "machine", "connection_epoch": epoch }),
@@ -1202,9 +1252,8 @@ fn connect_once(state: &Arc<Mutex<RuntimeState>>, receiver: &Receiver<()>) -> Re
     let websocket_origin = origin
         .replacen("https://", "wss://", 1)
         .replacen("http://", "ws://", 1);
-    let (mut socket, _) =
-        tungstenite::connect(format!("{websocket_origin}/v1/socket?ticket={ticket}"))
-            .map_err(|error| error.to_string())?;
+    let mut socket =
+        connect_relay_socket(&format!("{websocket_origin}/v1/socket?ticket={ticket}"))?;
     match socket.get_mut() {
         MaybeTlsStream::Plain(stream) => {
             let _ = stream.set_read_timeout(Some(StdDuration::from_millis(200)));
@@ -1233,15 +1282,68 @@ fn connect_once(state: &Arc<Mutex<RuntimeState>>, receiver: &Receiver<()>) -> Re
             ProjectionSnapshot::from_state(&guard),
         )
     };
+    let (completed, results) = mpsc::sync_channel::<Result<String, String>>(8);
     let mut last_heartbeat = Instant::now();
+    let mut last_received = Instant::now();
+    let mut last_receipt_replay = Instant::now() - StdDuration::from_secs(60);
     loop {
         if !has_remote_control_entitlement(state) {
             return Err("commercial entitlement expired".to_owned());
         }
         match socket.read() {
             Ok(Message::Text(text)) => {
+                last_received = Instant::now();
                 match handle_socket_frame(state, &identity, &mut socket, text.as_str())? {
                     RelayFrameAction::None => {}
+                    RelayFrameAction::Command {
+                        command,
+                        body,
+                        authenticated,
+                        key,
+                    } => {
+                        let admitted = {
+                            let mut guard = state.lock().unwrap();
+                            if guard.edition.remote.commands_inflight >= 8 {
+                                false
+                            } else {
+                                guard.edition.remote.commands_inflight += 1;
+                                true
+                            }
+                        };
+                        if !admitted {
+                            let result = RemoteCommandResult {
+                                command_id: command.command_id,
+                                status: "rejected",
+                                error_code: Some("rate_limited"),
+                                result: None,
+                            };
+                            socket
+                                .send(Message::Text(
+                                    command_result_frame(&command, &key, &result)?.into(),
+                                ))
+                                .map_err(|e| e.to_string())?;
+                        } else {
+                            let state = Arc::clone(state);
+                            let completed = completed.clone();
+                            thread::spawn(move || {
+                                let result = super::ssh_remote::with_operation_id(
+                                    command.command_id,
+                                    || {
+                                        execute_command(
+                                            Arc::clone(&state),
+                                            &command,
+                                            &body,
+                                            authenticated,
+                                        )
+                                    },
+                                );
+                                let frame = command_result_frame(&command, &key, &result);
+                                // A closed socket abandons delivery, never the owning runtime's operation.
+                                let _ = completed.send(frame);
+                                state.lock().unwrap().edition.remote.commands_inflight -= 1;
+                            });
+                        }
+                    }
                     RelayFrameAction::ProjectionAck {
                         epoch,
                         sequence,
@@ -1288,6 +1390,18 @@ fn connect_once(state: &Arc<Mutex<RuntimeState>>, receiver: &Receiver<()>) -> Re
             Err(error) => return Err(error.to_string()),
         }
 
+        if last_receipt_replay.elapsed() >= StdDuration::from_secs(60) {
+            schedule_receipt_replay(state, &identity, completed.clone());
+            last_receipt_replay = Instant::now();
+        }
+        while let Ok(frame) = results.try_recv() {
+            socket
+                .send(Message::Text(frame?.into()))
+                .map_err(|e| e.to_string())?;
+        }
+        if last_received.elapsed() > StdDuration::from_secs(60) {
+            return Err("relay heartbeat response timed out".into());
+        }
         if last_heartbeat.elapsed() >= HEARTBEAT_INTERVAL {
             socket
                 .send(Message::Text(
@@ -1330,9 +1444,139 @@ fn connect_once(state: &Arc<Mutex<RuntimeState>>, receiver: &Receiver<()>) -> Re
     }
 }
 
-#[derive(Debug, PartialEq)]
+// A result can finish while the Mac's Relay socket is down. Recover receipts
+// and re-encrypt for the still-authorized phone after reconnect, without work replay.
+fn schedule_receipt_replay(
+    state: &Arc<Mutex<RuntimeState>>,
+    identity: &MachineIdentity,
+    completed: SyncSender<Result<String, String>>,
+) {
+    {
+        let mut guard = state.lock().unwrap();
+        if guard.edition.remote.receipt_replay_inflight {
+            return;
+        }
+        guard.edition.remote.receipt_replay_inflight = true;
+    }
+    let state = Arc::clone(state);
+    let identity = identity.clone();
+    thread::spawn(move || {
+        let commands = state
+            .lock()
+            .unwrap()
+            .store
+            .recent_remote_commands()
+            .unwrap_or_default();
+        let started = Instant::now();
+        for (id, device_id) in commands {
+            if started.elapsed() > StdDuration::from_secs(10) {
+                break;
+            }
+            let (owner_id, version, device, binding, response, connections, aliases) = {
+                let guard = state.lock().unwrap();
+                let Some(machine) = guard
+                    .store
+                    .remote_machine()
+                    .ok()
+                    .flatten()
+                    .filter(|m| m.enabled)
+                else {
+                    break;
+                };
+                let Some(owner) = machine.owner_id else {
+                    break;
+                };
+                let Some(device) = guard.store.remote_devices().ok().and_then(|ds| {
+                    ds.into_iter()
+                        .find(|d| d.device_id == device_id && d.state == "active")
+                }) else {
+                    continue;
+                };
+                let Some((binding, response)) = guard.store.operation_outcome(id).ok().flatten()
+                else {
+                    continue;
+                };
+                (
+                    owner,
+                    machine.key_version,
+                    device,
+                    binding,
+                    response,
+                    guard.remote_connections.clone(),
+                    guard
+                        .projects
+                        .values()
+                        .filter_map(super::ssh_remote::remote_alias)
+                        .map(str::to_owned)
+                        .collect::<Vec<_>>(),
+                )
+            };
+            let mut response =
+                response.and_then(|s| serde_json::from_str::<ServerResponse>(&s).ok());
+            if response.as_ref().is_none_or(|r| matches!(r, ServerResponse::Error(e) if matches!(e.code.as_str(), "operation_outcome_unknown" | "remote_unavailable"))) {
+                let alias = serde_json::from_str::<Value>(&binding).ok().and_then(|v| v.get("alias").and_then(Value::as_str).map(str::to_owned));
+                if let Some(alias) = alias.filter(|a| aliases.contains(a)) {
+                    if let Ok(ServerResponse::OperationOutcome { state: outcome, response: Some(value), .. }) = connections.request(&alias, ditch_protocol::ClientRequest::GetOperationOutcome { request_id:id }) {
+                        if outcome == "completed" { response = serde_json::from_value(value).ok(); }
+                    }
+                }
+            }
+            let Some(response) = response else {
+                continue;
+            };
+            // Unknown receipts are not rebroadcast: an original worker may still
+            // finish, and a delayed unknown must never overwrite its completion.
+            if matches!(&response, ServerResponse::Error(e) if matches!(e.code.as_str(), "operation_outcome_unknown" | "remote_unavailable"))
+            {
+                continue;
+            }
+            let command = RemoteCommand {
+                protocol_version: 1,
+                command_id: id,
+                idempotency_key: id.to_string(),
+                owner_id,
+                machine_id: identity.machine_id,
+                device_id,
+                command_type: RemoteCommandType::SessionPrompt,
+                created_at: Utc::now().timestamp_millis(),
+                expires_at: Utc::now().timestamp_millis() + 60_000,
+                confirmation_class: ConfirmationClass::None,
+                payload: ditch_remote::EncryptedPayload {
+                    key_version: version,
+                    nonce: String::new(),
+                    ciphertext: String::new(),
+                },
+            };
+            let context = PairwiseContext {
+                owner_id,
+                machine_id: identity.machine_id,
+                device_id,
+                key_version: version,
+            };
+            let Ok(key) = identity.derive_pairwise(&device.agreement_public_key, &context) else {
+                continue;
+            };
+            let result = finish_command_response(&state, &command, response);
+            if completed
+                .send(command_result_frame(&command, &key, &result))
+                .is_err()
+            {
+                break;
+            }
+        }
+        state.lock().unwrap().edition.remote.receipt_replay_inflight = false;
+    });
+}
+
+#[derive(Debug)]
 enum RelayFrameAction {
     None,
+    Command {
+        command: RemoteCommand,
+        body: Vec<u8>,
+        authenticated: bool,
+        key: [u8; 32],
+    },
     ProjectionAck {
         epoch: Uuid,
         sequence: u64,
@@ -1514,12 +1758,19 @@ fn handle_socket_frame<S: std::io::Read + std::io::Write>(
             (0..=60_000).contains(&age)
         });
     socket.send(Message::Text(json!({ "protocol_version": 1, "message_id": Uuid::new_v4(), "type": "command_ack", "created_at": Utc::now().timestamp_millis(), "payload": { "command_id": command.command_id, "device_id": command.device_id, "status": "accepted" } }).to_string().into())).map_err(|error| error.to_string())?;
-    let result = execute_command(
-        Arc::clone(state),
-        &command,
-        &serde_json::to_vec(&body).map_err(|error| error.to_string())?,
+    Ok(RelayFrameAction::Command {
+        command,
+        body: serde_json::to_vec(&body).map_err(|error| error.to_string())?,
         authenticated,
-    );
+        key,
+    })
+}
+
+fn command_result_frame(
+    command: &RemoteCommand,
+    key: &[u8; 32],
+    result: &RemoteCommandResult,
+) -> Result<String, String> {
     let result_message_id = Uuid::new_v4();
     let created_at = Utc::now().timestamp_millis();
     let expires_at = created_at + 60_000;
@@ -1534,13 +1785,12 @@ fn handle_socket_frame<S: std::io::Read + std::io::Write>(
         protocol_version: 1,
     };
     let encrypted = encrypt(
-        &key,
+        key,
         &result_aad,
         &serde_json::to_vec(&result).map_err(|error| error.to_string())?,
     )
     .map_err(|_| "result encryption failed".to_owned())?;
-    socket.send(Message::Text(json!({ "protocol_version": 1, "message_id": result_message_id, "type": "command_result", "created_at": created_at, "payload": { "command_id": command.command_id, "device_id": command.device_id, "expires_at": expires_at, "encrypted": encrypted } }).to_string().into())).map_err(|error| error.to_string())?;
-    Ok(RelayFrameAction::None)
+    Ok(json!({ "protocol_version": 1, "message_id": result_message_id, "type": "command_result", "created_at": created_at, "payload": { "command_id": command.command_id, "device_id": command.device_id, "expires_at": expires_at, "encrypted": encrypted } }).to_string())
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -1553,7 +1803,31 @@ pub(super) struct RemoteCommandResult {
 
 /// Execute a decrypted, authenticated command through the same functions used
 /// by the desktop IPC dispatcher. Network code must never bypass this adapter.
+fn manages_session(state: &Arc<Mutex<RuntimeState>>, id: Uuid) -> bool {
+    let guard = state.lock().unwrap();
+    guard
+        .agents
+        .get(&ditch_core::AgentId(id))
+        .is_some_and(|record| {
+            guard
+                .projects
+                .values()
+                .any(|project| project.id == record.run.project_id)
+        })
+}
+
 pub(super) fn execute_command(
+    state: Arc<Mutex<RuntimeState>>,
+    command: &RemoteCommand,
+    plaintext: &[u8],
+    device_owner_authenticated: bool,
+) -> RemoteCommandResult {
+    super::ssh_remote::with_operation_id(command.command_id, || {
+        execute_command_inner(state, command, plaintext, device_owner_authenticated)
+    })
+}
+
+fn execute_command_inner(
     state: Arc<Mutex<RuntimeState>>,
     command: &RemoteCommand,
     plaintext: &[u8],
@@ -1575,14 +1849,15 @@ pub(super) fn execute_command(
     {
         return failure("action_not_allowed");
     }
-    {
+    let duplicate = {
         let mut state = state
             .lock()
             .expect("runtime state lock should not be poisoned");
         let Some(machine) = state.store.remote_machine().ok().flatten() else {
             return failure("unauthorized");
         };
-        if !machine.enabled
+        if state.remote_runtime
+            || !machine.enabled
             || machine.machine_id != command.machine_id
             || machine.owner_id != Some(command.owner_id)
         {
@@ -1610,10 +1885,13 @@ pub(super) fn execute_command(
             command.device_id,
             expires_at,
         ) {
-            Ok(true) => {}
-            Ok(false) => return failure("command_duplicate"),
+            Ok(true) => false,
+            Ok(false) => true,
             Err(_) => return failure("internal_error"),
         }
+    };
+    if let Some(response) = prepare_command_receipt(&state, command, plaintext, duplicate) {
+        return finish_command_response(&state, command, response);
     }
 
     let response = match command.command_type {
@@ -1641,13 +1919,16 @@ pub(super) fn execute_command(
             let Some(project) = project else {
                 return finish_rejected(&state, command, "session_not_found");
             };
-            super::start_codex_session(
+            super::handle_request(
+                ditch_protocol::ClientRequest::StartCodexSession {
+                    project_id: Some(project.id),
+                    project_name: project.name,
+                    project_root: project.root.to_string_lossy().into_owned(),
+                    prompt: payload.initial_prompt,
+                    mode: ditch_core::CodexLaunchMode::Exec,
+                    execution_profile: ditch_core::AgentExecutionProfile::default(),
+                },
                 state.clone(),
-                project.name,
-                project.root.to_string_lossy().into_owned(),
-                payload.initial_prompt,
-                ditch_core::CodexLaunchMode::Exec,
-                ditch_core::AgentExecutionProfile::default(),
             )
         }
         RemoteCommandType::SessionPrompt => {
@@ -1658,11 +1939,16 @@ pub(super) fn execute_command(
             if payload.text.is_empty() || payload.text.chars().count() > 100_000 {
                 return finish_rejected(&state, command, "action_not_allowed");
             }
-            super::prompt_agent(
+            if !manages_session(&state, payload.session_id) {
+                return finish_rejected(&state, command, "session_not_found");
+            }
+            super::handle_request(
+                ditch_protocol::ClientRequest::PromptAgent {
+                    agent_id: ditch_core::AgentId(payload.session_id),
+                    prompt: payload.text,
+                    execution_profile: ditch_core::AgentExecutionProfile::default(),
+                },
                 state.clone(),
-                ditch_core::AgentId(payload.session_id),
-                payload.text,
-                ditch_core::AgentExecutionProfile::default(),
             )
         }
         RemoteCommandType::SessionStop => {
@@ -1670,14 +1956,30 @@ pub(super) fn execute_command(
                 Ok(value) => value,
                 Err(_) => return finish_rejected(&state, command, "action_not_allowed"),
             };
-            super::stop_agent(state.clone(), ditch_core::AgentId(payload.session_id))
+            if !manages_session(&state, payload.session_id) {
+                return finish_rejected(&state, command, "session_not_found");
+            }
+            super::handle_request(
+                ditch_protocol::ClientRequest::StopAgent {
+                    agent_id: ditch_core::AgentId(payload.session_id),
+                },
+                state.clone(),
+            )
         }
         RemoteCommandType::SessionForceKill => {
             let payload: SessionTargetPayload = match serde_json::from_slice(plaintext) {
                 Ok(value) => value,
                 Err(_) => return finish_rejected(&state, command, "action_not_allowed"),
             };
-            super::force_kill_agent(state.clone(), ditch_core::AgentId(payload.session_id))
+            if !manages_session(&state, payload.session_id) {
+                return finish_rejected(&state, command, "session_not_found");
+            }
+            super::handle_request(
+                ditch_protocol::ClientRequest::ForceKillAgent {
+                    agent_id: ditch_core::AgentId(payload.session_id),
+                },
+                state.clone(),
+            )
         }
         RemoteCommandType::AttentionAcknowledge => {
             let value: Value = match serde_json::from_slice(plaintext) {
@@ -1701,30 +2003,239 @@ pub(super) fn execute_command(
             if payload.limit == 0 || payload.limit > 200 {
                 return finish_rejected(&state, command, "action_not_allowed");
             }
-            let page = state
-                .lock()
-                .expect("runtime state lock should not be poisoned")
-                .store
-                .list_agent_messages(
-                    ditch_core::AgentId(payload.session_id),
-                    payload.before_sequence,
-                    payload.limit,
-                );
-            match page {
-                Ok(value) => ServerResponse::AgentMessages(value),
-                Err(_) => return finish_rejected(&state, command, "session_not_found"),
+            if !manages_session(&state, payload.session_id) {
+                return finish_rejected(&state, command, "session_not_found");
+            }
+            super::handle_request(
+                ditch_protocol::ClientRequest::ListAgentMessages {
+                    agent_id: ditch_core::AgentId(payload.session_id),
+                    before_sequence: payload.before_sequence,
+                    limit: payload.limit,
+                },
+                state.clone(),
+            )
+        }
+        RemoteCommandType::ApprovalRespond
+        | RemoteCommandType::QueryApproval
+        | RemoteCommandType::AttentionExecute => {
+            let payload: Value = match serde_json::from_slice(plaintext) {
+                Ok(value) => value,
+                Err(_) => return finish_rejected(&state, command, "action_not_allowed"),
+            };
+            let id = match uuid_field(&payload, "attention_id") {
+                Ok(id) => id,
+                Err(_) => return finish_rejected(&state, command, "action_not_allowed"),
+            };
+            if command.command_type != RemoteCommandType::QueryApproval
+                && payload.get("action_id").and_then(Value::as_str) != Some(id.to_string().as_str())
+            {
+                return finish_rejected(&state, command, "action_not_allowed");
+            }
+            let pending = state.lock().unwrap().pending_permissions.get(&id).cloned();
+            let Some(request) = pending else {
+                return finish_rejected(&state, command, "approval_stale");
+            };
+            if !request
+                .agent_id
+                .is_some_and(|agent| manages_session(&state, agent.0))
+            {
+                return finish_rejected(&state, command, "action_not_allowed");
+            }
+            if command.command_type == RemoteCommandType::QueryApproval {
+                super::handle_request(
+                    ditch_protocol::ClientRequest::GetPermissionRequest { request_id: id },
+                    state.clone(),
+                )
+            } else if command.command_type == RemoteCommandType::AttentionExecute {
+                let answers = match payload
+                    .get("answers")
+                    .cloned()
+                    .and_then(|v| serde_json::from_value(v).ok())
+                {
+                    Some(answers) => answers,
+                    None => return finish_rejected(&state, command, "action_not_allowed"),
+                };
+                super::answer_agent_questions(state.clone(), id, answers)
+            } else {
+                let decision = match payload.get("decision").and_then(Value::as_str) {
+                    Some("approve") => super::codex_app_server::PermissionDecision::ApproveOnce,
+                    Some("deny") => super::codex_app_server::PermissionDecision::Deny,
+                    _ => return finish_rejected(&state, command, "action_not_allowed"),
+                };
+                super::respond_permission_for_target(state.clone(), id, decision)
             }
         }
-        // These domain services do not exist in the current shipped runtime.
-        // Fail closed until desktop and remote can share a canonical service.
-        RemoteCommandType::ApprovalRespond
-        | RemoteCommandType::AttentionExecute
-        | RemoteCommandType::AttentionSnooze
+        RemoteCommandType::AttentionSnooze
         | RemoteCommandType::IntegrationApply
         | RemoteCommandType::QuerySessionReview => {
             return finish_rejected(&state, command, "action_not_allowed");
         }
     };
+    finish_command_response(&state, command, response)
+}
+
+// Store target and payload binding before dispatch. A duplicate may only read a
+// completed receipt; it cannot re-execute the mutation after a Mac/SSH failure.
+fn prepare_command_receipt(
+    state: &Arc<Mutex<RuntimeState>>,
+    command: &RemoteCommand,
+    plaintext: &[u8],
+    duplicate: bool,
+) -> Option<ServerResponse> {
+    use sha2::Digest;
+    let payload: Value = match serde_json::from_slice(plaintext) {
+        Ok(value) => value,
+        Err(_) => return Some(protocol_error("action_not_allowed", "Invalid command body")),
+    };
+    let hash = format!(
+        "{:x}",
+        sha2::Sha256::digest(
+            serde_json::to_vec(&(
+                command.command_type,
+                command.device_id,
+                &command.idempotency_key,
+                &payload
+            ))
+            .unwrap()
+        )
+    );
+    let mut guard = state.lock().unwrap();
+    match guard.store.operation_outcome(command.command_id) {
+        Ok(Some((binding, saved))) => {
+            let binding: Value = match serde_json::from_str(&binding) {
+                Ok(v) => v,
+                Err(_) => {
+                    return Some(protocol_error(
+                        "operation_conflict",
+                        "Command identity is already in use",
+                    ));
+                }
+            };
+            if binding.get("hash").and_then(Value::as_str) != Some(hash.as_str()) {
+                return Some(protocol_error(
+                    "operation_conflict",
+                    "Command identity belongs to a different payload",
+                ));
+            }
+            if let Some(response) =
+                saved.and_then(|s| serde_json::from_str::<ServerResponse>(&s).ok())
+            {
+                if !matches!(&response, ServerResponse::Error(e) if e.code == "operation_outcome_unknown" || e.code == "remote_unavailable")
+                {
+                    return Some(response);
+                }
+            }
+            let alias = binding
+                .get("alias")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            let connections = guard.remote_connections.clone();
+            // Retired projects/hosts are never contacted based only on a receipt.
+            let alias = alias.filter(|alias| {
+                guard
+                    .projects
+                    .values()
+                    .any(|p| super::ssh_remote::remote_alias(p) == Some(alias.as_str()))
+            });
+            drop(guard);
+            if let Some(alias) = alias {
+                if let Ok(ServerResponse::OperationOutcome {
+                    state,
+                    response: Some(response),
+                    ..
+                }) = connections.request(
+                    &alias,
+                    ditch_protocol::ClientRequest::GetOperationOutcome {
+                        request_id: command.command_id,
+                    },
+                ) {
+                    if state == "completed" {
+                        if let Ok(response) = serde_json::from_value(response) {
+                            return Some(response);
+                        }
+                    }
+                }
+            }
+            Some(protocol_error(
+                "operation_outcome_unknown",
+                "Command may have executed; reconnect and inspect the session before sending new work",
+            ))
+        }
+        Ok(None) if duplicate => Some(protocol_error(
+            "operation_outcome_unknown",
+            "Previous command has no completed receipt",
+        )),
+        Ok(None) => {
+            let project_id = payload
+                .get("project_id")
+                .and_then(Value::as_str)
+                .and_then(|v| Uuid::parse_str(v).ok())
+                .map(ditch_core::ProjectId)
+                .or_else(|| {
+                    payload
+                        .get("session_id")
+                        .and_then(Value::as_str)
+                        .and_then(|v| Uuid::parse_str(v).ok())
+                        .and_then(|id| {
+                            guard
+                                .agents
+                                .get(&ditch_core::AgentId(id))
+                                .map(|a| a.run.project_id)
+                        })
+                });
+            let alias = project_id
+                .and_then(|id| guard.projects.values().find(|p| p.id == id))
+                .and_then(super::ssh_remote::remote_alias)
+                .map(str::to_owned)
+                .or_else(|| {
+                    payload
+                        .get("attention_id")
+                        .and_then(Value::as_str)
+                        .and_then(|v| Uuid::parse_str(v).ok())
+                        .and_then(|id| {
+                            guard
+                                .remote_permission_hosts
+                                .get(&id)
+                                .or_else(|| guard.remote_attention_hosts.get(&id))
+                                .cloned()
+                        })
+                });
+            let binding = json!({"hash":hash,"alias":alias}).to_string();
+            match guard.store.reserve_operation(command.command_id, &binding) {
+                Ok(true) => None,
+                _ => Some(protocol_error(
+                    "operation_outcome_unknown",
+                    "Unable to reserve command receipt",
+                )),
+            }
+        }
+        Err(_) => Some(protocol_error(
+            "operation_outcome_unknown",
+            "Unable to read command receipt",
+        )),
+    }
+}
+
+fn finish_command_response(
+    state: &Arc<Mutex<RuntimeState>>,
+    command: &RemoteCommand,
+    response: ServerResponse,
+) -> RemoteCommandResult {
+    // Conflicting duplicate requests must never overwrite the original receipt.
+    if !matches!(&response, ServerResponse::Error(e) if e.code == "operation_conflict") {
+        let saved = state.lock().unwrap().store.finish_operation(
+            command.command_id,
+            &serde_json::to_string(&response).unwrap(),
+        );
+        if saved.is_err() {
+            return RemoteCommandResult {
+                command_id: command.command_id,
+                status: "rejected",
+                error_code: Some("operation_outcome_unknown"),
+                result: None,
+            };
+        }
+    }
     let result = serde_json::to_value(&response).ok();
     let (status, error_code) = match &response {
         ServerResponse::Error(error) => ("rejected", Some(error.code.as_str())),
@@ -1746,8 +2257,12 @@ pub(super) fn execute_command(
         command_id: command.command_id,
         status,
         error_code: match owned_error.as_deref() {
+            Some("permission_not_found") => Some("approval_stale"),
             Some("agent_not_found") => Some("session_not_found"),
             Some("agent_busy") => Some("session_not_running"),
+            Some("remote_unavailable") => Some("remote_unavailable"),
+            Some("operation_outcome_unknown") => Some("operation_outcome_unknown"),
+            Some("operation_conflict") => Some("operation_conflict"),
             Some(_) => Some("action_not_allowed"),
             None => None,
         },
@@ -1761,6 +2276,10 @@ fn finish_rejected(
     code: &'static str,
 ) -> RemoteCommandResult {
     if let Ok(mut state) = state.lock() {
+        let _ = state.store.finish_operation(
+            command.command_id,
+            &serde_json::to_string(&protocol_error(code, code)).unwrap(),
+        );
         let _ = state
             .store
             .finish_remote_command(command.command_id, "rejected", Some(code), None);
@@ -1784,15 +2303,7 @@ fn remote_error_code(error: &ditch_remote::RemoteError) -> &'static str {
 
 #[cfg(test)]
 mod relay_origin_tests {
-    use super::{
-        MAX_MACHINE_NAME_CHARS, ProjectionAckOutcome, ProjectionSnapshot, ProjectionTransport,
-        active_devices_from_response, configured_relay_origin, machine_device_path,
-        machine_devices_path, preferred_machine_name,
-    };
-    use ditch_remote::ProjectProjection;
-    use serde_json::{Value, json};
-    use uuid::Uuid;
-
+    use super::*;
     #[derive(Default)]
     struct FakeProjectionRelay {
         active: ProjectionSnapshot,
@@ -1958,6 +2469,8 @@ mod relay_origin_tests {
     #[test]
     fn transmitted_projection_frame_keeps_timestamp_as_json_integer() {
         let project = ProjectProjection {
+            target_host: None,
+            target_status: None,
             project_id: Uuid::new_v4(),
             name: "Fixture project".into(),
             status: "idle".into(),
@@ -2171,3 +2684,7 @@ mod relay_origin_tests {
         assert!(transport.dirty);
     }
 }
+
+#[cfg(test)]
+#[path = "mac_mediated_tests.rs"]
+mod mac_mediated_tests;

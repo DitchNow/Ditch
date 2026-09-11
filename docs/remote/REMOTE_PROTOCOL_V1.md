@@ -154,6 +154,7 @@ attention.snooze
 integration.apply
 query.session_transcript
 query.session_review
+query.approval
 ```
 
 There is no generic RPC. `shell.execute`, `pty.write`, `run_command`,
@@ -256,3 +257,37 @@ There is no email/password recovery. A surviving Mac revokes a lost phone and
 pairs another. Loss of all machines and phones has no v1 recovery path. Remote
 identity deletion never deletes local projects. Disabling Remote Control closes
 the machine socket and revokes remote authorization while local Ditch continues.
+
+
+### Mac-mediated SSH recovery (SSH runtime protocol 4)
+
+The only control path is Mobile -> Relay -> Mac ditchd -> SSH -> remote ditchd.
+Mobile pairs with the Mac and retains its existing encrypted Mac channel. SSH
+hosts are execution targets of Mac-managed projects, never separately paired
+Mobile machines. They neither enroll in Relay nor publish their own projections.
+Legacy remote-node enrollment endpoints and SSH-node Mobile access are retired.
+
+Mac projections include local and configured SSH projects, agents and attention.
+All Mobile envelopes retain the paired Mac machine ID. Project records may include
+`target_host` (an SSH alias) and `target_status` (`online`, `offline`, `reconnecting`,
+`unknown`). Omission means local execution. Agent state remains last known when a
+host is disconnected; target availability is reported separately.
+
+`query.approval` takes encrypted `{attention_id}` and returns encrypted request
+details through the Mac. Approval decisions and typed question answers use the
+same owning-runtime dispatch as desktop. `attention.execute` accepts an `answers`
+map from question IDs to answer arrays; action/request identity must still be live.
+
+Mobile control requires the Mac runtime online. A disconnected SSH target reports
+`remote_unavailable`; an unconfirmed mutation reports `operation_outcome_unknown`.
+The same command ID and body may recover a receipt, but never resend a mutation.
+Reusing an ID for a different payload is `operation_conflict`. Rejoin reads session
+state and transcript without submitting a prompt. No automatic offline work queue.
+
+Neither remote-host key discovery nor the discarded bound-enrollment migration
+is part of this extension. Relay migration `0017_mac_ssh_targets.sql` adds only
+nullable SSH target metadata to Mac-owned project projections. Existing Mac/device
+encryption, pairing and authorization remain. The Mac retries delivery of saved
+mutation results from the last 15 minutes after Relay reconnect (up to 64 recent
+receipts), re-encrypting for authorized devices. This never resubmits agent work;
+older uncertain operations remain inspectable through session rejoin.

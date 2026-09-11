@@ -11,3 +11,10 @@ The Flutter application is a thin private composition root. It depends on `commu
 Commercial `ditchd` reuses the exact Community installation identity, refreshes sanitized entitlement from the official backend, and gates only private capability routes and Relay connectivity. The local macOS runtime migrates the legacy `identity/installation-v1.json` private material into the login Keychain after a verified write; headless SSH runtimes retain their protected `~/.ditch` file identity. Relay remains authoritative. Expiry removes `remote_control_v1` from runtime capabilities and closes the Relay path while local sessions, PTYs, persistence, and SSH remain available.
 
 New Community functionality must be consumed from the pinned submodule rather than copied into private UI files. Private protocol contracts remain canonical here and are exported deterministically to the private Relay and iPhone repositories. Commercial-only SQLite tables live behind `CommercialStoreExt`, while the canonical Community `DitchStore` retains the only connection and migration authority.
+
+Mobile control follows exactly `Mobile ↔ Relay ↔ Mac ditchd ↔ SSH ↔ Remote ditchd ↔ Agents`.
+The Mac owns SSH credentials and the Mobile connection. SSH runtimes own remote
+execution and persistence; they do not start Relay connections or Mobile
+entitlement polling and cannot pair with phones. The Mac projects both local
+and configured SSH work under its own Mobile machine identity. Mobile retains
+its existing paired Mac encryption keys and never discovers SSH-host keys.

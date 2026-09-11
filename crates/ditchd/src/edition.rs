@@ -122,6 +122,9 @@ pub fn after_broadcast(state: &mut RuntimeState) {
 }
 
 pub fn start(state: Arc<Mutex<RuntimeState>>) {
+    if state.lock().unwrap().remote_runtime {
+        return;
+    }
     start_entitlement_reconciler(Arc::clone(&state));
     remote_control::start_connection(state);
 }
@@ -193,17 +196,13 @@ fn refresh_entitlement_now(state: &Arc<Mutex<RuntimeState>>) -> RefreshOutcome {
                     guard.edition.entitlement_refresh_failures.saturating_add(1);
                 guard.edition.entitlement_refresh_failures
             };
-            log_entitlement_refresh_failure(state, &error, failures);
+            log_entitlement_refresh_failure(state, &error.to_string(), failures);
             RefreshOutcome::Failed(failures)
         }
     }
 }
 
-fn log_entitlement_refresh_failure(
-    state: &Arc<Mutex<RuntimeState>>,
-    error: &ditch_commercial::EntitlementRefreshError,
-    failures: u32,
-) {
+fn log_entitlement_refresh_failure(state: &Arc<Mutex<RuntimeState>>, error: &str, failures: u32) {
     let message = format!("Commercial entitlement refresh attempt {failures} failed: {error}");
     eprintln!("The Ditch Runtime {message}");
     let path = state
@@ -250,6 +249,12 @@ pub fn accept_commercial_entitlement(
 pub fn require_remote_control_entitlement(
     state: &Arc<Mutex<RuntimeState>>,
 ) -> Option<ServerResponse> {
+    if state.lock().unwrap().remote_runtime {
+        return Some(protocol_error(
+            "wrong_execution_target",
+            "Mobile control is available through the Mac runtime only",
+        ));
+    }
     let availability = {
         let guard = state
             .lock()
@@ -307,38 +312,14 @@ fn entitlement_required(status: CommercialEntitlementStatus) -> ServerResponse {
 }
 
 pub fn handle_request(request: ClientRequest, state: Arc<Mutex<RuntimeState>>) -> ServerResponse {
+    if state.lock().unwrap().remote_runtime {
+        return protocol_error(
+            "wrong_execution_target",
+            "Mobile control is available through the Mac runtime only",
+        );
+    }
     match request {
         ClientRequest::RemoteControlStatus => remote_control::status(state),
-        ClientRequest::EnsureRemoteMachineIdentity => {
-            remote_control::ensure_machine_identity(state)
-        }
-        ClientRequest::RemoteMachineControlStatus { alias } => {
-            forward_remote_machine_request(&state, &alias, ClientRequest::RemoteControlStatus)
-        }
-        ClientRequest::CreateRemoteMachinePairing { alias } => {
-            forward_remote_machine_request(&state, &alias, ClientRequest::CreateRemotePairing)
-        }
-        ClientRequest::GetRemoteMachinePairing { alias, pairing_id } => {
-            forward_remote_machine_request(
-                &state,
-                &alias,
-                ClientRequest::GetRemotePairing { pairing_id },
-            )
-        }
-        ClientRequest::ConfirmRemoteMachinePairing { alias, pairing_id } => {
-            forward_remote_machine_request(
-                &state,
-                &alias,
-                ClientRequest::ConfirmRemotePairing { pairing_id },
-            )
-        }
-        ClientRequest::CancelRemoteMachinePairing { alias, pairing_id } => {
-            forward_remote_machine_request(
-                &state,
-                &alias,
-                ClientRequest::CancelRemotePairing { pairing_id },
-            )
-        }
         ClientRequest::CreateRemotePairing => remote_control::create_pairing(state),
         ClientRequest::GetRemotePairing { pairing_id } => {
             remote_control::get_pairing(state, pairing_id)
@@ -358,21 +339,6 @@ pub fn handle_request(request: ClientRequest, state: Arc<Mutex<RuntimeState>>) -
             "request is not implemented by this Commercial capability composition",
         ),
     }
-}
-
-fn forward_remote_machine_request(
-    state: &Arc<Mutex<RuntimeState>>,
-    alias: &str,
-    request: ClientRequest,
-) -> ServerResponse {
-    let connections = state
-        .lock()
-        .expect("runtime state lock should not be poisoned")
-        .remote_connections
-        .clone();
-    connections
-        .request(alias, request)
-        .unwrap_or_else(|error| protocol_error("remote_unavailable", error.to_string()))
 }
 
 #[cfg(test)]

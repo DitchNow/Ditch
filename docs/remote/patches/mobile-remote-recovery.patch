@@ -1,0 +1,1681 @@
+diff --git a/contracts/remote-v1/REMOTE_PROTOCOL_V1.md b/contracts/remote-v1/REMOTE_PROTOCOL_V1.md
+--- a/contracts/remote-v1/REMOTE_PROTOCOL_V1.md
++++ b/contracts/remote-v1/REMOTE_PROTOCOL_V1.md
+@@ -54,6 +54,29 @@
+ The verifier enforces a five-minute clock window, consumes a nonce once for ten
+ minutes, verifies principal state, and derives owner scope from the database.
+ Client-supplied `owner_id` is never an authorization source.
++
++## Device roster and revocation
++
++The relay is authoritative for machine-device authorization. Owner identity is
++the tenancy boundary but does not automatically grant every owner device access
++to every owner machine. Pairing creates an explicit many-to-many authorization
++between one machine and one device.
++
++A signed machine `GET /v1/machines/{machine_id}/devices` returns the complete
++set of active devices authorized for that machine, including the public keys
++needed for pairwise command validation. A machine may request only its own
++roster. Before desktop Remote settings are displayed, `ditchd` transactionally
++replaces its local `remote_devices` cache with this snapshot. An empty array is
++a valid complete snapshot.
++
++`DELETE /v1/machines/{machine_id}/devices/{device_id}` revokes only that
++machine-device authorization. Machine-initiated revocation also deletes the
++corresponding local row immediately. Device-initiated disconnection is removed
++locally by the next settings reconciliation. Global device-identity revocation
++is a separate operation that removes all of the device's machine
++authorizations. Revoked authorization tombstones are not displayed, and a
++failed roster request must not be represented as a successful cached device
++list.
+ 
+ ## Pairing
+ 
+@@ -131,6 +154,7 @@
+ integration.apply
+ query.session_transcript
+ query.session_review
++query.approval
+ ```
+ 
+ There is no generic RPC. `shell.execute`, `pty.write`, `run_command`,
+@@ -142,14 +166,65 @@
+ 
+ ## Projection sequencing
+ 
+-Each machine publishes `{epoch, sequence}`. The relay applies the next sequence,
+-ignores an exact duplicate, rejects stale epochs and out-of-order updates, and
+-requests a full sanitized snapshot on a gap. Reconnect creates a fresh epoch and
+-starts with a full snapshot. Local SQLite is authoritative.
++Each machine publishes `{epoch, sequence}`. Only one projection frame is in
++flight per machine in v1. The relay commits the exact next sequence and then
++returns `projection_ack`; an exact duplicate returns a duplicate ACK without
++repeating its mutation. The Mac does not advance its durable acknowledged
++sequence until that ACK arrives.
++
++A full reconciliation is staged using:
++
++```text
++projection_snapshot_begin
++projection_snapshot_record (zero or more)
++projection_snapshot_commit
++```
++
++Begin and commit include exact `projects`, `sessions`, and `attention` record
++counts. Snapshot records use the same allowlisted records as incremental
++updates. The relay writes the new epoch as staging data. It keeps the previous
++committed epoch visible until it validates and commits the complete new
++snapshot. A disconnect, timeout, or invalid record before commit cannot clear
++the last committed projection.
++
++After snapshot commit, `projection_update` carries one changed record or an
++explicit delete record. `ditchd` coalesces repeated changes by stable domain ID,
++sends no more than 32 records in an incremental batch, and never queues an
++unbounded stream of projection payloads.
++
++Every projection data frame contains exact `owner_id`, `machine_id`, `epoch`,
++and positive `sequence` fields. The owner and machine must match the
++authenticated WebSocket attachment. Acknowledgements contain:
++
++```json
++{"epoch":"uuid","accepted_sequence":42,"status":"applied"}
++```
++
++The only ACK statuses are `applied` and `duplicate`. On an out-of-order frame,
++the relay does not mutate projection data and returns:
++
++```json
++{"epoch":"uuid","expected_sequence":42,"received_sequence":44,"full_snapshot_required":true}
++```
++
++On `projection_gap`, `ditchd` abandons all queued and in-flight work for that
++epoch, creates a fresh random epoch at sequence one, and sends a new staged
++snapshot. Stale ACKs and gaps from an abandoned epoch are ignored. Reconnect
++also creates a fresh epoch and staged snapshot. Local SQLite remains
++authoritative.
+ 
+ Project, session, and attention projections are explicit allowlists. In
+ particular, project root paths, prompts, transcript bodies, terminal output,
+ source, Git objects, and environment data are excluded.
++
++All Remote Protocol v1 timestamp fields, including project and session
++`last_activity_at`, are signed 64-bit Unix epoch milliseconds encoded as JSON
++integers. RFC3339 strings are not a valid wire representation.
++
++Heartbeat, inbound command, gap, acknowledgement, and revocation processing
++take priority over projection transmission. Projection backpressure cannot make
++an authenticated but unresponsive socket appear healthy, and cannot block
++local execution.
+ 
+ ## Transcripts
+ 
+@@ -183,3 +258,36 @@
+ identity deletion never deletes local projects. Disabling Remote Control closes
+ the machine socket and revokes remote authorization while local Ditch continues.
+ 
++
++### Mac-mediated SSH recovery (SSH runtime protocol 4)
++
++The only control path is Mobile -> Relay -> Mac ditchd -> SSH -> remote ditchd.
++Mobile pairs with the Mac and retains its existing encrypted Mac channel. SSH
++hosts are execution targets of Mac-managed projects, never separately paired
++Mobile machines. They neither enroll in Relay nor publish their own projections.
++Legacy remote-node enrollment endpoints and SSH-node Mobile access are retired.
++
++Mac projections include local and configured SSH projects, agents and attention.
++All Mobile envelopes retain the paired Mac machine ID. Project records may include
++`target_host` (an SSH alias) and `target_status` (`online`, `offline`, `reconnecting`,
++`unknown`). Omission means local execution. Agent state remains last known when a
++host is disconnected; target availability is reported separately.
++
++`query.approval` takes encrypted `{attention_id}` and returns encrypted request
++details through the Mac. Approval decisions and typed question answers use the
++same owning-runtime dispatch as desktop. `attention.execute` accepts an `answers`
++map from question IDs to answer arrays; action/request identity must still be live.
++
++Mobile control requires the Mac runtime online. A disconnected SSH target reports
++`remote_unavailable`; an unconfirmed mutation reports `operation_outcome_unknown`.
++The same command ID and body may recover a receipt, but never resend a mutation.
++Reusing an ID for a different payload is `operation_conflict`. Rejoin reads session
++state and transcript without submitting a prompt. No automatic offline work queue.
++
++Neither remote-host key discovery nor the discarded bound-enrollment migration
++is part of this extension. Relay migration `0017_mac_ssh_targets.sql` adds only
++nullable SSH target metadata to Mac-owned project projections. Existing Mac/device
++encryption, pairing and authorization remain. The Mac retries delivery of saved
++mutation results from the last 15 minutes after Relay reconnect (up to 64 recent
++receipts), re-encrypting for authorized devices. This never resubmits agent work;
++older uncertain operations remain inspectable through session rejoin.
+diff --git a/contracts/remote-v1/fixtures/v1.json b/contracts/remote-v1/fixtures/v1.json
+--- a/contracts/remote-v1/fixtures/v1.json
++++ b/contracts/remote-v1/fixtures/v1.json
+@@ -18,6 +18,22 @@
+     "secret": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+     "expires_at": 1787596980000
+   },
++  "machine_device_roster": {
++    "protocol_version": 1,
++    "devices": [
++      {
++        "id": "11111111-1111-4111-8111-111111111111",
++        "name": "Fixture iPhone",
++        "platform": "ios",
++        "state": "active",
++        "signing_public_key": "BEpzUDasQTezvS3DbSVeuAqDbQ7lL27drGz6T2wFxigZ7q0Cq5KV0ZgV3gGsCWAQq6d1GgTTArxB7r-tF3UsNeY",
++        "agreement_public_key": "BKLLvBAvoHGRc8aMEJgGlYX6M_FcwKQqu8B5czZ-XzsEoEvQgqAK7cDxfc1NpOQVmXFm6pfcyXSoSm5bfEoo05E",
++        "key_version": 1,
++        "authorized_at": 1787596790000,
++        "last_seen_at": 1787596800000
++      }
++    ]
++  },
+   "valid_command": {
+     "protocol_version": 1,
+     "command_id": "44444444-4444-4444-8444-444444444444",
+@@ -36,5 +52,135 @@
+     {"epoch":"66666666-6666-4666-8666-666666666666","sequence":1,"expected":"duplicate"},
+     {"epoch":"66666666-6666-4666-8666-666666666666","sequence":3,"expected":"gap"}
+   ],
++  "projection_envelopes": {
++    "snapshot_begin": {
++      "protocol_version": 1,
++      "message_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1",
++      "type": "projection_snapshot_begin",
++      "created_at": 1787596800000,
++      "payload": {
++        "owner_id": "55555555-5555-4555-8555-555555555555",
++        "machine_id": "22222222-2222-4222-8222-222222222222",
++        "epoch": "66666666-6666-4666-8666-666666666666",
++        "sequence": 1,
++        "counts": {"projects": 1, "sessions": 1, "attention": 0}
++      }
++    },
++    "snapshot_record": {
++      "protocol_version": 1,
++      "message_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa5",
++      "type": "projection_snapshot_record",
++      "created_at": 1787596800100,
++      "payload": {
++        "owner_id": "55555555-5555-4555-8555-555555555555",
++        "machine_id": "22222222-2222-4222-8222-222222222222",
++        "epoch": "66666666-6666-4666-8666-666666666666",
++        "sequence": 2,
++        "kind": "project",
++        "record": {
++          "project_id": "88888888-8888-4888-8888-888888888888",
++          "name": "Fixture project",
++          "status": "running",
++          "running_count": 1,
++          "waiting_count": 0,
++          "ready_count": 0,
++          "failed_count": 0,
++          "attention_count": 1,
++          "last_activity_at": 1787596800000,
++          "projection_version": 2
++        }
++      }
++    },
++    "snapshot_commit": {
++      "protocol_version": 1,
++      "message_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa2",
++      "type": "projection_snapshot_commit",
++      "created_at": 1787596800200,
++      "payload": {
++        "owner_id": "55555555-5555-4555-8555-555555555555",
++        "machine_id": "22222222-2222-4222-8222-222222222222",
++        "epoch": "66666666-6666-4666-8666-666666666666",
++        "sequence": 4,
++        "counts": {"projects": 1, "sessions": 1, "attention": 0}
++      }
++    },
++    "ack": {
++      "protocol_version": 1,
++      "message_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa3",
++      "type": "projection_ack",
++      "created_at": 1787596800201,
++      "payload": {
++        "epoch": "66666666-6666-4666-8666-666666666666",
++        "accepted_sequence": 4,
++        "status": "applied"
++      }
++    },
++    "incremental_update": {
++      "protocol_version": 1,
++      "message_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa6",
++      "type": "projection_update",
++      "created_at": 1787596800300,
++      "payload": {
++        "owner_id": "55555555-5555-4555-8555-555555555555",
++        "machine_id": "22222222-2222-4222-8222-222222222222",
++        "epoch": "66666666-6666-4666-8666-666666666666",
++        "sequence": 5,
++        "kind": "project",
++        "record": {
++          "project_id": "88888888-8888-4888-8888-888888888888",
++          "name": "Fixture project",
++          "status": "idle",
++          "running_count": 0,
++          "waiting_count": 0,
++          "ready_count": 0,
++          "failed_count": 0,
++          "attention_count": 0,
++          "last_activity_at": 1787596800300,
++          "projection_version": 5
++        }
++      }
++    },
++    "gap": {
++      "protocol_version": 1,
++      "message_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa4",
++      "type": "projection_gap",
++      "created_at": 1787596800202,
++      "payload": {
++        "epoch": "66666666-6666-4666-8666-666666666666",
++        "expected_sequence": 5,
++        "received_sequence": 7,
++        "full_snapshot_required": true
++      }
++    }
++  },
++  "projection_records": {
++    "project": {
++      "project_id": "88888888-8888-4888-8888-888888888888",
++      "name": "Fixture project",
++      "status": "running",
++      "running_count": 1,
++      "waiting_count": 0,
++      "ready_count": 0,
++      "failed_count": 0,
++      "attention_count": 1,
++      "last_activity_at": 1787596800000,
++      "projection_version": 1
++    },
++    "session": {
++      "session_id": "99999999-9999-4999-8999-999999999999",
++      "project_id": "88888888-8888-4888-8888-888888888888",
++      "title": "Fixture session",
++      "provider_name": "Codex",
++      "status": "working",
++      "semantic_phase": "Implementing",
++      "needs_user": false,
++      "attention_count": 0,
++      "changed_file_count": 2,
++      "validation_summary": null,
++      "integration_readiness": null,
++      "last_activity_at": 1787596800123,
++      "projection_version": 1
++    }
++  },
+   "error": {"error":{"code":"machine_offline","message":"The Mac is offline.","request_id":"77777777-7777-4777-8777-777777777777","retryable":false}}
+ }
+diff --git a/contracts/remote-v1/manifest.json b/contracts/remote-v1/manifest.json
+--- a/contracts/remote-v1/manifest.json
++++ b/contracts/remote-v1/manifest.json
+@@ -2,19 +2,19 @@
+   "protocol_version": 1,
+   "package_version": "1.0.0",
+   "canonical_owner": "The Ditch macOS repository",
+-  "source_snapshot_date": "2026-08-25",
+-  "bundle_sha256": "04a96404aa6685127e63383213bbc43f9d4af9a54a88c42c7811b66555b10b9e",
++  "source_snapshot_date": "2026-09-11",
++  "bundle_sha256": "3b08430915120edde6112ca0086915171824a61b0545d4f7b57e89e30513b1c3",
+   "files": {
+-    "REMOTE_PROTOCOL_V1.md": "34c3ae6111a1e9a210afc611941a8dfd9c9b5395d37d4a398e28664178189b90",
++    "REMOTE_PROTOCOL_V1.md": "fe332091444205983ca09fb05ac5e9c2ba26efd6625bc5ffe017f4506927d9ea",
+     "fixtures/crypto-v1.json": "53c71f10411542b3f654dfb3925b8bb41dde31505d6a8eaa584f40ab085dd95a",
+-    "fixtures/v1.json": "3a9b012817d194105b039fc933fee78ccb4863722f8b37f42ce6130efd3d99ef",
+-    "openapi-v1.yaml": "f4cc4d1d6a3c34d5996461750e25ffa43ea7cd420be480901834f5774122f74b",
++    "fixtures/v1.json": "a4ee41d0005bbf9a984f11c544a0b9b1f07a43d529812b651c7fd66e95ddfa12",
++    "openapi-v1.yaml": "ea2a9c663cc0015ae15352d4a9a1a79ea86517892f2dd9a2a09e1128a2423716",
+     "package.json": "7bc06591a283fb241a8dc06c86f4521cc97fda73043eda6cd5d7dd3fe52b8fc1",
+-    "schemas/command.schema.json": "f63433619dd553c692fd10fe81df5e0e17237fe51aa51fb59e8728c6a0df7a2b",
++    "schemas/command.schema.json": "1f8107786046ca942826b44139a701abbbedcf8543a40d4624f01bc6680f4024",
+     "schemas/encrypted-payload.schema.json": "1cb3e30cb4c391f7a8a6a204ff22c780a5876392005420d797bd6eec263ea228",
+     "schemas/error.schema.json": "52c76efc381ede1817d0d3bbfd62f5a589f7b4455e1550e45dd993a868ab4721",
+     "schemas/pairing-qr.schema.json": "fa98c1eba06e8a51f5ee4d9b1c31a7530d10e97123271480a39e5cf6a95f884a",
+-    "schemas/projection.schema.json": "0f7716752bcdc2f723f2d9d3e7f17013fdb5944904405ad518a1887617d71357",
+-    "schemas/ws-envelope.schema.json": "ccd04d22b3fc90cb81bb97bc6317e08e64b50cadc116ec02589b3b3089a7d94f"
++    "schemas/projection.schema.json": "031cc64dbf86bb81f6739b782ef85698cb7c691672b9be28b8ff5d404857b88a",
++    "schemas/ws-envelope.schema.json": "5b1aa6c779faeaf406558e243d5824a411926e1f1deb11f300e20799dfb6b1e8"
+   }
+ }
+diff --git a/contracts/remote-v1/openapi-v1.yaml b/contracts/remote-v1/openapi-v1.yaml
+--- a/contracts/remote-v1/openapi-v1.yaml
++++ b/contracts/remote-v1/openapi-v1.yaml
+@@ -4,7 +4,7 @@
+   version: 1.0.0
+   description: Optional anonymous control plane. All authenticated operations use Ditch signed requests.
+ servers:
+-  - url: https://relay.theditch.dev
++  - url: https://relay.ditchnow.nl
+ paths:
+   /v1/machines/register:
+     post:
+@@ -87,9 +87,38 @@
+       operationId: putPushToken
+       parameters: [{$ref: '#/components/parameters/DeviceId'}]
+       responses: {'204': {description: Updated}, '401': {$ref: '#/components/responses/Error'}}
++  /v1/machines/{machine_id}/devices:
++    get:
++      operationId: listMachineDevices
++      description: Returns the complete active-device roster authorized for this machine. A machine may request only its own roster. Machine clients use this authoritative snapshot to reconcile their local authorization cache before displaying Remote settings.
++      parameters: [{$ref: '#/components/parameters/MachineId'}]
++      responses:
++        '200':
++          description: Active devices authorized for this machine
++          content:
++            application/json:
++              schema:
++                type: object
++                additionalProperties: false
++                required: [protocol_version, devices]
++                properties:
++                  protocol_version: {const: 1}
++                  devices:
++                    type: array
++                    items: {$ref: '#/components/schemas/ActiveDevice'}
++        '401': {$ref: '#/components/responses/Error'}
++  /v1/machines/{machine_id}/devices/{device_id}:
++    delete:
++      operationId: revokeMachineDevice
++      description: Revokes this device's authorization for this machine only. It does not revoke the device identity or its authorization for another machine.
++      parameters:
++        - {$ref: '#/components/parameters/MachineId'}
++        - {$ref: '#/components/parameters/DeviceId'}
++      responses: {'204': {description: Machine-specific authorization revoked}, '401': {$ref: '#/components/responses/Error'}}
+   /v1/devices/{device_id}:
+     delete:
+       operationId: revokeDevice
++      description: Globally revokes the device identity and all of its machine authorizations. The ordinary Mac settings Revoke action does not use this operation.
+       parameters: [{$ref: '#/components/parameters/DeviceId'}]
+       responses: {'204': {description: Revoked}, '401': {$ref: '#/components/responses/Error'}}
+   /v1/machines/{machine_id}/commands:
+@@ -116,6 +145,20 @@
+       description: Stable error envelope
+       content: {application/json: {schema: {$ref: './schemas/error.schema.json'}}}
+   schemas:
++    ActiveDevice:
++      type: object
++      additionalProperties: false
++      required: [id, name, platform, state, signing_public_key, agreement_public_key, key_version, authorized_at, last_seen_at]
++      properties:
++        id: {type: string, format: uuid}
++        name: {type: string, maxLength: 120}
++        platform: {const: ios}
++        state: {const: active}
++        signing_public_key: {type: string}
++        agreement_public_key: {type: string}
++        key_version: {type: integer, minimum: 1}
++        authorized_at: {type: integer}
++        last_seen_at: {type: [integer, 'null']}
+     MachineRegistration:
+       type: object
+       additionalProperties: false
+diff --git a/contracts/remote-v1/schemas/command.schema.json b/contracts/remote-v1/schemas/command.schema.json
+--- a/contracts/remote-v1/schemas/command.schema.json
++++ b/contracts/remote-v1/schemas/command.schema.json
+@@ -1 +1 @@
+-{"$schema":"https://json-schema.org/draft/2020-12/schema","$id":"https://theditch.dev/remote/v1/command.schema.json","title":"RemoteCommand","type":"object","additionalProperties":false,"required":["protocol_version","command_id","idempotency_key","owner_id","machine_id","device_id","type","created_at","expires_at","confirmation_class","payload"],"properties":{"protocol_version":{"const":1},"command_id":{"type":"string","format":"uuid"},"idempotency_key":{"type":"string","minLength":16,"maxLength":128},"owner_id":{"type":"string","format":"uuid"},"machine_id":{"type":"string","format":"uuid"},"device_id":{"type":"string","format":"uuid"},"type":{"enum":["session.start","session.prompt","session.stop","session.force_kill","approval.respond","attention.execute","attention.acknowledge","attention.snooze","integration.apply","query.session_transcript","query.session_review"]},"created_at":{"type":"integer"},"expires_at":{"type":"integer"},"confirmation_class":{"enum":["none","context_confirmation","device_owner_authentication","desktop_only"]},"payload":{"$ref":"encrypted-payload.schema.json"}}}
++{"$schema":"https://json-schema.org/draft/2020-12/schema","$id":"https://theditch.dev/remote/v1/command.schema.json","title":"RemoteCommand","type":"object","additionalProperties":false,"required":["protocol_version","command_id","idempotency_key","owner_id","machine_id","device_id","type","created_at","expires_at","confirmation_class","payload"],"properties":{"protocol_version":{"const":1},"command_id":{"type":"string","format":"uuid"},"idempotency_key":{"type":"string","minLength":16,"maxLength":128},"owner_id":{"type":"string","format":"uuid"},"machine_id":{"type":"string","format":"uuid"},"device_id":{"type":"string","format":"uuid"},"type":{"enum":["session.start","session.prompt","session.stop","session.force_kill","approval.respond","attention.execute","attention.acknowledge","attention.snooze","integration.apply","query.session_transcript","query.session_review","query.approval"]},"created_at":{"type":"integer"},"expires_at":{"type":"integer"},"confirmation_class":{"enum":["none","context_confirmation","device_owner_authentication","desktop_only"]},"payload":{"$ref":"encrypted-payload.schema.json"}}}
+diff --git a/contracts/remote-v1/schemas/projection.schema.json b/contracts/remote-v1/schemas/projection.schema.json
+--- a/contracts/remote-v1/schemas/projection.schema.json
++++ b/contracts/remote-v1/schemas/projection.schema.json
+@@ -1 +1,268 @@
+-{"$schema":"https://json-schema.org/draft/2020-12/schema","$id":"https://theditch.dev/remote/v1/projection.schema.json","title":"ProjectionUpdate","type":"object","additionalProperties":false,"required":["protocol_version","machine_id","epoch","sequence","kind","record"],"properties":{"protocol_version":{"const":1},"machine_id":{"type":"string","format":"uuid"},"epoch":{"type":"string","format":"uuid"},"sequence":{"type":"integer","minimum":1},"kind":{"enum":["full_snapshot","project","session","attention","delete"]},"record":{"type":"object"}}}
++{
++  "$schema": "https://json-schema.org/draft/2020-12/schema",
++  "$id": "https://theditch.dev/remote/v1/projection.schema.json",
++  "title": "ProjectionWebSocketEnvelope",
++  "oneOf": [
++    { "$ref": "#/$defs/snapshotBegin" },
++    { "$ref": "#/$defs/snapshotRecord" },
++    { "$ref": "#/$defs/snapshotCommit" },
++    { "$ref": "#/$defs/incrementalUpdate" },
++    { "$ref": "#/$defs/projectionAck" },
++    { "$ref": "#/$defs/projectionGap" }
++  ],
++  "$defs": {
++    "counts": {
++      "type": "object",
++      "additionalProperties": false,
++      "required": ["projects", "sessions", "attention"],
++      "properties": {
++        "projects": { "type": "integer", "minimum": 0 },
++        "sessions": { "type": "integer", "minimum": 0 },
++        "attention": { "type": "integer", "minimum": 0 }
++      }
++    },
++    "epochMilliseconds": {
++      "type": "integer",
++      "description": "Signed 64-bit Unix epoch milliseconds. RFC3339 strings are invalid.",
++      "minimum": -9223372036854775808,
++      "maximum": 9223372036854775807
++    },
++    "projectRecord": {
++      "type": "object",
++      "additionalProperties": false,
++      "required": [
++        "project_id",
++        "name",
++        "status",
++        "running_count",
++        "waiting_count",
++        "ready_count",
++        "failed_count",
++        "attention_count",
++        "last_activity_at",
++        "projection_version"
++      ],
++      "properties": {
++        "target_host": { "type": "string", "maxLength": 128 },
++        "target_status": { "enum": ["online", "offline", "reconnecting", "unknown"] },
++        "project_id": { "type": "string", "format": "uuid" },
++        "name": { "type": "string", "maxLength": 200 },
++        "status": { "type": "string", "maxLength": 40 },
++        "running_count": { "type": "integer", "minimum": 0 },
++        "waiting_count": { "type": "integer", "minimum": 0 },
++        "ready_count": { "type": "integer", "minimum": 0 },
++        "failed_count": { "type": "integer", "minimum": 0 },
++        "attention_count": { "type": "integer", "minimum": 0 },
++        "last_activity_at": { "$ref": "#/$defs/epochMilliseconds" },
++        "projection_version": { "type": "integer", "minimum": 1 }
++      }
++    },
++    "sessionRecord": {
++      "type": "object",
++      "additionalProperties": false,
++      "required": [
++        "session_id",
++        "project_id",
++        "title",
++        "provider_name",
++        "status",
++        "semantic_phase",
++        "needs_user",
++        "attention_count",
++        "changed_file_count",
++        "validation_summary",
++        "integration_readiness",
++        "last_activity_at",
++        "projection_version"
++      ],
++      "properties": {
++        "session_id": { "type": "string", "format": "uuid" },
++        "project_id": { "type": "string", "format": "uuid" },
++        "title": { "type": "string", "maxLength": 240 },
++        "provider_name": { "type": "string", "maxLength": 80 },
++        "status": { "type": "string", "maxLength": 40 },
++        "semantic_phase": { "type": ["string", "null"], "maxLength": 240 },
++        "needs_user": { "type": "boolean" },
++        "attention_count": { "type": "integer", "minimum": 0 },
++        "changed_file_count": { "type": ["integer", "null"], "minimum": 0 },
++        "validation_summary": { "type": ["string", "null"], "maxLength": 240 },
++        "integration_readiness": { "type": ["string", "null"], "maxLength": 240 },
++        "last_activity_at": { "$ref": "#/$defs/epochMilliseconds" },
++        "projection_version": { "type": "integer", "minimum": 1 }
++      }
++    },
++    "attentionRecord": {
++      "type": "object",
++      "additionalProperties": false,
++      "required": ["attention_id", "project_id", "session_id", "type", "severity", "summary", "state", "remote_actions", "projection_version"],
++      "properties": {
++        "attention_id": { "type": "string", "format": "uuid" },
++        "project_id": { "type": ["string", "null"], "format": "uuid" },
++        "session_id": { "type": ["string", "null"], "format": "uuid" },
++        "type": { "type": "string", "maxLength": 64 },
++        "severity": { "type": "string", "maxLength": 24 },
++        "summary": { "type": "string", "maxLength": 240 },
++        "state": { "type": "string", "maxLength": 32 },
++        "remote_actions": { "type": "array", "maxItems": 8, "items": { "type": "object" } },
++        "projection_version": { "type": "integer", "minimum": 1 }
++      }
++    },
++    "deleteRecord": {
++      "type": "object",
++      "additionalProperties": false,
++      "required": ["entity", "id"],
++      "properties": {
++        "entity": { "enum": ["project", "session", "attention"] },
++        "id": { "type": "string", "format": "uuid" }
++      }
++    },
++    "snapshotBegin": {
++      "type": "object",
++      "additionalProperties": false,
++      "required": ["protocol_version", "message_id", "type", "created_at", "payload"],
++      "properties": {
++        "protocol_version": { "const": 1 },
++        "message_id": { "type": "string", "format": "uuid" },
++        "type": { "const": "projection_snapshot_begin" },
++        "created_at": { "$ref": "#/$defs/epochMilliseconds" },
++        "payload": {
++          "type": "object",
++          "additionalProperties": false,
++          "required": ["owner_id", "machine_id", "epoch", "sequence", "counts"],
++          "properties": {
++            "owner_id": { "type": "string", "format": "uuid" },
++            "machine_id": { "type": "string", "format": "uuid" },
++            "epoch": { "type": "string", "format": "uuid" },
++            "sequence": { "type": "integer", "const": 1 },
++            "counts": { "$ref": "#/$defs/counts" }
++          }
++        }
++      }
++    },
++    "snapshotRecord": {
++      "type": "object",
++      "additionalProperties": false,
++      "required": ["protocol_version", "message_id", "type", "created_at", "payload"],
++      "properties": {
++        "protocol_version": { "const": 1 },
++        "message_id": { "type": "string", "format": "uuid" },
++        "type": { "const": "projection_snapshot_record" },
++        "created_at": { "$ref": "#/$defs/epochMilliseconds" },
++        "payload": {
++          "type": "object",
++          "additionalProperties": false,
++          "required": ["owner_id", "machine_id", "epoch", "sequence", "kind", "record"],
++          "properties": {
++            "owner_id": { "type": "string", "format": "uuid" },
++            "machine_id": { "type": "string", "format": "uuid" },
++            "epoch": { "type": "string", "format": "uuid" },
++            "sequence": { "type": "integer", "minimum": 2 },
++            "kind": { "enum": ["project", "session", "attention"] },
++            "record": { "type": "object" }
++          },
++          "allOf": [
++            { "if": { "properties": { "kind": { "const": "project" } } }, "then": { "properties": { "record": { "$ref": "#/$defs/projectRecord" } } } },
++            { "if": { "properties": { "kind": { "const": "session" } } }, "then": { "properties": { "record": { "$ref": "#/$defs/sessionRecord" } } } },
++            { "if": { "properties": { "kind": { "const": "attention" } } }, "then": { "properties": { "record": { "$ref": "#/$defs/attentionRecord" } } } }
++          ]
++        }
++      }
++    },
++    "snapshotCommit": {
++      "type": "object",
++      "additionalProperties": false,
++      "required": ["protocol_version", "message_id", "type", "created_at", "payload"],
++      "properties": {
++        "protocol_version": { "const": 1 },
++        "message_id": { "type": "string", "format": "uuid" },
++        "type": { "const": "projection_snapshot_commit" },
++        "created_at": { "$ref": "#/$defs/epochMilliseconds" },
++        "payload": {
++          "type": "object",
++          "additionalProperties": false,
++          "required": ["owner_id", "machine_id", "epoch", "sequence", "counts"],
++          "properties": {
++            "owner_id": { "type": "string", "format": "uuid" },
++            "machine_id": { "type": "string", "format": "uuid" },
++            "epoch": { "type": "string", "format": "uuid" },
++            "sequence": { "type": "integer", "minimum": 2 },
++            "counts": { "$ref": "#/$defs/counts" }
++          }
++        }
++      }
++    },
++    "incrementalUpdate": {
++      "type": "object",
++      "additionalProperties": false,
++      "required": ["protocol_version", "message_id", "type", "created_at", "payload"],
++      "properties": {
++        "protocol_version": { "const": 1 },
++        "message_id": { "type": "string", "format": "uuid" },
++        "type": { "const": "projection_update" },
++        "created_at": { "$ref": "#/$defs/epochMilliseconds" },
++        "payload": {
++          "type": "object",
++          "additionalProperties": false,
++          "required": ["owner_id", "machine_id", "epoch", "sequence", "kind", "record"],
++          "properties": {
++            "owner_id": { "type": "string", "format": "uuid" },
++            "machine_id": { "type": "string", "format": "uuid" },
++            "epoch": { "type": "string", "format": "uuid" },
++            "sequence": { "type": "integer", "minimum": 1 },
++            "kind": { "enum": ["project", "session", "attention", "delete"] },
++            "record": { "type": "object" }
++          },
++          "allOf": [
++            { "if": { "properties": { "kind": { "const": "project" } } }, "then": { "properties": { "record": { "$ref": "#/$defs/projectRecord" } } } },
++            { "if": { "properties": { "kind": { "const": "session" } } }, "then": { "properties": { "record": { "$ref": "#/$defs/sessionRecord" } } } },
++            { "if": { "properties": { "kind": { "const": "attention" } } }, "then": { "properties": { "record": { "$ref": "#/$defs/attentionRecord" } } } },
++            { "if": { "properties": { "kind": { "const": "delete" } } }, "then": { "properties": { "record": { "$ref": "#/$defs/deleteRecord" } } } }
++          ]
++        }
++      }
++    },
++    "projectionAck": {
++      "type": "object",
++      "additionalProperties": false,
++      "required": ["protocol_version", "message_id", "type", "created_at", "payload"],
++      "properties": {
++        "protocol_version": { "const": 1 },
++        "message_id": { "type": "string", "format": "uuid" },
++        "type": { "const": "projection_ack" },
++        "created_at": { "$ref": "#/$defs/epochMilliseconds" },
++        "payload": {
++          "type": "object",
++          "additionalProperties": false,
++          "required": ["epoch", "accepted_sequence", "status"],
++          "properties": {
++            "epoch": { "type": "string", "format": "uuid" },
++            "accepted_sequence": { "type": "integer", "minimum": 1 },
++            "status": { "enum": ["applied", "duplicate"] }
++          }
++        }
++      }
++    },
++    "projectionGap": {
++      "type": "object",
++      "additionalProperties": false,
++      "required": ["protocol_version", "message_id", "type", "created_at", "payload"],
++      "properties": {
++        "protocol_version": { "const": 1 },
++        "message_id": { "type": "string", "format": "uuid" },
++        "type": { "const": "projection_gap" },
++        "created_at": { "$ref": "#/$defs/epochMilliseconds" },
++        "payload": {
++          "type": "object",
++          "additionalProperties": false,
++          "required": ["epoch", "expected_sequence", "received_sequence", "full_snapshot_required"],
++          "properties": {
++            "epoch": { "type": "string", "format": "uuid" },
++            "expected_sequence": { "type": "integer", "minimum": 1 },
++            "received_sequence": { "type": "integer", "minimum": 1 },
++            "full_snapshot_required": { "const": true }
++          }
++        }
++      }
++    }
++  }
++}
+diff --git a/contracts/remote-v1/schemas/ws-envelope.schema.json b/contracts/remote-v1/schemas/ws-envelope.schema.json
+--- a/contracts/remote-v1/schemas/ws-envelope.schema.json
++++ b/contracts/remote-v1/schemas/ws-envelope.schema.json
+@@ -1 +1 @@
+-{"$schema":"https://json-schema.org/draft/2020-12/schema","$id":"https://theditch.dev/remote/v1/ws-envelope.schema.json","title":"WebSocketEnvelope","type":"object","additionalProperties":false,"required":["protocol_version","message_id","type","created_at","payload"],"properties":{"protocol_version":{"const":1},"message_id":{"type":"string","format":"uuid"},"type":{"enum":["hello","heartbeat","presence","command","command_ack","command_result","projection_update","projection_gap","query_cancel","revoked","error"]},"created_at":{"type":"integer"},"payload":{"type":"object"}}}
++{"$schema":"https://json-schema.org/draft/2020-12/schema","$id":"https://theditch.dev/remote/v1/ws-envelope.schema.json","title":"WebSocketEnvelope","type":"object","additionalProperties":false,"required":["protocol_version","message_id","type","created_at","payload"],"properties":{"protocol_version":{"const":1},"message_id":{"type":"string","format":"uuid"},"type":{"enum":["hello","heartbeat","presence","command","command_ack","command_result","projection_snapshot_begin","projection_snapshot_record","projection_snapshot_commit","projection_update","projection_ack","projection_gap","query_cancel","revoked","machine_access_revoked","error"]},"created_at":{"type":"integer"},"payload":{"type":"object"}}}
+diff --git a/lib/app/app_controller.dart b/lib/app/app_controller.dart
+--- a/lib/app/app_controller.dart
++++ b/lib/app/app_controller.dart
+@@ -338,6 +338,10 @@
+       !deepLinkRevalidating &&
+       isMachineOnline(machineId);
+ 
++  bool canControlProject(String machineId, String? projectId) =>
++      canControlMachine(machineId) &&
++      (projectId == null || projectFor(projectId)?.targetAvailable == true);
++
+   String get remoteControlStatus => switch (authorizationState) {
+     AuthorizationState.paired => 'Active',
+     AuthorizationState.checking => 'Checking…',
+@@ -642,6 +646,7 @@
+     AttentionItem item,
+     AllowedRemoteAction action, {
+     String? answer,
++    Map<String, List<String>>? answers,
+   }) async {
+     final requiresOwnerAuthentication =
+         action.confirmation == ConfirmationClass.ownerAuthentication ||
+@@ -673,6 +678,7 @@
+           if (action.type == RemoteActionType.approve) 'decision': 'approve',
+           if (action.type == RemoteActionType.deny) 'decision': 'deny',
+           'answer': ?answer,
++          'answers': ?answers,
+         },
+       ),
+       projectId: item.projectId,
+@@ -681,6 +687,9 @@
+       refreshAttentionAfter: true,
+     );
+   }
++
++  Future<Map<String, dynamic>> approvalDetails(AttentionItem item) =>
++      repository.approvalDetails(item.machineId, item.id);
+ 
+   Future<TranscriptPage> transcript(
+     SessionProjection session, {
+diff --git a/lib/data/remote/protocol.dart b/lib/data/remote/protocol.dart
+--- a/lib/data/remote/protocol.dart
++++ b/lib/data/remote/protocol.dart
+@@ -31,6 +31,7 @@
+   'integration.apply',
+   'query.session_transcript',
+   'query.session_review',
++  'query.approval',
+ };
+ 
+ const sensitiveCommandTypes = {
+@@ -257,7 +258,8 @@
+     'session.start' ||
+     'session.prompt' ||
+     'query.session_transcript' ||
+-    'query.session_review' => 'none',
++    'query.session_review' ||
++    'query.approval' => 'none',
+     'session.stop' ||
+     'attention.execute' ||
+     'attention.acknowledge' ||
+diff --git a/lib/data/remote/realtime.dart b/lib/data/remote/realtime.dart
+--- a/lib/data/remote/realtime.dart
++++ b/lib/data/remote/realtime.dart
+@@ -70,8 +70,27 @@
+ Future<RemoteSocket> _connectIoSocket(
+   Uri uri,
+   Map<String, String> headers,
+-) async =>
+-    IoRemoteSocket(await WebSocket.connect(uri.toString(), headers: headers));
++) async {
++  final pending = WebSocket.connect(uri.toString(), headers: headers);
++  var expired = false;
++  // Close a connection that succeeds after its caller has already timed out.
++  unawaited(
++    pending.then((socket) {
++      if (expired) unawaited(socket.close());
++    }, onError: (Object _) {}),
++  );
++  // Ownership transfers to IoRemoteSocket, whose close method disposes it.
++  // ignore: close_sinks
++  final socket = await pending.timeout(
++    const Duration(seconds: 15),
++    onTimeout: () {
++      expired = true;
++      throw TimeoutException('The runtime connection timed out.');
++    },
++  );
++  socket.pingInterval = const Duration(seconds: 20);
++  return IoRemoteSocket(socket);
++}
+ 
+ Duration _defaultRetryDelay(int attempt) {
+   final exponent = min(max(attempt - 1, 0), 5);
+diff --git a/lib/data/remote/remote_api.dart b/lib/data/remote/remote_api.dart
+--- a/lib/data/remote/remote_api.dart
++++ b/lib/data/remote/remote_api.dart
+@@ -300,6 +300,8 @@
+             return <String, Object?>{
+               ...project,
+               'machine_id': machineId,
++              'target_host': ?project['target_host'],
++              'target_status': ?project['target_status'],
+               'running': project['running_count'] ?? 0,
+               'waiting': project['waiting_count'] ?? 0,
+               'ready': project['ready_count'] ?? 0,
+diff --git a/lib/data/remote/remote_repository.dart b/lib/data/remote/remote_repository.dart
+--- a/lib/data/remote/remote_repository.dart
++++ b/lib/data/remote/remote_repository.dart
+@@ -85,6 +85,7 @@
+     }
+     origin = snapshot.relayOrigin;
+     machines = snapshot.machines
++        .where((item) => item.kind == MachineKind.desktopMac)
+         .map(
+           (item) => MachineSummary(
+             id: item.id,
+@@ -97,12 +98,24 @@
+           ),
+         )
+         .toList();
+-    projects = snapshot.projects;
+-    sessions = snapshot.sessions;
+-    attention = snapshot.attention;
++    final visibleMachines = machines.map((m) => m.id).toSet();
++    projects = snapshot.projects
++        .where((p) => visibleMachines.contains(p.machineId))
++        .toList();
++    sessions = snapshot.sessions
++        .where((s) => visibleMachines.contains(s.machineId))
++        .toList();
++    attention = snapshot.attention
++        .where((a) => visibleMachines.contains(a.machineId))
++        .toList();
+     ownerId = snapshot.ownerId;
+     machineAgreementKeys = snapshot.machineAgreementKeys;
+     machineKeyVersions = snapshot.machineKeyVersions;
++    final macIds = machines.map((m) => m.id).toSet();
++    machineAgreementKeys = Map.of(machineAgreementKeys)
++      ..removeWhere((id, _) => !macIds.contains(id));
++    machineKeyVersions = Map.of(machineKeyVersions)
++      ..removeWhere((id, _) => !macIds.contains(id));
+     projectionUpdatedAt = snapshot.projectionUpdatedAt ?? snapshot.savedAt;
+     projectionSnapshotLoaded = true;
+     // Cached credentials prove a prior pairing, not current Commercial
+@@ -199,10 +212,22 @@
+     // Protocol validation and model construction scale with projection size.
+     // Keep the complete pass off the UI isolate, not only JSON tokenization.
+     final decoded = await compute(_decodeProjection, json);
+-    machines = decoded.machines;
+-    projects = _mergeProjects(const [], decoded.projects);
+-    sessions = decoded.includesSessions ? decoded.sessions : sessions;
+-    attention = decoded.attention;
++    machines = decoded.machines
++        .where((item) => item.kind == MachineKind.desktopMac)
++        .toList();
++    final visibleMachines = machines.map((m) => m.id).toSet();
++    projects = _mergeProjects(
++      const [],
++      decoded.projects
++          .where((p) => visibleMachines.contains(p.machineId))
++          .toList(),
++    );
++    sessions = (decoded.includesSessions ? decoded.sessions : sessions)
++        .where((s) => visibleMachines.contains(s.machineId))
++        .toList();
++    attention = decoded.attention
++        .where((a) => visibleMachines.contains(a.machineId))
++        .toList();
+     _replaceProjectPaging(json['project_pages']);
+     if (decoded.includesSessions) {
+       _initializedSessionProjects
+@@ -456,6 +481,29 @@
+     // This check occurs before payload encryption/serialization: no offline queue.
+     requireAuthorized();
+     requireOnline(command.machineId);
++    String? targetProject = command.payload['project_id'] as String?;
++    final sessionId = command.payload['session_id'];
++    for (final session in sessions) {
++      if (session.id == sessionId && session.machineId == command.machineId) {
++        targetProject = session.projectId;
++      }
++    }
++    final attentionId = command.payload['attention_id'];
++    for (final item in attention) {
++      if (item.id == attentionId && item.machineId == command.machineId) {
++        targetProject = item.projectId;
++      }
++    }
++    for (final project in projects) {
++      if (project.id == targetProject &&
++          project.machineId == command.machineId &&
++          !project.targetAvailable) {
++        throw DitchException(
++          RemoteErrorCode.remoteUnavailable,
++          project.targetUnavailableMessage!,
++        );
++      }
++    }
+     final relay = origin;
+     if (relay == null) {
+       throw const DitchException(RemoteErrorCode.unauthorized, 'Not paired.');
+@@ -536,6 +584,55 @@
+     int? beforeSequence,
+     int limit = 15,
+   }) async {
++    if (limit < 1 || limit > 200) {
++      throw const DitchException(
++        RemoteErrorCode.invalidPayload,
++        'The transcript page size is invalid.',
++      );
++    }
++    final plaintext = await _encryptedQuery(
++      RemoteCommand.create(
++        type: 'query.session_transcript',
++        machineId: machineId,
++        lifetime: const Duration(seconds: 30),
++        payload: {
++          'session_id': sessionId,
++          'before_sequence': beforeSequence,
++          'limit': limit,
++          'query_id': uuidV4(),
++        },
++      ),
++    );
++    return _transcriptDecoder.decode(plaintext, sessionId);
++  }
++
++  Future<Map<String, dynamic>> approvalDetails(
++    String machineId,
++    String attentionId,
++  ) async {
++    final plaintext = await _encryptedQuery(
++      RemoteCommand.create(
++        type: 'query.approval',
++        machineId: machineId,
++        lifetime: const Duration(seconds: 30),
++        payload: {'attention_id': attentionId},
++      ),
++    );
++    final result = objectMap(jsonDecode(plaintext), 'command result');
++    if (result['status'] == 'rejected') {
++      throw DitchException(
++        RemoteErrorCode.parse(result['error_code']),
++        'This request is no longer available.',
++      );
++    }
++    final tagged = objectMap(result['result'], 'permission result');
++    return Map<String, dynamic>.from(
++      objectMap(tagged['PermissionDetails'], 'permission details'),
++    );
++  }
++
++  Future<String> _encryptedQuery(RemoteCommand query) async {
++    final machineId = query.machineId;
+     requireAuthorized();
+     requireOnline(machineId);
+     final channel = realtime;
+@@ -551,23 +648,6 @@
+         'The encrypted machine channel is unavailable.',
+       );
+     }
+-    if (limit < 1 || limit > 200) {
+-      throw const DitchException(
+-        RemoteErrorCode.invalidPayload,
+-        'The transcript page size is invalid.',
+-      );
+-    }
+-    final query = RemoteCommand.create(
+-      type: 'query.session_transcript',
+-      machineId: machineId,
+-      lifetime: const Duration(seconds: 30),
+-      payload: {
+-        'session_id': sessionId,
+-        'before_sequence': beforeSequence,
+-        'limit': limit,
+-        'query_id': uuidV4(),
+-      },
+-    );
+     _ephemeralQueryCommandIds.add(query.commandId);
+     try {
+       final responseFuture = channel.envelopes
+@@ -577,6 +657,8 @@
+                 envelope.payload['command_id'] == query.commandId,
+           )
+           .timeout(const Duration(seconds: 40));
++      // A submission error must not leave an unhandled timeout on the listener.
++      unawaited(responseFuture.then<void>((_) {}, onError: (Object _) {}));
+       await command(query);
+       final RemoteEnvelope response;
+       try {
+@@ -612,7 +694,7 @@
+         nonce: wireString(encrypted, 'nonce', max: 64),
+         ciphertext: wireString(encrypted, 'ciphertext', max: 2000000),
+       );
+-      return await _transcriptDecoder.decode(plaintext, sessionId);
++      return plaintext;
+     } finally {
+       _ephemeralQueryCommandIds.remove(query.commandId);
+     }
+diff --git a/lib/domain/errors.dart b/lib/domain/errors.dart
+--- a/lib/domain/errors.dart
++++ b/lib/domain/errors.dart
+@@ -1,5 +1,8 @@
+ enum RemoteErrorCode {
+   machineOffline('machine_offline'),
++  remoteUnavailable('remote_unavailable'),
++  operationOutcomeUnknown('operation_outcome_unknown'),
++  operationConflict('operation_conflict'),
+   machineRevoked('machine_revoked'),
+   deviceRevoked('device_revoked'),
+   pairingExpired('pairing_expired'),
+@@ -78,6 +81,12 @@
+       'Remote Control is currently unavailable.\n\nManage your Ditch setup from your Mac.',
+     RemoteErrorCode.unsupportedProtocol =>
+       'This version of The Ditch cannot use that connection code.',
++    RemoteErrorCode.remoteUnavailable =>
++      'Your Mac cannot reach the SSH host. It will reconnect automatically.',
++    RemoteErrorCode.operationOutcomeUnknown =>
++      'The command may have reached the agent. Reconnect and check the session before sending it again.',
++    RemoteErrorCode.operationConflict =>
++      'This command identifier was already used. Refresh the session.',
+     RemoteErrorCode.approvalStale =>
+       'This approval is no longer waiting for a response.',
+     RemoteErrorCode.integrationConflict =>
+diff --git a/lib/domain/models.dart b/lib/domain/models.dart
+--- a/lib/domain/models.dart
++++ b/lib/domain/models.dart
+@@ -146,7 +146,15 @@
+     required this.failed,
+     required this.lastActivityAt,
+     this.freshness = Freshness.live,
+-  });
++    this.targetHost,
++    this.targetStatus,
++  });
++  final String? targetHost;
++  final String? targetStatus;
++  bool get targetAvailable => targetStatus == null || targetStatus == 'online';
++  String? get targetUnavailableMessage => targetAvailable
++      ? null
++      : 'SSH host ${targetHost ?? ""} is ${targetStatus == "reconnecting" ? "reconnecting" : "unavailable"}. Your Mac will reconnect automatically.';
+   final String id;
+   final String machineId;
+   final String name;
+@@ -172,10 +180,13 @@
+       failed: wireInt(json, 'failed'),
+       lastActivityAt: wireTime(json, 'last_activity_at'),
+       freshness: freshness,
++      targetHost: json['target_host'] as String?,
++      targetStatus: json['target_status'] as String?,
+     );
+   }
+ 
+   String get summary {
++    if (!targetAvailable) return targetUnavailableMessage!;
+     final parts = <String>[];
+     if (running > 0) parts.add('$running running');
+     if (waiting > 0) {
+@@ -187,6 +198,8 @@
+   }
+ 
+   Map<String, Object?> toJson() => {
++    if (targetHost != null) 'target_host': targetHost,
++    if (targetStatus != null) 'target_status': targetStatus,
+     'project_id': id,
+     'machine_id': machineId,
+     'name': name,
+@@ -207,6 +220,8 @@
+     failed: failed,
+     lastActivityAt: lastActivityAt,
+     freshness: value,
++    targetHost: targetHost,
++    targetStatus: targetStatus,
+   );
+ }
+ 
+diff --git a/lib/features/attention/agent_request_dialog.dart b/lib/features/attention/agent_request_dialog.dart
+new file mode 100644
+--- /dev/null
++++ b/lib/features/attention/agent_request_dialog.dart
+@@ -0,0 +1,98 @@
++import 'package:flutter/material.dart';
++import '../../app/app_controller.dart';
++import '../../domain/models.dart';
++
++class AgentRequestDecision {
++  const AgentRequestDecision(this.answers);
++  final Map<String, List<String>> answers;
++}
++
++Future<AgentRequestDecision?> reviewAgentRequest(
++  BuildContext context,
++  AppController controller,
++  AttentionItem item,
++  AllowedRemoteAction action,
++) async {
++  final detail = await controller.approvalDetails(item);
++  if (!context.mounted) return null;
++  final questions = (detail['questions'] as List? ?? []).cast<Map>();
++  final answers = <String, List<String>>{};
++  return showDialog<AgentRequestDecision>(
++    context: context,
++    builder: (dialogContext) => StatefulBuilder(
++      builder: (context, setState) => AlertDialog(
++        title: Text(
++          action.type == RemoteActionType.answer
++              ? 'Answer agent'
++              : action.label,
++        ),
++        content: SizedBox(
++          width: 480,
++          child: SingleChildScrollView(
++            child: Column(
++              mainAxisSize: MainAxisSize.min,
++              crossAxisAlignment: CrossAxisAlignment.start,
++              children: [
++                Text(
++                  detail['summary'] as String? ?? 'Review the agent request',
++                ),
++                if ((detail['command'] as String? ?? '').isNotEmpty)
++                  SelectableText(detail['command'] as String),
++                if ((detail['target'] as String? ?? '').isNotEmpty)
++                  SelectableText(detail['target'] as String),
++                for (final question in questions) ...[
++                  const SizedBox(height: 16),
++                  Text(question['question'] as String),
++                  for (final option in (question['options'] as List? ?? []))
++                    ListTile(
++                      contentPadding: EdgeInsets.zero,
++                      title: Text(option['label'] as String),
++                      subtitle: Text(option['description'] as String? ?? ''),
++                      selected:
++                          answers[question['id']]?.contains(option['label']) ==
++                          true,
++                      onTap: () => setState(
++                        () => answers[question['id'] as String] = [
++                          option['label'] as String,
++                        ],
++                      ),
++                    ),
++                  if ((question['options'] as List? ?? []).isEmpty ||
++                      question['isOther'] == true)
++                    TextField(
++                      obscureText: question['isSecret'] == true,
++                      decoration: const InputDecoration(
++                        labelText: 'Your answer',
++                      ),
++                      onChanged: (value) => setState(
++                        () => answers[question['id'] as String] = [value],
++                      ),
++                    ),
++                ],
++              ],
++            ),
++          ),
++        ),
++        actions: [
++          TextButton(
++            onPressed: () => Navigator.pop(dialogContext),
++            child: const Text('Cancel'),
++          ),
++          FilledButton(
++            onPressed:
++                questions.every(
++                  (q) =>
++                      answers[q['id']]?.any((a) => a.trim().isNotEmpty) == true,
++                )
++                ? () => Navigator.pop(
++                    dialogContext,
++                    AgentRequestDecision(answers),
++                  )
++                : null,
++            child: Text(action.label),
++          ),
++        ],
++      ),
++    ),
++  );
++}
+diff --git a/lib/features/attention/attention_screen.dart b/lib/features/attention/attention_screen.dart
+--- a/lib/features/attention/attention_screen.dart
++++ b/lib/features/attention/attention_screen.dart
+@@ -1,3 +1,4 @@
++import '../attention/agent_request_dialog.dart';
+ import 'dart:async';
+ 
+ import 'package:flutter/material.dart';
+@@ -89,7 +90,7 @@
+ 
+   @override
+   Widget build(BuildContext context) {
+-    final online = controller.canControlMachine(item.machineId);
++    final online = controller.canControlProject(item.machineId, item.projectId);
+     final presenceUnknown =
+         controller.machineFor(item.machineId)?.connection ==
+         MachineConnection.unknown;
+@@ -145,7 +146,10 @@
+                             ].join(' · ')
+                           : presenceUnknown
+                           ? 'Mac status unknown · action unavailable'
+-                          : 'Mac offline · action unavailable',
++                          : (controller.isMachineOnline(item.machineId)
++                                    ? project?.targetUnavailableMessage
++                                    : null) ??
++                                'Mac offline · action unavailable',
+                       style: TextStyle(
+                         color: online
+                             ? Theme.of(context).colorScheme.onSurfaceVariant
+@@ -262,7 +266,10 @@
+       final current = controller.attention
+           .where((candidate) => candidate.id == item.id)
+           .firstOrNull;
+-      final online = controller.canControlMachine(item.machineId);
++      final online = controller.canControlProject(
++        item.machineId,
++        item.projectId,
++      );
+       final presenceUnknown =
+           controller.machineFor(item.machineId)?.connection ==
+           MachineConnection.unknown;
+@@ -360,42 +367,36 @@
+     AttentionItem current,
+     AllowedRemoteAction action,
+   ) async {
+-    String? answer;
+-    if (action.type == RemoteActionType.answer) {
+-      var draft = '';
+-      answer = await showDialog<String>(
+-        context: context,
+-        builder: (dialogContext) => AlertDialog(
+-          title: const Text('Answer agent'),
+-          content: TextField(
+-            onChanged: (value) => draft = value,
+-            autofocus: true,
+-            minLines: 3,
+-            maxLines: 8,
+-            decoration: const InputDecoration(
+-              labelText: 'Review before sending',
+-            ),
+-          ),
+-          actions: [
+-            TextButton(
+-              onPressed: () => Navigator.pop(dialogContext),
+-              child: const Text('Cancel'),
+-            ),
+-            FilledButton(
+-              onPressed: () => Navigator.pop(dialogContext, draft.trim()),
+-              child: const Text('Send answer'),
+-            ),
+-          ],
+-        ),
+-      );
+-      if (answer == null || answer.isEmpty) return;
++    Map<String, List<String>>? answers;
++    if ([
++      RemoteActionType.answer,
++      RemoteActionType.approve,
++      RemoteActionType.deny,
++    ].contains(action.type)) {
++      try {
++        final decision = await reviewAgentRequest(
++          context,
++          controller,
++          current,
++          action,
++        );
++        if (decision == null) return;
++        answers = decision.answers;
++      } on DitchException catch (error) {
++        if (context.mounted) {
++          ScaffoldMessenger.of(
++            context,
++          ).showSnackBar(SnackBar(content: Text(error.userMessage)));
++        }
++        return;
++      }
+     } else if (action.confirmation != ConfirmationClass.none) {
+       final confirmed = await showDialog<bool>(
+         context: context,
+         builder: (context) => AlertDialog(
+           title: Text('${action.label}?'),
+           content: Text(
+-            'Ditch on the Mac will revalidate that this action is still available.',
++            'The owning runtime will revalidate that this action is still available.',
+           ),
+           actions: [
+             TextButton(
+@@ -412,7 +413,7 @@
+       if (confirmed != true) return;
+     }
+     try {
+-      await controller.executeAttention(current, action, answer: answer);
++      await controller.executeAttention(current, action, answers: answers);
+       if (context.mounted) Navigator.pop(context);
+     } on DitchException catch (error) {
+       if (context.mounted) {
+diff --git a/lib/features/projects/project_detail_screen.dart b/lib/features/projects/project_detail_screen.dart
+--- a/lib/features/projects/project_detail_screen.dart
++++ b/lib/features/projects/project_detail_screen.dart
+@@ -89,7 +89,10 @@
+       final current = controller.projectFor(project.id) ?? project;
+       final machine = controller.machineFor(current.machineId);
+       final machineOnline = machine?.isOnline == true;
+-      final commandAvailable = controller.canControlMachine(current.machineId);
++      final commandAvailable = controller.canControlProject(
++        current.machineId,
++        current.id,
++      );
+       final presenceUnknown = machine?.connection == MachineConnection.unknown;
+       final sessions = controller.sessionsFor(current.id);
+       final loadingSessions =
+@@ -118,7 +121,7 @@
+               ? 'Remote Control unavailable'
+               : presenceUnknown
+               ? 'Mac status is unavailable'
+-              : 'Mac is offline',
++              : current.targetUnavailableMessage ?? 'Mac is offline',
+           icon: _startingAgent
+               ? const SizedBox.square(
+                   dimension: 18,
+@@ -134,6 +137,11 @@
+             if (!controller.remoteControlAvailable)
+               RemoteControlUnavailableBanner(
+                 message: controller.remoteControlUnavailableMessage,
++              )
++            else if (machineOnline && !current.targetAvailable)
++              OfflineBanner(
++                cached: true,
++                message: current.targetUnavailableMessage,
+               )
+             else if (!machineOnline)
+               OfflineBanner(
+diff --git a/lib/features/sessions/session_screen.dart b/lib/features/sessions/session_screen.dart
+--- a/lib/features/sessions/session_screen.dart
++++ b/lib/features/sessions/session_screen.dart
+@@ -1,3 +1,4 @@
++import '../attention/agent_request_dialog.dart';
+ import 'dart:async';
+ 
+ import 'package:flutter/material.dart';
+@@ -41,7 +42,10 @@
+   SessionProjection get session =>
+       widget.controller.sessionFor(widget.session.id) ?? widget.session;
+ 
+-  bool get online => widget.controller.canControlMachine(session.machineId);
++  bool get online =>
++      widget.controller.canControlProject(session.machineId, session.projectId);
++  String? get targetUnavailableMessage =>
++      widget.controller.projectFor(session.projectId)?.targetUnavailableMessage;
+   bool get machineOnline =>
+       widget.controller.isMachineOnline(session.machineId);
+   bool get presenceUnknown =>
+@@ -225,7 +229,7 @@
+               !widget.controller.remoteControlAvailable
+                   ? 'Remote Control unavailable'
+                   : machineOnline
+-                  ? session.status.label
++                  ? targetUnavailableMessage ?? session.status.label
+                   : presenceUnknown
+                   ? 'Mac status unknown'
+                   : 'Mac offline',
+@@ -280,6 +284,8 @@
+             RemoteControlUnavailableBanner(
+               message: widget.controller.remoteControlUnavailableMessage,
+             )
++          else if (machineOnline && targetUnavailableMessage != null)
++            OfflineBanner(cached: true, message: targetUnavailableMessage)
+           else if (!machineOnline)
+             OfflineBanner(
+               cached: !presenceUnknown,
+@@ -358,7 +364,7 @@
+               ? 'Conversation is empty'
+               : presenceUnknown
+               ? 'Conversation temporarily unavailable'
+-              : 'Conversation unavailable offline',
++              : targetUnavailableMessage ?? 'Conversation unavailable offline',
+           body:
+               _transcript.loadError ??
+               'Messages from the Mac will appear here.',
+@@ -617,7 +623,7 @@
+                     ? 'Ask the agent…'
+                     : widget.presenceUnknown
+                     ? 'Draft while Mac status loads…'
+-                    : 'Draft while Mac is offline…',
++                    : 'Draft while connection is unavailable…',
+                 helperText: widget.online
+                     ? null
+                     : 'Draft stays on this screen and will not be queued.',
+@@ -892,42 +898,36 @@
+     AttentionItem current,
+     AllowedRemoteAction action,
+   ) async {
+-    String? answer;
+-    if (action.type == RemoteActionType.answer) {
+-      var draft = '';
+-      answer = await showDialog<String>(
+-        context: pageContext,
+-        builder: (dialogContext) => AlertDialog(
+-          title: const Text('Answer agent'),
+-          content: TextField(
+-            onChanged: (value) => draft = value,
+-            autofocus: true,
+-            minLines: 3,
+-            maxLines: 8,
+-            decoration: const InputDecoration(
+-              labelText: 'Review before sending',
+-            ),
+-          ),
+-          actions: [
+-            TextButton(
+-              onPressed: () => Navigator.pop(dialogContext),
+-              child: const Text('Cancel'),
+-            ),
+-            FilledButton(
+-              onPressed: () => Navigator.pop(dialogContext, draft.trim()),
+-              child: const Text('Send answer'),
+-            ),
+-          ],
+-        ),
+-      );
+-      if (answer == null || answer.isEmpty) return;
++    Map<String, List<String>>? answers;
++    if ([
++      RemoteActionType.answer,
++      RemoteActionType.approve,
++      RemoteActionType.deny,
++    ].contains(action.type)) {
++      try {
++        final decision = await reviewAgentRequest(
++          pageContext,
++          controller,
++          current,
++          action,
++        );
++        if (decision == null) return;
++        answers = decision.answers;
++      } on DitchException catch (error) {
++        if (pageContext.mounted) {
++          ScaffoldMessenger.of(
++            pageContext,
++          ).showSnackBar(SnackBar(content: Text(error.userMessage)));
++        }
++        return;
++      }
+     } else if (action.confirmation != ConfirmationClass.none) {
+       final confirmed = await showDialog<bool>(
+         context: pageContext,
+         builder: (dialogContext) => AlertDialog(
+           title: Text('${action.label}?'),
+           content: const Text(
+-            'Ditch on the Mac will revalidate this action before executing it.',
++            'The owning runtime will revalidate this action before executing it.',
+           ),
+           actions: [
+             TextButton(
+@@ -944,7 +944,7 @@
+       if (confirmed != true) return;
+     }
+     try {
+-      await controller.executeAttention(current, action, answer: answer);
++      await controller.executeAttention(current, action, answers: answers);
+       if (sheetContext.mounted) Navigator.pop(sheetContext);
+     } on DitchException catch (error) {
+       if (pageContext.mounted) {
+diff --git a/test/command_matrix_test.dart b/test/command_matrix_test.dart
+--- a/test/command_matrix_test.dart
++++ b/test/command_matrix_test.dart
+@@ -15,6 +15,7 @@
+       'integration.apply',
+       'query.session_transcript',
+       'query.session_review',
++      'query.approval',
+     };
+     expect(allowedCommandTypes, expected);
+     expect(allowedCommandTypes, isNot(contains('shell.execute')));
+diff --git a/test/commercial_authorization_test.dart b/test/commercial_authorization_test.dart
+--- a/test/commercial_authorization_test.dart
++++ b/test/commercial_authorization_test.dart
+@@ -614,7 +614,7 @@
+   );
+ 
+   test(
+-    'remote SSH project routes directly while desktop Mac is offline',
++    'legacy SSH endpoints are ignored and Mac offline blocks remote control',
+     () async {
+       final platform = CommercialPlatform(
+         '11111111-1111-4111-8111-111111111111',
+@@ -668,28 +668,94 @@
+ 
+       await repository.refresh();
+       await repository.flushPersistence();
+-      final remote = repository.machine(_remoteMachineId)!;
++      expect(repository.machine(_remoteMachineId), isNull);
+       expect(repository.machine(_machineId)!.isOnline, isFalse);
+-      expect(remote.isOnline, isTrue);
+-      expect(remote.kind, MachineKind.sshRemoteNode);
+-      expect(remote.presentationName, 'Remote · dev-box');
+-
+       final restored = _repository(platform, api);
+       await restored.restore();
+-      final cachedRemote = restored.machine(_remoteMachineId)!;
+-      expect(cachedRemote.kind, MachineKind.sshRemoteNode);
+-      expect(cachedRemote.presentationName, 'Remote · dev-box');
+-
+-      await repository.command(
++      expect(restored.machine(_remoteMachineId), isNull);
++      expect(
++        restored.machineAgreementKeys.containsKey(_remoteMachineId),
++        isFalse,
++      );
++      await expectLater(
++        repository.command(
++          RemoteCommand.create(
++            type: 'session.prompt',
++            machineId: _machineId,
++            payload: const {'session_id': 'remote_session', 'text': 'Continue'},
++          ),
++        ),
++        throwsA(isA<DitchException>()),
++      );
++      await expectLater(
++        repository.command(
++          RemoteCommand.create(
++            type: 'session.prompt',
++            machineId: _remoteMachineId,
++            payload: const {'session_id': 'remote_session', 'text': 'Continue'},
++          ),
++        ),
++        throwsA(isA<DitchException>()),
++      );
++      expect(api.commandCount, 0);
++    },
++  );
++  test('SSH target uses only the paired Mac key and command route', () async {
++    final platform = CommercialPlatform('11111111-1111-4111-8111-111111111111');
++    final api = CommercialApi(platform);
++    final repository = _repository(platform, api);
++    await repository.pair(_pairingQr());
++    api.snapshotValue['projects'] = [
++      {
++        'project_id': 'ssh-project',
++        'machine_id': _machineId,
++        'name': 'Remote work',
++        'running': 1,
++        'waiting': 0,
++        'ready': 0,
++        'failed': 0,
++        'last_activity_at': 1893456000000,
++        'target_host': 'dev-box',
++        'target_status': 'online',
++      },
++    ];
++    await repository.refresh();
++    final project = repository.projects.single;
++    expect(project.targetHost, 'dev-box');
++    expect(project.machineId, _machineId);
++    expect(repository.machineAgreementKeys.keys, [_machineId]);
++    await repository.command(
++      RemoteCommand.create(
++        type: 'session.start',
++        machineId: project.machineId,
++        payload: const {
++          'project_id': 'ssh-project',
++          'task_title': 'Task',
++          'initial_prompt': 'start',
++        },
++      ),
++    );
++    expect(api.lastCommand!['machine_id'], _machineId);
++    api.snapshotValue['projects'] = [
++      project.toJson()..['target_status'] = 'reconnecting',
++    ];
++    await repository.refresh();
++    expect(repository.projects.single.targetAvailable, isFalse);
++    expect(repository.projects.single.summary, contains('reconnecting'));
++    await expectLater(
++      repository.command(
+         RemoteCommand.create(
+-          type: 'session.prompt',
+-          machineId: _remoteMachineId,
+-          payload: const {'session_id': 'remote_session', 'text': 'Continue'},
++          type: 'session.start',
++          machineId: _machineId,
++          payload: const {
++            'project_id': 'ssh-project',
++            'task_title': 'Task',
++            'initial_prompt': 'start',
++          },
+         ),
+-      );
+-
+-      expect(api.commandCount, 1);
+-      expect(api.lastCommand!['machine_id'], _remoteMachineId);
+-    },
+-  );
++      ),
++      throwsA(isA<DitchException>()),
++    );
++    expect(api.commandCount, 1);
++  });
+ }
+diff --git a/test/widget_screens_test.dart b/test/widget_screens_test.dart
+--- a/test/widget_screens_test.dart
++++ b/test/widget_screens_test.dart
+@@ -23,6 +23,23 @@
+ class WidgetRepository extends RemoteRepository {
+   WidgetRepository((RemoteApi, PlatformServices, ProjectionCache) superArgs)
+     : super(api: superArgs.$1, platform: superArgs.$2, cache: superArgs.$3);
++  @override
++  Future<Map<String, dynamic>> approvalDetails(
++    String machineId,
++    String attentionId,
++  ) async => {
++    'id': attentionId,
++    'summary': 'Agent needs input',
++    'questions': [
++      {
++        'id': 'question_1',
++        'header': 'Choice',
++        'question': 'Which approach?',
++        'options': [],
++        'isOther': true,
++      },
++    ],
++  };
+   int commands = 0;
+   RemoteCommand? lastCommand;
+   Object? disconnectError;
+@@ -287,16 +304,21 @@
+       matching: find.byType(TextField),
+     );
+     await tester.enterText(dialogField, 'Use the mobile-safe path');
+-    await tester.tap(find.text('Send answer'));
++    await tester.pump();
++    await tester.tap(
++      find.descendant(
++        of: find.byType(AlertDialog),
++        matching: find.widgetWithText(FilledButton, 'Reply'),
++      ),
++    );
+ 
+     await tester.pump();
+     expect(tester.takeException(), isNull);
+     expect(repository.commands, 1);
+     expect(repository.lastCommand?.type, 'attention.execute');
+-    expect(
+-      repository.lastCommand?.payload['answer'],
+-      'Use the mobile-safe path',
+-    );
++    expect(repository.lastCommand?.payload['answers'], {
++      'question_1': ['Use the mobile-safe path'],
++    });
+     await tester.pumpAndSettle();
+     expect(tester.takeException(), isNull);
+   });
+@@ -315,16 +337,21 @@
+     await tester.tap(find.text('Reply'));
+     await tester.pumpAndSettle();
+     await tester.enterText(find.byType(TextField), 'Proceed with option one');
+-    await tester.tap(find.text('Send answer'));
++    await tester.pump();
++    await tester.tap(
++      find.descendant(
++        of: find.byType(AlertDialog),
++        matching: find.widgetWithText(FilledButton, 'Reply'),
++      ),
++    );
+ 
+     await tester.pump();
+     expect(tester.takeException(), isNull);
+     expect(repository.commands, 1);
+     expect(repository.lastCommand?.type, 'attention.execute');
+-    expect(
+-      repository.lastCommand?.payload['answer'],
+-      'Proceed with option one',
+-    );
++    expect(repository.lastCommand?.payload['answers'], {
++      'question_1': ['Proceed with option one'],
++    });
+     await tester.pumpAndSettle();
+     expect(tester.takeException(), isNull);
+   });

@@ -1,0 +1,204 @@
+{
+  "TheDitchRelay": {
+    "patch": "relay-remote-recovery.patch",
+    "sha256": "c4c653ad8bf75cea05c1e1193fee6d82753a6fc8b2fbe22c35addd205b54d6e0",
+    "files": [
+      {
+        "path": "contracts/remote-v1/REMOTE_PROTOCOL_V1.md",
+        "before_sha256": "8b8d5c2ba3ed025aaac1b4d6a53033c312addc94438be43650e9734bd7cf0c93",
+        "after_sha256": "fe332091444205983ca09fb05ac5e9c2ba26efd6625bc5ffe017f4506927d9ea"
+      },
+      {
+        "path": "contracts/remote-v1/manifest.json",
+        "before_sha256": "6d0ec59a1b8ec9a5624102105a210d73e1836cf4ab57def00f9d75f42805697a",
+        "after_sha256": "490c2252bd9e252c0b091fd416d40057ed831b6788c3232ae5063b23b76e6add"
+      },
+      {
+        "path": "contracts/remote-v1/schemas/command.schema.json",
+        "before_sha256": "f63433619dd553c692fd10fe81df5e0e17237fe51aa51fb59e8728c6a0df7a2b",
+        "after_sha256": "1f8107786046ca942826b44139a701abbbedcf8543a40d4624f01bc6680f4024"
+      },
+      {
+        "path": "contracts/remote-v1/schemas/projection.schema.json",
+        "before_sha256": "424e6345597568bd182767b37b945560a08f13114e6d60e6354143d6c2942380",
+        "after_sha256": "031cc64dbf86bb81f6739b782ef85698cb7c691672b9be28b8ff5d404857b88a"
+      },
+      {
+        "path": "migrations/0017_mac_ssh_targets.sql",
+        "before_sha256": null,
+        "after_sha256": "b5ec9f88848cbd4a5bfc69e3ed97069806092cbc3bb0729bd3a8debb44fc3402"
+      },
+      {
+        "path": "src/auth.ts",
+        "before_sha256": "2072d602a61517db8da16278ee013c9df5583b12179ea5c15fead266dbed89e5",
+        "after_sha256": "4d54f273d856db44e05f941247a09b402157e069bfec13ec943048fff74e0a00"
+      },
+      {
+        "path": "src/enrollment.ts",
+        "before_sha256": "fc5068f6a3f485dbd6e6dddbceb2b2cc2b1655b194b4c105e17e218520539c5d",
+        "after_sha256": null
+      },
+      {
+        "path": "src/machine_hub.ts",
+        "before_sha256": "343995b662ddf43315fb6cf17a3782cafe9e9cebff15c2185d1a1d677dde6449",
+        "after_sha256": "a61cd8f94b7867db5fdc94374ad34fa909476451efdd03d3490dcefea80784e0"
+      },
+      {
+        "path": "src/pairing.ts",
+        "before_sha256": "373b3b0a0b25d595e1da2c34fa18b6a07f920f65f6e0894669be15cca26578ad",
+        "after_sha256": "0a4859d50512c9dd4b9caa0fc918382b2c72c7dd0e7a3b173bfbea379cb9037b"
+      },
+      {
+        "path": "src/types.ts",
+        "before_sha256": "353d78ced71fb534cd79cb919dff2c018bf22d753e3e7935d03996dbad5e11c6",
+        "after_sha256": "2b6ad81a5e3b6c205ff5350ca8a2ad4398062c48e69941beac14dae7dc1a28ec"
+      },
+      {
+        "path": "src/validation.ts",
+        "before_sha256": "00041c62eece46fae2dd45485fa273d68493ef64e26421030af1e51d531c475d",
+        "after_sha256": "201799cf143354eb4c5d94206acdc29c273667a10fc43371d27b2f391a548201"
+      },
+      {
+        "path": "src/worker.ts",
+        "before_sha256": "e5d3d244a528f5428314b4d7bc893c634ae07bb01d5f5b55f47fb57888f0bae0",
+        "after_sha256": "4ae511cf642c4d2fbb111c44c02f58228bf8f754cb1d439b092e88e87eb75fb3"
+      },
+      {
+        "path": "test/commercial.test.ts",
+        "before_sha256": "5c3cf78b3436c88455d8f35e6509d83355d678c9815893429bb7c1d5fa0a16b7",
+        "after_sha256": "cdc6c5128865b8df01fb223608cc14f323e88957490ab957114b56d2db25357b"
+      },
+      {
+        "path": "test/hub_projection.test.ts",
+        "before_sha256": "6a93e17b0a24b015c867ec412ab1ea514f3b51fa1ae9cd3d536bca35f236b1b9",
+        "after_sha256": "93a7dcd743d41c06fc2424efd4eb79755f8175abfbf70702a7193bf0ad3a0be0"
+      },
+      {
+        "path": "test/mac_mediated.test.ts",
+        "before_sha256": null,
+        "after_sha256": "52beb53be513e61ee42c4d86d861e0513955b51ca275f3fe4eec01467f86d5be"
+      },
+      {
+        "path": "test/releases.test.ts",
+        "before_sha256": "b9327ad010ff05ce19593a78d01eb5b60e7460083d1983523cf2810598d56b61",
+        "after_sha256": "75ff312f4148a80d9b0ba45a3fb1377702693161b22ed9c7dbc3210dc2b529b9"
+      },
+      {
+        "path": "test/support/harness.ts",
+        "before_sha256": "f0f66063ed9cf187bd91abd9ab0fcdb8c34659e0740e58da66d3089652a1cf8e",
+        "after_sha256": "765f8731d1b22e31875cf22867666cddfcd9a343864d2f8f8cfdba49136343ce"
+      }
+    ]
+  },
+  "TheDitchMobile": {
+    "patch": "mobile-remote-recovery.patch",
+    "sha256": "74b93329d31211a4740de1f158d22c30d3d0bd0184acc64d4d29b6abb0330f40",
+    "files": [
+      {
+        "path": "contracts/remote-v1/REMOTE_PROTOCOL_V1.md",
+        "before_sha256": "34c3ae6111a1e9a210afc611941a8dfd9c9b5395d37d4a398e28664178189b90",
+        "after_sha256": "fe332091444205983ca09fb05ac5e9c2ba26efd6625bc5ffe017f4506927d9ea"
+      },
+      {
+        "path": "contracts/remote-v1/fixtures/v1.json",
+        "before_sha256": "3a9b012817d194105b039fc933fee78ccb4863722f8b37f42ce6130efd3d99ef",
+        "after_sha256": "a4ee41d0005bbf9a984f11c544a0b9b1f07a43d529812b651c7fd66e95ddfa12"
+      },
+      {
+        "path": "contracts/remote-v1/manifest.json",
+        "before_sha256": "69306fa99acdd95b90192524231a7b0661db1f69fbc2dedaf359d76d95fb6bfe",
+        "after_sha256": "490c2252bd9e252c0b091fd416d40057ed831b6788c3232ae5063b23b76e6add"
+      },
+      {
+        "path": "contracts/remote-v1/openapi-v1.yaml",
+        "before_sha256": "f4cc4d1d6a3c34d5996461750e25ffa43ea7cd420be480901834f5774122f74b",
+        "after_sha256": "ea2a9c663cc0015ae15352d4a9a1a79ea86517892f2dd9a2a09e1128a2423716"
+      },
+      {
+        "path": "contracts/remote-v1/schemas/command.schema.json",
+        "before_sha256": "f63433619dd553c692fd10fe81df5e0e17237fe51aa51fb59e8728c6a0df7a2b",
+        "after_sha256": "1f8107786046ca942826b44139a701abbbedcf8543a40d4624f01bc6680f4024"
+      },
+      {
+        "path": "contracts/remote-v1/schemas/projection.schema.json",
+        "before_sha256": "0f7716752bcdc2f723f2d9d3e7f17013fdb5944904405ad518a1887617d71357",
+        "after_sha256": "031cc64dbf86bb81f6739b782ef85698cb7c691672b9be28b8ff5d404857b88a"
+      },
+      {
+        "path": "contracts/remote-v1/schemas/ws-envelope.schema.json",
+        "before_sha256": "ccd04d22b3fc90cb81bb97bc6317e08e64b50cadc116ec02589b3b3089a7d94f",
+        "after_sha256": "5b1aa6c779faeaf406558e243d5824a411926e1f1deb11f300e20799dfb6b1e8"
+      },
+      {
+        "path": "lib/app/app_controller.dart",
+        "before_sha256": "a813d3bd23827d5e8dbc0fe8390e8d3556fbe1a98d07350697d0ab9f0a3fa365",
+        "after_sha256": "1423a6d5cb8525ca6637207c78d120f3f2ffb2b585537f0dc6f0c1ec402af9e8"
+      },
+      {
+        "path": "lib/data/remote/protocol.dart",
+        "before_sha256": "40ef549dd4aabcc81db82821b8783726b218ceced482719f9a15bdb0d1a5ca88",
+        "after_sha256": "73af204ef4a773083c5c062e575e7ed59775fd3040fab961e583af594ac472dc"
+      },
+      {
+        "path": "lib/data/remote/realtime.dart",
+        "before_sha256": "8790cb3341033fe7562dad17c86a1d343b52286ec7ddd6deff988eb7f49fddbb",
+        "after_sha256": "ea086b6a7d17a5e33e2f56725d4bda2831cebb1365f4441fa69694c9529292bb"
+      },
+      {
+        "path": "lib/data/remote/remote_api.dart",
+        "before_sha256": "382acc085dab8145de6b3ccb74d0634a1b5b806740d233b4f2d8c1ba30d2727c",
+        "after_sha256": "ece41670ed34d05e63c69fb8bb765c6bdf2bf08c3fc337c55d8bac5a4f730a91"
+      },
+      {
+        "path": "lib/data/remote/remote_repository.dart",
+        "before_sha256": "e57615090c85ffc2b3244c0ba86d42ee689e10a899bb58a12b363040ce06fe93",
+        "after_sha256": "2910570755341ae4bda38b7bb980d78671eb27e73d095a6ff08874f8b8411eb6"
+      },
+      {
+        "path": "lib/domain/errors.dart",
+        "before_sha256": "79dbb8af6cf16bac4a35f24a88a469fa1e8fe203bee6d86edc5ecb3ac2ecaf2e",
+        "after_sha256": "cc0dceb082bd050ee0b21f30cd840a93bdfc6fc259998b5878175adc08bb93e3"
+      },
+      {
+        "path": "lib/domain/models.dart",
+        "before_sha256": "bb529dd379a14887fd010264ed85a275861e05106f1b0316d5a4f9d006fe9419",
+        "after_sha256": "4ffa008c7dd60620b5ece055a2fcd0c7453d0d2e742a79bc28f616e4275d1f9b"
+      },
+      {
+        "path": "lib/features/attention/agent_request_dialog.dart",
+        "before_sha256": null,
+        "after_sha256": "3a87985a81d6287bae7372b0a7c868064964913c3370af77ecc9370d749239f7"
+      },
+      {
+        "path": "lib/features/attention/attention_screen.dart",
+        "before_sha256": "cfef849c9cf1050998df2ada811fe1f1277c2e1ed62e10587accc144dff09426",
+        "after_sha256": "9bd7d3f683001ffd8b9269b11983374c702e6a15438669c7b83f9fa5989f0d44"
+      },
+      {
+        "path": "lib/features/projects/project_detail_screen.dart",
+        "before_sha256": "ca6afd9470de4c8b7fef8c8d3a9bd9468d37a1b16e93ccc9a3944775a44a6a3e",
+        "after_sha256": "256d90fcf3380f91fbe6f91b4dbc3f44cc522b4cf2b195ff29798fedb2cf3ed9"
+      },
+      {
+        "path": "lib/features/sessions/session_screen.dart",
+        "before_sha256": "5b450f5b0cdfe5c32846a760d3f58749d2980cd8ce6195dfbcafd30189dc9c3f",
+        "after_sha256": "dfeab0b411958d5bf32d4a93c61167f3569fb76608d593476508ea9288258db2"
+      },
+      {
+        "path": "test/command_matrix_test.dart",
+        "before_sha256": "49269414df51b94b382870a0bbd00c8f25002e578b8859667f7dfa6185f76310",
+        "after_sha256": "572bc6a2d1e41e49bebf497af78aff7d1284a0aa66bde0dd5ade8d0ba654f90d"
+      },
+      {
+        "path": "test/commercial_authorization_test.dart",
+        "before_sha256": "df0cbe40c5a28af6a3c7632d07105a3660cb9469b66ba3bd3e0da6dabbf90cc5",
+        "after_sha256": "bd3047872155515cc4238489eee64a93053924e1616f2f16570cedb3a1b9b426"
+      },
+      {
+        "path": "test/widget_screens_test.dart",
+        "before_sha256": "e410b2d110b395d2c0c48f569b46d67e12d3e244b38641f83ef47ab4a2488c77",
+        "after_sha256": "e2ea4cdb005e060df27e7839704224b61271a4acbaced7464a31359beeceb05e"
+      }
+    ]
+  }
+}

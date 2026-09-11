@@ -33,7 +33,8 @@ class RuntimeTransport {
       final line = await utf8.decoder
           .bind(socket)
           .transform(const LineSplitter())
-          .first;
+          .first
+          .timeout(const Duration(seconds: 100));
       return parseRuntimeResponseLine(line);
     } finally {
       socket.destroy();
