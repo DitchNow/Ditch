@@ -21,6 +21,7 @@ jobs:
           channel: stable
           cache: true
       - run: cargo fmt --all -- --check
+      - run: python3 scripts/test-macos-runtime-signing.py
       - run: scripts/check-commercial-offer-contract
       - run: scripts/check-community-clean-checkout
       - run: cargo build --locked -p ditchd -p ditch_cli
