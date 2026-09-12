@@ -310,3 +310,34 @@ fn relay_reconnect_redelivers_saved_result_without_redispatching_work() {
     assert!(frame["payload"]["encrypted"]["ciphertext"].is_string());
     assert_eq!(calls.lock().unwrap().len(), 1);
 }
+
+#[test]
+fn inline_approval_choices_preserve_scope_and_require_authentication() {
+    for decision in ["approve", "approve_session", "deny"] {
+        let (state, mut command, _, request_id, calls) = fixture();
+        command.command_type = RemoteCommandType::ApprovalRespond;
+        command.confirmation_class = command.command_type.required_confirmation();
+        let body = serde_json::to_vec(&json!({
+            "attention_id": request_id, "action_id": request_id, "decision": decision
+        }))
+        .unwrap();
+        let result = execute_command(state.clone(), &command, &body, false);
+        assert_eq!(result.status, "rejected");
+        assert!(calls.lock().unwrap().is_empty());
+        // A fresh authenticated command owns a fresh durable receipt.
+        command.command_id = Uuid::new_v4();
+        command.idempotency_key = Uuid::new_v4().to_string();
+        let result = execute_command(state.clone(), &command, &body, true);
+        assert_eq!(result.status, "completed", "{decision}: {result:?}");
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        match (&calls[0].2, decision) {
+            (ClientRequest::ApprovePermission { request_id: id }, "approve")
+            | (ClientRequest::ApprovePermissionForSession { request_id: id }, "approve_session")
+            | (ClientRequest::DenyPermission { request_id: id, .. }, "deny") => {
+                assert_eq!(*id, request_id)
+            }
+            other => panic!("wrong approval scope: {other:?}"),
+        }
+    }
+}

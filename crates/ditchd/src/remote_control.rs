@@ -2059,6 +2059,9 @@ fn execute_command_inner(
             } else {
                 let decision = match payload.get("decision").and_then(Value::as_str) {
                     Some("approve") => super::codex_app_server::PermissionDecision::ApproveOnce,
+                    Some("approve_session") => {
+                        super::codex_app_server::PermissionDecision::ApproveForSession
+                    }
                     Some("deny") => super::codex_app_server::PermissionDecision::Deny,
                     _ => return finish_rejected(&state, command, "action_not_allowed"),
                 };

@@ -1,0 +1,44 @@
+diff --git a/contracts/remote-v1/REMOTE_PROTOCOL_V1.md b/contracts/remote-v1/REMOTE_PROTOCOL_V1.md
+--- a/contracts/remote-v1/REMOTE_PROTOCOL_V1.md
++++ b/contracts/remote-v1/REMOTE_PROTOCOL_V1.md
+@@ -278,6 +278,23 @@
+ same owning-runtime dispatch as desktop. `attention.execute` accepts an `answers`
+ map from question IDs to answer arrays; action/request identity must still be live.
+ 
++Approval requests are presented inside the owning agent's chat. The encrypted
++`approval.respond` body is `{attention_id, action_id, decision}`. Decisions are
++`approve` (approve once, retained for older clients), `approve_session` (approve
++in this session), and `deny` (the chat's Cancel button). Cancel denies the pending
++operation; it does not stop the agent. Session approval retains the owning
++runtime's existing session scope. All three decisions require device owner
++authentication and a live request. Relay forwards the opaque encrypted payload;
++no Relay deployment, remote enrollment, or additional keys are needed.
++
++Clients must not present Relay delivery or `command_ack` as a successful approval.
++The Mac's encrypted `command_result` must confirm completion. Pending cards are
++keyed by machine/request and attached to their project and agent. An uncertain
++result disables resubmission while read-only request queries and runtime snapshots
++reconcile it; a stale request is rendered as no longer awaiting approval. Agent
++question forms remain a separate interaction.
++
++
+ Mobile control requires the Mac runtime online. A disconnected SSH target reports
+ `remote_unavailable`; an unconfirmed mutation reports `operation_outcome_unknown`.
+ The same command ID and body may recover a receipt, but never resend a mutation.
+diff --git a/contracts/remote-v1/manifest.json b/contracts/remote-v1/manifest.json
+--- a/contracts/remote-v1/manifest.json
++++ b/contracts/remote-v1/manifest.json
+@@ -2,10 +2,10 @@
+   "protocol_version": 1,
+   "package_version": "1.0.0",
+   "canonical_owner": "The Ditch macOS repository",
+-  "source_snapshot_date": "2026-09-11",
+-  "bundle_sha256": "3b08430915120edde6112ca0086915171824a61b0545d4f7b57e89e30513b1c3",
++  "source_snapshot_date": "2026-09-12",
++  "bundle_sha256": "98396e3571a1fd0d23a9157331982e7cb8c95c323e4f73438c43f5d29c7e3a0f",
+   "files": {
+-    "REMOTE_PROTOCOL_V1.md": "fe332091444205983ca09fb05ac5e9c2ba26efd6625bc5ffe017f4506927d9ea",
++    "REMOTE_PROTOCOL_V1.md": "4f03a63d6afc821daa575eee8ef89af5720543a7065b68b036ca813eee7aaf5e",
+     "fixtures/crypto-v1.json": "53c71f10411542b3f654dfb3925b8bb41dde31505d6a8eaa584f40ab085dd95a",
+     "fixtures/v1.json": "a4ee41d0005bbf9a984f11c544a0b9b1f07a43d529812b651c7fd66e95ddfa12",
+     "openapi-v1.yaml": "ea2a9c663cc0015ae15352d4a9a1a79ea86517892f2dd9a2a09e1128a2423716",

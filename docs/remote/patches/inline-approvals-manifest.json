@@ -1,0 +1,84 @@
+{
+  "TheDitchMobile": {
+    "patch": "mobile-inline-approvals.patch",
+    "sha256": "5cd18b6cadc8c1c57637f9828308a5dc01c8662b56876c33db371eb21e5ca66e",
+    "files": [
+      {
+        "path": "contracts/remote-v1/REMOTE_PROTOCOL_V1.md",
+        "before_sha256": "fe332091444205983ca09fb05ac5e9c2ba26efd6625bc5ffe017f4506927d9ea",
+        "after_sha256": "4f03a63d6afc821daa575eee8ef89af5720543a7065b68b036ca813eee7aaf5e"
+      },
+      {
+        "path": "contracts/remote-v1/manifest.json",
+        "before_sha256": "490c2252bd9e252c0b091fd416d40057ed831b6788c3232ae5063b23b76e6add",
+        "after_sha256": "ec23f09769a9d389deb86afe35e70c27fb3c53485bf2f96fc7304e52ac60f366"
+      },
+      {
+        "path": "lib/app/app_controller.dart",
+        "before_sha256": "a0068d010f43bb6510ea427dcb5ba3fc3c9997b988c2117d3a11db8990e6973c",
+        "after_sha256": "e32bcf122e3e77912773b92160265e770129104bda78cc0b4baa59e8c460ffcb"
+      },
+      {
+        "path": "lib/app/approval_interaction.dart",
+        "before_sha256": null,
+        "after_sha256": "5dba79635dfabc6bc9d7642b1cb607799db555f31eacd19513888cad5bb4a968"
+      },
+      {
+        "path": "lib/data/remote/protocol.dart",
+        "before_sha256": "9103f9c3f481d3030b8c1afe5470d4fd087925795b337ccdc989cfd98c85f517",
+        "after_sha256": "0dd2e11d091507c4cbf9331c046cb6ab5431c4d0f1323df5685d01fff2ab7d87"
+      },
+      {
+        "path": "lib/data/remote/remote_repository.dart",
+        "before_sha256": "9449dc68426fc47f6f7f558cd325d668cf883b3472ad1193a911ec70b60091ae",
+        "after_sha256": "ae4157128f91152626be31648a1e8a5809b5d71fabea300648ea429d906458c0"
+      },
+      {
+        "path": "lib/features/attention/attention_screen.dart",
+        "before_sha256": "9bd7d3f683001ffd8b9269b11983374c702e6a15438669c7b83f9fa5989f0d44",
+        "after_sha256": "cad220488aa88e33ee5ebc223bdff9c67b447aa6b33ff2b488b6a8c3faa53a12"
+      },
+      {
+        "path": "lib/features/attention/inline_approval_card.dart",
+        "before_sha256": null,
+        "after_sha256": "cfacc2d463c7c6dbaac9c0b67da11084627a65a24f35ab0c8cb5f2a223aa4677"
+      },
+      {
+        "path": "lib/features/sessions/session_screen.dart",
+        "before_sha256": "467cb88e3e2c552c8f9af09571a51d06d91f8202e79c16402eb78ed53be84261",
+        "after_sha256": "6398357d5d35f4ab4b77c0d0a5fbd09bd1b48cc50349470a3b8bce5c8d7106ae"
+      },
+      {
+        "path": "test/approval_receipt_test.dart",
+        "before_sha256": null,
+        "after_sha256": "f3353eb699097fbf807dbfc43ccb48a2dc16a9df81967d8e2c094148f14fd32b"
+      },
+      {
+        "path": "test/inline_approval_test.dart",
+        "before_sha256": null,
+        "after_sha256": "aacbeba2dd0a438390ada12ec2bb16dcc9fa25f615dd3f547feb15fb0087ead9"
+      },
+      {
+        "path": "test/widget_screens_test.dart",
+        "before_sha256": "57586c3f774e4fce9dc3beabc6ebc3610691eba4cd4c3e22858af40ea1add511",
+        "after_sha256": "7991469d434c3d5f4e8160ea9613176cdff00fab9053adc635cb2aed0c71e1a3"
+      }
+    ]
+  },
+  "TheDitchRelay": {
+    "patch": "relay-inline-approvals-contract.patch",
+    "sha256": "19544ffc2230277dc98682f724bbca027375f9aed35573dcc6e1d33e0a26ca35",
+    "files": [
+      {
+        "path": "contracts/remote-v1/REMOTE_PROTOCOL_V1.md",
+        "before_sha256": "fe332091444205983ca09fb05ac5e9c2ba26efd6625bc5ffe017f4506927d9ea",
+        "after_sha256": "4f03a63d6afc821daa575eee8ef89af5720543a7065b68b036ca813eee7aaf5e"
+      },
+      {
+        "path": "contracts/remote-v1/manifest.json",
+        "before_sha256": "490c2252bd9e252c0b091fd416d40057ed831b6788c3232ae5063b23b76e6add",
+        "after_sha256": "ec23f09769a9d389deb86afe35e70c27fb3c53485bf2f96fc7304e52ac60f366"
+      }
+    ]
+  }
+}

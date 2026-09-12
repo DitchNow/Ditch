@@ -278,6 +278,23 @@ details through the Mac. Approval decisions and typed question answers use the
 same owning-runtime dispatch as desktop. `attention.execute` accepts an `answers`
 map from question IDs to answer arrays; action/request identity must still be live.
 
+Approval requests are presented inside the owning agent's chat. The encrypted
+`approval.respond` body is `{attention_id, action_id, decision}`. Decisions are
+`approve` (approve once, retained for older clients), `approve_session` (approve
+in this session), and `deny` (the chat's Cancel button). Cancel denies the pending
+operation; it does not stop the agent. Session approval retains the owning
+runtime's existing session scope. All three decisions require device owner
+authentication and a live request. Relay forwards the opaque encrypted payload;
+no Relay deployment, remote enrollment, or additional keys are needed.
+
+Clients must not present Relay delivery or `command_ack` as a successful approval.
+The Mac's encrypted `command_result` must confirm completion. Pending cards are
+keyed by machine/request and attached to their project and agent. An uncertain
+result disables resubmission while read-only request queries and runtime snapshots
+reconcile it; a stale request is rendered as no longer awaiting approval. Agent
+question forms remain a separate interaction.
+
+
 Mobile control requires the Mac runtime online. A disconnected SSH target reports
 `remote_unavailable`; an unconfirmed mutation reports `operation_outcome_unknown`.
 The same command ID and body may recover a receipt, but never resend a mutation.

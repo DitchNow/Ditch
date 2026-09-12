@@ -1,0 +1,1012 @@
+diff --git a/contracts/remote-v1/REMOTE_PROTOCOL_V1.md b/contracts/remote-v1/REMOTE_PROTOCOL_V1.md
+--- a/contracts/remote-v1/REMOTE_PROTOCOL_V1.md
++++ b/contracts/remote-v1/REMOTE_PROTOCOL_V1.md
+@@ -278,6 +278,23 @@
+ same owning-runtime dispatch as desktop. `attention.execute` accepts an `answers`
+ map from question IDs to answer arrays; action/request identity must still be live.
+ 
++Approval requests are presented inside the owning agent's chat. The encrypted
++`approval.respond` body is `{attention_id, action_id, decision}`. Decisions are
++`approve` (approve once, retained for older clients), `approve_session` (approve
++in this session), and `deny` (the chat's Cancel button). Cancel denies the pending
++operation; it does not stop the agent. Session approval retains the owning
++runtime's existing session scope. All three decisions require device owner
++authentication and a live request. Relay forwards the opaque encrypted payload;
++no Relay deployment, remote enrollment, or additional keys are needed.
++
++Clients must not present Relay delivery or `command_ack` as a successful approval.
++The Mac's encrypted `command_result` must confirm completion. Pending cards are
++keyed by machine/request and attached to their project and agent. An uncertain
++result disables resubmission while read-only request queries and runtime snapshots
++reconcile it; a stale request is rendered as no longer awaiting approval. Agent
++question forms remain a separate interaction.
++
++
+ Mobile control requires the Mac runtime online. A disconnected SSH target reports
+ `remote_unavailable`; an unconfirmed mutation reports `operation_outcome_unknown`.
+ The same command ID and body may recover a receipt, but never resend a mutation.
+diff --git a/contracts/remote-v1/manifest.json b/contracts/remote-v1/manifest.json
+--- a/contracts/remote-v1/manifest.json
++++ b/contracts/remote-v1/manifest.json
+@@ -2,10 +2,10 @@
+   "protocol_version": 1,
+   "package_version": "1.0.0",
+   "canonical_owner": "The Ditch macOS repository",
+-  "source_snapshot_date": "2026-09-11",
+-  "bundle_sha256": "3b08430915120edde6112ca0086915171824a61b0545d4f7b57e89e30513b1c3",
++  "source_snapshot_date": "2026-09-12",
++  "bundle_sha256": "98396e3571a1fd0d23a9157331982e7cb8c95c323e4f73438c43f5d29c7e3a0f",
+   "files": {
+-    "REMOTE_PROTOCOL_V1.md": "fe332091444205983ca09fb05ac5e9c2ba26efd6625bc5ffe017f4506927d9ea",
++    "REMOTE_PROTOCOL_V1.md": "4f03a63d6afc821daa575eee8ef89af5720543a7065b68b036ca813eee7aaf5e",
+     "fixtures/crypto-v1.json": "53c71f10411542b3f654dfb3925b8bb41dde31505d6a8eaa584f40ab085dd95a",
+     "fixtures/v1.json": "a4ee41d0005bbf9a984f11c544a0b9b1f07a43d529812b651c7fd66e95ddfa12",
+     "openapi-v1.yaml": "ea2a9c663cc0015ae15352d4a9a1a79ea86517892f2dd9a2a09e1128a2423716",
+diff --git a/lib/app/app_controller.dart b/lib/app/app_controller.dart
+--- a/lib/app/app_controller.dart
++++ b/lib/app/app_controller.dart
+@@ -1,4 +1,5 @@
+ import 'dart:async';
++import 'approval_interaction.dart';
+ import 'dart:collection';
+ 
+ import 'package:flutter/widgets.dart';
+@@ -783,11 +784,20 @@
+     );
+   }
+ 
++  // Retain in-flight decisions across navigation; never submit them twice.
++  final Map<String, ApprovalInteraction> approvalInteractions = {};
++  ApprovalInteraction approvalInteraction(AttentionItem item) =>
++      approvalInteractions.putIfAbsent(
++        '${item.machineId}:${item.id}',
++        () => ApprovalInteraction(item),
++      );
++
+   Future<CommandReceipt?> executeAttention(
+     AttentionItem item,
+     AllowedRemoteAction action, {
+     String? answer,
+     Map<String, List<String>>? answers,
++    bool forSession = false,
+   }) async {
+     final requiresOwnerAuthentication =
+         action.confirmation == ConfirmationClass.ownerAuthentication ||
+@@ -816,7 +826,8 @@
+         payload: {
+           'attention_id': item.id,
+           'action_id': action.id,
+-          if (action.type == RemoteActionType.approve) 'decision': 'approve',
++          if (action.type == RemoteActionType.approve)
++            'decision': forSession ? 'approve_session' : 'approve',
+           if (action.type == RemoteActionType.deny) 'decision': 'deny',
+           'answer': ?answer,
+           'answers': ?answers,
+@@ -826,6 +837,7 @@
+       sessionId: item.sessionId,
+       refreshProjectSessions: item.sessionId != null,
+       refreshAttentionAfter: true,
++      awaitRuntimeResult: type == 'approval.respond',
+     );
+   }
+ 
+@@ -885,6 +897,7 @@
+     String? sessionId,
+     bool refreshProjectSessions = false,
+     bool refreshAttentionAfter = false,
++    bool awaitRuntimeResult = false,
+   }) async {
+     error = null;
+     if (resourceId != null) {
+@@ -893,7 +906,9 @@
+       notifyListeners();
+     }
+     try {
+-      final receipt = await repository.command(command);
++      final receipt = awaitRuntimeResult
++          ? await repository.respondApproval(command)
++          : await repository.command(command);
+       if (resourceId != null) {
+         sessionCommandStates[resourceId] = receipt.state;
+       }
+@@ -1312,6 +1327,7 @@
+   }
+ 
+   void _clearPagingUiState() {
++    approvalInteractions.clear();
+     loadingMoreProjects = false;
+     projectPageError = null;
+     _loadingSessionProjects.clear();
+diff --git a/lib/app/approval_interaction.dart b/lib/app/approval_interaction.dart
+new file mode 100644
+--- /dev/null
++++ b/lib/app/approval_interaction.dart
+@@ -0,0 +1,97 @@
++import 'package:flutter/foundation.dart';
++import '../data/remote/protocol.dart';
++import '../data/remote/remote_repository.dart';
++import '../domain/errors.dart';
++import '../domain/models.dart';
++
++enum ApprovalChoice { session, cancel, once }
++
++extension ApprovalChoiceLabel on ApprovalChoice {
++  String get label => switch (this) {
++    ApprovalChoice.session => 'Approve in this session',
++    ApprovalChoice.cancel => 'Cancel',
++    ApprovalChoice.once => 'Approve once',
++  };
++  String get result => switch (this) {
++    ApprovalChoice.session => 'Approved in this session',
++    ApprovalChoice.cancel => 'Cancelled',
++    ApprovalChoice.once => 'Approved once',
++  };
++}
++
++/// Survives chat navigation so a pending command cannot be sent twice.
++class ApprovalInteraction extends ChangeNotifier {
++  ApprovalInteraction(this.item);
++  final AttentionItem item;
++  Map<String, dynamic>? details;
++  bool loading = false;
++  bool submitting = false;
++  bool awaitingConfirmation = false;
++  String? resolution;
++  String? error;
++  DateTime? get expiresAt =>
++      DateTime.tryParse(details?['expires_at']?.toString() ?? '');
++  bool get expired => expiresAt?.isBefore(DateTime.now()) ?? false;
++  bool get actionable =>
++      details != null &&
++      resolution == null &&
++      !expired &&
++      !submitting &&
++      !awaitingConfirmation &&
++      !loading;
++
++  Future<void> load(Future<Map<String, dynamic>> Function() fetch) async {
++    if (loading || resolution != null) return;
++    loading = true;
++    error = null;
++    notifyListeners();
++    try {
++      details = await fetch();
++    } on DitchException catch (caught) {
++      if (caught.code == RemoteErrorCode.approvalStale) {
++        resolution = 'No longer awaiting approval';
++      } else {
++        error = caught.userMessage;
++      }
++    } on Object {
++      error =
++          'Could not load this request. Check the connection and try again.';
++    } finally {
++      loading = false;
++      notifyListeners();
++    }
++  }
++
++  Future<void> choose(
++    ApprovalChoice choice,
++    Future<CommandReceipt?> Function() send,
++  ) async {
++    if (!actionable) return;
++    submitting = true;
++    error = null;
++    notifyListeners();
++    try {
++      final receipt = await send();
++      // Cancelling device authentication leaves the request untouched.
++      if (receipt == null) return;
++      if (receipt.state == CommandState.succeeded) {
++        resolution = choice.result;
++      } else if (receipt.errorCode == RemoteErrorCode.approvalStale) {
++        resolution = 'No longer awaiting approval';
++      } else {
++        awaitingConfirmation = true;
++        error = receipt.state == CommandState.rejected
++            ? 'The runtime did not confirm this decision. Check request status.'
++            : 'Waiting for confirmation from the runtime.';
++      }
++    } on Object catch (caught) {
++      error = caught is DitchException
++          ? caught.userMessage
++          : 'Connection interrupted. The result is not known yet.';
++      awaitingConfirmation = true;
++    } finally {
++      submitting = false;
++      notifyListeners();
++    }
++  }
++}
+diff --git a/lib/data/remote/protocol.dart b/lib/data/remote/protocol.dart
+--- a/lib/data/remote/protocol.dart
++++ b/lib/data/remote/protocol.dart
+@@ -225,7 +225,8 @@
+   bool get isDestructive =>
+       type == 'session.force_kill' ||
+       type == 'integration.apply' ||
+-      (type == 'approval.respond' && payload['decision'] == 'approve');
++      (type == 'approval.respond' &&
++          const ['approve', 'approve_session'].contains(payload['decision']));
+ 
+   factory RemoteCommand.create({
+     required String type,
+diff --git a/lib/data/remote/remote_repository.dart b/lib/data/remote/remote_repository.dart
+--- a/lib/data/remote/remote_repository.dart
++++ b/lib/data/remote/remote_repository.dart
+@@ -723,6 +723,37 @@
+     );
+   }
+ 
++  /// Relay delivery alone is not a runtime approval acknowledgement.
++  Future<CommandReceipt> respondApproval(RemoteCommand command) async {
++    try {
++      final result = objectMap(
++        jsonDecode(await _encryptedQuery(command)),
++        'approval result',
++      );
++      if (result['command_id'] != command.commandId) {
++        throw const DitchException(
++          RemoteErrorCode.invalidPayload,
++          'Mismatched approval response.',
++        );
++      }
++      final completed =
++          result['status'] == 'completed' && result['result'] == 'Accepted';
++      return CommandReceipt(
++        commandId: command.commandId,
++        state: completed ? CommandState.succeeded : CommandState.rejected,
++        errorCode: completed
++            ? null
++            : RemoteErrorCode.parse(result['error_code']),
++      );
++    } on DitchException catch (error) {
++      if (error.code != RemoteErrorCode.timeout) rethrow;
++      return CommandReceipt(
++        commandId: command.commandId,
++        state: CommandState.unknown,
++      );
++    }
++  }
++
+   Future<CommandReceipt> decodeCommandReceipt(
+     String machineId,
+     RemoteEnvelope response,
+@@ -808,14 +839,24 @@
+           .timeout(const Duration(seconds: 40));
+       // A submission error must not leave an unhandled timeout on the listener.
+       unawaited(responseFuture.then<void>((_) {}, onError: (Object _) {}));
+-      await command(query);
++      final receipt = await command(query);
++      if (const [
++        CommandState.rejected,
++        CommandState.expired,
++        CommandState.failed,
++      ].contains(receipt.state)) {
++        throw DitchException(
++          receipt.errorCode ?? RemoteErrorCode.actionNotAllowed,
++          'The request was rejected.',
++        );
++      }
+       final RemoteEnvelope response;
+       try {
+         response = await responseFuture;
+       } on TimeoutException {
+         throw const DitchException(
+           RemoteErrorCode.timeout,
+-          'The transcript result is not known yet.',
++          'The runtime result is not known yet.',
+         );
+       }
+       final encrypted = objectMap(
+diff --git a/lib/features/attention/attention_screen.dart b/lib/features/attention/attention_screen.dart
+--- a/lib/features/attention/attention_screen.dart
++++ b/lib/features/attention/attention_screen.dart
+@@ -334,6 +334,23 @@
+                     const Text(
+                       'Ditch has already resolved or replaced this item.',
+                     )
++                  else if (current.type == AttentionType.approval)
++                    TextButton(
++                      onPressed: controller.sessionForAttention(current) == null
++                          ? null
++                          : () => Navigator.of(context).push(
++                              MaterialPageRoute(
++                                builder: (_) => SessionScreen(
++                                  controller: controller,
++                                  session: controller.sessionForAttention(
++                                    current,
++                                  )!,
++                                  attention: current,
++                                ),
++                              ),
++                            ),
++                      child: const Text('Review in chat'),
++                    )
+                   else
+                     ...current.actions.map(
+                       (action) => Padding(
+@@ -368,11 +385,7 @@
+     AllowedRemoteAction action,
+   ) async {
+     Map<String, List<String>>? answers;
+-    if ([
+-      RemoteActionType.answer,
+-      RemoteActionType.approve,
+-      RemoteActionType.deny,
+-    ].contains(action.type)) {
++    if ([RemoteActionType.answer].contains(action.type)) {
+       try {
+         final decision = await reviewAgentRequest(
+           context,
+diff --git a/lib/features/attention/inline_approval_card.dart b/lib/features/attention/inline_approval_card.dart
+new file mode 100644
+--- /dev/null
++++ b/lib/features/attention/inline_approval_card.dart
+@@ -0,0 +1,169 @@
++import 'dart:async';
++import 'package:flutter/material.dart';
++import '../../app/app_controller.dart';
++import '../../app/approval_interaction.dart';
++import '../../domain/models.dart';
++
++class InlineApprovalCard extends StatefulWidget {
++  const InlineApprovalCard({
++    super.key,
++    required this.controller,
++    required this.interaction,
++  });
++  final AppController controller;
++  final ApprovalInteraction interaction;
++  @override
++  State<InlineApprovalCard> createState() => _InlineApprovalCardState();
++}
++
++class _InlineApprovalCardState extends State<InlineApprovalCard> {
++  Timer? _expiry;
++  bool _wasOnline = false;
++  bool _wasLive = true;
++  ApprovalInteraction get request => widget.interaction;
++  bool get online => widget.controller.canControlProject(
++    request.item.machineId,
++    request.item.projectId,
++  );
++
++  @override
++  void initState() {
++    super.initState();
++    _wasOnline = online;
++    widget.controller.addListener(_reconcile);
++    WidgetsBinding.instance.addPostFrameCallback((_) {
++      if (mounted && online) unawaited(_load());
++    });
++  }
++
++  void _reconcile() {
++    final live = widget.controller.attention.any(
++      (item) =>
++          item.id == request.item.id &&
++          item.machineId == request.item.machineId &&
++          item.actions.isNotEmpty,
++    );
++    final refresh = online && (!_wasOnline || (_wasLive && !live));
++    _wasOnline = online;
++    _wasLive = live;
++    if (refresh) unawaited(_load());
++  }
++
++  Future<void> _load() async {
++    await request.load(() => widget.controller.approvalDetails(request.item));
++    if (!mounted) return;
++    _expiry?.cancel();
++    final expires = request.expiresAt;
++    if (expires != null && expires.isAfter(DateTime.now())) {
++      _expiry = Timer(expires.difference(DateTime.now()), () {
++        if (mounted) setState(() {});
++      });
++    }
++  }
++
++  AllowedRemoteAction? _action(ApprovalChoice choice) {
++    final type = choice == ApprovalChoice.cancel
++        ? RemoteActionType.deny
++        : RemoteActionType.approve;
++    for (final item in widget.controller.attention) {
++      if (item.id != request.item.id ||
++          item.machineId != request.item.machineId ||
++          item.sessionId != request.item.sessionId ||
++          item.projectId != request.item.projectId) {
++        continue;
++      }
++      for (final action in item.actions) {
++        if (action.type == type) return action;
++      }
++    }
++    return null;
++  }
++
++  @override
++  void dispose() {
++    widget.controller.removeListener(_reconcile);
++    _expiry?.cancel();
++    super.dispose();
++  }
++
++  @override
++  Widget build(BuildContext context) => ListenableBuilder(
++    listenable: Listenable.merge([widget.controller, request]),
++    builder: (context, _) => Card(
++      child: Padding(
++        padding: const EdgeInsets.all(16),
++        child: Column(
++          crossAxisAlignment: CrossAxisAlignment.start,
++          children: [
++            Text(
++              'Approval required',
++              style: Theme.of(context).textTheme.titleSmall,
++            ),
++            const SizedBox(height: 8),
++            Text(
++              request.details?['summary'] as String? ?? request.item.summary,
++            ),
++            if (request.details?['command'] case final String command
++                when command.isNotEmpty) ...[
++              const SizedBox(height: 8),
++              SelectableText(
++                command,
++                style: const TextStyle(fontFamily: 'monospace'),
++              ),
++            ],
++            if (request.details?['target'] case final String target
++                when target.isNotEmpty) ...[
++              const SizedBox(height: 8),
++              Text('Target: $target'),
++            ],
++            const SizedBox(height: 12),
++            if (request.resolution != null || request.expired)
++              Text(request.resolution ?? 'Expired')
++            else ...[
++              Wrap(
++                spacing: 8,
++                runSpacing: 8,
++                children: [
++                  for (final choice in ApprovalChoice.values)
++                    OutlinedButton(
++                      onPressed:
++                          online &&
++                              request.actionable &&
++                              _action(choice) != null
++                          ? () => request.choose(
++                              choice,
++                              () => widget.controller.executeAttention(
++                                request.item,
++                                _action(choice)!,
++                                forSession: choice == ApprovalChoice.session,
++                              ),
++                            )
++                          : null,
++                      child: Text(choice.label),
++                    ),
++                ],
++              ),
++              if (request.loading) const Text('Loading request…'),
++              if (request.submitting) const Text('Waiting for the runtime…'),
++              if (!online) const Text('Reconnect to respond to this request.'),
++              if (request.error != null) Text(request.error!),
++              if (request.awaitingConfirmation)
++                const Text(
++                  'This decision will not be sent again while its result is unknown.',
++                ),
++              if (request.error != null ||
++                  request.awaitingConfirmation ||
++                  request.details == null)
++                TextButton(
++                  onPressed: online && !request.loading && !request.submitting
++                      ? _load
++                      : null,
++                  child: const Text('Check status'),
++                ),
++            ],
++          ],
++        ),
++      ),
++    ),
++  );
++}
+diff --git a/lib/features/sessions/session_screen.dart b/lib/features/sessions/session_screen.dart
+--- a/lib/features/sessions/session_screen.dart
++++ b/lib/features/sessions/session_screen.dart
+@@ -1,3 +1,4 @@
++import '../attention/inline_approval_card.dart';
+ import '../attention/agent_request_dialog.dart';
+ import 'dart:async';
+ 
+@@ -239,6 +240,8 @@
+       controller.authorizationState,
+       controller.deepLinkRevalidating,
+       controller.error,
++      controller.attention,
++      controller.projects,
+     ),
+     builder: (context, _) => Scaffold(
+       appBar: AppBar(
+@@ -325,7 +328,8 @@
+           if (widget.controller.sessionCommandStates[session.id]
+               case final state?)
+             _CommandBanner(state: state),
+-          if (widget.attention case final attention?)
++          if (widget.attention case final attention?
++              when attention.type != AttentionType.approval)
+             _AttentionBanner(controller: widget.controller, item: attention),
+           Padding(
+             padding: const EdgeInsets.fromLTRB(16, 8, 16, 8),
+@@ -388,11 +392,43 @@
+     listenable: _transcript,
+     builder: (context, _) {
+       final messages = _transcript.messages;
++      for (final item in widget.controller.attention) {
++        if (item.type == AttentionType.approval &&
++            item.sessionId == session.id &&
++            item.machineId == session.machineId &&
++            item.projectId == session.projectId) {
++          widget.controller.approvalInteraction(item);
++        }
++      }
++      final approvals = widget.controller.approvalInteractions.values
++          .where(
++            (entry) =>
++                entry.item.sessionId == session.id &&
++                entry.item.machineId == session.machineId &&
++                entry.item.projectId == session.projectId,
++          )
++          .toList();
++      final entries = <({DateTime at, Widget child})>[
++        for (final message in messages)
++          (
++            at: message.createdAt,
++            child: _MessageBubble(key: ValueKey(message.id), message: message),
++          ),
++        for (final approval in approvals)
++          (
++            at: approval.item.createdAt,
++            child: InlineApprovalCard(
++              key: ValueKey('approval:${approval.item.id}'),
++              controller: widget.controller,
++              interaction: approval,
++            ),
++          ),
++      ]..sort((a, b) => a.at.compareTo(b.at));
+       if ((_waitingForInitialTranscript || _transcript.loadingInitial) &&
+-          messages.isEmpty) {
++          entries.isEmpty) {
+         return const Center(child: CircularProgressIndicator.adaptive());
+       }
+-      if (messages.isEmpty) {
++      if (entries.isEmpty) {
+         return EmptyState(
+           icon: online ? Icons.forum_outlined : Icons.cloud_off_outlined,
+           title: online
+@@ -417,11 +453,11 @@
+             keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
+             padding: const EdgeInsets.fromLTRB(16, 4, 16, 18),
+             itemCount:
+-                messages.length +
++                entries.length +
+                 (_transcript.hasMore || _transcript.loadingOlder ? 1 : 0),
+             itemBuilder: (context, index) {
+               if ((_transcript.hasMore || _transcript.loadingOlder) &&
+-                  index == messages.length) {
++                  index == entries.length) {
+                 return Center(
+                   child: TextButton(
+                     onPressed: online && !_transcript.loadingOlder
+@@ -437,11 +473,7 @@
+                   ),
+                 );
+               }
+-              final message = messages[messages.length - index - 1];
+-              return _MessageBubble(
+-                key: ValueKey(message.id),
+-                message: message,
+-              );
++              return entries[entries.length - index - 1].child;
+             },
+           ),
+         ),
+@@ -939,11 +971,7 @@
+     AllowedRemoteAction action,
+   ) async {
+     Map<String, List<String>>? answers;
+-    if ([
+-      RemoteActionType.answer,
+-      RemoteActionType.approve,
+-      RemoteActionType.deny,
+-    ].contains(action.type)) {
++    if ([RemoteActionType.answer].contains(action.type)) {
+       try {
+         final decision = await reviewAgentRequest(
+           pageContext,
+diff --git a/test/approval_receipt_test.dart b/test/approval_receipt_test.dart
+new file mode 100644
+--- /dev/null
++++ b/test/approval_receipt_test.dart
+@@ -0,0 +1,130 @@
++import 'dart:async';
++import 'dart:convert';
++import 'package:flutter_test/flutter_test.dart';
++import 'package:the_ditch_remote/data/cache/projection_cache.dart';
++import 'package:the_ditch_remote/data/remote/protocol.dart';
++import 'package:the_ditch_remote/data/remote/realtime.dart';
++import 'package:the_ditch_remote/data/remote/remote_api.dart';
++import 'package:the_ditch_remote/data/remote/remote_repository.dart';
++import 'package:the_ditch_remote/domain/models.dart';
++import 'package:the_ditch_remote/domain/remote_state.dart';
++import 'offline_command_test.dart' show FakePlatform;
++
++class ReceiptPlatform extends FakePlatform {
++  String plaintext = '';
++  String? peer;
++  @override
++  Future<String> decrypt({
++    required String peerPublicKey,
++    required String hkdfSalt,
++    required String hkdfInfo,
++    required String aad,
++    required String nonce,
++    required String ciphertext,
++  }) async {
++    peer = peerPublicKey;
++    return plaintext;
++  }
++}
++
++class ReceiptRealtime extends MachineRealtime {
++  ReceiptRealtime(RemoteApi api)
++    : super(api: api, origin: Uri.parse('https://relay.example'));
++  // Closed by the test after completing all receipts.
++  // ignore: close_sinks
++  final events = StreamController<RemoteEnvelope>.broadcast();
++  @override
++  Stream<RemoteEnvelope> get envelopes => events.stream;
++}
++
++class ReceiptRepository extends RemoteRepository {
++  ReceiptRepository({
++    required super.api,
++    required super.platform,
++    required super.cache,
++  });
++  int sends = 0;
++  @override
++  Future<CommandReceipt> command(RemoteCommand command) async {
++    sends++;
++    return CommandReceipt(
++      commandId: command.commandId,
++      state: CommandState.accepted,
++    );
++  }
++}
++
++void main() {
++  test('approval requires decrypted Mac result, not relay delivery', () async {
++    final platform = ReceiptPlatform();
++    final api = RemoteApi(SignedHttpClient(platform), platform);
++    final channel = ReceiptRealtime(api);
++    final repository =
++        ReceiptRepository(
++            api: api,
++            platform: platform,
++            cache: ProjectionCache(platform),
++          )
++          ..authorizationState = AuthorizationState.paired
++          ..ownerId = 'owner'
++          ..machineAgreementKeys = {'mac': 'paired-mac-key'}
++          ..machineKeyVersions = {'mac': 1}
++          ..machines = [
++            MachineSummary(
++              id: 'mac',
++              name: 'Mac',
++              connection: MachineConnection.online,
++              lastSeenAt: DateTime.now(),
++            ),
++          ]
++          ..realtime = channel;
++    for (final (status, result, expected) in [
++      ('completed', 'Accepted', CommandState.succeeded),
++      ('rejected', null, CommandState.rejected),
++    ]) {
++      final command = RemoteCommand.create(
++        type: 'approval.respond',
++        machineId: 'mac',
++        payload: {'decision': 'approve_session'},
++      );
++      var finished = false;
++      final pending = repository.respondApproval(command).then((value) {
++        finished = true;
++        return value;
++      });
++      await Future<void>.delayed(Duration.zero);
++      expect(
++        finished,
++        isFalse,
++        reason: 'Relay acceptance cannot confirm runtime execution',
++      );
++      platform.plaintext = jsonEncode({
++        'command_id': command.commandId,
++        'status': status,
++        'result': result,
++        'error_code': status == 'rejected' ? 'approval_stale' : null,
++      });
++      channel.events.add(
++        RemoteEnvelope(
++          id: 'result',
++          kind: 'command_result',
++          machineId: 'mac',
++          sequence: null,
++          sentAt: DateTime.now(),
++          type: 'command_result',
++          payload: {
++            'command_id': command.commandId,
++            'expires_at': DateTime.now()
++                .add(const Duration(minutes: 1))
++                .millisecondsSinceEpoch,
++            'encrypted': {'nonce': 'nonce', 'ciphertext': 'ciphertext'},
++          },
++        ),
++      );
++      expect((await pending).state, expected);
++      expect(platform.peer, 'paired-mac-key');
++    }
++    expect(repository.sends, 2);
++    await channel.events.close();
++  });
++}
+diff --git a/test/inline_approval_test.dart b/test/inline_approval_test.dart
+new file mode 100644
+--- /dev/null
++++ b/test/inline_approval_test.dart
+@@ -0,0 +1,69 @@
++import 'dart:async';
++import 'package:flutter_test/flutter_test.dart';
++import 'package:the_ditch_remote/app/approval_interaction.dart';
++import 'package:the_ditch_remote/domain/errors.dart';
++import 'package:the_ditch_remote/data/remote/protocol.dart';
++import 'package:the_ditch_remote/data/remote/remote_repository.dart';
++import 'widget_screens_test.dart' as fixtures;
++
++void main() {
++  test(
++    'relay delivery and unknown results never claim approval or resend',
++    () async {
++      for (final status in [CommandState.accepted, CommandState.unknown]) {
++        final request = ApprovalInteraction(
++          fixtures.controller().attention.single,
++        );
++        await request.load(() async => {'summary': 'Run tests'});
++        var sends = 0;
++        Future<CommandReceipt?> send() async {
++          sends++;
++          return CommandReceipt(commandId: 'command', state: status);
++        }
++
++        await request.choose(ApprovalChoice.once, send);
++        await request.choose(ApprovalChoice.session, send);
++        expect(sends, 1);
++        expect(request.resolution, isNull);
++        expect(request.awaitingConfirmation, isTrue);
++        await request.load(
++          () async => throw const DitchException(
++            RemoteErrorCode.approvalStale,
++            'resolved elsewhere',
++          ),
++        );
++        expect(request.actionable, isFalse);
++        expect(request.resolution, 'No longer awaiting approval');
++      }
++    },
++  );
++  test('cancelled owner authentication permits a later decision', () async {
++    final request = ApprovalInteraction(fixtures.controller().attention.single);
++    await request.load(() async => {});
++    await request.choose(ApprovalChoice.once, () async => null);
++    expect(request.actionable, isTrue);
++    expect(request.resolution, isNull);
++  });
++  test(
++    'a disconnected details query does not resolve or discard a card',
++    () async {
++      final request = ApprovalInteraction(
++        fixtures.controller().attention.single,
++      );
++      await request.load(() async => throw TimeoutException('offline'));
++      expect(request.resolution, isNull);
++      expect(request.actionable, isFalse);
++      await request.load(() async => {});
++      expect(request.actionable, isTrue);
++    },
++  );
++  test('session approval retains destructive command classification', () {
++    final command = RemoteCommand.create(
++      type: 'approval.respond',
++      machineId: 'mac',
++      payload: {'decision': 'approve_session'},
++    );
++    expect(command.isDestructive, isTrue);
++    expect(command.isSensitive, isTrue);
++  });
++}
+diff --git a/test/widget_screens_test.dart b/test/widget_screens_test.dart
+--- a/test/widget_screens_test.dart
++++ b/test/widget_screens_test.dart
+@@ -23,23 +23,42 @@
+ class WidgetRepository extends RemoteRepository {
+   WidgetRepository((RemoteApi, PlatformServices, ProjectionCache) superArgs)
+     : super(api: superArgs.$1, platform: superArgs.$2, cache: superArgs.$3);
++  DitchException? approvalError;
+   @override
+   Future<Map<String, dynamic>> approvalDetails(
+     String machineId,
+     String attentionId,
+-  ) async => {
+-    'id': attentionId,
+-    'summary': 'Agent needs input',
+-    'questions': [
+-      {
+-        'id': 'question_1',
+-        'header': 'Choice',
+-        'question': 'Which approach?',
+-        'options': [],
+-        'isOther': true,
+-      },
+-    ],
+-  };
++  ) async {
++    if (approvalError case final error?) throw error;
++    return {
++      'id': attentionId,
++      'summary': 'Agent needs input',
++      'questions': [
++        {
++          'id': 'question_1',
++          'header': 'Choice',
++          'question': 'Which approach?',
++          'options': [],
++          'isOther': true,
++        },
++      ],
++    };
++  }
++
++  Completer<CommandReceipt>? approvalCompleter;
++  @override
++  Future<CommandReceipt> respondApproval(RemoteCommand command) async {
++    commands++;
++    lastCommand = command;
++    return approvalCompleter?.future ??
++        Future.value(
++          CommandReceipt(
++            commandId: command.commandId,
++            state: CommandState.succeeded,
++          ),
++        );
++  }
++
+   int commands = 0;
+   RemoteCommand? lastCommand;
+   Completer<CommandReceipt>? commandCompleter;
+@@ -208,6 +227,87 @@
+         );
+   });
+ 
++  for (final (label, decision, result) in [
++    ('Approve in this session', 'approve_session', 'Approved in this session'),
++    ('Cancel', 'deny', 'Cancelled'),
++    ('Approve once', 'approve', 'Approved once'),
++  ]) {
++    testWidgets('inline approval $decision waits for runtime confirmation', (
++      tester,
++    ) async {
++      final value = controller();
++      final repository = value.repository as WidgetRepository;
++      final json = repository.attention.single.toJson();
++      json['allowed_remote_actions'] = [
++        for (final type in ['approve', 'deny'])
++          {
++            'action_id': 'attention_1',
++            'action_type': type,
++            'label': type,
++            'confirmation_class': 'device_owner_authentication',
++          },
++      ];
++      repository.attention = [AttentionItem.fromJson(json)];
++      repository.approvalCompleter = Completer<CommandReceipt>();
++      await tester.pumpWidget(
++        host(SessionScreen(controller: value, session: value.sessions.single)),
++      );
++      await tester.pumpAndSettle();
++      expect(find.byType(AlertDialog), findsNothing);
++      expect(find.text(label), findsOneWidget);
++      await tester.tap(find.text(label));
++      await tester.pump();
++      expect(repository.commands, 1);
++      expect(repository.lastCommand?.payload['decision'], decision);
++      expect(repository.lastCommand?.machineId, 'machine_1');
++      expect(repository.lastCommand?.ownerAuthenticatedAt, isNotNull);
++      expect(find.text(result), findsNothing);
++      await tester.tap(find.text(label));
++      await tester.pump();
++      expect(repository.commands, 1);
++      repository.approvalCompleter!.complete(
++        CommandReceipt(
++          commandId: repository.lastCommand!.commandId,
++          state: CommandState.succeeded,
++        ),
++      );
++      await tester.pumpAndSettle();
++      expect(find.text(result), findsOneWidget);
++      expect(find.byType(AlertDialog), findsNothing);
++      // Switching away and back must not restore actionable buttons.
++      await tester.pumpWidget(host(const SizedBox()));
++      await tester.pumpWidget(
++        host(SessionScreen(controller: value, session: value.sessions.single)),
++      );
++      await tester.pumpAndSettle();
++      expect(find.text(result), findsOneWidget);
++      expect(find.text('Approve once'), findsNothing);
++      expect(tester.takeException(), isNull);
++    });
++  }
++
++  testWidgets('approval resolved on another device becomes inert in chat', (
++    tester,
++  ) async {
++    final value = controller();
++    final repository = value.repository as WidgetRepository;
++    await tester.pumpWidget(
++      host(SessionScreen(controller: value, session: value.sessions.single)),
++    );
++    await tester.pumpAndSettle();
++    expect(find.text('Approval required'), findsOneWidget);
++    repository.attention = [];
++    repository.approvalError = const DitchException(
++      RemoteErrorCode.approvalStale,
++      'Resolved elsewhere',
++    );
++    await value.refreshAttention();
++    await tester.pumpAndSettle();
++    expect(find.text('No longer awaiting approval'), findsOneWidget);
++    expect(find.text('Approve once'), findsNothing);
++    expect(repository.commands, 0);
++  });
++
+   testWidgets('fresh app presents focused QR onboarding', (tester) async {
+     final value = controller()
+       ..repository.machines = []
+@@ -362,6 +462,8 @@
+     tester,
+   ) async {
+     final value = controller(online: false);
++    value.repository.attention =
++        []; // This test exercises a chat without pending approvals.
+     await tester.pumpWidget(
+       host(SessionScreen(controller: value, session: value.sessions.single)),
+     );
+@@ -795,6 +897,8 @@
+     tester,
+   ) async {
+     final value = controller();
++    value.repository.attention =
++        []; // This test exercises a chat without pending approvals.
+     final repository = value.repository as WidgetRepository;
+     repository.transcriptCompleter = Completer<TranscriptPage>();
+     await tester.pumpWidget(
+@@ -839,6 +943,8 @@
+     tester,
+   ) async {
+     final value = controller();
++    value.repository.attention =
++        []; // This test exercises a chat without pending approvals.
+     final repository = value.repository as WidgetRepository;
+     repository.transcriptCompleter = Completer<TranscriptPage>();
+     await tester.pumpWidget(
