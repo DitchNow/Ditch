@@ -12,13 +12,31 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use uuid::Uuid;
+
+thread_local! {
+    static OPERATION_ID: std::cell::Cell<Option<Uuid>> = const { std::cell::Cell::new(None) };
+}
+
+/// One user command keeps its receipt identity through the Mac's SSH dispatch.
+/// The guard restores nested calls and unwinding; read-only calls use fresh IDs.
+pub fn with_operation_id<T>(id: Uuid, run: impl FnOnce() -> T) -> T {
+    struct Reset(Option<Uuid>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            OPERATION_ID.set(self.0);
+        }
+    }
+    let _reset = Reset(OPERATION_ID.replace(Some(id)));
+    run()
+}
 
 const PREFLIGHT_SCRIPT: &str = r#"set -eu
 printf 'home\t%s\n' "$HOME"
@@ -53,20 +71,29 @@ else printf 'package_manager\tunknown\n'; fi
 
 #[derive(Clone, Default)]
 pub struct RemoteConnectionManager {
+    #[cfg(test)]
+    pub test_rpc: Option<
+        Arc<dyn Fn(&str, Uuid, ClientRequest) -> Result<ServerResponse, SshError> + Send + Sync>,
+    >,
     bridges: Arc<Mutex<HashMap<String, Arc<Mutex<Bridge>>>>>,
     session_passwords: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+    event_cancellations: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
+    event_cursors: Arc<Mutex<HashMap<String, (Uuid, u64)>>>,
 }
 
 struct Bridge {
     child: Child,
     stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
+    stdout: ChildStdout,
+    buffered: Vec<u8>,
+    verified: bool,
     _askpass: AskpassGuard,
 }
 
 #[derive(Deserialize)]
 struct RemoteSequencedEvent {
-    #[allow(dead_code)]
+    #[serde(default)]
+    epoch: Uuid,
     sequence: u64,
     event: ServerEvent,
 }
@@ -119,66 +146,134 @@ impl RemoteConnectionManager {
             .stdout
             .take()
             .ok_or_else(|| SshError::Failed("SSH bridge has no stdout".into()))?;
-        if let Some(stderr) = child.stderr.take() {
+        if let Some(mut stderr) = child.stderr.take() {
             std::thread::spawn(move || {
                 // Drain to prevent transport backpressure. SSH diagnostics are
                 // intentionally not copied into runtime logs because prompts
                 // can contain private host/user details.
-                for _ in BufReader::new(stderr).lines().take(512) {}
+                let _ = std::io::copy(&mut stderr, &mut std::io::sink());
             });
         }
         if let Some(prompt) = prompts.host_key_prompt() {
+            let _ = child.kill();
+            let _ = child.wait();
             return Err(SshError::Failed(prompt));
         }
+        nonblocking(&stdin)?;
+        nonblocking(&stdout)?;
         let value = Arc::new(Mutex::new(Bridge {
             child,
             stdin,
-            stdout: BufReader::new(stdout),
+            stdout,
+            buffered: Vec::new(),
+            verified: false,
             _askpass: guard,
         }));
-        self.bridges
+        let value = self
+            .bridges
             .lock()
             .unwrap()
-            .insert(alias.to_owned(), value.clone());
+            .entry(alias.to_owned())
+            .or_insert(value)
+            .clone();
         observe("remote_daemon_connected", alias, None);
         Ok(value)
     }
 
     pub fn request(&self, alias: &str, request: ClientRequest) -> Result<ServerResponse, SshError> {
-        let bridge = self.bridge(alias)?;
-        let mut bridge = bridge.lock().unwrap();
-        let envelope = Envelope::new(request);
-        serde_json::to_writer(&mut bridge.stdin, &envelope)
-            .map_err(|error| SshError::Failed(error.to_string()))?;
-        bridge.stdin.write_all(b"\n")?;
-        bridge.stdin.flush()?;
-        let mut descriptor = libc::pollfd {
-            fd: bridge.stdout.get_ref().as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
+        let read_only = matches!(
+            request,
+            ClientRequest::Health
+                | ClientRequest::RuntimeStatus
+                | ClientRequest::Snapshot
+                | ClientRequest::HostIdentityStatus
+                | ClientRequest::ListProjects
+                | ClientRequest::ListAgentMessages { .. }
+                | ClientRequest::RejoinAgent { .. }
+                | ClientRequest::GetOperationOutcome { .. }
+                | ClientRequest::GetPermissionRequest { .. }
+                | ClientRequest::ListFilesystemDirectory { .. }
+        );
+        let operation_id = if read_only {
+            Uuid::new_v4()
+        } else {
+            OPERATION_ID.get().unwrap_or_else(Uuid::new_v4)
         };
-        // Timing out owns only this transport. It never terminates or retries
-        // a remote mutation, daemon, PTY, or agent.
-        let ready = unsafe { libc::poll(&mut descriptor, 1, 30_000) };
-        if ready <= 0 {
-            self.bridges.lock().unwrap().remove(alias);
-            return Err(if ready == 0 {
-                SshError::Timeout
-            } else {
-                SshError::Failed(std::io::Error::last_os_error().to_string())
-            });
+        #[cfg(test)]
+        if let Some(rpc) = &self.test_rpc {
+            return rpc(alias, operation_id, request);
         }
-        let mut line = String::new();
-        if bridge.stdout.read_line(&mut line)? == 0 {
-            self.bridges.lock().unwrap().remove(alias);
-            observe("remote_daemon_disconnected", alias, None);
-            return Err(SshError::Failed("SSH bridge disconnected".into()));
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let entry = self.bridge(alias)?;
+        let mut dispatched = false;
+        let result = (|| {
+            let mut bridge = loop {
+                match entry.try_lock() {
+                    Ok(bridge) => break bridge,
+                    Err(std::sync::TryLockError::Poisoned(_)) => {
+                        return Err(SshError::Failed("SSH bridge lock failed".into()));
+                    }
+                    Err(_) if Instant::now() >= deadline => return Err(SshError::Timeout),
+                    Err(_) => std::thread::sleep(Duration::from_millis(5)),
+                }
+            };
+            if !read_only && !bridge.verified {
+                match bridge.exchange(ClientRequest::RuntimeStatus, deadline, true)? {
+                    ServerResponse::RuntimeStatus(status)
+                        if status
+                            .capabilities
+                            .iter()
+                            .any(|c| c == "remote_runtime_protocol_v4") =>
+                    {
+                        bridge.verified = true
+                    }
+                    _ => {
+                        return Err(SshError::Failed(
+                            "Remote runtime upgrade required before sending commands".into(),
+                        ));
+                    }
+                }
+            }
+            dispatched = true;
+            bridge.exchange_with_id(operation_id, request, deadline, read_only)
+        })();
+        if result.is_err() {
+            // An expired request must never evict a replacement connection.
+            let mut bridges = self.bridges.lock().unwrap();
+            if bridges
+                .get(alias)
+                .is_some_and(|current| Arc::ptr_eq(current, &entry))
+            {
+                bridges.remove(alias);
+            }
         }
-        let response =
-            serde_json::from_str::<Envelope<ServerResponse>>(&line).map_err(|error| {
-                SshError::Failed(format!("invalid remote daemon response: {error}"))
-            })?;
-        Ok(response.body)
+        if result.is_err() && !read_only && dispatched {
+            // Only query the receipt after losing an acknowledgement. Retrying
+            // the mutation itself could submit the user's prompt twice.
+            if let Ok(ServerResponse::OperationOutcome {
+                state,
+                response: Some(response),
+                ..
+            }) = self.request(
+                alias,
+                ClientRequest::GetOperationOutcome {
+                    request_id: operation_id,
+                },
+            ) && state == "completed"
+                && let Ok(response) = serde_json::from_value(response)
+            {
+                return Ok(response);
+            }
+        }
+        if result.is_err() && !read_only && dispatched {
+            return Ok(super::protocol_error(
+                "operation_outcome_unknown",
+                format!(
+                    "Operation {operation_id} may have reached the remote runtime; reconnect and check its receipt before sending new work"
+                ),
+            ));
+        }
+        result
     }
 
     /// Opens a dedicated typed event subscription over OpenSSH. This is a
@@ -188,7 +283,7 @@ impl RemoteConnectionManager {
     pub fn stream_events(
         &self,
         alias: &str,
-        mut on_event: impl FnMut(ServerEvent),
+        mut on_event: impl FnMut(Uuid, u64, ServerEvent),
     ) -> Result<(), SshError> {
         let resolved = resolve_host(alias)?;
         let mut command = bridge_command(alias)?;
@@ -205,8 +300,10 @@ impl RemoteConnectionManager {
             .stdout
             .take()
             .ok_or_else(|| SshError::Failed("SSH event bridge has no stdout".into()))?;
-        if let Some(stderr) = child.stderr.take() {
-            std::thread::spawn(move || for _ in BufReader::new(stderr).lines().take(512) {});
+        if let Some(mut stderr) = child.stderr.take() {
+            std::thread::spawn(move || {
+                let _ = std::io::copy(&mut stderr, &mut std::io::sink());
+            });
         }
         if let Some(prompt) = prompts.host_key_prompt() {
             let _ = child.kill();
@@ -214,22 +311,61 @@ impl RemoteConnectionManager {
             return Err(SshError::Failed(prompt));
         }
 
-        let envelope = Envelope::new(ClientRequest::SubscribeEvents { since_sequence: 0 });
-        serde_json::to_writer(&mut stdin, &envelope)
-            .map_err(|error| SshError::Failed(error.to_string()))?;
-        stdin.write_all(b"\n")?;
-        stdin.flush()?;
-
+        let cancel = Arc::new(AtomicBool::new(false));
+        if let Some(old) = self
+            .event_cancellations
+            .lock()
+            .unwrap()
+            .insert(alias.to_owned(), cancel.clone())
+        {
+            old.store(true, Ordering::Relaxed);
+        }
+        let cursor = self.event_cursors.lock().unwrap().get(alias).copied();
+        let request = cursor.map_or(
+            ClientRequest::SubscribeEvents { since_sequence: 0 },
+            |(epoch, sequence)| ClientRequest::SubscribeEventsSince { epoch, sequence },
+        );
         let result = (|| {
-            for line in BufReader::new(stdout).lines() {
-                let line = line?;
-                let envelope = serde_json::from_str::<Envelope<RemoteSequencedEvent>>(&line)
+            nonblocking(&stdin)?;
+            let mut bytes = serde_json::to_vec(&Envelope::new(request))
+                .map_err(|error| SshError::Failed(error.to_string()))?;
+            bytes.push(b'\n');
+            write_frame(&mut stdin, &bytes, Instant::now() + Duration::from_secs(15))?;
+            let mut stdout = stdout;
+            nonblocking(&stdout)?;
+            let mut buffered = Vec::new();
+            let mut last = cursor;
+            loop {
+                let line = read_frame(
+                    &mut stdout,
+                    &mut buffered,
+                    Instant::now() + Duration::from_secs(30),
+                    Some(&cancel),
+                )?;
+                let envelope = serde_json::from_slice::<Envelope<RemoteSequencedEvent>>(&line)
                     .map_err(|error| {
                         SshError::Failed(format!("invalid remote daemon event: {error}"))
                     })?;
-                on_event(envelope.body.event);
+                let event = envelope.body;
+                if matches!(event.event, ServerEvent::Heartbeat) {
+                    continue;
+                }
+                let snapshot = matches!(event.event, ServerEvent::SnapshotReplaced(_));
+                if !snapshot && let Some((epoch, sequence)) = last {
+                    if event.epoch != epoch || event.sequence != sequence + 1 {
+                        self.event_cursors.lock().unwrap().remove(alias);
+                        return Err(SshError::Failed(
+                            "Remote event gap; full reconciliation required".into(),
+                        ));
+                    }
+                }
+                on_event(event.epoch, event.sequence, event.event);
+                last = Some((event.epoch, event.sequence));
+                self.event_cursors
+                    .lock()
+                    .unwrap()
+                    .insert(alias.to_owned(), last.unwrap());
             }
-            Err(SshError::Failed("SSH event bridge disconnected".into()))
         })();
         drop(guard);
         let _ = child.kill();
@@ -239,6 +375,145 @@ impl RemoteConnectionManager {
 
     pub fn disconnect(&self, alias: &str) {
         self.bridges.lock().unwrap().remove(alias);
+        if let Some(cancel) = self.event_cancellations.lock().unwrap().remove(alias) {
+            cancel.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
+impl Bridge {
+    fn exchange(
+        &mut self,
+        request: ClientRequest,
+        deadline: Instant,
+        legacy_read: bool,
+    ) -> Result<ServerResponse, SshError> {
+        self.exchange_with_id(Uuid::new_v4(), request, deadline, legacy_read)
+    }
+
+    fn exchange_with_id(
+        &mut self,
+        id: Uuid,
+        request: ClientRequest,
+        deadline: Instant,
+        legacy_read: bool,
+    ) -> Result<ServerResponse, SshError> {
+        let mut envelope = Envelope::new(request);
+        envelope.id = id;
+        let mut bytes =
+            serde_json::to_vec(&envelope).map_err(|error| SshError::Failed(error.to_string()))?;
+        bytes.push(b'\n');
+        write_frame(&mut self.stdin, &bytes, deadline).map_err(|error| {
+            if legacy_read {
+                error
+            } else {
+                SshError::Failed(format!(
+                    "Operation {id} outcome unknown after transport failure: {error}"
+                ))
+            }
+        })?;
+        let line = read_frame(&mut self.stdout, &mut self.buffered, deadline, None).map_err(|error| {
+            if legacy_read { error } else { SshError::Failed(format!("Operation {} outcome unknown after transport failure: {error}. Rejoin before sending new work.", envelope.id)) }
+        })?;
+        let response: Envelope<ServerResponse> = serde_json::from_slice(&line)
+            .map_err(|error| SshError::Failed(format!("Invalid SSH response: {error}")))?;
+        if response.protocol_version != ditch_protocol::PROTOCOL_VERSION
+            || (!legacy_read && response.id != envelope.id)
+        {
+            return Err(SshError::Failed("SSH response correlation mismatch".into()));
+        }
+        Ok(response.body)
+    }
+}
+
+fn nonblocking(io: &impl AsRawFd) -> Result<(), SshError> {
+    let fd = io.as_raw_fd();
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(())
+}
+
+fn wait_fd(
+    fd: i32,
+    events: i16,
+    deadline: Instant,
+    cancelled: Option<&AtomicBool>,
+) -> Result<(), SshError> {
+    loop {
+        if cancelled.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            return Err(SshError::Failed("SSH connection replaced".into()));
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(SshError::Timeout);
+        }
+        let mut descriptor = libc::pollfd {
+            fd,
+            events,
+            revents: 0,
+        };
+        let ready =
+            unsafe { libc::poll(&mut descriptor, 1, left.as_millis().clamp(1, 200) as i32) };
+        if ready > 0 {
+            return Ok(());
+        }
+        if ready < 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+            return Err(std::io::Error::last_os_error().into());
+        }
+    }
+}
+
+fn write_frame(
+    writer: &mut (impl Write + AsRawFd),
+    mut bytes: &[u8],
+    deadline: Instant,
+) -> Result<(), SshError> {
+    while !bytes.is_empty() {
+        wait_fd(writer.as_raw_fd(), libc::POLLOUT, deadline, None)?;
+        match writer.write(bytes) {
+            Ok(0) => return Err(SshError::Failed("SSH write disconnected".into())),
+            Ok(count) => bytes = &bytes[count..],
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                ) => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
+fn read_frame(
+    reader: &mut (impl Read + AsRawFd),
+    buffered: &mut Vec<u8>,
+    deadline: Instant,
+    cancelled: Option<&AtomicBool>,
+) -> Result<Vec<u8>, SshError> {
+    loop {
+        if cancelled.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            return Err(SshError::Failed("SSH connection replaced".into()));
+        }
+        if let Some(end) = buffered.iter().position(|byte| *byte == b'\n') {
+            return Ok(buffered.drain(..=end).collect());
+        }
+        if buffered.len() > 4 * 1024 * 1024 {
+            return Err(SshError::Failed("SSH frame exceeds limit".into()));
+        }
+        wait_fd(reader.as_raw_fd(), libc::POLLIN, deadline, cancelled)?;
+        let mut chunk = [0; 8192];
+        match reader.read(&mut chunk) {
+            Ok(0) => return Err(SshError::Failed("SSH stream disconnected".into())),
+            Ok(count) => buffered.extend_from_slice(&chunk[..count]),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                ) => {}
+            Err(error) => return Err(error.into()),
+        }
     }
 }
 
@@ -467,12 +742,12 @@ pub fn check_setup(
         if persistent {
             RemoteCheckState::Ready
         } else {
-            RemoteCheckState::ManualActionRequired
+            RemoteCheckState::Ready
         },
         if persistent {
             "Available"
         } else {
-            "Enable systemd lingering for this user; Ditch never runs sudo automatically"
+            "Optional; Ditch starts the runtime automatically when connecting over SSH"
         },
         None,
     ));
@@ -497,23 +772,30 @@ pub fn check_setup(
         .unwrap_or("unavailable");
     checks.push(check(
         "service",
-        "Background Service",
+        "Optional Startup Service",
+        RemoteCheckState::Ready,
         if service == "unavailable" {
-            RemoteCheckState::ManualActionRequired
+            "Not installed; SSH starts the runtime automatically"
         } else {
-            RemoteCheckState::Ready
+            service
         },
-        service,
         None,
     ));
 
     let mut machine_id = None;
     let mut daemon_epoch = None;
+    let mut daemon_ready = false;
     if exact {
         connections.disconnect(alias);
         if let Ok(ServerResponse::RuntimeStatus(status)) =
             connections.request(alias, ClientRequest::RuntimeStatus)
         {
+            daemon_ready = status
+                .capabilities
+                .iter()
+                .any(|c| c == "remote_runtime_protocol_v4")
+                && status.build_identifier
+                    == option_env!("DITCH_BUILD_IDENTIFIER").unwrap_or(env!("CARGO_PKG_VERSION"));
             daemon_epoch = Some(status.instance_id);
         }
         if let Ok(ServerResponse::HostIdentity(status)) =
@@ -528,13 +810,18 @@ pub fn check_setup(
         git != "missing",
         codex != "missing",
         codex_auth == "ready",
-        service != "unavailable",
+        daemon_ready && machine_id.is_some(),
     );
     Ok(RemoteSetupStatus {
         ssh_host_alias: alias.to_owned(),
         remote_machine_id: machine_id,
         ready,
-        connection_state: if exact { "connected" } else { "setup_required" }.into(),
+        connection_state: if daemon_ready {
+            "connected"
+        } else {
+            "setup_required"
+        }
+        .into(),
         home_directory: values.get("home").cloned(),
         checks,
         handshake: RemoteRuntimeHandshake {
@@ -561,9 +848,9 @@ fn desktop_project_setup_ready(
     git_ready: bool,
     codex_ready: bool,
     codex_authenticated: bool,
-    service_ready: bool,
+    daemon_ready: bool,
 ) -> bool {
-    supported && exact_runtime && git_ready && codex_ready && codex_authenticated && service_ready
+    supported && exact_runtime && git_ready && codex_ready && codex_authenticated && daemon_ready
 }
 
 /// Fixed user-local Codex setup action using OpenAI's current standalone
@@ -714,10 +1001,7 @@ pub fn install_remote_runtime(
     let deadline = std::time::Instant::now() + Duration::from_secs(15);
     loop {
         if let Ok(status) = check_setup(connections, alias, None, false, false)
-            && status
-                .checks
-                .iter()
-                .any(|check| check.key == "runtime" && check.state == RemoteCheckState::Ready)
+            && status.connection_state == "connected"
         {
             return Ok(status);
         }
@@ -745,12 +1029,12 @@ ln -s "$previous" "$root/bin/current.next"
 case "$(uname -s)" in
   Linux)
     mv -Tf "$root/bin/current.next" "$root/bin/current"
-    systemctl --user restart the-ditch.service
+    if command -v systemctl >/dev/null 2>&1 && systemctl --user is-active --quiet the-ditch.service; then systemctl --user restart the-ditch.service; fi
     ;;
   Darwin)
     mv -fh "$root/bin/current.next" "$root/bin/current"
     uid=$(id -u)
-    launchctl kickstart -k "user/$uid/dev.theditch.runtime.remote"
+    if launchctl print "user/$uid/dev.theditch.runtime.remote" >/dev/null 2>&1; then launchctl kickstart -k "user/$uid/dev.theditch.runtime.remote"; fi
     ;;
 esac
 "#;
@@ -1102,59 +1386,19 @@ esac
 # never a release and is scoped to the exact version/target being installed.
 legacy_nested_next="$root/bin/versions/$version/$target/current.next"
 [ ! -L "$legacy_nested_next" ] || rm -f "$legacy_nested_next"
-case "$(uname -s)" in
-  Linux)
-    if command -v systemctl >/dev/null 2>&1 && systemctl --user show-environment >/dev/null 2>&1; then
-      mkdir -p "$HOME/.config/systemd/user"
-      cat > "$HOME/.config/systemd/user/the-ditch.service" <<'UNIT'
-[Unit]
-Description=The Ditch Remote Runtime
-After=network-online.target
-[Service]
-Type=simple
-ExecStart=%h/.ditch/bin/current/ditchd daemon --remote
-Restart=on-failure
-RestartSec=2
-StandardOutput=append:%h/.ditch/logs/runtime.log
-StandardError=append:%h/.ditch/logs/runtime.log
-[Install]
-WantedBy=default.target
-UNIT
-      systemctl --user daemon-reload
-      systemctl --user enable the-ditch.service
-      systemctl --user restart the-ditch.service
-    else
-      echo 'A persistent user service manager is unavailable' >&2
-      exit 43
-    fi
-    ;;
-  Darwin)
-    uid=$(id -u)
-    mkdir -p "$HOME/Library/LaunchAgents"
-    cat > "$HOME/Library/LaunchAgents/dev.theditch.runtime.remote.plist" <<PLIST
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict>
-<key>Label</key><string>dev.theditch.runtime.remote</string>
-<key>ProgramArguments</key><array><string>$HOME/.ditch/bin/current/ditchd</string><string>daemon</string><string>--remote</string></array>
-<key>RunAtLoad</key><true/><key>KeepAlive</key><true/>
-<key>StandardOutPath</key><string>$HOME/.ditch/logs/runtime.log</string>
-<key>StandardErrorPath</key><string>$HOME/.ditch/logs/runtime.log</string>
-</dict></plist>
-PLIST
-    chmod 600 "$HOME/Library/LaunchAgents/dev.theditch.runtime.remote.plist"
-    launchctl bootout "user/$uid/dev.theditch.runtime.remote" >/dev/null 2>&1 || true
-    launchctl bootstrap "user/$uid" "$HOME/Library/LaunchAgents/dev.theditch.runtime.remote.plist" || {
-      echo 'launchd user domain is unavailable without a login session' >&2
-      exit 44
-    }
-    launchctl enable "user/$uid/dev.theditch.runtime.remote"
-    ;;
-  *)
-    echo 'Unsupported remote OS' >&2
-    exit 45
-    ;;
-esac
+# A healthy daemon is reused. The bridge bootstraps a detached user process on
+# demand; systemd/launchd and lingering are not prerequisites. Explicit upgrades
+# of an already-running older daemon require a separate, visible restart.
+"$root/bin/current/ditchd" version-json
+# This is explicit setup/upgrade, never reconnect. Reuse an existing supervisor
+# if one was installed by an older Ditch; do not install another service.
+if [ "$(uname -s)" = Linux ] && command -v systemctl >/dev/null 2>&1 && systemctl --user is-active --quiet the-ditch.service; then
+  systemctl --user restart the-ditch.service
+fi
+if [ "$(uname -s)" = Darwin ] && launchctl print "user/$(id -u)/dev.theditch.runtime.remote" >/dev/null 2>&1; then
+  launchctl kickstart -k "user/$(id -u)/dev.theditch.runtime.remote"
+fi
+
 "#;
 
 pub fn observe(event: &str, alias: &str, detail: Option<&str>) {
@@ -1172,6 +1416,54 @@ pub fn observe(event: &str, alias: &str, detail: Option<&str>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn silent_stream_deadlines_and_cancellation_are_bounded() {
+        use std::os::unix::net::UnixStream;
+        let (_writer, mut reader) = UnixStream::pair().unwrap();
+        nonblocking(&reader).unwrap();
+        let now = Instant::now();
+        assert!(matches!(
+            read_frame(
+                &mut reader,
+                &mut Vec::new(),
+                now + Duration::from_millis(30),
+                None
+            ),
+            Err(SshError::Timeout)
+        ));
+        assert!(now.elapsed() < Duration::from_secs(1));
+        let cancelled = AtomicBool::new(true);
+        assert!(
+            read_frame(
+                &mut reader,
+                &mut Vec::new(),
+                Instant::now() + Duration::from_secs(30),
+                Some(&cancelled)
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn framed_stream_keeps_coalesced_messages_and_detects_hangup() {
+        use std::os::unix::net::UnixStream;
+        let (mut writer, mut reader) = UnixStream::pair().unwrap();
+        nonblocking(&reader).unwrap();
+        writer.write_all(b"one\ntwo\n").unwrap();
+        drop(writer);
+        let mut buffer = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        assert_eq!(
+            read_frame(&mut reader, &mut buffer, deadline, None).unwrap(),
+            b"one\n"
+        );
+        assert_eq!(
+            read_frame(&mut reader, &mut buffer, deadline, None).unwrap(),
+            b"two\n"
+        );
+        assert!(read_frame(&mut reader, &mut buffer, deadline, None).is_err());
+    }
 
     #[test]
     fn fingerprint_is_taken_from_the_openssh_prompt() {

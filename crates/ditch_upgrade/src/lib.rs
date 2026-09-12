@@ -1052,14 +1052,14 @@ impl HttpUpgradeBackend {
     ) -> Result<EntitlementSummary, UpgradeError> {
         #[derive(Deserialize)]
         struct ActivationResponse {
-            entitlement: EntitlementSummary,
+            entitlement: RelayEntitlement,
         }
         let path = format!(
             "/v1/commercial/devices/{}/activate",
             installation.installation_id()
         );
         let response: ActivationResponse = self.signed_json(installation, "POST", &path, b"")?;
-        Ok(response.entitlement)
+        Ok(response.entitlement.into())
     }
 
     pub fn current_release_for_edition(
@@ -1417,6 +1417,151 @@ mod tests {
     use p256::ecdsa::{SigningKey, signature::Signer};
     use rand_core::OsRng;
     use std::sync::Mutex;
+
+    // Relay's wire response deliberately has no top-level `active` or `mac_slots`.
+    const RELAY_ACTIVATION: &str = include_str!("../tests/fixtures/relay-device-activation.json");
+
+    fn relay_http_fixture(
+        responses: Vec<(u16, serde_json::Value)>,
+    ) -> (HttpUpgradeBackend, std::thread::JoinHandle<Vec<String>>) {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+        use std::time::{Duration as StdDuration, Instant};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        // Loopback HTTP is available only to this test helper; production constructors
+        // continue to enforce the official HTTPS origin.
+        let backend = HttpUpgradeBackend {
+            origin: Url::parse(&format!("http://{}", listener.local_addr().unwrap())).unwrap(),
+        };
+        let server = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            for (status, body) in responses {
+                let deadline = Instant::now() + StdDuration::from_secs(5);
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(Instant::now() < deadline, "expected another Relay request");
+                            std::thread::sleep(StdDuration::from_millis(5));
+                        }
+                        Err(error) => panic!("mock Relay accept failed: {error}"),
+                    }
+                };
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(StdDuration::from_secs(5)))
+                    .unwrap();
+                let mut reader = BufReader::new(&stream);
+                let mut request = String::new();
+                reader.read_line(&mut request).unwrap();
+                let mut headers = String::new();
+                loop {
+                    let mut line = String::new();
+                    assert!(reader.read_line(&mut line).unwrap() > 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                    headers.push_str(&line);
+                }
+                assert!(headers.to_ascii_lowercase().contains("x-ditch-signature:"));
+                requests.push(request.trim().to_owned());
+                let body = body.to_string();
+                write!(stream, "HTTP/1.1 {status} Fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+            requests
+        });
+        (backend, server)
+    }
+
+    #[test]
+    fn activation_http_response_converts_relay_entitlement() {
+        let identity = InstallationIdentity::generate();
+        for plan in ["complimentary", "commercial_lifetime", "commercial_monthly"] {
+            let mut body: serde_json::Value = serde_json::from_str(RELAY_ACTIVATION).unwrap();
+            body["entitlement"]["plan"] = plan.into();
+            let (backend, server) = relay_http_fixture(vec![(200, body)]);
+            let result = backend.activate_commercial_device(&identity);
+            let requests = server.join().unwrap();
+            assert_eq!(
+                requests,
+                vec![format!(
+                    "POST /v1/commercial/devices/{}/activate HTTP/1.1",
+                    identity.installation_id()
+                )]
+            );
+            let entitlement = result.unwrap();
+            assert!(entitlement.active);
+            assert_eq!(entitlement.plan.as_deref(), Some(plan));
+            assert_eq!(entitlement.status, "active");
+            assert_eq!((entitlement.mac_slots, entitlement.iphone_slots), (2, 2));
+            assert_eq!(entitlement.expires_at, None);
+            assert_eq!(entitlement.current_license.edition, "commercial");
+            assert_eq!(entitlement.current_license.status, "active");
+            assert!(!entitlement.billing_management_available);
+        }
+    }
+
+    #[test]
+    fn commercial_update_http_flow_continues_after_activation() {
+        let identity = InstallationIdentity::generate();
+        let release = signed_release(&SigningKey::random(&mut OsRng), b"test artifact", 123);
+        let (backend, server) = relay_http_fixture(vec![
+            (200, serde_json::from_str(RELAY_ACTIVATION).unwrap()),
+            (
+                200,
+                serde_json::json!({
+                    "release": {"release_id": release.manifest.release_id, "signature_metadata": release},
+                    "update_session": release.update_session,
+                }),
+            ),
+        ]);
+        let result = backend.current_release_for_edition(&identity, Edition::Commercial);
+        // Join before asserting the result so both requests must actually reach the server.
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].contains("/activate"));
+        assert!(requests[1].starts_with("GET /v1/commercial/releases/current?channel="));
+        let received = result.unwrap();
+        assert_eq!(received.manifest.release_id, release.manifest.release_id);
+        assert_eq!(
+            received.update_session.unwrap().bearer,
+            release.update_session.unwrap().bearer
+        );
+    }
+
+    #[test]
+    fn activation_http_errors_preserve_relay_codes() {
+        let identity = InstallationIdentity::generate();
+        for (status, code) in [
+            (401, "unauthorized"),
+            (403, "commercial_required"),
+            (409, "mac_slot_unavailable"),
+        ] {
+            let (backend, server) = relay_http_fixture(vec![(
+                status,
+                serde_json::json!({
+                    "error": {"code": code, "message": "Relay denied activation"},
+                }),
+            )]);
+            let result = backend.activate_commercial_device(&identity);
+            server.join().unwrap();
+            assert!(
+                matches!(result, Err(UpgradeError::Relay { code: actual, message })
+                if actual == code && message == "Relay denied activation")
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_activation_http_response_is_not_a_connection_failure() {
+        let (backend, server) =
+            relay_http_fixture(vec![(200, serde_json::json!({"entitlement": {}}))]);
+        let result = backend.activate_commercial_device(&InstallationIdentity::generate());
+        server.join().unwrap();
+        assert!(matches!(result, Err(UpgradeError::InvalidResponse(_))));
+    }
 
     struct FakeBackend {
         redeemed: Mutex<bool>,

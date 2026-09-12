@@ -17,13 +17,15 @@ use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex, Weak};
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 
-const INITIALIZE_ID: i64 = 1;
-const THREAD_ID: i64 = 2;
-const TURN_ID: i64 = 3;
+const INITIALIZE_ID: &str = "ditch:initialize";
+const THREAD_ID: &str = "ditch:thread";
+const TURN_ID: &str = "ditch:turn";
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PermissionDecision {
@@ -46,6 +48,8 @@ pub enum Event {
     },
     Diagnostic(String),
     Failed(String),
+    OutputClosed,
+    PermissionResolved(Uuid),
 }
 
 #[derive(Clone)]
@@ -64,6 +68,7 @@ struct PendingApproval {
 enum ApprovalKind {
     Decision,
     Permissions(Value),
+    Questions(Vec<ditch_core::AgentQuestion>),
 }
 
 pub struct SpawnedTurn {
@@ -84,6 +89,47 @@ pub struct Launch<'a> {
 }
 
 impl ActiveTurn {
+    pub fn answer(
+        &self,
+        request_id: Uuid,
+        answers: std::collections::BTreeMap<String, Vec<String>>,
+    ) -> io::Result<()> {
+        let mut pending = self.pending.lock().unwrap();
+        let entry = pending
+            .get(&request_id)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Question expired"))?;
+        let ApprovalKind::Questions(questions) = &entry.kind else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Not a question",
+            ));
+        };
+        if answers.len() != questions.len()
+            || questions.iter().any(|question| {
+                answers.get(&question.id).is_none_or(|values| {
+                    values.is_empty()
+                        || values.len() > 20
+                        || values.iter().any(|v| v.len() > 20_000)
+                })
+            })
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Answer each requested question",
+            ));
+        }
+        let values = answers
+            .into_iter()
+            .map(|(id, answers)| (id, json!({"answers":answers})))
+            .collect::<serde_json::Map<_, _>>();
+        write_message(
+            &self.writer,
+            &json!({"id":entry.rpc_id,"result":{"answers":values}}),
+        )?;
+        pending.remove(&request_id);
+        Ok(())
+    }
+
     pub fn respond(&self, request_id: Uuid, decision: PermissionDecision) -> io::Result<()> {
         let pending = self
             .pending
@@ -92,6 +138,13 @@ impl ActiveTurn {
             .remove(&request_id)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "approval request expired"))?;
         let result = match pending.kind {
+            ApprovalKind::Questions(_) => {
+                self.pending.lock().unwrap().insert(request_id, pending);
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "This request needs answers, not an approval",
+                ));
+            }
             ApprovalKind::Decision => json!({
                 "decision": match decision {
                     PermissionDecision::ApproveOnce => "accept",
@@ -159,7 +212,7 @@ pub fn spawn_turn(launch: Launch<'_>, events: Sender<Event>) -> io::Result<Spawn
     let writer = Arc::new(Mutex::new(stdin));
     let pending = Arc::new(Mutex::new(HashMap::new()));
 
-    write_message(
+    if let Err(error) = write_message(
         &writer,
         &json!({
             "id": INITIALIZE_ID,
@@ -172,8 +225,11 @@ pub fn spawn_turn(launch: Launch<'_>, events: Sender<Event>) -> io::Result<Spawn
                 }
             }
         }),
-    )?;
-    write_message(&writer, &json!({"method": "initialized", "params": {}}))?;
+    ) {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error);
+    }
 
     let (approval_policy, sandbox) = remote_policy(launch.execution_profile);
     let mut thread_params = json!({
@@ -196,7 +252,6 @@ pub fn spawn_turn(launch: Launch<'_>, events: Sender<Event>) -> io::Result<Spawn
     } else {
         json!({"id": THREAD_ID, "method": "thread/start", "params": thread_params})
     };
-    write_message(&writer, &thread_request)?;
 
     let child = Arc::new(Mutex::new(child));
     let reader_writer = Arc::downgrade(&writer);
@@ -208,30 +263,80 @@ pub fn spawn_turn(launch: Launch<'_>, events: Sender<Event>) -> io::Result<Spawn
     let project_id = launch.project_id;
     let agent_id = launch.agent_id;
     let reader_events = events.clone();
+    let (lines_tx, lines_rx) = mpsc::sync_channel(128);
     std::thread::spawn(move || {
         for line in BufReader::new(stdout).lines() {
-            match line {
-                Ok(line) => handle_line(
-                    &line,
-                    &reader_writer,
-                    &reader_pending,
-                    &reader_events,
-                    project_id,
-                    agent_id,
-                    &cwd,
-                    &prompt,
-                    model.as_deref(),
-                    effort.as_deref(),
-                    approval_policy,
-                ),
-                Err(error) => {
+            if lines_tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    std::thread::spawn(move || {
+        let mut waiting_for = Some(INITIALIZE_ID);
+        let mut deadline = Instant::now() + STARTUP_TIMEOUT;
+        loop {
+            if waiting_for.is_some() && Instant::now() >= deadline {
+                let _ = reader_events.send(Event::Failed(format!(
+                    "Codex App Server timed out waiting for {}",
+                    waiting_for.unwrap()
+                )));
+                break;
+            }
+            let line = match lines_rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(Ok(line)) => line,
+                Ok(Err(error)) => {
                     let _ = reader_events.send(Event::Failed(format!(
                         "Failed to read Codex App Server output: {error}"
                     )));
                     break;
                 }
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if waiting_for.is_some() && Instant::now() >= deadline {
+                        let _ = reader_events.send(Event::Failed(format!(
+                            "Codex App Server timed out waiting for {}",
+                            waiting_for.unwrap()
+                        )));
+                        break;
+                    }
+                    continue;
+                }
+            };
+            // Responses and server-initiated requests have independent ID spaces.
+            // Only consume a response to the currently outstanding startup step.
+            if let Ok(value) = serde_json::from_str::<Value>(&line)
+                && value.get("method").is_none()
+            {
+                let response_id = value.get("id").and_then(Value::as_str);
+                if response_id.is_none() || response_id != waiting_for {
+                    continue;
+                }
+                if rpc_error(&value).is_none() {
+                    waiting_for = match response_id {
+                        Some(INITIALIZE_ID) => Some(THREAD_ID),
+                        Some(THREAD_ID) => Some(TURN_ID),
+                        _ => None,
+                    };
+                    deadline = Instant::now() + STARTUP_TIMEOUT;
+                }
             }
+            handle_line(
+                &line,
+                &reader_writer,
+                &reader_pending,
+                &reader_events,
+                project_id,
+                agent_id,
+                &cwd,
+                &prompt,
+                model.as_deref(),
+                effort.as_deref(),
+                approval_policy,
+                Some(&thread_request),
+            );
         }
+        // Emitted after all stdout messages; child exit alone cannot finalize a run.
+        let _ = reader_events.send(Event::OutputClosed);
     });
 
     std::thread::spawn(move || {
@@ -270,6 +375,7 @@ fn handle_line(
     model: Option<&str>,
     effort: Option<&str>,
     approval_policy: &str,
+    thread_request: Option<&Value>,
 ) {
     let Ok(value) = serde_json::from_str::<Value>(line) else {
         let text = line.trim();
@@ -279,13 +385,23 @@ fn handle_line(
         return;
     };
 
-    if value.get("id").and_then(Value::as_i64) == Some(INITIALIZE_ID) {
+    if value.get("method").is_none()
+        && value.get("id").and_then(Value::as_str) == Some(INITIALIZE_ID)
+    {
         if let Some(error) = rpc_error(&value) {
             let _ = events.send(Event::Failed(error));
+        } else if let (Some(writer), Some(request)) = (writer.upgrade(), thread_request) {
+            if let Err(error) = write_message(&writer, &json!({"method":"initialized","params":{}}))
+                .and_then(|_| write_message(&writer, request))
+            {
+                let _ = events.send(Event::Failed(format!(
+                    "Failed to initialize Codex: {error}"
+                )));
+            }
         }
         return;
     }
-    if value.get("id").and_then(Value::as_i64) == Some(THREAD_ID) {
+    if value.get("method").is_none() && value.get("id").and_then(Value::as_str) == Some(THREAD_ID) {
         if let Some(error) = rpc_error(&value) {
             let _ = events.send(Event::Failed(error));
             return;
@@ -324,7 +440,7 @@ fn handle_line(
         }
         return;
     }
-    if value.get("id").and_then(Value::as_i64) == Some(TURN_ID) {
+    if value.get("method").is_none() && value.get("id").and_then(Value::as_str) == Some(TURN_ID) {
         if let Some(error) = rpc_error(&value) {
             let _ = events.send(Event::Failed(error));
         }
@@ -336,6 +452,19 @@ fn handle_line(
     };
     let params = value.get("params").unwrap_or(&Value::Null);
     match method {
+        "serverRequest/resolved" => {
+            if let Some(rpc_id) = params.get("requestId") {
+                let mut pending = pending.lock().unwrap();
+                let ids = pending
+                    .iter()
+                    .filter_map(|(id, entry)| (&entry.rpc_id == rpc_id).then_some(*id))
+                    .collect::<Vec<_>>();
+                for id in ids {
+                    pending.remove(&id);
+                    let _ = events.send(Event::PermissionResolved(id));
+                }
+            }
+        }
         "turn/started" => {
             let _ = events.send(Event::TurnStarted);
         }
@@ -372,6 +501,31 @@ fn handle_line(
                 PermissionActionKind::EditFiles,
                 ApprovalKind::Decision,
             );
+        }
+        "item/tool/requestUserInput" | "tool/requestUserInput" => {
+            match serde_json::from_value::<Vec<ditch_core::AgentQuestion>>(
+                params.get("questions").cloned().unwrap_or(Value::Null),
+            ) {
+                Ok(questions) if !questions.is_empty() && questions.len() <= 3 => {
+                    queue_approval(
+                        &value,
+                        pending,
+                        events,
+                        project_id,
+                        agent_id,
+                        PermissionActionKind::AnswerQuestion,
+                        ApprovalKind::Questions(questions),
+                    );
+                }
+                _ => {
+                    if let Some(writer) = writer.upgrade() {
+                        let _ = write_message(
+                            &writer,
+                            &json!({"id":value.get("id"),"error":{"code":-32602,"message":"Invalid questions"}}),
+                        );
+                    }
+                }
+            }
         }
         "item/permissions/requestApproval" => {
             let requested = params
@@ -411,7 +565,12 @@ fn handle_line(
         }
         "error" => {
             if let Some(message) = params.pointer("/error/message").and_then(Value::as_str) {
-                let _ = events.send(Event::Failed(message.to_owned()));
+                let event = if params.get("willRetry").and_then(Value::as_bool) == Some(true) {
+                    Event::Action(format!("Codex reconnecting: {message}"))
+                } else {
+                    Event::Failed(message.to_owned())
+                };
+                let _ = events.send(event);
             }
         }
         "warning" | "configWarning" => {
@@ -422,7 +581,19 @@ fn handle_line(
                 .unwrap_or("Codex App Server warning");
             let _ = events.send(Event::Diagnostic(message.to_owned()));
         }
-        _ => {}
+        _ => {
+            if let Some(id) = value.get("id") {
+                if let Some(writer) = writer.upgrade() {
+                    let _ = write_message(
+                        &writer,
+                        &json!({"id":id,"error":{"code":-32601,"message":format!("Ditch does not support {method}")}}),
+                    );
+                }
+                let _ = events.send(Event::ToolMessage(format!(
+                    "Unsupported Codex request was rejected: {method}"
+                )));
+            }
+        }
     }
 }
 
@@ -465,6 +636,14 @@ fn queue_approval(
         ));
         return;
     };
+    if pending
+        .lock()
+        .unwrap()
+        .values()
+        .any(|entry| entry.rpc_id == rpc_id)
+    {
+        return;
+    }
     let params = value.get("params").unwrap_or(&Value::Null);
     let command = params.get("command").map(display_json_text);
     let network = params.get("networkApprovalContext");
@@ -484,6 +663,9 @@ fn queue_approval(
         .and_then(Value::as_str)
         .map(str::to_owned)
         .unwrap_or_else(|| match action {
+            PermissionActionKind::AnswerQuestion => {
+                "Codex needs your answer to continue".to_owned()
+            }
             PermissionActionKind::AccessNetwork => {
                 "Codex requests network access on the SSH host".to_owned()
             }
@@ -493,12 +675,17 @@ fn queue_approval(
             _ => "Codex requests permission to run a remote command".to_owned(),
         });
     let request_id = Uuid::new_v4();
+    let questions = match &kind {
+        ApprovalKind::Questions(questions) => questions.clone(),
+        _ => Vec::new(),
+    };
     pending
         .lock()
-        .expect("App Server approval lock should not be poisoned")
+        .unwrap()
         .insert(request_id, PendingApproval { rpc_id, kind });
     let _ = events.send(Event::ApprovalRequested(PermissionRequest {
         id: request_id,
+        questions,
         project_id,
         agent_id: Some(agent_id),
         action,
@@ -533,12 +720,68 @@ fn rpc_error(value: &Value) -> Option<String> {
 }
 
 fn write_message(writer: &Arc<Mutex<ChildStdin>>, value: &Value) -> io::Result<()> {
-    let mut writer = writer
-        .lock()
-        .map_err(|_| io::Error::other("App Server writer lock was poisoned"))?;
-    serde_json::to_writer(&mut *writer, value).map_err(io::Error::other)?;
-    writer.write_all(b"\n")?;
-    writer.flush()
+    use std::os::fd::AsRawFd;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut writer = loop {
+        match writer.try_lock() {
+            Ok(writer) => break writer,
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(io::Error::other("App Server writer lock was poisoned"));
+            }
+            Err(_) if Instant::now() >= deadline => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "App Server writer busy",
+                ));
+            }
+            Err(_) => std::thread::sleep(Duration::from_millis(5)),
+        }
+    };
+    let fd = writer.as_raw_fd();
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut bytes = serde_json::to_vec(value).map_err(io::Error::other)?;
+    bytes.push(b'\n');
+    let mut remaining = bytes.as_slice();
+    while !remaining.is_empty() {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "App Server stopped reading input",
+            ));
+        }
+        let mut pollfd = libc::pollfd {
+            fd,
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+        let ready = unsafe { libc::poll(&mut pollfd, 1, left.as_millis().clamp(1, 100) as i32) };
+        if ready < 0 && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+            return Err(io::Error::last_os_error());
+        }
+        if ready <= 0 {
+            continue;
+        }
+        match writer.write(remaining) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "App Server input closed",
+                ));
+            }
+            Ok(count) => remaining = &remaining[count..],
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                ) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -552,6 +795,128 @@ mod tests {
 
     fn ids() -> (ProjectId, AgentId) {
         (ProjectId::new(), AgentId::new())
+    }
+
+    #[test]
+    fn server_approval_ids_never_collide_with_client_responses() {
+        for rpc_id in [
+            json!(0),
+            json!(1),
+            json!(2),
+            json!(3),
+            json!(77),
+            json!("ditch:initialize"),
+        ] {
+            let (project_id, agent_id) = ids();
+            let pending = Arc::new(Mutex::new(HashMap::new()));
+            let (tx, rx) = mpsc::channel();
+            let request = json!({"id":rpc_id,"method":"item/commandExecution/requestApproval",
+                "params":{"command":"cat README.md","cwd":"/tmp"}})
+            .to_string();
+            for _ in 0..2 {
+                handle_line(
+                    &request,
+                    &Weak::new(),
+                    &pending,
+                    &tx,
+                    project_id,
+                    agent_id,
+                    Path::new("/tmp"),
+                    "",
+                    None,
+                    None,
+                    "untrusted",
+                    None,
+                );
+            }
+            assert!(
+                matches!(rx.try_recv(), Ok(Event::ApprovalRequested(_))),
+                "{rpc_id}"
+            );
+            assert!(rx.try_recv().is_err(), "duplicate request {rpc_id}");
+            assert_eq!(pending.lock().unwrap().len(), 1);
+        }
+    }
+
+    #[test]
+    fn questions_require_complete_answers_and_use_server_request_id() {
+        let mut child = Command::new("/bin/cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let writer = Arc::new(Mutex::new(child.stdin.take().unwrap()));
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let control = ActiveTurn {
+            writer: writer.clone(),
+            pending: pending.clone(),
+        };
+        let (tx, rx) = mpsc::channel();
+        handle_line(&json!({"id":1,"method":"item/tool/requestUserInput","params":{"questions":[
+            {"id":"choice","header":"Select","question":"Which path?","options":[{"label":"A","description":"First"}]},
+            {"id":"note","header":"Note","question":"Any details?","isSecret":true}
+        ]}}).to_string(), &Arc::downgrade(&writer), &pending, &tx, ProjectId::new(), AgentId::new(), Path::new("/tmp"), "", None, None, "untrusted", None);
+        let Event::ApprovalRequested(request) = rx.recv().unwrap() else {
+            panic!("missing questions")
+        };
+        assert_eq!(request.questions.len(), 2);
+        assert!(
+            control
+                .respond(request.id, PermissionDecision::ApproveOnce)
+                .is_err()
+        );
+        assert!(
+            control
+                .answer(
+                    request.id,
+                    std::collections::BTreeMap::from([("choice".into(), vec!["A".into()])])
+                )
+                .is_err()
+        );
+        assert!(pending.lock().unwrap().contains_key(&request.id));
+        control
+            .answer(
+                request.id,
+                std::collections::BTreeMap::from([
+                    ("choice".into(), vec!["A".into()]),
+                    ("note".into(), vec!["Keep it simple".into()]),
+                ]),
+            )
+            .unwrap();
+        let mut line = String::new();
+        BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        let response: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(response["id"], 1);
+        assert_eq!(
+            response["result"]["answers"]["note"]["answers"][0],
+            "Keep it simple"
+        );
+        assert!(pending.lock().unwrap().is_empty());
+        assert!(control.answer(request.id, Default::default()).is_err());
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn retryable_errors_do_not_end_a_turn() {
+        let (tx, rx) = mpsc::channel();
+        handle_line(
+            r#"{"method":"error","params":{"willRetry":true,"error":{"message":"connection lost"}}}"#,
+            &Weak::new(),
+            &Arc::new(Mutex::new(HashMap::new())),
+            &tx,
+            ProjectId::new(),
+            AgentId::new(),
+            Path::new("/tmp"),
+            "",
+            None,
+            None,
+            "untrusted",
+            None,
+        );
+        assert!(matches!(rx.try_recv(), Ok(Event::Action(_))));
     }
 
     #[test]
@@ -582,6 +947,7 @@ mod tests {
             None,
             None,
             "untrusted",
+            None,
         );
         let Event::ApprovalRequested(request) = rx.recv().unwrap() else {
             panic!("expected approval event");
@@ -610,6 +976,7 @@ mod tests {
             None,
             None,
             "untrusted",
+            None,
         );
         assert_eq!(
             rx.recv().unwrap(),
@@ -630,12 +997,13 @@ mod tests {
             format!(
                 r#"#!/bin/sh
 read initialize
-printf '%s\n' '{{"id":1,"result":{{"userAgent":"fake"}}}}'
+printf '%s\n' '{{"id":"ditch:initialize","result":{{"userAgent":"fake"}}}}'
 read initialized
 read thread_start
 printf '%s\n' "$thread_start" > '{}'
-printf '%s\n' '{{"id":2,"result":{{"thread":{{"id":"thr_remote"}}}}}}'
+printf '%s\n' '{{"id":"ditch:thread","result":{{"thread":{{"id":"thr_remote"}}}}}}'
 read turn_start
+printf '%s\n' '{{"id":"ditch:turn","result":{{}}}}'
 printf '%s\n' "$turn_start" > '{}'
 printf '%s\n' '{{"method":"turn/started","params":{{"turn":{{"id":"turn_remote","status":"inProgress","items":[]}}}}}}'
 printf '%s\n' '{{"id":77,"method":"item/commandExecution/requestApproval","params":{{"threadId":"thr_remote","turnId":"turn_remote","itemId":"item_1","reason":"Run tests","command":"cargo test","cwd":"/srv/app"}}}}'

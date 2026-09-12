@@ -94,6 +94,7 @@ class _CommercialOffersClient extends DitchRuntimeClient {
   final int activeAgents;
   int activationCalls = 0;
   bool failActivation = false;
+  DitchRuntimeException? activationError;
 
   @override
   Future<RuntimeStatusDto> runtimeStatus() async => RuntimeStatusDto(
@@ -116,6 +117,7 @@ class _CommercialOffersClient extends DitchRuntimeClient {
   @override
   Future<Map<String, dynamic>> activateCommercialDevice() async {
     activationCalls++;
+    if (activationError != null) throw activationError!;
     if (failActivation) {
       throw const DitchRuntimeException(
         'mac_slot_unavailable',
@@ -1480,6 +1482,51 @@ void main() {
       );
     },
   );
+
+  for (final failure in [
+    (
+      'commercial_activation_network_failed',
+      'Ditch could not reach Relay to activate this Mac. Check your connection and try again.',
+    ),
+    (
+      'commercial_activation_invalid_response',
+      'Relay responded, but Ditch could not read the activation result. This Mac may already be activated. Please report this error to DitchNow.',
+    ),
+    (
+      'commercial_activation_failed',
+      'Ditch could not confirm activation on this Mac. Please try again.',
+    ),
+  ]) {
+    testWidgets(
+      'activation error ${failure.$1} explains the failure and preserves the license',
+      (tester) async {
+        final client =
+            _RelayUpgradeClient(
+                initiallyActive: true,
+                installedEdition: 'commercial',
+              )
+              ..activationError = DitchRuntimeException(
+                failure.$1,
+                'diagnostic detail',
+              );
+        await tester.pumpWidget(
+          MaterialApp(home: CommercialUpgradeDialog(client: client)),
+        );
+        await tester.pumpAndSettle();
+        await tester.tap(find.byKey(const Key('activate-commercial-device')));
+        await tester.pumpAndSettle();
+        expect(find.text(failure.$2), findsOneWidget);
+        expect(find.text('Commercial active'), findsOneWidget);
+        expect(client.commercialReleaseCalls, 0);
+        expect(
+          find.text(
+            'Commercial is active on this Mac. Remote Control is ready.',
+          ),
+          findsNothing,
+        );
+      },
+    );
+  }
 
   test('lifetime add-on checkout remains a Ditch Relay offer', () async {
     final client = _RelayContractClient();

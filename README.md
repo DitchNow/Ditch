@@ -137,8 +137,8 @@ Building Ditch Community Edition requires Flutter with macOS desktop support and
 Fetch the dependencies and run the app from the Flutter project:
 
 ```sh
-git clone https://github.com/DitchNow/TheDitch.git
-cd TheDitch/apps/macos
+git clone https://github.com/ditchnow/ditch.git
+cd ditch/apps/macos
 flutter pub get
 flutter run -d macos
 ```
@@ -154,8 +154,9 @@ scripts/macos-app staging build
 scripts/macos-app production build
 ```
 
-The public configuration lives in `apps/macos/config/.env.staging` and
-`apps/macos/config/.env.production`. These files contain only the deployment
+Maintainers create ignored local configuration at `apps/macos/config/.env.staging`
+and `apps/macos/config/.env.production`; these files are absent from the OSS clone.
+Direct Flutter source builds do not require either file or Relay credentials. These files contain only the deployment
 name, Relay HTTPS origin, and allowed Commercial-update hosts. Stripe keys,
 webhook secrets, Cloudflare credentials, Apple signing credentials, and other
 secrets belong in the Relay or protected release environment and must never be

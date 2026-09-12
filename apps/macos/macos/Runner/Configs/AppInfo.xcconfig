@@ -16,8 +16,11 @@ PRODUCT_COPYRIGHT = Copyright © 2026 Ditch. All rights reserved.
 // Public verification keys are injected by the official release job. Source
 // builds remain fully functional but cannot install an official Commercial
 // artifact unless built with the published verification configuration.
+// OSS builds use ad-hoc signing; official release configuration overrides this.
+DITCH_CODE_SIGN_IDENTITY = -
 DITCH_SPARKLE_PUBLIC_ED_KEY =
 DITCH_RELEASE_MANIFEST_PUBLIC_KEY_SEC1_B64 =
+DITCH_COMMUNITY_RELEASE_MANIFEST_PUBLIC_KEY_SEC1_B64 =
 DITCH_APPLE_TEAM_ID =
 DITCH_COMMUNITY_BUILD_SEQUENCE = 0
 #include? "ReleaseVerification.xcconfig"

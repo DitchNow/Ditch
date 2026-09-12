@@ -304,28 +304,7 @@ test -x "$HELPER_MACOS/ditchd-remote-$HOST_REMOTE_TARGET"
 test "$(stat -f %z "$DITCH_CLI_SOURCE")" = "$(stat -f %z "$MAIN_MACOS/ditch_cli")"
 test "$(stat -f %z "$DITCH_CLI_SOURCE")" = "$(stat -f %z "$HELPER_MACOS/ditch_cli")"
 
-# Every executable inside a notarized app must carry a hardened signature.
-# During an Archive, use the identity selected by Xcode; local unsigned builds
-# fall back to an ad-hoc identity while retaining Hardened Runtime flags.
-SIGNING_IDENTITY="${EXPANDED_CODE_SIGN_IDENTITY:--}"
-if [ -z "$SIGNING_IDENTITY" ]; then
-  SIGNING_IDENTITY="-"
-fi
-/usr/bin/codesign --force --sign "$SIGNING_IDENTITY" --options runtime "$MAIN_MACOS/ditch_cli"
-/usr/bin/codesign --force --sign "$SIGNING_IDENTITY" --options runtime "$MAIN_MACOS/ditchd-remote-$HOST_REMOTE_TARGET"
-/usr/bin/codesign --force --sign "$SIGNING_IDENTITY" --options runtime "$HELPER_MACOS/ditchd-remote-$HOST_REMOTE_TARGET"
-/usr/bin/codesign --force --sign "$SIGNING_IDENTITY" --options runtime "$HELPER_MACOS/ditch_cli"
-/usr/bin/codesign --force --sign "$SIGNING_IDENTITY" --options runtime "$HELPER_APP"
-for SIGNED_CODE in \
-  "$MAIN_MACOS/ditch_cli" \
-  "$MAIN_MACOS/ditchd-remote-$HOST_REMOTE_TARGET" \
-  "$HELPER_MACOS/ditchd" \
-  "$HELPER_MACOS/ditch_cli" \
-  "$HELPER_MACOS/ditchd-remote-$HOST_REMOTE_TARGET" \
-  "$HELPER_APP"
-do
-  /usr/bin/codesign --verify --strict "$SIGNED_CODE"
-done
+. "$PROJECT_DIR/sign_status_host.sh"
 
 rm -rf "$TARGET_BUILD_DIR/$CONTENTS_FOLDER_PATH/Library/LoginItems/The Ditch Status.app"
 rm -f "$TARGET_BUILD_DIR/$CONTENTS_FOLDER_PATH/MacOS/ditch-status-host"

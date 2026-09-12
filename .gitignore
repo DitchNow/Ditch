@@ -11,6 +11,8 @@ dist/
 .DS_Store
 .env
 .env.*
+.release-keys/
+.secrets/
 
 *.iml
 *.log

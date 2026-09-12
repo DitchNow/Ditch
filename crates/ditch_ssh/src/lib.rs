@@ -375,6 +375,10 @@ pub fn base_ssh_command(alias: &str) -> Result<Command, SshError> {
         "NumberOfPasswordPrompts=1",
         "-o",
         "ConnectTimeout=15",
+        "-o",
+        "ServerAliveInterval=10",
+        "-o",
+        "ServerAliveCountMax=3",
         "--",
         alias,
     ]);

@@ -15,6 +15,12 @@ tracked_environment_files=$(git ls-files | awk -F/ '$NF == ".env" || $NF ~ /^\.e
   fail "tracked .env files are forbidden"
 }
 
+tracked_credential_files=$(git ls-files | awk '$0 ~ /(^|\/)(\.release-keys|\.secrets)\// { print }')
+[ -z "$tracked_credential_files" ] || {
+  printf '%s\n' "$tracked_credential_files" >&2
+  fail "tracked release credential files are forbidden"
+}
+
 private_crate="ditch_""remote"
 private_module="remote_""control.rs"
 service_daemon="ditch-""servicesd"

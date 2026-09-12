@@ -664,6 +664,7 @@ class AgentSession {
   bool messagesLoading;
   bool hasOlderMessages;
   int? nextBeforeSequence;
+  int latestMessageSequence = 0;
   String? historyError;
 
   String get displayName {
@@ -1770,8 +1771,11 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
   final Map<String, ProjectFilesState> _projectFiles = {};
   final Map<String, String> _remoteHostStatus = {};
   final List<Map<String, dynamic>> _permissionQueue = [];
+  final Set<String> _pendingMessageRefresh = {};
   final Set<String> _pendingPermissionIds = {};
   bool _showingPermission = false;
+  String? _activePermissionId;
+  BuildContext? _activePermissionContext;
 
   StreamSubscription<Map<String, dynamic>>? _runtimeEvents;
   Timer? _productUpdateTimer;
@@ -2764,11 +2768,14 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
       if (session != null) {
         final existing = existingSessions[session.localId];
         if (existing != null) {
-          if (session.updatedAt.isAfter(existing.updatedAt) &&
-              _projects.any(
+          if (_projects.any(
                 (project) =>
                     project.id == session.projectId && project.isRemote,
-              )) {
+              ) &&
+              (session.updatedAt.isAfter(existing.updatedAt) ||
+                  session.isActive ||
+                  session.localId == _expandedAgentLocalId ||
+                  existing.historyError != null)) {
             refreshLatestAgentIds.add(session.localId);
           }
           session.messages
@@ -2778,6 +2785,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
           session.messagesLoading = existing.messagesLoading;
           session.hasOlderMessages = existing.hasOlderMessages;
           session.nextBeforeSequence = existing.nextBeforeSequence;
+          session.latestMessageSequence = existing.latestMessageSequence;
           session.historyError = existing.historyError;
         }
         sessionsById[session.localId] = session;
@@ -2875,8 +2883,30 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
         unawaited(_loadAgentMessages(session, refreshLatest: true));
       }
     }
+    final hosts = snapshot['remote_hosts'];
+    if (hosts is List) {
+      for (final host in hosts.whereType<Map>()) {
+        final alias = host['ssh_host_alias']?.toString();
+        if (alias != null) {
+          _remoteHostStatus[alias] = host['state']?.toString() ?? 'offline';
+        }
+      }
+    }
     final permissionsJson = snapshot['permissions'];
     if (permissionsJson is List) {
+      final liveIds = permissionsJson
+          .whereType<Map>()
+          .map((request) => request['id']?.toString())
+          .toSet();
+      _pendingPermissionIds.removeWhere((id) => !liveIds.contains(id));
+      _permissionQueue.removeWhere(
+        (request) => !liveIds.contains(request['id']?.toString()),
+      );
+      if (_activePermissionId != null &&
+          !liveIds.contains(_activePermissionId)) {
+        final dialog = _activePermissionContext;
+        if (dialog != null && dialog.mounted) Navigator.of(dialog).pop();
+      }
       for (final request in permissionsJson) {
         _enqueueRemotePermission(request);
       }
@@ -3111,18 +3141,33 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
     ).showSnackBar(const SnackBar(content: Text('Project path copied.')));
   }
 
-  Future<void> _reconnectRemoteProject(DitchProject project) async {
+  Future<void> _setupRemoteProject(DitchProject project) async {
     final alias = project.sshHostAlias;
     if (alias == null) return;
     await showDialog<bool>(
       context: context,
-      barrierDismissible: true,
       builder: (context) => AddRemoteProjectDialog(
         client: _runtimeClient,
         initialAlias: alias,
         repairOnly: true,
       ),
     );
+  }
+
+  Future<void> _reconnectRemoteProject(DitchProject project) async {
+    final alias = project.sshHostAlias;
+    if (alias == null) return;
+    setState(() => _remoteHostStatus[alias] = 'reconnecting');
+    try {
+      await _runtimeClient.request({
+        'ReconnectRemoteHost': {'alias': alias},
+      });
+    } on Object catch (error) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('Reconnect failed: $error')));
+    }
   }
 
   Future<void> _deleteProject(DitchProject project) async {
@@ -3868,6 +3913,18 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
       return;
     }
 
+    final resolved = eventBody['PermissionResolved'];
+    if (resolved is Map) {
+      final id = resolved['request_id']?.toString();
+      _pendingPermissionIds.remove(id);
+      _permissionQueue.removeWhere(
+        (request) => request['id']?.toString() == id,
+      );
+      if (_activePermissionId == id && _activePermissionContext != null) {
+        Navigator.of(_activePermissionContext!).pop();
+      }
+      return;
+    }
     final agentChanged = eventBody['AgentChanged'];
     if (agentChanged != null) {
       final incoming = _agentSessionFromRuntime(agentChanged, const []);
@@ -4021,74 +4078,175 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
             'Codex is requesting permission on the SSH host.';
         final action = request['action']?.toString();
         if (!mounted) break;
+        final questions = request['questions'];
+        if (questions is List && questions.isNotEmpty) {
+          final fields = {
+            for (final q in questions.whereType<Map>())
+              q['id'].toString(): TextEditingController(),
+          };
+          _activePermissionId = requestId;
+          final answers = await showDialog<Map<String, List<String>>>(
+            context: context,
+            barrierDismissible: false,
+            builder: (dialogContext) {
+              _activePermissionContext = dialogContext;
+              return AlertDialog(
+                title: const Text('Agent needs your answer'),
+                content: SizedBox(
+                  width: 560,
+                  child: SingleChildScrollView(
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        for (final question in questions.whereType<Map>()) ...[
+                          Text(question['question']?.toString() ?? ''),
+                          if (question['options'] is List)
+                            Wrap(
+                              spacing: 8,
+                              children: [
+                                for (final option
+                                    in (question['options'] as List)
+                                        .whereType<Map>())
+                                  ActionChip(
+                                    label: Text(
+                                      option['label']?.toString() ?? '',
+                                    ),
+                                    onPressed: () =>
+                                        fields[question['id'].toString()]!
+                                                .text =
+                                            option['label']?.toString() ?? '',
+                                  ),
+                              ],
+                            ),
+                          TextField(
+                            controller: fields[question['id'].toString()],
+                            obscureText: question['isSecret'] == true,
+                          ),
+                          const SizedBox(height: 16),
+                        ],
+                      ],
+                    ),
+                  ),
+                ),
+                actions: [
+                  FilledButton(
+                    onPressed: () {
+                      if (fields.values.every(
+                        (field) => field.text.trim().isNotEmpty,
+                      )) {
+                        Navigator.pop(dialogContext, {
+                          for (final entry in fields.entries)
+                            entry.key: [entry.value.text.trim()],
+                        });
+                      }
+                    },
+                    child: const Text('Send answers'),
+                  ),
+                ],
+              );
+            },
+          );
+          _activePermissionContext = null;
+          _activePermissionId = null;
+          if (answers != null && _pendingPermissionIds.contains(requestId)) {
+            try {
+              await _runtimeClient.request({
+                'AnswerAgentQuestions': {
+                  'request_id': requestId,
+                  'answers': answers,
+                },
+              });
+            } on Object catch (error) {
+              if (mounted) {
+                ScaffoldMessenger.of(context).showSnackBar(
+                  SnackBar(content: Text('Could not send answers: $error')),
+                );
+              }
+            }
+          }
+          for (final field in fields.values) {
+            field.dispose();
+          }
+          _pendingPermissionIds.remove(requestId);
+          continue;
+        }
+        _activePermissionId = requestId;
         final decision = await showDialog<_RemotePermissionDecision>(
           context: context,
           barrierDismissible: false,
-          builder: (context) => AlertDialog(
-            icon: const Icon(Icons.security_outlined),
-            title: Text(
-              action == 'AccessNetwork'
-                  ? 'Allow remote network access?'
-                  : action == 'EditFiles'
-                  ? 'Allow remote file changes?'
-                  : 'Allow remote command?',
-            ),
-            content: SizedBox(
-              width: 560,
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(summary),
-                  if (command != null && command.isNotEmpty) ...[
+          builder: (context) {
+            _activePermissionContext = context;
+            return AlertDialog(
+              icon: const Icon(Icons.security_outlined),
+              title: Text(
+                action == 'AccessNetwork'
+                    ? 'Allow remote network access?'
+                    : action == 'EditFiles'
+                    ? 'Allow remote file changes?'
+                    : 'Allow remote command?',
+              ),
+              content: SizedBox(
+                width: 560,
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(summary),
+                    if (command != null && command.isNotEmpty) ...[
+                      const SizedBox(height: 14),
+                      const Text('Command'),
+                      const SizedBox(height: 6),
+                      Container(
+                        width: double.infinity,
+                        padding: const EdgeInsets.all(10),
+                        decoration: BoxDecoration(
+                          color: context.ditch.surfaceHover,
+                          borderRadius: BorderRadius.circular(8),
+                        ),
+                        child: SelectableText(
+                          command,
+                          style: const TextStyle(fontFamily: 'monospace'),
+                        ),
+                      ),
+                    ],
+                    if (target != null && target.isNotEmpty) ...[
+                      const SizedBox(height: 12),
+                      Text('Target: $target'),
+                    ],
                     const SizedBox(height: 14),
-                    const Text('Command'),
-                    const SizedBox(height: 6),
-                    Container(
-                      width: double.infinity,
-                      padding: const EdgeInsets.all(10),
-                      decoration: BoxDecoration(
-                        color: context.ditch.surfaceHover,
-                        borderRadius: BorderRadius.circular(8),
-                      ),
-                      child: SelectableText(
-                        command,
-                        style: const TextStyle(fontFamily: 'monospace'),
-                      ),
+                    const Text(
+                      'This action will run with the SSH user’s permissions on the remote machine.',
                     ),
                   ],
-                  if (target != null && target.isNotEmpty) ...[
-                    const SizedBox(height: 12),
-                    Text('Target: $target'),
-                  ],
-                  const SizedBox(height: 14),
-                  const Text(
-                    'This action will run with the SSH user’s permissions on the remote machine.',
-                  ),
-                ],
-              ),
-            ),
-            actions: [
-              TextButton(
-                onPressed: () =>
-                    Navigator.pop(context, _RemotePermissionDecision.deny),
-                child: const Text('Deny'),
-              ),
-              OutlinedButton(
-                onPressed: () => Navigator.pop(
-                  context,
-                  _RemotePermissionDecision.allowSession,
                 ),
-                child: const Text('Allow for Session'),
               ),
-              FilledButton(
-                onPressed: () =>
-                    Navigator.pop(context, _RemotePermissionDecision.allowOnce),
-                child: const Text('Allow Once'),
-              ),
-            ],
-          ),
+              actions: [
+                TextButton(
+                  onPressed: () =>
+                      Navigator.pop(context, _RemotePermissionDecision.deny),
+                  child: const Text('Deny'),
+                ),
+                OutlinedButton(
+                  onPressed: () => Navigator.pop(
+                    context,
+                    _RemotePermissionDecision.allowSession,
+                  ),
+                  child: const Text('Allow for Session'),
+                ),
+                FilledButton(
+                  onPressed: () => Navigator.pop(
+                    context,
+                    _RemotePermissionDecision.allowOnce,
+                  ),
+                  child: const Text('Allow Once'),
+                ),
+              ],
+            );
+          },
         );
+        _activePermissionContext = null;
+        _activePermissionId = null;
+        if (!_pendingPermissionIds.contains(requestId)) continue;
         try {
           switch (decision) {
             case _RemotePermissionDecision.allowOnce:
@@ -4305,14 +4463,56 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
     _scheduleStatusBarUpdate();
   }
 
+  Future<void> _rejoinAgent(AgentSession session) async {
+    var sequence = session.latestMessageSequence;
+    while (mounted) {
+      final result = await _runtimeClient.request({
+        'RejoinAgent': {
+          'agent_id': session.localId,
+          'after_sequence': sequence,
+        },
+      });
+      final page = result['AgentRejoined'];
+      if (page is! Map) {
+        throw const FormatException('Invalid agent rejoin response');
+      }
+      final target = _agentSessionByLocalId(session.localId);
+      if (target == null || !mounted) return;
+      final items = <AgentChatMessage>[];
+      for (final raw
+          in (page['messages'] as List? ?? const []).whereType<Map>()) {
+        final message = _agentChatMessageFromRuntime(
+          raw['message'],
+          identity: 'persisted:${session.localId}:${raw['sequence']}',
+        );
+        if (message != null) items.add(message);
+      }
+      final next = page['next_sequence'] as int? ?? sequence;
+      setState(() {
+        target.messages.addAll(uniqueRuntimeMessages(target.messages, items));
+        target.latestMessageSequence = next;
+        target.messagesLoaded = true;
+      });
+      for (final request in page['permissions'] as List? ?? const []) {
+        _enqueueRemotePermission(request);
+      }
+      if (page['has_more'] != true) return;
+      if (next <= sequence) {
+        throw const FormatException('Transcript cursor did not advance');
+      }
+      sequence = next;
+    }
+  }
+
   Future<void> _loadAgentMessages(
     AgentSession session, {
     bool refreshLatest = false,
   }) async {
-    if (session.messagesLoading ||
-        (!refreshLatest &&
-            session.messagesLoaded &&
-            !session.hasOlderMessages)) {
+    if (session.messagesLoading) {
+      if (refreshLatest) _pendingMessageRefresh.add(session.localId);
+      return;
+    }
+    if (!refreshLatest && session.messagesLoaded && !session.hasOlderMessages) {
       return;
     }
     final initial = refreshLatest || !session.messagesLoaded;
@@ -4321,6 +4521,19 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
       session.historyError = null;
     });
     try {
+      final remote = _projects.any(
+        (project) => project.id == session.projectId && project.isRemote,
+      );
+      if (refreshLatest && remote && session.messagesLoaded) {
+        await _rejoinAgent(session);
+        if (mounted) {
+          setState(
+            () => _agentSessionByLocalId(session.localId)?.messagesLoading =
+                false,
+          );
+        }
+        return;
+      }
       final response = await _runtimeClient.listAgentMessages(
         agentId: session.localId,
         beforeSequence: initial ? null : session.nextBeforeSequence,
@@ -4356,6 +4569,14 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
         } else {
           target.messages.insertAll(0, additions);
         }
+        if (rawMessages is List) {
+          for (final raw in rawMessages.whereType<Map>()) {
+            final seq = raw['sequence'];
+            if (seq is int && seq > target.latestMessageSequence) {
+              target.latestMessageSequence = seq;
+            }
+          }
+        }
         target.messagesLoaded = true;
         target.messagesLoading = false;
         if (!refreshLatest || target.nextBeforeSequence == null) {
@@ -4373,6 +4594,13 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
         target.messagesLoading = false;
         target.historyError = 'Could not load message history. $error';
       });
+    } finally {
+      if (mounted && _pendingMessageRefresh.remove(session.localId)) {
+        final current = _agentSessionByLocalId(session.localId);
+        if (current != null) {
+          unawaited(_loadAgentMessages(current, refreshLatest: true));
+        }
+      }
     }
   }
 
@@ -4982,6 +5210,8 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
                             unawaited(_revealProjectInFinder(project)),
                         onCopyProjectPath: (project) =>
                             unawaited(_copyProjectPath(project)),
+                        onSetupRemoteProject: (project) =>
+                            unawaited(_setupRemoteProject(project)),
                         onReconnectRemoteProject: (project) =>
                             unawaited(_reconnectRemoteProject(project)),
                         onDeleteProject: (project) =>
@@ -6106,8 +6336,12 @@ class _CommercialUpgradeDialogState extends State<CommercialUpgradeDialog> {
           'This Ditch build is not configured to verify official Commercial releases. Install an official build and try again.',
         'commercial_release_network_failed' =>
           'Ditch could not reach the Relay to authorize the Commercial download. Check your connection and try again.',
+        'commercial_activation_network_failed' =>
+          'Ditch could not reach Relay to activate this Mac. Check your connection and try again.',
+        'commercial_activation_invalid_response' =>
+          'Relay responded, but Ditch could not read the activation result. This Mac may already be activated. Please report this error to DitchNow.',
         'commercial_activation_failed' =>
-          'Ditch could not activate this Mac. Check the connection and try again.',
+          'Ditch could not confirm activation on this Mac. Please try again.',
         'device_not_licensed' ||
         'mac_slot_unavailable' ||
         'commercial_device_not_licensed' =>
@@ -7296,6 +7530,7 @@ class ProjectSidebar extends StatelessWidget {
     required this.onRevealProject,
     required this.onCopyProjectPath,
     required this.onReconnectRemoteProject,
+    this.onSetupRemoteProject,
     required this.onDeleteProject,
     required this.summaryForProject,
     super.key,
@@ -7310,6 +7545,7 @@ class ProjectSidebar extends StatelessWidget {
   final ValueChanged<DitchProject> onRevealProject;
   final ValueChanged<DitchProject> onCopyProjectPath;
   final ValueChanged<DitchProject> onReconnectRemoteProject;
+  final ValueChanged<DitchProject>? onSetupRemoteProject;
   final ValueChanged<DitchProject> onDeleteProject;
   final ProjectAgentSummary Function(DitchProject) summaryForProject;
 
@@ -7356,6 +7592,10 @@ class ProjectSidebar extends StatelessWidget {
                         onTap: () => onSelectProject(index),
                         onReveal: () => onRevealProject(project),
                         onCopyPath: () => onCopyProjectPath(project),
+                        onSetup:
+                            project.isRemote && onSetupRemoteProject != null
+                            ? () => onSetupRemoteProject!(project)
+                            : null,
                         onReconnect: project.isRemote
                             ? () => onReconnectRemoteProject(project)
                             : null,
@@ -7391,6 +7631,7 @@ class ProjectTile extends StatelessWidget {
     required this.onReveal,
     required this.onCopyPath,
     this.onReconnect,
+    this.onSetup,
     required this.onDelete,
     this.runningCount = 0,
     this.stoppedCount = 0,
@@ -7408,6 +7649,7 @@ class ProjectTile extends StatelessWidget {
   final VoidCallback onReveal;
   final VoidCallback onCopyPath;
   final VoidCallback? onReconnect;
+  final VoidCallback? onSetup;
   final VoidCallback onDelete;
   final int runningCount;
   final int stoppedCount;
@@ -7437,6 +7679,11 @@ class ProjectTile extends StatelessWidget {
           value: _ProjectMenuAction.copyPath,
           child: Text('Copy Project Path'),
         ),
+        if (onSetup != null)
+          const PopupMenuItem(
+            value: _ProjectMenuAction.setup,
+            child: Text('Remote Runtime Setup…'),
+          ),
         if (onReconnect != null)
           const PopupMenuItem(
             value: _ProjectMenuAction.reconnect,
@@ -7452,6 +7699,8 @@ class ProjectTile extends StatelessWidget {
     switch (action) {
       case _ProjectMenuAction.copyPath:
         onCopyPath();
+      case _ProjectMenuAction.setup:
+        onSetup?.call();
       case _ProjectMenuAction.reconnect:
         onReconnect?.call();
       case _ProjectMenuAction.delete:
@@ -7563,7 +7812,7 @@ class ProjectTile extends StatelessWidget {
   }
 }
 
-enum _ProjectMenuAction { copyPath, reconnect, delete }
+enum _ProjectMenuAction { copyPath, setup, reconnect, delete }
 
 class AgentsSurface extends StatelessWidget {
   const AgentsSurface({

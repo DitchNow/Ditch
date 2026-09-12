@@ -143,8 +143,15 @@ configure_release_verification() {
     exit 1
   fi
   if [ "$configured" -eq 5 ]; then
+    # Certificate selection is release-machine configuration, never a private key.
+    signing_identity=${DITCH_CODESIGN_IDENTITY:--}
+    case "$signing_identity" in
+      *'
+'*|*'//'*) echo "error: invalid signing identity" >&2; exit 1 ;;
+    esac
     umask 022
     printf '%s\n' \
+      "DITCH_CODE_SIGN_IDENTITY = $signing_identity" \
       "DITCH_SPARKLE_PUBLIC_ED_KEY = $DITCH_SPARKLE_PUBLIC_ED_KEY" \
       "DITCH_RELEASE_MANIFEST_PUBLIC_KEY_SEC1_B64 = $DITCH_RELEASE_MANIFEST_PUBLIC_KEY_SEC1_B64" \
       "DITCH_COMMUNITY_RELEASE_MANIFEST_PUBLIC_KEY_SEC1_B64 = $DITCH_COMMUNITY_RELEASE_MANIFEST_PUBLIC_KEY_SEC1_B64" \

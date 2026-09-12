@@ -63,6 +63,7 @@ jobs:
         env:
           SPARKLE_PUBLIC_KEY: ${{ secrets.DITCH_SPARKLE_PUBLIC_ED_KEY }}
           MANIFEST_PUBLIC_KEY: ${{ secrets.DITCH_RELEASE_MANIFEST_PUBLIC_KEY_SEC1_B64 }}
+          COMMUNITY_MANIFEST_PUBLIC_KEY: ${{ secrets.DITCH_COMMUNITY_RELEASE_MANIFEST_PUBLIC_KEY_SEC1_B64 }}
           APPLE_TEAM_ID: ${{ secrets.DITCH_APPLE_TEAM_ID }}
           BUILD_SEQUENCE: ${{ inputs.build_sequence }}
         run: |
@@ -75,6 +76,7 @@ jobs:
           printf '%s\n' \
             "DITCH_SPARKLE_PUBLIC_ED_KEY=$SPARKLE_PUBLIC_KEY" \
             "DITCH_RELEASE_MANIFEST_PUBLIC_KEY_SEC1_B64=$MANIFEST_PUBLIC_KEY" \
+            "DITCH_COMMUNITY_RELEASE_MANIFEST_PUBLIC_KEY_SEC1_B64=$COMMUNITY_MANIFEST_PUBLIC_KEY" \
             "DITCH_APPLE_TEAM_ID=$APPLE_TEAM_ID" \
             "DITCH_COMMUNITY_BUILD_SEQUENCE=$BUILD_SEQUENCE" \
             > apps/macos/config/.env.release.staging
@@ -90,9 +92,11 @@ jobs:
       - name: Build signed staging application
         env:
           DITCH_FLUTTER: ${{ env.FLUTTER_ROOT }}
+          DITCH_CODESIGN_IDENTITY: ${{ secrets.DITCH_CODESIGN_IDENTITY }}
           DITCH_OFFICIAL_BUILD_CREDENTIAL: ${{ secrets.DITCH_OFFICIAL_BUILD_CREDENTIAL_STAGING }}
         run: |
           test -n "$DITCH_OFFICIAL_BUILD_CREDENTIAL"
+          test -n "$DITCH_CODESIGN_IDENTITY"
           scripts/macos-app staging build --release --build-name '${{ inputs.version }}' --build-number '${{ inputs.build_sequence }}'
       - run: scripts/check-community-leakage
       - name: Verify application signature
