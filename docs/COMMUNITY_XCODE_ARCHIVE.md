@@ -80,9 +80,22 @@ existing protected release inputs explicitly.
 
 ```sh
 node --test scripts/test-prepare-community-archive.mjs
+python3 community/scripts/test-macos-runtime-signing.py
 ```
 
-Tests substitute the compiler and Xcode launch; they verify environment/edition
+Preparation tests substitute the compiler and Xcode launch; they verify environment/edition
 selection, credential isolation, receipt compatibility and reuse, source mismatch
 rejection, public trust matching, and remote artifact validation. They do not build
 or publish an actual application.
+
+On macOS, the signing regression tests compile ARM and Intel Mach-O fixtures and
+run the archive's signing step with an ad-hoc identity. They verify Hardened
+Runtime signatures, the helper's resource seal, refreshed runtime checksums,
+unchanged Linux artifacts, and source builds without release credentials.
+
+If Xcode reports **Hardened Runtime is Not Enabled** for the bundled
+`ditchd-*-apple-darwin` resources, create a fresh archive with the corrected
+Community packaging script. Retrying distribution of an existing archive does
+not run the packaging script again. Commit the source fix first and use a new
+build number: an existing registration receipt is tied to its original source
+revision.
