@@ -13,6 +13,7 @@ import 'data/commercial_models.dart';
 import 'data/runtime_models.dart';
 import 'data/runtime_transport.dart';
 import 'design_system/ditch_theme.dart';
+import 'widgets/inline_approval.dart';
 
 export 'data/runtime_transport.dart'
     show DitchRuntimeException, parseRuntimeResponseLine;
@@ -436,8 +437,6 @@ class ProjectFilesState {
 
 enum AgentApprovalPreset { ask, approveForMe, fullAccess }
 
-enum _RemotePermissionDecision { allowOnce, allowSession, deny }
-
 class AgentModelOption {
   const AgentModelOption({
     required this.id,
@@ -660,6 +659,7 @@ class AgentSession {
   bool canStop;
   DateTime updatedAt;
   final List<AgentChatMessage> messages;
+  final List<InlineApproval> approvals = [];
   bool messagesLoaded;
   bool messagesLoading;
   bool hasOlderMessages;
@@ -882,6 +882,17 @@ class AgentChatMessage {
 int _nextChatMessageIdentity = 1;
 
 class ConversationItem {
+  ConversationItem.approval(InlineApproval approval)
+    : this._(
+        identity: 'approval:${approval.id}',
+        message: null,
+        approval: approval,
+        toolMessages: const [],
+        isActiveToolGroup: false,
+      );
+  DateTime get createdAt =>
+      approval?.createdAt ?? message?.createdAt ?? toolMessages.first.createdAt;
+
   ConversationItem.message(AgentChatMessage message)
     : this._(
         identity: message.identity,
@@ -904,12 +915,14 @@ class ConversationItem {
   const ConversationItem._({
     required this.identity,
     required this.message,
+    this.approval,
     required this.toolMessages,
     required this.isActiveToolGroup,
   });
 
   final String identity;
   final AgentChatMessage? message;
+  final InlineApproval? approval;
   final List<AgentChatMessage> toolMessages;
   final bool isActiveToolGroup;
 
@@ -1773,6 +1786,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
   final List<Map<String, dynamic>> _permissionQueue = [];
   final Set<String> _pendingMessageRefresh = {};
   final Set<String> _pendingPermissionIds = {};
+  final Map<String, InlineApproval> _inlineApprovals = {};
   bool _showingPermission = false;
   String? _activePermissionId;
   BuildContext? _activePermissionContext;
@@ -2781,6 +2795,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
           session.messages
             ..clear()
             ..addAll(existing.messages);
+          session.approvals.addAll(existing.approvals);
           session.messagesLoaded = existing.messagesLoaded;
           session.messagesLoading = existing.messagesLoading;
           session.hasOlderMessages = existing.hasOlderMessages;
@@ -2898,6 +2913,9 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
           .whereType<Map>()
           .map((request) => request['id']?.toString())
           .toSet();
+      for (final approval in _inlineApprovals.values) {
+        if (!liveIds.contains(approval.id)) approval.resolve();
+      }
       _pendingPermissionIds.removeWhere((id) => !liveIds.contains(id));
       _permissionQueue.removeWhere(
         (request) => !liveIds.contains(request['id']?.toString()),
@@ -3916,6 +3934,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
     final resolved = eventBody['PermissionResolved'];
     if (resolved is Map) {
       final id = resolved['request_id']?.toString();
+      _inlineApprovals[id]?.resolve();
       _pendingPermissionIds.remove(id);
       _permissionQueue.removeWhere(
         (request) => request['id']?.toString() == id,
@@ -4051,14 +4070,59 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
     final request = Map<String, dynamic>.from(value);
     final requestId = request['id']?.toString();
     final projectId = request['project_id']?.toString();
-    final isRemoteProject = _projects.any(
-      (project) => project.id == projectId && project.isRemote,
-    );
+    final agentId = _agentIdToString(request['agent_id']);
+    final session = agentId == null ? null : _agentSessionByLocalId(agentId);
     if (requestId == null ||
-        !isRemoteProject ||
-        !_pendingPermissionIds.add(requestId)) {
+        session == null ||
+        session.projectId != projectId) {
       return;
     }
+    final questions = request['questions'];
+    if (questions is! List || questions.isEmpty) {
+      final approval = _inlineApprovals.putIfAbsent(
+        requestId,
+        () => InlineApproval(
+          request: request,
+          isAvailable: () {
+            if (_presentation.value.connection !=
+                RuntimeConnectionPhase.connected) {
+              return false;
+            }
+            final project = _projects
+                .where((project) => project.id == projectId)
+                .firstOrNull;
+            return project != null &&
+                (!project.isRemote ||
+                    _remoteHostStatus[project.sshHostAlias] == 'online');
+          },
+          respond: (choice) async {
+            final response = choice == ApprovalChoice.cancel
+                ? await _runtimeClient.denyPermission(requestId)
+                : await _runtimeClient.approvePermission(
+                    requestId,
+                    forSession: choice == ApprovalChoice.session,
+                  );
+            if (response['Accepted'] != true) {
+              throw const FormatException('Missing approval acknowledgement');
+            }
+          },
+          refresh: () async {
+            final snapshot = await _runtimeClient.snapshot();
+            if (mounted) _hydrateRuntimeSnapshot(snapshot);
+          },
+        ),
+      );
+      if (!session.approvals.contains(approval)) {
+        setState(() => session.approvals.add(approval));
+      }
+      return;
+    }
+    if (!_projects.any(
+      (project) => project.id == projectId && project.isRemote,
+    )) {
+      return;
+    }
+    if (!_pendingPermissionIds.add(requestId)) return;
     _permissionQueue.add(request);
     unawaited(_showNextRemotePermission());
   }
@@ -4071,12 +4135,6 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
         final request = _permissionQueue.removeAt(0);
         final requestId = request['id']?.toString();
         if (requestId == null) continue;
-        final command = request['command']?.toString().trim();
-        final target = request['target']?.toString().trim();
-        final summary =
-            request['summary']?.toString().trim() ??
-            'Codex is requesting permission on the SSH host.';
-        final action = request['action']?.toString();
         if (!mounted) break;
         final questions = request['questions'];
         if (questions is List && questions.isNotEmpty) {
@@ -4169,107 +4227,6 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
           }
           _pendingPermissionIds.remove(requestId);
           continue;
-        }
-        _activePermissionId = requestId;
-        final decision = await showDialog<_RemotePermissionDecision>(
-          context: context,
-          barrierDismissible: false,
-          builder: (context) {
-            _activePermissionContext = context;
-            return AlertDialog(
-              icon: const Icon(Icons.security_outlined),
-              title: Text(
-                action == 'AccessNetwork'
-                    ? 'Allow remote network access?'
-                    : action == 'EditFiles'
-                    ? 'Allow remote file changes?'
-                    : 'Allow remote command?',
-              ),
-              content: SizedBox(
-                width: 560,
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(summary),
-                    if (command != null && command.isNotEmpty) ...[
-                      const SizedBox(height: 14),
-                      const Text('Command'),
-                      const SizedBox(height: 6),
-                      Container(
-                        width: double.infinity,
-                        padding: const EdgeInsets.all(10),
-                        decoration: BoxDecoration(
-                          color: context.ditch.surfaceHover,
-                          borderRadius: BorderRadius.circular(8),
-                        ),
-                        child: SelectableText(
-                          command,
-                          style: const TextStyle(fontFamily: 'monospace'),
-                        ),
-                      ),
-                    ],
-                    if (target != null && target.isNotEmpty) ...[
-                      const SizedBox(height: 12),
-                      Text('Target: $target'),
-                    ],
-                    const SizedBox(height: 14),
-                    const Text(
-                      'This action will run with the SSH user’s permissions on the remote machine.',
-                    ),
-                  ],
-                ),
-              ),
-              actions: [
-                TextButton(
-                  onPressed: () =>
-                      Navigator.pop(context, _RemotePermissionDecision.deny),
-                  child: const Text('Deny'),
-                ),
-                OutlinedButton(
-                  onPressed: () => Navigator.pop(
-                    context,
-                    _RemotePermissionDecision.allowSession,
-                  ),
-                  child: const Text('Allow for Session'),
-                ),
-                FilledButton(
-                  onPressed: () => Navigator.pop(
-                    context,
-                    _RemotePermissionDecision.allowOnce,
-                  ),
-                  child: const Text('Allow Once'),
-                ),
-              ],
-            );
-          },
-        );
-        _activePermissionContext = null;
-        _activePermissionId = null;
-        if (!_pendingPermissionIds.contains(requestId)) continue;
-        try {
-          switch (decision) {
-            case _RemotePermissionDecision.allowOnce:
-              await _runtimeClient.approvePermission(requestId);
-            case _RemotePermissionDecision.allowSession:
-              await _runtimeClient.approvePermission(
-                requestId,
-                forSession: true,
-              );
-            case _RemotePermissionDecision.deny:
-            case null:
-              await _runtimeClient.denyPermission(requestId);
-          }
-        } on Object catch (error) {
-          if (mounted) {
-            ScaffoldMessenger.of(context).showSnackBar(
-              SnackBar(
-                content: Text('Could not answer Codex approval: $error'),
-              ),
-            );
-          }
-        } finally {
-          _pendingPermissionIds.remove(requestId);
         }
       }
     } finally {
@@ -8367,6 +8324,7 @@ class ExpandableAgentPanel extends StatelessWidget {
         Widget buildChatPanel() => AgentChatPanel(
           conversationId: session.localId,
           messages: session.messages,
+          approvals: session.approvals,
           viewport: chatViewport!,
           enlarged: enlarged,
           composerKey: composerKey!,
@@ -8511,6 +8469,7 @@ class AgentChatPanel extends StatelessWidget {
   const AgentChatPanel({
     required this.conversationId,
     required this.messages,
+    this.approvals = const [],
     required this.viewport,
     required this.enlarged,
     required this.composerKey,
@@ -8534,6 +8493,7 @@ class AgentChatPanel extends StatelessWidget {
 
   final String conversationId;
   final List<AgentChatMessage> messages;
+  final List<InlineApproval> approvals;
   final ConversationViewportController viewport;
   final bool enlarged;
   final GlobalKey<AgentComposerState> composerKey;
@@ -8611,6 +8571,7 @@ class AgentChatPanel extends StatelessWidget {
             child: ConversationTranscript(
               key: ValueKey('conversation-$conversationId'),
               messages: messages,
+              approvals: approvals,
               isWorking: isWorking,
               viewport: viewport,
               ready: messagesReady,
@@ -8633,6 +8594,7 @@ class AgentChatPanel extends StatelessWidget {
 class ConversationTranscript extends StatefulWidget {
   const ConversationTranscript({
     required this.messages,
+    this.approvals = const [],
     required this.viewport,
     this.isWorking = false,
     this.ready = true,
@@ -8645,6 +8607,7 @@ class ConversationTranscript extends StatefulWidget {
   });
 
   final List<AgentChatMessage> messages;
+  final List<InlineApproval> approvals;
   final ConversationViewportController viewport;
   final bool isWorking;
   final bool ready;
@@ -8659,13 +8622,16 @@ class ConversationTranscript extends StatefulWidget {
 }
 
 class _ConversationTranscriptState extends State<ConversationTranscript> {
+  bool get _canRender => widget.ready || widget.approvals.isNotEmpty;
+
   @override
   void initState() {
     super.initState();
-    if (widget.ready) {
+    if (_canRender) {
       widget.viewport.synchronizeItems(_itemIds);
       widget.viewport.attach(onInitialPositioned: widget.onInitialPositioned);
-    } else {
+    }
+    if (!widget.ready) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (mounted) widget.onLoadOlder();
       });
@@ -8676,20 +8642,34 @@ class _ConversationTranscriptState extends State<ConversationTranscript> {
   void didUpdateWidget(ConversationTranscript oldWidget) {
     super.didUpdateWidget(oldWidget);
     if (oldWidget.viewport != widget.viewport) {
-      if (widget.ready) {
+      if (_canRender) {
         widget.viewport.attach(onInitialPositioned: widget.onInitialPositioned);
       }
     }
-    if (widget.ready) {
+    if (_canRender) {
       widget.viewport.synchronizeItems(_itemIds);
-      if (!oldWidget.ready) {
+      if (!oldWidget.ready && oldWidget.approvals.isEmpty) {
         widget.viewport.attach(onInitialPositioned: widget.onInitialPositioned);
       }
     }
   }
 
-  List<ConversationItem> get _items =>
-      buildConversationItems(widget.messages, isWorking: widget.isWorking);
+  List<ConversationItem> get _items {
+    final items = buildConversationItems(
+      widget.messages,
+      isWorking: widget.isWorking,
+    );
+    for (final approval in widget.approvals) {
+      final index = items.indexWhere(
+        (item) => item.createdAt.isAfter(approval.createdAt),
+      );
+      items.insert(
+        index < 0 ? items.length : index,
+        ConversationItem.approval(approval),
+      );
+    }
+    return items;
+  }
 
   List<String> get _itemIds =>
       _items.map((item) => item.identity).toList(growable: false);
@@ -8697,7 +8677,7 @@ class _ConversationTranscriptState extends State<ConversationTranscript> {
   @override
   Widget build(BuildContext context) {
     final controller = widget.viewport.scrollController;
-    if (!widget.ready) {
+    if (!_canRender) {
       return Center(
         child: widget.historyError == null
             ? const CircularProgressIndicator(
@@ -8710,10 +8690,11 @@ class _ConversationTranscriptState extends State<ConversationTranscript> {
       );
     }
     final showHistoryControl =
+        !widget.ready ||
         widget.hasOlderMessages ||
         widget.loadingOlder ||
         widget.historyError != null;
-    final showEmptyState = widget.messages.isEmpty;
+    final showEmptyState = widget.messages.isEmpty && widget.approvals.isEmpty;
     final items = _items;
     return Stack(
       fit: StackFit.expand,
@@ -8748,7 +8729,9 @@ class _ConversationTranscriptState extends State<ConversationTranscript> {
                 }
                 if (index == items.length) {
                   return _HistoryLoadControl(
-                    loading: widget.loadingOlder,
+                    loading:
+                        widget.loadingOlder ||
+                        (!widget.ready && widget.historyError == null),
                     error: widget.historyError,
                     onRetry: widget.onLoadOlder,
                   );
@@ -8756,7 +8739,9 @@ class _ConversationTranscriptState extends State<ConversationTranscript> {
                 final item = items[items.length - 1 - index];
                 return KeyedSubtree(
                   key: ValueKey(item.identity),
-                  child: item.isToolGroup
+                  child: item.approval != null
+                      ? InlineApprovalCard(approval: item.approval!)
+                      : item.isToolGroup
                       ? ToolActivityGroup(
                           messages: item.toolMessages,
                           active: item.isActiveToolGroup,
