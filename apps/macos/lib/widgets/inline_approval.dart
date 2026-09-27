@@ -25,7 +25,7 @@ class InlineApproval extends ChangeNotifier {
     required this.refresh,
     this.isAvailable,
   });
-  final Map<String, dynamic> request;
+  Map<String, dynamic> request;
   final Future<void> Function(ApprovalChoice) respond;
   final Future<void> Function() refresh;
   final bool Function()? isAvailable;
@@ -40,11 +40,32 @@ class InlineApproval extends ChangeNotifier {
   bool submitting = false;
   bool uncertain = false;
   String? resolution;
+  ApprovalChoice? submittedChoice;
+  bool get awaitingConfirmation => request['response_pending'] == true;
   String? error;
   bool get pending => resolution == null && !expired;
-  bool get actionable => pending && available && !submitting && !uncertain;
+  bool get actionable =>
+      pending &&
+      available &&
+      !submitting &&
+      !uncertain &&
+      !awaitingConfirmation;
+
+  void updateRequest(Map<String, dynamic> value) {
+    request = value;
+    // A host can recover a live request after an incomplete/offline snapshot.
+    // Presence in an authoritative pending list supersedes a stale UI resolution.
+    resolution = null;
+    // A fresh authoritative snapshot distinguishes unsent from sent responses.
+    // The runtime also deduplicates by permission ID while a response is pending.
+    uncertain = awaitingConfirmation;
+    if (!uncertain) error = null;
+    notifyListeners();
+  }
 
   void resolve([String label = 'Resolved']) {
+    // Closure can mean confirmation, cancellation, or turn failure. Do not
+    // claim the command ran successfully merely because the request disappeared.
     resolution ??= label;
     error = null;
     notifyListeners();
@@ -57,8 +78,11 @@ class InlineApproval extends ChangeNotifier {
     notifyListeners();
     try {
       await respond(choice);
-      // A resolution event may arrive before the command acknowledgement.
-      resolution = choice.result;
+      submittedChoice = choice;
+      if (resolution == null) {
+        request = {...request, 'response_pending': true};
+        uncertain = true;
+      }
     } on DitchRuntimeException catch (caught) {
       if (caught.code == 'permission_not_found') {
         resolution = 'No longer awaiting approval';
@@ -170,9 +194,9 @@ class _InlineApprovalCardState extends State<InlineApprovalCard> {
                   const Text('Reconnect to respond to this request.'),
                 if (approval.submitting) const Text('Waiting for the runtime…'),
                 if (approval.error != null) Text(approval.error!),
-                if (approval.uncertain) ...[
+                if (approval.uncertain || approval.awaitingConfirmation) ...[
                   const Text(
-                    'Awaiting confirmation. This request will not be sent again.',
+                    'Response sent. Waiting for the agent to confirm. Check status after reconnecting.',
                   ),
                   TextButton(
                     onPressed: approval.submitting

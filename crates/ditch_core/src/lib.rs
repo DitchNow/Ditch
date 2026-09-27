@@ -256,6 +256,9 @@ pub struct AgentRun {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PermissionRequest {
+    /// A response was sent; await authoritative resolution rather than sending another.
+    #[serde(default)]
+    pub response_pending: bool,
     #[serde(default)]
     pub questions: Vec<AgentQuestion>,
     pub id: Uuid,

@@ -406,6 +406,7 @@ impl RuntimeState {
         let mut capabilities = vec![
             format!("edition_{RUNTIME_EDITION}"),
             "persistent_sessions_v1".to_owned(),
+            "app_server_sessions_v2".to_owned(),
             "attention_stream_v1".to_owned(),
             "transcript_pagination_v1".to_owned(),
             "project_files_v1".to_owned(),
@@ -1797,12 +1798,16 @@ fn handle_request(request: ClientRequest, state: Arc<Mutex<RuntimeState>>) -> Se
                     execution_profile,
                 )
             } else {
-                start_codex_session(
+                let project = project_id
+                    .and_then(|id| project_by_id(&state, id))
+                    .unwrap_or_else(|| project_for_launch(&state, project_name, project_root));
+                start_app_server_session(
                     state,
-                    project_name,
-                    project_root,
+                    project.id,
+                    project.name,
+                    project.root.to_string_lossy().into_owned(),
+                    None,
                     prompt,
-                    mode,
                     execution_profile,
                 )
             }
@@ -1845,11 +1850,15 @@ fn handle_request(request: ClientRequest, state: Arc<Mutex<RuntimeState>>) -> Se
                     execution_profile,
                 )
             } else {
-                resume_codex_session(
+                let project = project_id
+                    .and_then(|id| project_by_id(&state, id))
+                    .unwrap_or_else(|| project_for_launch(&state, project_name, project_root));
+                start_app_server_session(
                     state,
-                    project_name,
-                    project_root,
-                    thread_id,
+                    project.id,
+                    project.name,
+                    project.root.to_string_lossy().into_owned(),
+                    Some(thread_id),
                     prompt,
                     execution_profile,
                 )
@@ -3003,10 +3012,7 @@ fn forward_or_prompt_agent(
 ) -> ServerResponse {
     let remote = remote_agent_connection(&state, agent_id);
     let Some((alias, connections)) = remote else {
-        if state.lock().unwrap().remote_runtime {
-            return prompt_remote_app_server_agent(state, agent_id, prompt, execution_profile);
-        }
-        return prompt_agent(state, agent_id, prompt, execution_profile);
+        return prompt_app_server_agent(state, agent_id, prompt, execution_profile);
     };
     ensure_remote_event_subscription(&state, &alias);
     match connections.request(
@@ -3485,64 +3491,85 @@ fn discover_codex_models(binary: &str) -> io::Result<Vec<AgentModel>> {
         serde_json::json!({"id":2,"method":"model/list","params":{"limit":100,"includeHidden":false}})
     )?;
     stdin.flush()?;
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
     let mut models = Vec::new();
-    for line in BufReader::new(stdout).lines() {
-        let value: Value = serde_json::from_str(&line?)?;
-        if value.get("id").and_then(Value::as_i64) != Some(2) {
-            continue;
-        }
-        if let Some(error) = value.get("error") {
-            let _ = child.kill();
-            return Err(io::Error::other(error.to_string()));
-        }
-        for item in value
-            .pointer("/result/data")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-        {
-            let Some(id) = item.get("id").and_then(Value::as_str) else {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let result: io::Result<()> = (|| {
+        loop {
+            let line = rx
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "Codex model discovery timed out or disconnected",
+                    )
+                })??;
+            let value: Value = serde_json::from_str(&line)?;
+            if value.get("id").and_then(Value::as_i64) != Some(2) {
                 continue;
-            };
-            let efforts = item
-                .get("supportedReasoningEfforts")
+            }
+            if let Some(error) = value.get("error") {
+                let _ = child.kill();
+                return Err(io::Error::other(error.to_string()));
+            }
+            for item in value
+                .pointer("/result/data")
                 .and_then(Value::as_array)
                 .into_iter()
                 .flatten()
-                .filter_map(|entry| entry.get("reasoningEffort").and_then(Value::as_str))
-                .map(str::to_owned)
-                .collect();
-            models.push(AgentModel {
-                id: id.to_owned(),
-                display_name: item
-                    .get("displayName")
-                    .and_then(Value::as_str)
-                    .unwrap_or(id)
-                    .to_owned(),
-                is_default: item
-                    .get("isDefault")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false),
-                default_reasoning_effort: item
-                    .get("defaultReasoningEffort")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned),
-                supported_reasoning_efforts: efforts,
-                context_window_tokens: item
-                    .get("contextWindowTokens")
-                    .or_else(|| item.get("contextWindow"))
-                    .or_else(|| item.get("context_window_tokens"))
-                    .and_then(|value| {
-                        value
-                            .as_u64()
-                            .or_else(|| value.as_str().and_then(|text| text.parse().ok()))
-                    }),
-            });
+            {
+                let Some(id) = item.get("id").and_then(Value::as_str) else {
+                    continue;
+                };
+                let efforts = item
+                    .get("supportedReasoningEfforts")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|entry| entry.get("reasoningEffort").and_then(Value::as_str))
+                    .map(str::to_owned)
+                    .collect();
+                models.push(AgentModel {
+                    id: id.to_owned(),
+                    display_name: item
+                        .get("displayName")
+                        .and_then(Value::as_str)
+                        .unwrap_or(id)
+                        .to_owned(),
+                    is_default: item
+                        .get("isDefault")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                    default_reasoning_effort: item
+                        .get("defaultReasoningEffort")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                    supported_reasoning_efforts: efforts,
+                    context_window_tokens: item
+                        .get("contextWindowTokens")
+                        .or_else(|| item.get("contextWindow"))
+                        .or_else(|| item.get("context_window_tokens"))
+                        .and_then(|value| {
+                            value
+                                .as_u64()
+                                .or_else(|| value.as_str().and_then(|text| text.parse().ok()))
+                        }),
+                });
+            }
+            break;
         }
-        break;
-    }
+        Ok(())
+    })();
     let _ = child.kill();
     let _ = child.wait();
+    result?;
     Ok(models)
 }
 
@@ -4111,15 +4138,6 @@ fn stop_agent(state: Arc<Mutex<RuntimeState>>, agent_id: AgentId) -> ServerRespo
             .lock()
             .expect("runtime state lock should not be poisoned");
         let active = state.children.get(&agent_id).cloned();
-        if active.as_ref().is_some_and(|child| child.app_server) {
-            state.app_server_turns.remove(&agent_id);
-            state
-                .app_server_permission_agents
-                .retain(|_, owner| *owner != agent_id);
-            state
-                .pending_permissions
-                .retain(|_, request| request.agent_id != Some(agent_id));
-        }
         let Some(record) = state.agents.get_mut(&agent_id) else {
             return protocol_error("agent_not_found", "agent session was not found");
         };
@@ -4153,6 +4171,26 @@ fn stop_agent(state: Arc<Mutex<RuntimeState>>, agent_id: AgentId) -> ServerRespo
         return ServerResponse::Accepted;
     };
 
+    if active.app_server {
+        let control = state
+            .lock()
+            .unwrap()
+            .app_server_turns
+            .get(&agent_id)
+            .cloned();
+        if let Some(control) = control {
+            if control.interrupt().is_ok()
+                && wait_for_run_finalization(
+                    &state,
+                    agent_id,
+                    active.run_id,
+                    Duration::from_secs(3),
+                )
+            {
+                return ServerResponse::Accepted;
+            }
+        }
+    }
     signal_process(active.process_group_id, libc::SIGINT);
     let mut group_stopped = wait_for_process_group_exit(&active, STOP_INTERRUPT_GRACE);
     if !group_stopped {
@@ -4295,6 +4333,8 @@ fn finalize_stopped_run(state: &Arc<Mutex<RuntimeState>>, agent_id: AgentId, run
         return;
     }
     state.children.remove(&agent_id);
+    state.app_server_turns.remove(&agent_id);
+    clear_agent_permissions(&mut state, agent_id);
     let Some(record) = state.agents.get_mut(&agent_id) else {
         return;
     };
@@ -4913,7 +4953,10 @@ fn update_agent_action(
     let Some(record) = state.agents.get_mut(&agent_id) else {
         return;
     };
-    if record.run.state == AgentState::Stopping {
+    if matches!(
+        record.run.state,
+        AgentState::Stopping | AgentState::AwaitingApproval
+    ) {
         return;
     }
     record.run.last_visible_action = Some(action.to_owned());
@@ -5643,7 +5686,7 @@ fn check_codex_readiness(binary: Option<&str>) -> CodexReadiness {
         .is_some_and(|help| help.contains("app-server"))
     {
         issues.push(
-            "The selected Codex CLI cannot provide the model catalog required by Ditch.".to_owned(),
+            "The selected Codex CLI lacks app-server support required for Ditch sessions and model selection.".to_owned(),
         );
     }
 
