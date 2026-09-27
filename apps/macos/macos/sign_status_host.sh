@@ -2,6 +2,10 @@
 # Sourced by package_status_host.sh after assembling the runtime helper.
 set -eu
 
+if [ "${CODE_SIGNING_ALLOWED:-YES}" = "NO" ]; then
+  return 0
+fi
+
 # Every executable inside a notarized app must carry a hardened signature.
 # During an Archive, use the identity selected by Xcode; local unsigned builds
 # fall back to an ad-hoc identity while retaining Hardened Runtime flags.

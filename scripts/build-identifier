@@ -17,7 +17,7 @@ fi
 
 fingerprint=$(
   cd "$workspace"
-  find Cargo.toml Cargo.lock crates -type f -print |
+  find Cargo.toml Cargo.lock crates -type f ! -name '.DS_Store' -print |
     LC_ALL=C sort |
     while IFS= read -r file; do
       printf '%s\t%s\n' "$file" "$(hash_file "$file")"

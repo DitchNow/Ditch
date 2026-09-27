@@ -353,7 +353,7 @@ if '--version' in sys.argv:
     print('codex-cli 0.154.0'); sys.exit(0)
 def read(): return json.loads(sys.stdin.readline())
 def send(v): print(json.dumps(v), flush=True)
-read(); send({'id':'ditch:initialize','result':{}})
+initialize=read(); send({'id':initialize['id'],'result':{}})
 read(); request=read()
 with open('requests.jsonl','a') as f: f.write(json.dumps(request)+'\n')
 assert request['method'] in ['thread/start','thread/resume']
@@ -403,6 +403,7 @@ time.sleep(0.3) # Keep the thread writer alive briefly after turn completion.
                 prompt: "ask".into(),
                 mode: CodexLaunchMode::Exec,
                 execution_profile: AgentExecutionProfile {
+                    transport: ditch_core::AgentTransport::AppServer,
                     model: Some("model-a".into()),
                     approval: AgentApprovalPreset::Ask,
                     ..Default::default()
@@ -502,6 +503,7 @@ time.sleep(0.3) # Keep the thread writer alive briefly after turn completion.
                         agent_id: id,
                         prompt: prompt.into(),
                         execution_profile: AgentExecutionProfile {
+                    transport: ditch_core::AgentTransport::AppServer,
                             model: Some(model.into()),
                             approval,
                             ..Default::default()

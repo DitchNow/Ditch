@@ -241,6 +241,17 @@ struct RuntimeState {
     store: DitchStore,
     projects: HashMap<String, Project>,
     agents: HashMap<AgentId, AgentRecord>,
+    tasks: HashMap<TaskId, Task>,
+    app_server_streams: HashMap<AgentId, String>,
+    acceptance_controls:HashMap<TaskId,AcceptanceControl>,
+    acceptance_waiters:HashMap<AgentId,mpsc::Sender<()>>,
+    acceptance_owners:std::collections::HashSet<AgentId>,
+    validator_owners:std::collections::HashSet<AgentId>,
+    skill_discovery: HashMap<ProjectId, Vec<ditch_core::SkillEntry>>,
+    writer_leases: HashMap<AgentId, WorkspaceLease>,
+    remote_write_uncertain: HashMap<AgentId,String>,
+    orphan_writer_groups: HashMap<AgentId,i32>,
+    remote_task_generation: HashMap<String,u64>,
     children: HashMap<AgentId, ActiveAgentChild>,
     remote_launching: HashSet<AgentId>,
     terminals: HashMap<uuid::Uuid, ProjectTerminalRecord>,
@@ -312,7 +323,21 @@ impl RuntimeState {
         let mut store = DitchStore::open(&paths).map_err(io::Error::other)?;
         edition::initialize_store(&mut store)?;
         store.reconcile_active_agents().map_err(io::Error::other)?;
+        store.reconcile_tasks().map_err(io::Error::other)?;
         let durable = store.load().map_err(io::Error::other)?;
+        let mut writer_leases=HashMap::new();
+        let mut orphan_writer_groups=HashMap::new();
+        let mut remote_write_uncertain=HashMap::new();
+        for (id,lease,pid) in store.writer_reservations().map_err(io::Error::other)? {
+            if lease.target != "local" {
+                if let Some(alias)=durable.projects.iter().find_map(|p| match &p.execution_target { ProjectExecutionTarget::Remote {remote_machine_id,ssh_host_alias} if remote_machine_id.to_string()==lease.target => Some(ssh_host_alias.clone()), _=>None }) {
+                    remote_write_uncertain.insert(id,alias); writer_leases.insert(id,lease);
+                } else { store.release_writer(id).map_err(io::Error::other)?; }
+            } else if let Some(pid)=pid.filter(|pid|process_group_exists(*pid)) {
+                orphan_writer_groups.insert(id,pid);writer_leases.insert(id,lease);
+            } else { store.release_writer(id).map_err(io::Error::other)?; }
+        }
+
         let projects = durable
             .projects
             .into_iter()
@@ -363,11 +388,21 @@ impl RuntimeState {
         #[cfg(not(target_os = "macos"))]
         let installation_identity = FileIdentityStore::new(&legacy_identity_path).load_or_create();
         let installation_identity = Arc::new(installation_identity.map_err(io::Error::other)?);
+        let validator_owners=store.validator_owners().map_err(io::Error::other)?;
         Ok(Self {
             paths,
             store,
             projects,
             agents,
+            app_server_streams: HashMap::new(),
+            validator_owners,
+            acceptance_controls:HashMap::new(), acceptance_waiters:HashMap::new(), acceptance_owners:std::collections::HashSet::new(),
+            skill_discovery: HashMap::new(),
+            tasks: durable.tasks.into_iter().map(|t|(t.id,t)).collect(),
+            writer_leases,
+            remote_write_uncertain,
+            orphan_writer_groups,
+            remote_task_generation: HashMap::new(),
             children: HashMap::new(),
             remote_launching: HashSet::new(),
             terminals: HashMap::new(),
@@ -405,6 +440,10 @@ impl RuntimeState {
     fn runtime_status(&self) -> RuntimeStatus {
         let mut capabilities = vec![
             format!("edition_{RUNTIME_EDITION}"),
+            "tasks_v1".to_owned(),
+            "acceptance_v1".to_owned(),
+            "identified_tasks_v1".to_owned(),
+            "bounded_context_v1".to_owned(),
             "persistent_sessions_v1".to_owned(),
             "app_server_sessions_v2".to_owned(),
             "attention_stream_v1".to_owned(),
@@ -413,6 +452,8 @@ impl RuntimeState {
             "persistent_attention_read_v1".to_owned(),
             "always_on_web_access_v1".to_owned(),
             "ssh_remote_runtime_v1".to_owned(),
+            "skills_v1".to_owned(),
+            "local_app_server_opt_in_v1".to_owned(),
             "remote_directory_picker_v1".to_owned(),
             format!(
                 "remote_runtime_protocol_v{}",
@@ -449,7 +490,7 @@ impl RuntimeState {
                             | AgentState::Blocked
                     )
                 })
-                .count(),
+                .count().max(self.writer_leases.len()),
             attention_count: self.attention.len(),
             unread_attention_count: self
                 .attention
@@ -486,7 +527,7 @@ impl RuntimeState {
                 })
                 .collect(),
             projects: self.projects.values().cloned().collect(),
-            tasks: Vec::new(),
+            tasks: self.tasks.values().cloned().collect(),
             agents: self
                 .agents
                 .values()
@@ -499,6 +540,10 @@ impl RuntimeState {
     }
 
     fn broadcast(&mut self, event: ServerEvent) {
+        if let ServerEvent::AgentChanged(run) = &event {
+            if !run.can_stop && !self.children.contains_key(&run.id) && !matches!(run.state,AgentState::Starting | AgentState::Working | AgentState::Stopping | AgentState::AwaitingApproval) { self.release_writer(run.id); }
+            self.sync_agent_task(run.id);
+        }
         let is_attention_event = matches!(
             event,
             ServerEvent::AttentionRaised(_)
@@ -640,6 +685,7 @@ fn start_remote_reconciler(state: Arc<Mutex<RuntimeState>>) {
                             connections.disconnect(&alias);
                             break;
                         }
+                        let task_generation = *state.lock().unwrap().remote_task_generation.get(&alias).unwrap_or(&0);
                         let result = (|| {
                             let ServerResponse::RuntimeStatus(status) = connections
                                 .request(&alias, ClientRequest::RuntimeStatus)
@@ -675,6 +721,7 @@ fn start_remote_reconciler(state: Arc<Mutex<RuntimeState>>) {
                                 &projects,
                                 status.instance_id,
                                 snapshot,
+                                task_generation,
                             );
                             update_remote_presence(&state, &alias, "online", None);
                             ensure_remote_event_subscription(&state, &alias);
@@ -745,12 +792,14 @@ fn ensure_remote_event_subscription(state: &Arc<Mutex<RuntimeState>>, alias: &st
                     })
                     .cloned()
                     .collect::<Vec<_>>();
+                let task_generation = *guard.remote_task_generation.get(&alias_for_event).unwrap_or(&0);
                 reconcile_remote_snapshot_locked(
                     &mut guard,
                     &alias_for_event,
                     &projects,
                     epoch,
                     snapshot,
+                    task_generation,
                 );
             } else {
                 forward_remote_event_locked(&mut guard, &alias_for_event, event);
@@ -783,6 +832,26 @@ fn forward_remote_event(state: &Arc<Mutex<RuntimeState>>, alias: &str, event: Se
 
 fn forward_remote_event_locked(state: &mut RuntimeState, alias: &str, event: ServerEvent) {
     match event {
+        ServerEvent::AgentStreamingText {agent_id,text} => {
+            if state.remote_agent_hosts.get(&agent_id).is_some_and(|host|host==alias) { state.broadcast(ServerEvent::AgentStreamingText{agent_id,text}); }
+        }
+        ServerEvent::SkillsChanged {project_id} => {
+            if project_id.is_some_and(|id|state.projects.values().any(|p|p.id==id&&ssh_remote::remote_alias(p)==Some(alias))) {state.broadcast(ServerEvent::SkillsChanged{project_id});}
+        }
+        ServerEvent::TaskChanged(task) => {
+            *state.remote_task_generation.entry(alias.into()).or_default() += 1;
+            if state.projects.values().any(|p|p.id == task.project_id && ssh_remote::remote_alias(p) == Some(alias))
+                && state.tasks.get(&task.id).is_none_or(|old|old.revision <= task.revision) {
+                    state.update_remote_task(task.clone()); state.broadcast(ServerEvent::TaskChanged(task));
+            }
+        }
+        ServerEvent::TaskDeleted {task_id,project_id} => {
+            *state.remote_task_generation.entry(alias.into()).or_default() += 1;
+            if state.projects.values().any(|p|p.id == project_id && ssh_remote::remote_alias(p) == Some(alias)) {
+                state.tasks.remove(&task_id); state.broadcast(ServerEvent::TaskDeleted {task_id,project_id});
+            }
+        }
+
         ServerEvent::AgentChanged(run) => {
             let owns_project = state.projects.values().any(|project| {
                 project.id == run.project_id
@@ -905,8 +974,9 @@ fn reconcile_remote_snapshot(
     projects: &[Project],
     epoch: uuid::Uuid,
     snapshot: Snapshot,
+    task_generation: u64,
 ) {
-    reconcile_remote_snapshot_locked(&mut state.lock().unwrap(), alias, projects, epoch, snapshot);
+    reconcile_remote_snapshot_locked(&mut state.lock().unwrap(), alias, projects, epoch, snapshot, task_generation);
 }
 
 fn reconcile_remote_snapshot_locked(
@@ -915,6 +985,7 @@ fn reconcile_remote_snapshot_locked(
     projects: &[Project],
     epoch: Uuid,
     snapshot: Snapshot,
+    task_generation: u64,
 ) {
     let project_ids = projects
         .iter()
@@ -943,6 +1014,14 @@ fn reconcile_remote_snapshot_locked(
         );
     }
 
+    if *state.remote_task_generation.get(alias).unwrap_or(&0) == task_generation {
+        let remote_ids:HashSet<_>=snapshot.tasks.iter().map(|t|t.id).collect();
+        state.tasks.retain(|id,t|!project_ids.contains(&t.project_id) || remote_ids.contains(id));
+        for task in snapshot.tasks.into_iter().filter(|t|project_ids.contains(&t.project_id)) { state.update_remote_task(task); }
+    }
+    let uncertain:Vec<_>=state.remote_write_uncertain.iter().filter_map(|(id,host)|(host == alias).then_some(*id)).collect();
+    for id in uncertain { state.remote_write_uncertain.remove(&id); state.release_writer(id); }
+    for run in &snapshot.agents { if !run.can_stop { state.release_writer(run.id); } }
     let authoritative_ids = snapshot
         .agents
         .iter()
@@ -1101,13 +1180,20 @@ fn handle_client(mut stream: UnixStream, state: Arc<Mutex<RuntimeState>>) -> io:
     let request = {
         let mut reader = BufReader::new(stream.try_clone()?);
         let mut line = String::new();
-        reader.read_line(&mut line)?;
+        (&mut reader).take(8 * 1024 * 1024 + 1).read_line(&mut line)?;
+        if line.len()>8*1024*1024 {return Err(io::Error::new(io::ErrorKind::InvalidData,"Runtime request exceeds 8 MiB"));}
         serde_json::from_str::<Envelope<ClientRequest>>(&line)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?
     };
 
     let request_id = request.id;
     let request = request.body;
+    if let Err(message)=edition::authorize_client(&stream,&request,&state) {
+        let response=Envelope::new(protocol_error("client_not_authorized",message));
+        stream.write_all(serde_json::to_string(&response).map_err(io::Error::other)?.as_bytes())?;
+        stream.write_all(b"\n")?;
+        return Ok(());
+    }
     if let ClientRequest::SubscribeEvents { .. } = request {
         return subscribe(stream, state);
     }
@@ -1752,6 +1838,8 @@ fn handle_request(request: ClientRequest, state: Arc<Mutex<RuntimeState>>) -> Se
             state.broadcast(ServerEvent::ProjectChanged(project.clone()));
             ServerResponse::ProjectCreated(project)
         }
+        ClientRequest::SkillRequest(request) => handle_skill_request(state,request),
+        ClientRequest::TaskRequest(request) => handle_task_request(state,request),
         ClientRequest::DeleteProject { project_id } => delete_project_for_target(state, project_id),
         ClientRequest::StartCodexSession {
             project_id,
@@ -1801,6 +1889,9 @@ fn handle_request(request: ClientRequest, state: Arc<Mutex<RuntimeState>>) -> Se
                 let project = project_id
                     .and_then(|id| project_by_id(&state, id))
                     .unwrap_or_else(|| project_for_launch(&state, project_name, project_root));
+                if execution_profile.transport == ditch_core::AgentTransport::Legacy {
+                    start_codex_session(state, project.name, project.root.to_string_lossy().into_owned(), prompt, mode, execution_profile)
+                } else {
                 start_app_server_session(
                     state,
                     project.id,
@@ -1810,6 +1901,7 @@ fn handle_request(request: ClientRequest, state: Arc<Mutex<RuntimeState>>) -> Se
                     prompt,
                     execution_profile,
                 )
+                }
             }
         }
         ClientRequest::ResumeCodexSession {
@@ -1853,6 +1945,9 @@ fn handle_request(request: ClientRequest, state: Arc<Mutex<RuntimeState>>) -> Se
                 let project = project_id
                     .and_then(|id| project_by_id(&state, id))
                     .unwrap_or_else(|| project_for_launch(&state, project_name, project_root));
+                if execution_profile.transport == ditch_core::AgentTransport::Legacy {
+                    resume_codex_session(state, project.name, project.root.to_string_lossy().into_owned(), thread_id, prompt, execution_profile)
+                } else {
                 start_app_server_session(
                     state,
                     project.id,
@@ -1862,6 +1957,7 @@ fn handle_request(request: ClientRequest, state: Arc<Mutex<RuntimeState>>) -> Se
                     prompt,
                     execution_profile,
                 )
+                }
             }
         }
         ClientRequest::StartRemoteCodexAppServerSession {
@@ -1952,6 +2048,7 @@ fn handle_request(request: ClientRequest, state: Arc<Mutex<RuntimeState>>) -> Se
                 relative_path,
             },
         ),
+        ClientRequest::ReadProjectContext {project_id,relative_path,max_bytes} => project_file_request_for_target(state,project_id,ClientRequest::ReadProjectContext{project_id,relative_path,max_bytes}),
         ClientRequest::ReadProjectFile {
             project_id,
             relative_path,
@@ -2348,6 +2445,14 @@ fn project_file_request_for_target(
     };
     if project.is_remote() {
         return match request {
+            ClientRequest::ReadProjectContext { .. } => {
+                let alias=ssh_remote::remote_alias(&project).unwrap();
+                let connections=state.lock().unwrap().remote_connections.clone();
+                match connections.request(alias,ClientRequest::RuntimeStatus) {
+                    Ok(ServerResponse::RuntimeStatus(status)) if status.capabilities.iter().any(|c|c=="bounded_context_v1") => forward_project_command(&state,&project,request),
+                    _=>protocol_error("unsupported_context", "Install a runtime supporting bounded project context reads on this SSH host"),
+                }
+            }
             ClientRequest::ListProjectDirectory { .. } | ClientRequest::ReadProjectFile { .. } => {
                 forward_project_command(&state, &project, request)
             }
@@ -2362,6 +2467,7 @@ fn project_file_request_for_target(
         ClientRequest::ListProjectDirectory { relative_path, .. } => {
             list_project_directory(state, project_id, &relative_path)
         }
+        ClientRequest::ReadProjectContext {relative_path,max_bytes,..} => read_project_context(state,project_id,&relative_path,max_bytes),
         ClientRequest::ReadProjectFile { relative_path, .. } => {
             read_project_file(state, project_id, &relative_path)
         }
@@ -2814,6 +2920,7 @@ fn delete_project_for_target(
         state
             .projects
             .retain(|_, candidate| candidate.id != project_id);
+        state.tasks.retain(|_,t|t.project_id != project_id);
         state.broadcast(ServerEvent::ProjectDeleted { project_id });
         return ServerResponse::Accepted;
     }
@@ -2919,11 +3026,6 @@ fn forward_remote_start(
     let Some(alias) = ssh_remote::remote_alias(&project).map(str::to_owned) else {
         return protocol_error("wrong_execution_target", "project is not remote");
     };
-    let connections = state
-        .lock()
-        .expect("runtime state lock should not be poisoned")
-        .remote_connections
-        .clone();
     ensure_remote_event_subscription(&state, &alias);
     let request = ClientRequest::StartRemoteCodexAppServerSession {
         project_id: project.id,
@@ -2932,8 +3034,8 @@ fn forward_remote_start(
         prompt,
         execution_profile,
     };
-    match connections.request(&alias, request) {
-        Ok(ServerResponse::AgentStarted(run)) => {
+    match remote_writer_request(&state, &project, request) {
+        ServerResponse::AgentStarted(run) => {
             if !cache_remote_agent(&state, &alias, &project, &run) {
                 return protocol_error(
                     "agent_target_conflict",
@@ -2942,8 +3044,7 @@ fn forward_remote_start(
             }
             ServerResponse::AgentStarted(run)
         }
-        Ok(response) => response,
-        Err(error) => protocol_error("remote_unavailable", error.to_string()),
+        response => response,
     }
 }
 
@@ -2959,11 +3060,6 @@ fn forward_remote_resume(
     let Some(alias) = ssh_remote::remote_alias(&project).map(str::to_owned) else {
         return protocol_error("wrong_execution_target", "project is not remote");
     };
-    let connections = state
-        .lock()
-        .expect("runtime state lock should not be poisoned")
-        .remote_connections
-        .clone();
     ensure_remote_event_subscription(&state, &alias);
     let request = ClientRequest::ResumeRemoteCodexAppServerSession {
         project_id: project.id,
@@ -2973,8 +3069,8 @@ fn forward_remote_resume(
         prompt,
         execution_profile,
     };
-    match connections.request(&alias, request) {
-        Ok(ServerResponse::AgentStarted(run)) => {
+    match remote_writer_request(&state, &project, request) {
+        ServerResponse::AgentStarted(run) => {
             if !cache_remote_agent(&state, &alias, &project, &run) {
                 return protocol_error(
                     "agent_target_conflict",
@@ -2983,8 +3079,7 @@ fn forward_remote_resume(
             }
             ServerResponse::AgentStarted(run)
         }
-        Ok(response) => response,
-        Err(error) => protocol_error("remote_unavailable", error.to_string()),
+        response => response,
     }
 }
 
@@ -3011,21 +3106,13 @@ fn forward_or_prompt_agent(
     execution_profile: AgentExecutionProfile,
 ) -> ServerResponse {
     let remote = remote_agent_connection(&state, agent_id);
-    let Some((alias, connections)) = remote else {
-        return prompt_app_server_agent(state, agent_id, prompt, execution_profile);
+    let Some((alias, _connections)) = remote else {
+        return prompt_agent(state, agent_id, prompt, execution_profile);
     };
     ensure_remote_event_subscription(&state, &alias);
-    match connections.request(
-        &alias,
-        ClientRequest::PromptRemoteCodexAppServerAgent {
-            agent_id,
-            prompt,
-            execution_profile,
-        },
-    ) {
-        Ok(response) => response,
-        Err(error) => protocol_error("remote_unavailable", error.to_string()),
-    }
+    let project = { let locked=state.lock().expect("runtime lock poisoned"); locked.agents.get(&agent_id).and_then(|r|locked.projects.values().find(|p|p.id == r.run.project_id)).cloned() };
+    let Some(project)=project else { return protocol_error("project_not_found","Project unavailable"); };
+    remote_writer_request(&state,&project,ClientRequest::PromptRemoteCodexAppServerAgent { agent_id,prompt,execution_profile })
 }
 
 fn forward_or_stop_agent(
@@ -3203,6 +3290,9 @@ fn shutdown_runtime(state: Arc<Mutex<RuntimeState>>) -> ServerResponse {
         let mut state = state
             .lock()
             .expect("runtime state lock should not be poisoned");
+        edition::shutdown(&mut state);
+        for control in state.acceptance_controls.values(){control.cancel.store(true,Ordering::Release);let _=control.wake.send(());}
+
         let children = std::mem::take(&mut state.children);
         for child in children.values() {
             signal_process_group(child.process_group_id, libc::SIGKILL);
@@ -3573,31 +3663,55 @@ fn discover_codex_models(binary: &str) -> io::Result<Vec<AgentModel>> {
     Ok(models)
 }
 
+include!("task_runtime.rs");
+include!("acceptance_runtime.rs");
+include!("skill_runtime.rs");
 include!("remote_app_server_runtime.rs");
 
-fn start_codex_session(
+fn start_codex_session(state: Arc<Mutex<RuntimeState>>, project_name:String, project_root:String, prompt:String, mode:CodexLaunchMode, execution_profile:AgentExecutionProfile) -> ServerResponse {
+    start_codex_session_linked(state,project_name,project_root,prompt,mode,execution_profile,None)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn start_codex_session_linked(
     state: Arc<Mutex<RuntimeState>>,
     project_name: String,
     project_root: String,
     prompt: String,
     mode: CodexLaunchMode,
     execution_profile: ditch_core::AgentExecutionProfile,
+    binding: Option<(TaskId,AgentId)>,
 ) -> ServerResponse {
-    let project = project_for_launch(&state, project_name, project_root);
+    let project = if let Some((task_id,_)) = binding {
+        let locked=state.lock().expect("runtime lock poisoned");
+        let project=locked.tasks.get(&task_id).and_then(|task|locked.projects.values().find(|p|p.id==task.project_id)).cloned();
+        let Some(project)=project else {return protocol_error("project_not_found","The task project is no longer registered");};project
+    } else { project_for_launch(&state, project_name, project_root) };
+    if execution_profile.transport == ditch_core::AgentTransport::AppServer {
+        if let Err(error)=skill_client(&state,&project) {
+            if !execution_profile.skills.is_empty(){return protocol_error("skills_require_app_server",format!("App Server unavailable: {error}. Selected skills were not launched."));}
+            let mut fallback=execution_profile.clone();fallback.transport=ditch_core::AgentTransport::Legacy;
+            let response=start_codex_session_linked(Arc::clone(&state),project.name,project.root.to_string_lossy().into_owned(),prompt,mode,fallback,binding);
+            if let ServerResponse::AgentStarted(run)=&response {append_message(&state,run.id,AgentChatRole::Tool,format!("App Server unavailable; using legacy execution without interactive approvals or skills. {error}"),None);}
+            return response;
+        }
+        return start_remote_app_server_session_linked(state,project.id,project.name,project.root.to_string_lossy().into_owned(),None,prompt,execution_profile,binding);
+    }
+    if !execution_profile.skills.is_empty() { return protocol_error("skills_require_app_server", "Selected skills require App Server. Enable it or remove the selection."); }
     if let Err(error) = ensure_project_metadata(&project) {
         return protocol_error("project_metadata_failed", error.to_string());
     }
 
     let now = Utc::now();
     let mut run = AgentRun {
-        id: AgentId::new(),
+        id: binding.map(|b|b.1).unwrap_or_default(),
         provider: AgentProvider::Codex,
         state: AgentState::Starting,
         can_stop: false,
         launch_mode: mode.clone(),
         execution_profile: execution_profile.clone(),
         project_id: project.id,
-        task_id: None,
+        task_id: binding.map(|b|b.0),
         pane_id: None,
         native_session_id: None,
         codex_title: None,
@@ -3614,6 +3728,7 @@ fn start_codex_session(
         resume_block_reason: None,
     };
 
+    let writer = match WriterGuard::acquire(&state,run.id,&project,&execution_profile) { Ok(w) => w, Err(e) => return protocol_error("workspace_busy",e) };
     if let Err(error) = verify_project_git_policy(&project) {
         return error;
     }
@@ -3643,6 +3758,7 @@ fn start_codex_session(
         None,
         allow_non_git,
         &execution_profile,
+        &writer,
     ) {
         Ok(child) => Arc::new(Mutex::new(child)),
         Err(error) => {
@@ -3717,6 +3833,7 @@ fn start_codex_session(
         state.broadcast(ServerEvent::AgentMessageAppended(user_message));
     }
 
+    writer.retain();
     attach_codex_io(Arc::clone(&state), run.id, run_id, child);
     ServerResponse::AgentStarted(run)
 }
@@ -3842,6 +3959,19 @@ fn resume_codex_session(
     execution_profile: ditch_core::AgentExecutionProfile,
 ) -> ServerResponse {
     let project = project_for_launch(&state, project_name, project_root);
+    if !execution_profile.skills.is_empty() { return protocol_error("skill_thread_changed", "Attach skills to a fresh agent or task attempt, not an imported thread."); }
+    if execution_profile.transport == ditch_core::AgentTransport::AppServer {
+        if let Err(error) = skill_client(&state, &project) {
+            let mut fallback = execution_profile.clone();
+            fallback.transport = ditch_core::AgentTransport::Legacy;
+            let response = resume_codex_session(Arc::clone(&state), project.name, project.root.to_string_lossy().into_owned(), thread_id, prompt, fallback);
+            if let ServerResponse::AgentStarted(run) = &response {
+                append_message(&state, run.id, AgentChatRole::Tool, format!("App Server unavailable; using legacy execution without interactive approvals or skills. {error}"), None);
+            }
+            return response;
+        }
+        return start_remote_app_server_session_linked(state,project.id,project.name,project.root.to_string_lossy().into_owned(),Some(thread_id),prompt,execution_profile,None);
+    }
     if let Err(message) = validate_thread_project(&state, &thread_id, &project.root) {
         return protocol_error("codex_thread_project_mismatch", message);
     }
@@ -3896,6 +4026,7 @@ fn resume_codex_session(
             "No working Codex CLI installation was found. Choose an existing installation in Ditch settings.".to_owned(),
         );
     };
+    let writer = match WriterGuard::acquire(&state,run.id,&project,&execution_profile) { Ok(w) => w, Err(e) => return protocol_error("workspace_busy",e) };
     let child = match spawn_codex_child(
         &binary,
         &project.root,
@@ -3904,6 +4035,7 @@ fn resume_codex_session(
         Some(&thread_id),
         allow_non_git,
         &execution_profile,
+        &writer,
     ) {
         Ok(child) => Arc::new(Mutex::new(child)),
         Err(error) => {
@@ -3978,6 +4110,7 @@ fn resume_codex_session(
         state.broadcast(ServerEvent::AgentMessageAppended(user_message));
     }
 
+    writer.retain();
     attach_codex_io(Arc::clone(&state), run.id, run_id, child);
     ServerResponse::AgentStarted(run)
 }
@@ -4011,8 +4144,21 @@ fn prompt_agent(
     state: Arc<Mutex<RuntimeState>>,
     agent_id: AgentId,
     prompt: String,
-    execution_profile: ditch_core::AgentExecutionProfile,
+    mut execution_profile: ditch_core::AgentExecutionProfile,
 ) -> ServerResponse {
+    if state.lock().unwrap().acceptance_owners.contains(&agent_id) {return protocol_error("attempt_active","Use Cancel loop before changing its worker prompt.");}
+
+    let original = state.lock().unwrap().agents.get(&agent_id).map(|r|r.run.execution_profile.clone());
+    if let Some(original) = original {
+        execution_profile.skills = original.skills.clone();
+        execution_profile.transport = original.transport.clone();
+        if original.transport == ditch_core::AgentTransport::AppServer {
+            return prompt_app_server_agent(state,agent_id,prompt,execution_profile);
+        }
+        if !execution_profile.skills.is_empty() || execution_profile.transport != original.transport {
+            return protocol_error("skill_thread_changed", "Start a fresh agent to switch transport or attach skills.");
+        }
+    }
     let (project_root, thread_id, allow_non_git) = {
         let state = state
             .lock()
@@ -4056,6 +4202,10 @@ fn prompt_agent(
         )
     };
 
+    let project = { let locked = state.lock().expect("runtime state lock poisoned");
+        locked.agents.get(&agent_id).and_then(|a|locked.projects.values().find(|p|p.id == a.run.project_id)).cloned() };
+    let Some(project) = project else { return protocol_error("project_not_found","Project is not registered"); };
+    let writer = match WriterGuard::acquire(&state,agent_id,&project,&execution_profile) { Ok(w) => w, Err(e) => return protocol_error("workspace_busy",e) };
     let binary = active_codex_binary(&state);
     let Some(binary) = binary else {
         let message = "No working Codex CLI installation was found. Choose an existing installation in Ditch settings.".to_owned();
@@ -4072,6 +4222,7 @@ fn prompt_agent(
         thread_id.as_deref(),
         allow_non_git,
         &execution_profile,
+        &writer,
     ) {
         Ok(child) => Arc::new(Mutex::new(child)),
         Err(error) => {
@@ -4128,6 +4279,7 @@ fn prompt_agent(
         state.broadcast(ServerEvent::AgentMessageAppended(user_message));
     }
 
+    writer.retain();
     attach_codex_io(Arc::clone(&state), agent_id, run_id, child);
     ServerResponse::Accepted
 }
@@ -4137,6 +4289,7 @@ fn stop_agent(state: Arc<Mutex<RuntimeState>>, agent_id: AgentId) -> ServerRespo
         let mut state = state
             .lock()
             .expect("runtime state lock should not be poisoned");
+        if let Some(control)=state.acceptance_controls.values().find(|c|c.owner==agent_id) {control.cancel.store(true,Ordering::Release);let _=control.wake.send(());}
         let active = state.children.get(&agent_id).cloned();
         let Some(record) = state.agents.get_mut(&agent_id) else {
             return protocol_error("agent_not_found", "agent session was not found");
@@ -4178,8 +4331,8 @@ fn stop_agent(state: Arc<Mutex<RuntimeState>>, agent_id: AgentId) -> ServerRespo
             .app_server_turns
             .get(&agent_id)
             .cloned();
-        if let Some(control) = control {
-            if control.interrupt().is_ok()
+        if let Some(control) = control
+            && control.interrupt().is_ok()
                 && wait_for_run_finalization(
                     &state,
                     agent_id,
@@ -4189,7 +4342,6 @@ fn stop_agent(state: Arc<Mutex<RuntimeState>>, agent_id: AgentId) -> ServerRespo
             {
                 return ServerResponse::Accepted;
             }
-        }
     }
     signal_process(active.process_group_id, libc::SIGINT);
     let mut group_stopped = wait_for_process_group_exit(&active, STOP_INTERRUPT_GRACE);
@@ -4223,6 +4375,7 @@ fn stop_agent(state: Arc<Mutex<RuntimeState>>, agent_id: AgentId) -> ServerRespo
 }
 
 fn force_kill_agent(state: Arc<Mutex<RuntimeState>>, agent_id: AgentId) -> ServerResponse {
+    {let locked=state.lock().unwrap();if let Some(control)=locked.acceptance_controls.values().find(|c|c.owner==agent_id){control.cancel.store(true,Ordering::Release);let _=control.wake.send(());}}
     let active = {
         let state = state
             .lock()
@@ -4408,7 +4561,7 @@ fn delete_project(
                         | AgentState::Blocked
                 ))
     });
-    if has_active_agent {
+    if has_active_agent || state.tasks.values().any(|task|task.project_id==project_id && state.task_live(task)) {
         return protocol_error(
             "project_active",
             "Stop this project's active agents before deleting it.",
@@ -5058,6 +5211,7 @@ fn finish_agent(
     {
         return;
     }
+    let acceptance_owned=state.acceptance_owners.contains(&agent_id);
     let app_server = state
         .children
         .get(&agent_id)
@@ -5173,7 +5327,8 @@ fn finish_agent(
     };
     state.persist_agent(agent_id);
     state.broadcast(ServerEvent::AgentChanged(run));
-    if let Some(attention) = attention {
+    if let Some(wake)=state.acceptance_waiters.get(&agent_id) {let _=wake.send(());}
+    if let Some(attention) = attention.filter(|_|!acceptance_owned) {
         if let Err(error) = state.store.upsert_attention(&attention) {
             eprintln!("{RUNTIME_IDENTITY} failed to persist attention: {error}");
         }
@@ -5207,6 +5362,7 @@ fn notification_summary(value: &str) -> String {
     summary
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_codex_child(
     binary: &str,
     cwd: &Path,
@@ -5215,12 +5371,23 @@ fn spawn_codex_child(
     resume_thread: Option<&str>,
     allow_non_git: bool,
     execution_profile: &AgentExecutionProfile,
+    writer: &WriterGuard,
 ) -> io::Result<Child> {
-    let mut command = Command::new(binary);
+    // The gate cannot execute Codex until its process-group lease is durable.
+    // EOF on daemon death exits the gate without running project work.
+    let mut command = Command::new("/bin/sh");
+    command.args(["-c", "IFS= read -r ditch_launch_gate || exit 125; exec \"$@\"", "ditch-launch", binary]);
     // A dedicated process group lets Stop terminate Codex and every helper it
     // launches. Killing only the direct CLI process can orphan the app-server
     // process that owns the thread-store writer lock.
     command.process_group(0);
+    if execution_profile.approval != AgentApprovalPreset::FullAccess {
+        // Do not inherit extra writable roots from a user's global Codex config.
+        // Codex automatically includes the explicit cwd in workspace-write mode.
+        command.args(["--config","sandbox_workspace_write.writable_roots=[]",
+            "--config","sandbox_workspace_write.exclude_slash_tmp=true",
+            "--config","sandbox_workspace_write.exclude_tmpdir_env_var=true"]);
+    }
     command.args(codex_child_args(
         cwd,
         mode,
@@ -5241,11 +5408,14 @@ fn spawn_codex_child(
     command.stderr(Stdio::piped());
 
     let mut child = command.spawn()?;
-    if let Some(mut stdin) = child.stdin.take() {
+    let ready = writer.started(child.id() as i32).and_then(|_| {
+        let mut stdin=child.stdin.take().ok_or_else(||io::Error::other("missing Codex stdin"))?;
+        stdin.write_all(b"start\n")?;
         stdin.write_all(prompt.as_bytes())?;
         stdin.write_all(b"\n")?;
-        stdin.flush()?;
-    }
+        stdin.flush()
+    });
+    if let Err(error)=ready { signal_process_group(child.id() as i32,libc::SIGKILL); let _=child.wait(); return Err(error); }
     Ok(child)
 }
 
@@ -5446,6 +5616,19 @@ fn list_project_directory(
     })
 }
 
+fn read_project_context(state:Arc<Mutex<RuntimeState>>,project_id:ProjectId,relative:&str,max_bytes:u32)->ServerResponse {
+    let project=match project_for_file_request(&state,project_id){Ok(p)=>p,Err(e)=>return e};
+    let result=(||->Result<ProjectFile,String>{
+        if !(1..=32768).contains(&max_bytes){return Err("Context reads are limited to 32 KiB".into());}
+        for part in Path::new(relative).components(){let name=part.as_os_str().to_string_lossy().to_ascii_lowercase();
+            if name.starts_with('.') || ["secret","credential","token","password"].iter().any(|s|name.contains(s)) || name.ends_with(".pem") || name.ends_with(".key") || name.ends_with(".env") || name.ends_with(".p12") || name.ends_with(".pfx") || name=="auth.json" || name.starts_with("id_rsa") || name.starts_with("id_ed25519"){return Err("Hidden and secret-pattern paths are excluded from context reads".into());}}
+        let bytes=acceptance_evidence::read_scoped_file(&project.root,relative,max_bytes)?;
+        if bytes.len()>max_bytes as usize || bytes.contains(&0){return Err("Context exceeds byte limit or contains binary data".into());}
+        let content=String::from_utf8(bytes.clone()).map_err(|e|e.to_string())?;
+        Ok(ProjectFile{project_id,relative_path:relative.into(),content:acceptance_evidence::redact(&content),revision:file_revision(&bytes),size:bytes.len() as u64})
+    })();match result{Ok(file)=>ServerResponse::ProjectFile(file),Err(e)=>protocol_error("context_rejected",e)}
+}
+
 fn read_project_file(
     state: Arc<Mutex<RuntimeState>>,
     project_id: ProjectId,
@@ -5460,7 +5643,11 @@ fn read_project_file(
         Ok(_) => return protocol_error("not_a_file", "path is not a file"),
         Err(response) => return response,
     };
-    let bytes = match fs::read(&path) {
+    let bytes = match fs::File::open(&path).and_then(|file| {
+        let mut bytes=Vec::new();
+        std::io::Read::take(file, MAX_EDITABLE_FILE_BYTES + 1).read_to_end(&mut bytes)?;
+        Ok(bytes)
+    }) {
         Ok(bytes) => bytes,
         Err(error) => return protocol_error("file_read_failed", error.to_string()),
     };
@@ -6573,6 +6760,8 @@ esac
     #[test]
     fn codex_execution_profile_maps_approval_and_model_flags() {
         let ask = AgentExecutionProfile {
+            transport: ditch_core::AgentTransport::Legacy,
+            skills: vec![],
             model: Some("gpt-test".to_owned()),
             reasoning_effort: Some("high".to_owned()),
             approval: AgentApprovalPreset::Ask,
@@ -7273,3 +7462,12 @@ esac
         ));
     }
 }
+
+#[cfg(test)]
+include!("task_tests.rs");
+
+#[cfg(test)]
+include!("skill_tests.rs");
+
+#[cfg(test)]
+include!("acceptance_tests.rs");

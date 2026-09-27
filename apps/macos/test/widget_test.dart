@@ -7,6 +7,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/gestures.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:xterm/xterm.dart';
 import 'package:the_ditch/main.dart';
 import 'package:the_ditch/application/command_center_controller.dart';
 import 'package:the_ditch/data/runtime_models.dart';
@@ -35,6 +36,42 @@ class _PendingRemoteSetupClient extends DitchRuntimeClient {
     bool rememberPassword = false,
     bool trustUnknownHost = false,
   }) => pending.future;
+}
+
+class _RemoteFolderClient extends DitchRuntimeClient {
+  _RemoteFolderClient()
+    : super(socketPath: '/tmp/ditch-folder-regression.sock');
+  @override
+  Future<List<Map<String, dynamic>>> discoverSshHosts() async => [
+    {'alias': 'fixture'},
+  ];
+  @override
+  Future<Map<String, dynamic>> checkRemoteSetup({
+    required String alias,
+    String? password,
+    bool rememberPassword = false,
+    bool trustUnknownHost = false,
+  }) async => {
+    'ready': true,
+    'home_directory': '/home/user',
+    'checks': [
+      {'key': 'codex_sandbox', 'state': 'ready'},
+    ],
+  };
+  @override
+  Future<Map<String, dynamic>> listRemoteDirectory(
+    String alias,
+    String absolutePath,
+  ) async => {
+    'absolute_path': absolutePath,
+    'entries': [
+      {
+        'name': 'next',
+        'absolute_path': '$absolutePath/next',
+        'is_directory': true,
+      },
+    ],
+  };
 }
 
 class _CurrentLicenseClient extends DitchRuntimeClient {
@@ -1228,6 +1265,43 @@ void main() {
         findsOneWidget,
       );
       expect(find.text('Renew'), findsWidgets);
+    },
+  );
+
+  testWidgets(
+    'remote folder name follows navigation and preserves a custom name',
+    (tester) async {
+      tester.view.physicalSize = const Size(1200, 1000);
+      tester.view.devicePixelRatio = 1;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: AddRemoteProjectDialog(
+              client: _RemoteFolderClient(),
+              initialAlias: 'fixture',
+            ),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Connect'));
+      await tester.pumpAndSettle();
+      final nameField = find.byWidgetPredicate(
+        (w) => w is TextField && w.decoration?.labelText == 'Project name',
+      );
+      expect(tester.widget<TextField>(nameField).controller!.text, 'user');
+      await tester.tap(find.text('next'));
+      await tester.pumpAndSettle();
+      expect(tester.widget<TextField>(nameField).controller!.text, 'next');
+      await tester.enterText(nameField, 'Custom project');
+      await tester.tap(find.byTooltip('Go up'));
+      await tester.pumpAndSettle();
+      expect(
+        tester.widget<TextField>(nameField).controller!.text,
+        'Custom project',
+      );
     },
   );
 
@@ -3213,6 +3287,42 @@ void main() {
       isNull,
     );
     document.dispose();
+  });
+
+  testWidgets('focused terminal receives Escape without restoring its pane', (
+    tester,
+  ) async {
+    final session = ProjectTerminalSession(
+      id: 'escape',
+      projectId: 'p',
+      shell: '/bin/sh',
+    );
+    final output = <String>[];
+    session.terminal.onOutput = output.add;
+    var restored = false;
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: CallbackShortcuts(
+            bindings: {
+              const SingleActivator(LogicalKeyboardKey.escape): () =>
+                  restored = true,
+            },
+            child: ProjectTerminalBody(
+              terminal: session,
+              onEscape: () => restored = true,
+            ),
+          ),
+        ),
+      ),
+    );
+    await tester.tap(find.byType(TerminalView));
+    await tester.pump();
+    await tester.sendKeyEvent(LogicalKeyboardKey.escape);
+    expect(restored, isFalse);
+    expect(output.join(), contains('\x1b'));
+    await tester.pumpWidget(const SizedBox.shrink());
+    await tester.pump(const Duration(seconds: 1));
   });
 
   testWidgets('maximized terminal restores with close or Escape', (

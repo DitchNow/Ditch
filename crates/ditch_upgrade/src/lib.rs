@@ -343,6 +343,8 @@ fn parse_minor_amount(value: &str) -> Result<u128, UpgradeError> {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct EntitlementSummary {
+    #[serde(default)]
+    pub enabled_capabilities: Vec<String>,
     pub active: bool,
     pub plan: Option<String>,
     pub status: String,
@@ -883,6 +885,8 @@ struct RelayEntitlement {
 
 #[derive(Deserialize)]
 struct RelayCapabilities {
+    #[serde(flatten)]
+    extra: std::collections::BTreeMap<String, serde_json::Value>,
     remote_control: RelayRemoteControl,
 }
 
@@ -900,6 +904,18 @@ struct RelaySlots {
 
 impl From<RelayEntitlement> for EntitlementSummary {
     fn from(value: RelayEntitlement) -> Self {
+        let mut enabled_capabilities: Vec<String> = value
+            .capabilities
+            .extra
+            .iter()
+            .filter(|(_, value)| {
+                value.get("enabled").and_then(serde_json::Value::as_bool) == Some(true)
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        if value.capabilities.remote_control.enabled {
+            enabled_capabilities.push("remote_control".into());
+        }
         let active = value.capabilities.remote_control.enabled
             && matches!(value.status.as_str(), "active" | "over_limit");
         let billing_management_available = value.billing_management_available.unwrap_or(false);
@@ -926,6 +942,7 @@ impl From<RelayEntitlement> for EntitlementSummary {
             }
         });
         Self {
+            enabled_capabilities,
             active,
             plan: (value.plan != "community").then_some(value.plan),
             status: value.status,
@@ -1476,6 +1493,23 @@ mod tests {
     }
 
     #[test]
+    fn entitlement_preserves_only_explicitly_enabled_extension_capabilities() {
+        let mut body: serde_json::Value = serde_json::from_str(RELAY_ACTIVATION).unwrap();
+        body["entitlement"]["capabilities"]["extension_enabled"] =
+            serde_json::json!({"enabled":true});
+        body["entitlement"]["capabilities"]["extension_disabled"] =
+            serde_json::json!({"enabled":false});
+        body["entitlement"]["capabilities"]["extension_malformed"] =
+            serde_json::json!({"enabled":"true"});
+        let relay: RelayEntitlement = serde_json::from_value(body["entitlement"].clone()).unwrap();
+        let summary = EntitlementSummary::from(relay);
+        assert_eq!(
+            summary.enabled_capabilities,
+            vec!["extension_enabled", "remote_control"]
+        );
+    }
+
+    #[test]
     fn activation_http_response_converts_relay_entitlement() {
         let identity = InstallationIdentity::generate();
         for plan in ["complimentary", "commercial_lifetime", "commercial_monthly"] {
@@ -1598,6 +1632,7 @@ mod tests {
         ) -> Result<EntitlementSummary, UpgradeError> {
             let active = *self.redeemed.lock().unwrap();
             Ok(EntitlementSummary {
+                enabled_capabilities: vec![],
                 active,
                 plan: active.then(|| "commercial-monthly".to_owned()),
                 status: if active { "active" } else { "inactive" }.to_owned(),

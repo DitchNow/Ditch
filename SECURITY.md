@@ -5,3 +5,5 @@ Please do not post security vulnerabilities publicly before the maintainers have
 If GitHub displays **Security → Report a vulnerability** for this repository, use that private interface. If it is unavailable, do not disclose sensitive details publicly; open a non-sensitive [GitHub Discussion](https://github.com/DitchNow/TheDitch/discussions) asking the maintainers to establish a private reporting path.
 
 Include only the information needed to reproduce and assess the issue. Do not include secrets, credentials, private source code, prompts, transcripts, or personal data unnecessarily.
+
+For task, skill, validator, and SSH execution boundaries, see the [task and skill threat model](docs/AGENTIC_THREAT_MODEL.md).

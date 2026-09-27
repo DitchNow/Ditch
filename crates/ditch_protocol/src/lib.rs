@@ -31,6 +31,8 @@ impl<T> Envelope<T> {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ClientRequest {
+    SkillRequest(ditch_core::SkillRequest),
+    TaskRequest(ditch_core::TaskRequest),
     Health,
     RuntimeStatus,
     Snapshot,
@@ -244,6 +246,11 @@ pub enum ClientRequest {
         project_id: ProjectId,
         relative_path: String,
     },
+    ReadProjectContext {
+        project_id: ProjectId,
+        relative_path: String,
+        max_bytes: u32,
+    },
     ReadProjectFile {
         project_id: ProjectId,
         relative_path: String,
@@ -311,6 +318,8 @@ pub enum ClientRequest {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum ServerResponse {
     PermissionDetails(ditch_core::PermissionRequest),
+    SkillResponse(ditch_core::SkillResponse),
+    TaskResponse(ditch_core::TaskResponse),
     Health(HealthResponse),
     RuntimeStatus(RuntimeStatus),
     Snapshot(Snapshot),
@@ -635,6 +644,13 @@ pub enum ServerEvent {
     PermissionResolved {
         request_id: Uuid,
     },
+    AgentStreamingText {
+        agent_id: AgentId,
+        text: String,
+    },
+    SkillsChanged {
+        project_id: Option<ProjectId>,
+    },
     SnapshotReplaced(Snapshot),
     AttentionSnapshotReplaced(Vec<RuntimeAttention>),
     RuntimeStatusChanged(RuntimeStatus),
@@ -644,6 +660,10 @@ pub enum ServerEvent {
         project_id: ProjectId,
     },
     TaskChanged(Task),
+    TaskDeleted {
+        task_id: ditch_core::TaskId,
+        project_id: ProjectId,
+    },
     AgentChanged(AgentRun),
     AgentDeleted {
         agent_id: AgentId,

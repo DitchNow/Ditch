@@ -69,12 +69,14 @@ elif command -v brew >/dev/null 2>&1; then printf 'package_manager\tbrew\n';
 else printf 'package_manager\tunknown\n'; fi
 "#;
 
+#[cfg(test)]
+type TestRpc =
+    Arc<dyn Fn(&str, Uuid, ClientRequest) -> Result<ServerResponse, SshError> + Send + Sync>;
+
 #[derive(Clone, Default)]
 pub struct RemoteConnectionManager {
     #[cfg(test)]
-    pub test_rpc: Option<
-        Arc<dyn Fn(&str, Uuid, ClientRequest) -> Result<ServerResponse, SshError> + Send + Sync>,
-    >,
+    pub test_rpc: Option<TestRpc>,
     bridges: Arc<Mutex<HashMap<String, Arc<Mutex<Bridge>>>>>,
     session_passwords: Arc<Mutex<HashMap<String, Vec<u8>>>>,
     event_cancellations: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
@@ -367,13 +369,14 @@ impl RemoteConnectionManager {
                     continue;
                 }
                 let snapshot = matches!(event.event, ServerEvent::SnapshotReplaced(_));
-                if !snapshot && let Some((epoch, sequence)) = last {
-                    if event.epoch != epoch || event.sequence != sequence + 1 {
-                        self.event_cursors.lock().unwrap().remove(alias);
-                        return Err(SshError::Failed(
-                            "Remote event gap; full reconciliation required".into(),
-                        ));
-                    }
+                if !snapshot
+                    && let Some((epoch, sequence)) = last
+                    && (event.epoch != epoch || event.sequence != sequence + 1)
+                {
+                    self.event_cursors.lock().unwrap().remove(alias);
+                    return Err(SshError::Failed(
+                        "Remote event gap; full reconciliation required".into(),
+                    ));
                 }
                 on_event(event.epoch, event.sequence, event.event);
                 last = Some((event.epoch, event.sequence));
@@ -755,11 +758,7 @@ pub fn check_setup(
     checks.push(check(
         "persistence",
         "Automatic Startup",
-        if persistent {
-            RemoteCheckState::Ready
-        } else {
-            RemoteCheckState::Ready
-        },
+        RemoteCheckState::Ready,
         if persistent {
             "Available"
         } else {
