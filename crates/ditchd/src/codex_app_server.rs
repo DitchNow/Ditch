@@ -1,14 +1,14 @@
-//! Codex App Server transport used exclusively by SSH-hosted projects.
+//! Codex App Server transport shared by local and SSH-hosted projects.
 //!
-//! The desktop runtime never calls this module for local projects. The SSH
-//! daemon starts one stdio App Server process per active turn, translates its
+//! Each runtime starts one stdio App Server process per active turn, translates its
 //! JSON-RPC events into the stable Ditch protocol, and closes the process when
 //! the turn finishes. A later prompt resumes the persisted Codex thread in a
 //! fresh App Server process.
 
 use chrono::Utc;
 use ditch_core::{
-    AgentExecutionProfile, AgentId, PermissionActionKind, PermissionRequest, ProjectId,
+    AgentApprovalPreset, AgentExecutionProfile, AgentId, PermissionActionKind, PermissionRequest,
+    ProjectId,
 };
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -37,6 +37,7 @@ pub enum PermissionDecision {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Event {
     ThreadReady(String),
+    EffectiveModel(String),
     TurnStarted,
     Action(String),
     AssistantMessage(String),
@@ -56,12 +57,16 @@ pub enum Event {
 pub struct ActiveTurn {
     writer: Arc<Mutex<ChildStdin>>,
     pending: Arc<Mutex<HashMap<Uuid, PendingApproval>>>,
+    active_ids: Arc<Mutex<Option<(String, String)>>>,
 }
 
 #[derive(Clone)]
 struct PendingApproval {
     rpc_id: Value,
     kind: ApprovalKind,
+    item_id: Option<String>,
+    response: Option<Value>,
+    sent_at: Option<Instant>,
 }
 
 #[derive(Clone)]
@@ -122,24 +127,35 @@ impl ActiveTurn {
             .into_iter()
             .map(|(id, answers)| (id, json!({"answers":answers})))
             .collect::<serde_json::Map<_, _>>();
+        let response = json!({"answers":values});
+        send_approval_response(
+            &self.writer,
+            pending.get_mut(&request_id).unwrap(),
+            response,
+        )
+    }
+
+    pub fn interrupt(&self) -> io::Result<()> {
+        let (thread_id, turn_id) = self
+            .active_ids
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::WouldBlock, "Turn has not started"))?;
         write_message(
             &self.writer,
-            &json!({"id":entry.rpc_id,"result":{"answers":values}}),
-        )?;
-        pending.remove(&request_id);
-        Ok(())
+            &json!({"id":"ditch:interrupt","method":"turn/interrupt",
+            "params":{"threadId":thread_id,"turnId":turn_id}}),
+        )
     }
 
     pub fn respond(&self, request_id: Uuid, decision: PermissionDecision) -> io::Result<()> {
-        let pending = self
-            .pending
-            .lock()
-            .expect("App Server approval lock should not be poisoned")
-            .remove(&request_id)
+        let mut entries = self.pending.lock().unwrap();
+        let pending = entries
+            .get_mut(&request_id)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "approval request expired"))?;
         let result = match pending.kind {
             ApprovalKind::Questions(_) => {
-                self.pending.lock().unwrap().insert(request_id, pending);
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     "This request needs answers, not an approval",
@@ -149,7 +165,7 @@ impl ActiveTurn {
                 "decision": match decision {
                     PermissionDecision::ApproveOnce => "accept",
                     PermissionDecision::ApproveForSession => "acceptForSession",
-                    PermissionDecision::Deny => "decline",
+                    PermissionDecision::Deny => "cancel",
                 }
             }),
             ApprovalKind::Permissions(ref requested) => json!({
@@ -165,18 +181,29 @@ impl ActiveTurn {
                 }
             }),
         };
-        if let Err(error) = write_message(
-            &self.writer,
-            &json!({"id": pending.rpc_id.clone(), "result": result}),
-        ) {
-            self.pending
-                .lock()
-                .expect("App Server approval lock should not be poisoned")
-                .insert(request_id, pending);
-            return Err(error);
-        }
-        Ok(())
+        send_approval_response(&self.writer, pending, result)
     }
+}
+
+fn send_approval_response(
+    writer: &Arc<Mutex<ChildStdin>>,
+    pending: &mut PendingApproval,
+    result: Value,
+) -> io::Result<()> {
+    if let Some(previous) = &pending.response {
+        return if previous == &result {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "A different response is already awaiting confirmation",
+            ))
+        };
+    }
+    // Reserve before writing: a partial write must never be blindly repeated.
+    pending.response = Some(result.clone());
+    pending.sent_at = Some(Instant::now());
+    write_message(writer, &json!({"id":pending.rpc_id,"result":result}))
 }
 
 pub fn spawn_turn(launch: Launch<'_>, events: Sender<Event>) -> io::Result<SpawnedTurn> {
@@ -211,6 +238,7 @@ pub fn spawn_turn(launch: Launch<'_>, events: Sender<Event>) -> io::Result<Spawn
         .ok_or_else(|| io::Error::other("missing App Server stderr"))?;
     let writer = Arc::new(Mutex::new(stdin));
     let pending = Arc::new(Mutex::new(HashMap::new()));
+    let active_ids = Arc::new(Mutex::new(None));
 
     if let Err(error) = write_message(
         &writer,
@@ -219,8 +247,8 @@ pub fn spawn_turn(launch: Launch<'_>, events: Sender<Event>) -> io::Result<Spawn
             "method": "initialize",
             "params": {
                 "clientInfo": {
-                    "name": "the_ditch_ssh",
-                    "title": "The Ditch SSH",
+                    "name": "the_ditch",
+                    "title": "The Ditch",
                     "version": env!("CARGO_PKG_VERSION")
                 }
             }
@@ -231,16 +259,17 @@ pub fn spawn_turn(launch: Launch<'_>, events: Sender<Event>) -> io::Result<Spawn
         return Err(error);
     }
 
-    let (approval_policy, sandbox) = remote_policy(launch.execution_profile);
+    let (approval_policy, sandbox) = execution_policy(launch.execution_profile);
     let mut thread_params = json!({
         "cwd": launch.cwd.to_string_lossy(),
         "approvalPolicy": approval_policy,
         "approvalsReviewer": "user",
         "sandbox": sandbox,
-        "serviceName": "the_ditch_ssh",
+        "serviceName": "the_ditch",
         "config": {
             "web_search": "live",
-            "tools": {"web_search": true}
+            "tools": {"web_search": true},
+            "sandbox_workspace_write": {"network_access": true}
         }
     });
     if let Some(model) = launch.execution_profile.model.as_deref() {
@@ -256,6 +285,7 @@ pub fn spawn_turn(launch: Launch<'_>, events: Sender<Event>) -> io::Result<Spawn
     let child = Arc::new(Mutex::new(child));
     let reader_writer = Arc::downgrade(&writer);
     let reader_pending = Arc::clone(&pending);
+    let reader_ids = Arc::clone(&active_ids);
     let prompt = launch.prompt.to_owned();
     let cwd = launch.cwd.to_path_buf();
     let model = launch.execution_profile.model.clone();
@@ -273,8 +303,23 @@ pub fn spawn_turn(launch: Launch<'_>, events: Sender<Event>) -> io::Result<Spawn
     });
     std::thread::spawn(move || {
         let mut waiting_for = Some(INITIALIZE_ID);
+        let mut thread_id: Option<String> = None;
         let mut deadline = Instant::now() + STARTUP_TIMEOUT;
+        let mut last_progress = Instant::now() - Duration::from_secs(1);
         loop {
+            if reader_pending
+                .lock()
+                .unwrap()
+                .values()
+                .any(|entry: &PendingApproval| {
+                    entry
+                        .sent_at
+                        .is_some_and(|at| at.elapsed() > Duration::from_secs(30))
+                })
+            {
+                let _ = reader_events.send(Event::Failed("Codex did not confirm the approval response within 30 seconds. The turn was stopped; rejoin before continuing.".into()));
+                break;
+            }
             if waiting_for.is_some() && Instant::now() >= deadline {
                 let _ = reader_events.send(Event::Failed(format!(
                     "Codex App Server timed out waiting for {}",
@@ -302,6 +347,47 @@ pub fn spawn_turn(launch: Launch<'_>, events: Sender<Event>) -> io::Result<Spawn
                     continue;
                 }
             };
+            if let Ok(value) = serde_json::from_str::<Value>(&line) {
+                if matches!(
+                    value.get("method").and_then(Value::as_str),
+                    Some(
+                        "item/agentMessage/delta"
+                            | "item/commandExecution/outputDelta"
+                            | "item/mcpToolCall/progress"
+                    )
+                ) {
+                    if last_progress.elapsed() < Duration::from_millis(250) {
+                        continue;
+                    }
+                    last_progress = Instant::now();
+                }
+                if value.get("method").is_none()
+                    && value.get("id").and_then(Value::as_str) == Some(THREAD_ID)
+                {
+                    thread_id = value
+                        .pointer("/result/thread/id")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned);
+                }
+                if let (Some(thread), Some(turn)) = (
+                    thread_id.as_ref(),
+                    value
+                        .pointer("/result/turn/id")
+                        .or_else(|| value.pointer("/params/turn/id"))
+                        .and_then(Value::as_str),
+                ) {
+                    *reader_ids.lock().unwrap() = Some((thread.clone(), turn.to_owned()));
+                }
+                if value.get("method").is_none()
+                    && value.get("id").and_then(Value::as_str) == Some("ditch:interrupt")
+                {
+                    if let Some(error) = rpc_error(&value) {
+                        let _ = reader_events
+                            .send(Event::Diagnostic(format!("Interrupt failed: {error}")));
+                    }
+                    continue;
+                }
+            }
             // Responses and server-initiated requests have independent ID spaces.
             // Only consume a response to the currently outstanding startup step.
             if let Ok(value) = serde_json::from_str::<Value>(&line)
@@ -350,16 +436,20 @@ pub fn spawn_turn(launch: Launch<'_>, events: Sender<Event>) -> io::Result<Spawn
 
     Ok(SpawnedTurn {
         child,
-        control: ActiveTurn { writer, pending },
+        control: ActiveTurn {
+            writer,
+            pending,
+            active_ids,
+        },
     })
 }
 
-fn remote_policy(_: &AgentExecutionProfile) -> (&'static str, &'static str) {
-    // SSH hosts are always guarded by App Server approvals. The unconfined
-    // sandbox policy avoids making Bubblewrap a connection prerequisite, but
-    // it does not disable approvals: approved work runs with the SSH user's
-    // normal privileges and nothing silently receives root privileges.
-    ("untrusted", "danger-full-access")
+fn execution_policy(profile: &AgentExecutionProfile) -> (&'static str, &'static str) {
+    match profile.approval {
+        AgentApprovalPreset::Ask => ("on-request", "workspace-write"),
+        AgentApprovalPreset::ApproveForMe => ("never", "workspace-write"),
+        AgentApprovalPreset::FullAccess => ("never", "danger-full-access"),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -412,6 +502,9 @@ fn handle_line(
             ));
             return;
         };
+        if let Some(model) = value.pointer("/result/model").and_then(Value::as_str) {
+            let _ = events.send(Event::EffectiveModel(model.to_owned()));
+        }
         let _ = events.send(Event::ThreadReady(thread_id.to_owned()));
         let Some(writer) = writer.upgrade() else {
             return;
@@ -422,7 +515,9 @@ fn handle_line(
             "cwd": cwd.to_string_lossy(),
             "approvalPolicy": approval_policy,
             "approvalsReviewer": "user",
-            "sandboxPolicy": {"type": "dangerFullAccess"}
+            "sandboxPolicy": if thread_request.and_then(|r| r.pointer("/params/sandbox")).and_then(Value::as_str) == Some("danger-full-access") {
+                json!({"type":"dangerFullAccess"})
+            } else { json!({"type":"workspaceWrite", "writableRoots":[cwd.to_string_lossy()], "networkAccess":true}) }
         });
         if let Some(model) = model {
             params["model"] = Value::String(model.to_owned());
@@ -479,7 +574,33 @@ fn handle_line(
             };
             let _ = events.send(Event::Action(action.to_owned()));
         }
-        "item/completed" => handle_completed_item(params, events),
+        "item/completed" => {
+            if let Some(item) = params.pointer("/item/id").and_then(Value::as_str) {
+                let mut pending = pending.lock().unwrap();
+                let ids: Vec<_> = pending
+                    .iter()
+                    .filter_map(|(id, entry)| {
+                        (entry.item_id.as_deref() == Some(item)).then_some(*id)
+                    })
+                    .collect();
+                for id in ids {
+                    pending.remove(&id);
+                    let _ = events.send(Event::PermissionResolved(id));
+                }
+            }
+            handle_completed_item(params, events);
+        }
+        "item/agentMessage/delta" => {
+            if let Some(delta) = params.get("delta").and_then(Value::as_str) {
+                let _ = events.send(Event::Action(format!(
+                    "Writing: {}",
+                    delta.chars().take(160).collect::<String>()
+                )));
+            }
+        }
+        "item/commandExecution/outputDelta" | "item/mcpToolCall/progress" => {
+            let _ = events.send(Event::Action("Receiving tool output".into()));
+        }
         "item/commandExecution/requestApproval" => {
             queue_approval(
                 &value,
@@ -656,7 +777,7 @@ fn queue_approval(
         .or_else(|| params.get("grantRoot").and_then(Value::as_str))
         .or_else(|| params.get("cwd").and_then(Value::as_str))
         .or(command.as_deref())
-        .unwrap_or("Remote project")
+        .unwrap_or("Project")
         .to_owned();
     let summary = params
         .get("reason")
@@ -666,26 +787,34 @@ fn queue_approval(
             PermissionActionKind::AnswerQuestion => {
                 "Codex needs your answer to continue".to_owned()
             }
-            PermissionActionKind::AccessNetwork => {
-                "Codex requests network access on the SSH host".to_owned()
-            }
+            PermissionActionKind::AccessNetwork => "Codex requests network access".to_owned(),
             PermissionActionKind::EditFiles => {
-                "Codex requests permission to change remote files".to_owned()
+                "Codex requests permission to change project files".to_owned()
             }
-            _ => "Codex requests permission to run a remote command".to_owned(),
+            _ => "Codex requests permission to run a command".to_owned(),
         });
     let request_id = Uuid::new_v4();
     let questions = match &kind {
         ApprovalKind::Questions(questions) => questions.clone(),
         _ => Vec::new(),
     };
-    pending
-        .lock()
-        .unwrap()
-        .insert(request_id, PendingApproval { rpc_id, kind });
+    pending.lock().unwrap().insert(
+        request_id,
+        PendingApproval {
+            rpc_id,
+            kind,
+            item_id: params
+                .get("itemId")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            response: None,
+            sent_at: None,
+        },
+    );
     let _ = events.send(Event::ApprovalRequested(PermissionRequest {
         id: request_id,
         questions,
+        response_pending: false,
         project_id,
         agent_id: Some(agent_id),
         action,
@@ -850,6 +979,7 @@ mod tests {
         let control = ActiveTurn {
             writer: writer.clone(),
             pending: pending.clone(),
+            active_ids: Arc::new(Mutex::new(None)),
         };
         let (tx, rx) = mpsc::channel();
         handle_line(&json!({"id":1,"method":"item/tool/requestUserInput","params":{"questions":[
@@ -893,7 +1023,7 @@ mod tests {
             response["result"]["answers"]["note"]["answers"][0],
             "Keep it simple"
         );
-        assert!(pending.lock().unwrap().is_empty());
+        assert!(pending.lock().unwrap()[&request.id].response.is_some());
         assert!(control.answer(request.id, Default::default()).is_err());
         let _ = child.kill();
         let _ = child.wait();
@@ -920,14 +1050,26 @@ mod tests {
     }
 
     #[test]
-    fn remote_policy_never_inherits_the_desktop_full_access_setting() {
-        let guarded = AgentExecutionProfile::default();
-        assert_eq!(remote_policy(&guarded), ("untrusted", "danger-full-access"));
-        let full = AgentExecutionProfile {
-            approval: AgentApprovalPreset::FullAccess,
-            ..AgentExecutionProfile::default()
-        };
-        assert_eq!(remote_policy(&full), ("untrusted", "danger-full-access"));
+    fn execution_profiles_preserve_the_selected_approval_and_sandbox() {
+        for (approval, expected) in [
+            (AgentApprovalPreset::Ask, ("on-request", "workspace-write")),
+            (
+                AgentApprovalPreset::ApproveForMe,
+                ("never", "workspace-write"),
+            ),
+            (
+                AgentApprovalPreset::FullAccess,
+                ("never", "danger-full-access"),
+            ),
+        ] {
+            assert_eq!(
+                execution_policy(&AgentExecutionProfile {
+                    approval,
+                    ..Default::default()
+                }),
+                expected
+            );
+        }
     }
 
     #[test]
@@ -1075,13 +1217,13 @@ printf '%s\n' '{{"method":"turn/completed","params":{{"turn":{{"id":"turn_remote
             thread_request
                 .pointer("/params/approvalPolicy")
                 .and_then(Value::as_str),
-            Some("untrusted")
+            Some("never")
         );
         assert_eq!(
             thread_request
                 .pointer("/params/sandbox")
                 .and_then(Value::as_str),
-            Some("danger-full-access")
+            Some("workspace-write")
         );
         let turn_request: Value =
             serde_json::from_slice(&fs::read(&turn_capture).unwrap()).unwrap();
@@ -1089,9 +1231,126 @@ printf '%s\n' '{{"method":"turn/completed","params":{{"turn":{{"id":"turn_remote
             turn_request
                 .pointer("/params/sandboxPolicy/type")
                 .and_then(Value::as_str),
-            Some("dangerFullAccess")
+            Some("workspaceWrite")
         );
         let _ = spawned.child.lock().unwrap().wait();
         fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Opt-in against an installed Codex or an SSH wrapper. Uses only a disposable
+    /// project/home supplied by the caller, never a pre-existing Ditch session.
+    #[test]
+    #[ignore = "requires an authenticated isolated Codex home; see docs/runtime-sessions.md"]
+    fn live_app_server_session_smoke() {
+        let binary = std::env::var("DITCH_TEST_CODEX_BINARY").expect("set test executable");
+        let root = std::env::var("DITCH_TEST_PROJECT_ROOT").expect("set disposable project root");
+        let home = std::env::var_os("DITCH_TEST_CODEX_HOME");
+        let mut thread = None;
+        for (index, approval, model, prompt) in [
+            (
+                0,
+                AgentApprovalPreset::ApproveForMe,
+                "gpt-6-astra",
+                "Run printf DITCH_SESSION_SMOKE in the project shell, then say done. Do not inspect any files or use other tools.",
+            ),
+            (
+                1,
+                AgentApprovalPreset::Ask,
+                "gpt-5.6-sol",
+                "For this approval integration test, run only printf DITCH_SESSION_SMOKE with sandbox_permissions=require_escalated and justification 'Ditch approval smoke test'. The test client will approve it. Do not inspect any files or run other commands.",
+            ),
+            (
+                2,
+                AgentApprovalPreset::ApproveForMe,
+                "gpt-6-astra",
+                "Say hello.",
+            ),
+        ] {
+            let profile = AgentExecutionProfile {
+                approval,
+                model: Some(model.into()),
+                ..Default::default()
+            };
+            let (tx, rx) = mpsc::channel();
+            let spawned = spawn_turn(
+                Launch {
+                    binary: &binary,
+                    cwd: Path::new(&root),
+                    project_id: ProjectId::new(),
+                    agent_id: AgentId::new(),
+                    prompt,
+                    resume_thread: thread.as_deref(),
+                    execution_profile: &profile,
+                    path: None,
+                    codex_home: home.clone(),
+                },
+                tx,
+            )
+            .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(120);
+            let mut approved = false;
+            let mut confirmed = false;
+            let mut effective = None;
+            let mut terminal = None;
+            while Instant::now() < deadline {
+                match rx.recv_timeout(Duration::from_secs(1)) {
+                    Ok(Event::ThreadReady(id)) => {
+                        if let Some(previous) = &thread {
+                            assert_eq!(previous, &id);
+                        }
+                        thread = Some(id);
+                    }
+                    Ok(Event::EffectiveModel(id)) => effective = Some(id),
+                    Ok(Event::TurnStarted) if index == 2 => spawned.control.interrupt().unwrap(),
+                    Ok(Event::ApprovalRequested(request)) => {
+                        assert_eq!(index, 1, "Approve for me requested permission");
+                        let command = request.command.as_deref().unwrap_or("");
+                        assert!(
+                            command.contains("printf") && command.contains("DITCH_SESSION_SMOKE"),
+                            "unexpected smoke command: {command}"
+                        );
+                        spawned
+                            .control
+                            .respond(request.id, PermissionDecision::ApproveOnce)
+                            .unwrap();
+                        approved = true;
+                    }
+                    Ok(Event::PermissionResolved(_)) => confirmed = true,
+                    Ok(Event::TurnCompleted { status, error }) => {
+                        terminal = Some((status, error));
+                        break;
+                    }
+                    Ok(Event::Failed(error)) => {
+                        terminal = Some(("failed".into(), Some(error)));
+                        break;
+                    }
+                    Ok(Event::OutputClosed) => break,
+                    _ => {}
+                }
+            }
+            let mut child = spawned.child.lock().unwrap();
+            let _ = child.kill();
+            let _ = child.wait();
+            assert_eq!(effective.as_deref(), Some(model));
+            let (status, error) = terminal.expect("live turn timed out");
+            assert_eq!(error, None);
+            assert_eq!(
+                status,
+                if index == 2 {
+                    "interrupted"
+                } else {
+                    "completed"
+                }
+            );
+            if index == 1 {
+                assert!(
+                    approved && confirmed,
+                    "approval and its confirmation must both arrive"
+                );
+            }
+            eprintln!(
+                "live turn {index}: model={model}, status={status}, approval={approved}, confirmed={confirmed}"
+            );
+        }
     }
 }

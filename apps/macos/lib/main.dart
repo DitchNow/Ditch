@@ -556,7 +556,41 @@ class NotificationReadiness {
 }
 
 class AgentExecutionSettings extends ChangeNotifier {
+  AgentExecutionSettings({Map? profile}) {
+    syncProfile(profile);
+  }
+  bool edited = false;
+  bool loadingModels = false;
+  String? modelError;
   AgentApprovalPreset approval = AgentApprovalPreset.approveForMe;
+
+  void syncProfile(Map? profile) {
+    if (profile == null || edited) return;
+    model = profile['model']?.toString();
+    approval = switch (profile['approval']) {
+      'Ask' => AgentApprovalPreset.ask,
+      'FullAccess' => AgentApprovalPreset.fullAccess,
+      _ => AgentApprovalPreset.approveForMe,
+    };
+  }
+
+  Future<void> loadModels(
+    Future<List<AgentModelOption>> Function() load,
+  ) async {
+    if (loadingModels) return;
+    loadingModels = true;
+    modelError = null;
+    notifyListeners();
+    try {
+      setModels(await load());
+    } on Object {
+      modelError = 'Models unavailable. Retry';
+    } finally {
+      loadingModels = false;
+      notifyListeners();
+    }
+  }
+
   String? model;
   List<AgentModelOption> models = const [];
 
@@ -571,11 +605,13 @@ class AgentExecutionSettings extends ChangeNotifier {
   };
 
   void setApproval(AgentApprovalPreset value) {
+    edited = true;
     approval = value;
     notifyListeners();
   }
 
   void setModel(String? value) {
+    edited = true;
     model = value;
     notifyListeners();
   }
@@ -585,19 +621,29 @@ class AgentExecutionSettings extends ChangeNotifier {
 
   void setModels(List<AgentModelOption> value) {
     models = value;
-    if (model == null) {
-      for (final item in value) {
-        if (item.isDefault) {
-          model = item.id;
-          break;
-        }
-      }
-    }
     notifyListeners();
   }
 }
 
+// Fallback for standalone widgets; application composers always receive a scope.
 final agentExecutionSettings = AgentExecutionSettings();
+
+class AgentSettingsScope extends InheritedWidget {
+  const AgentSettingsScope({
+    super.key,
+    required this.settings,
+    required this.loadModels,
+    required super.child,
+  });
+  final AgentExecutionSettings settings;
+  final Future<List<AgentModelOption>> Function()? loadModels;
+  static AgentSettingsScope? of(BuildContext context) =>
+      context.dependOnInheritedWidgetOfExactType<AgentSettingsScope>();
+  @override
+  bool updateShouldNotify(AgentSettingsScope oldWidget) =>
+      settings != oldWidget.settings ||
+      (loadModels == null) != (oldWidget.loadModels == null);
+}
 
 class ProjectTerminalSession {
   ProjectTerminalSession({
@@ -622,6 +668,7 @@ class AgentSession {
     required this.status,
     required this.messages,
     this.projectId,
+    AgentExecutionSettings? executionSettings,
     this.codexThreadId,
     this.codexTitle,
     this.userTitle,
@@ -639,10 +686,12 @@ class AgentSession {
     this.historyError,
     DateTime? createdAt,
     DateTime? updatedAt,
-  }) : createdAt = createdAt ?? DateTime.now(),
+  }) : executionSettings = executionSettings ?? AgentExecutionSettings(),
+       createdAt = createdAt ?? DateTime.now(),
        updatedAt = updatedAt ?? DateTime.now();
 
   final String localId;
+  AgentExecutionSettings executionSettings;
   final String? projectId;
   final AgentProvider provider;
   final DateTime createdAt;
@@ -699,6 +748,9 @@ void reconcileAgentSession(List<AgentSession> sessions, AgentSession incoming) {
   }
 
   final existing = matches.first;
+  existing.executionSettings.syncProfile(
+    incoming.executionSettings.protocolValue,
+  );
   existing.status = incoming.status;
   existing.codexThreadId = incoming.codexThreadId;
   existing.codexTitle = incoming.codexTitle;
@@ -1421,6 +1473,7 @@ class DitchRuntimeClient {
     required String projectName,
     required String projectRoot,
     required String prompt,
+    Map<String, dynamic>? executionProfile,
   }) {
     return request({
       'StartCodexSession': {
@@ -1429,7 +1482,8 @@ class DitchRuntimeClient {
         'project_root': projectRoot,
         'prompt': prompt,
         'mode': 'Exec',
-        'execution_profile': agentExecutionSettings.protocolValue,
+        'execution_profile':
+            executionProfile ?? AgentExecutionSettings().protocolValue,
       },
     });
   }
@@ -1439,6 +1493,7 @@ class DitchRuntimeClient {
     required String projectRoot,
     required String threadId,
     required String prompt,
+    Map<String, dynamic>? executionProfile,
   }) {
     return request({
       'ResumeCodexSession': {
@@ -1446,7 +1501,8 @@ class DitchRuntimeClient {
         'project_root': projectRoot,
         'thread_id': threadId,
         'prompt': prompt,
-        'execution_profile': agentExecutionSettings.protocolValue,
+        'execution_profile':
+            executionProfile ?? AgentExecutionSettings().protocolValue,
       },
     });
   }
@@ -1454,12 +1510,14 @@ class DitchRuntimeClient {
   Future<Map<String, dynamic>> promptAgent({
     required String agentId,
     required String prompt,
+    Map<String, dynamic>? executionProfile,
   }) {
     return request({
       'PromptAgent': {
         'agent_id': agentId,
         'prompt': prompt,
-        'execution_profile': agentExecutionSettings.protocolValue,
+        'execution_profile':
+            executionProfile ?? AgentExecutionSettings().protocolValue,
       },
     });
   }
@@ -1787,6 +1845,12 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
   final Set<String> _pendingMessageRefresh = {};
   final Set<String> _pendingPermissionIds = {};
   final Map<String, InlineApproval> _inlineApprovals = {};
+  final Map<String, AgentExecutionSettings> _projectExecutionSettings = {};
+  AgentExecutionSettings _settingsForProject(String? id) =>
+      _projectExecutionSettings.putIfAbsent(
+        id ?? _selectedProject.path,
+        AgentExecutionSettings.new,
+      );
   bool _showingPermission = false;
   String? _activePermissionId;
   BuildContext? _activePermissionContext;
@@ -1801,6 +1865,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
   int _runtimeConnectionRetries = 0;
   bool _runtimeHomeMismatchReported = false;
   bool _runtimeCodexHomeMatches = true;
+  bool _runtimeSupportsAppServerSessions = true;
   bool _runtimeSupportsPersistence = true;
   bool _runtimeSupportsAlwaysOnWebAccess = true;
   bool _runtimeCompatibilityReported = false;
@@ -2310,14 +2375,6 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
         _codexBinary = report.path;
         _codexSetupChecking = false;
       });
-      if (report.ready) {
-        unawaited(
-          _runtimeClient
-              .listCodexModels()
-              .then(agentExecutionSettings.setModels)
-              .onError((_, _) {}),
-        );
-      }
     } on Object catch (error) {
       if (!mounted) return;
       setState(() {
@@ -2682,9 +2739,14 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
   }
 
   void _checkRuntimeCapabilities(RuntimeStatusDto status) {
+    _runtimeSupportsAppServerSessions = status.capabilities.contains(
+      'app_server_sessions_v2',
+    );
     _runtimeSupportsPersistence = status.supportsPersistentSessions;
     _runtimeSupportsAlwaysOnWebAccess = status.supportsAlwaysOnWebAccess;
-    if (_runtimeSupportsPersistence && _runtimeSupportsAlwaysOnWebAccess) {
+    if (_runtimeSupportsAppServerSessions &&
+        _runtimeSupportsPersistence &&
+        _runtimeSupportsAlwaysOnWebAccess) {
       _runtimeCompatibilityReported = false;
       return;
     }
@@ -2782,6 +2844,10 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
       if (session != null) {
         final existing = existingSessions[session.localId];
         if (existing != null) {
+          existing.executionSettings.syncProfile(
+            session.executionSettings.protocolValue,
+          );
+          session.executionSettings = existing.executionSettings;
           if (_projects.any(
                 (project) =>
                     project.id == session.projectId && project.isRemote,
@@ -2914,7 +2980,13 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
           .map((request) => request['id']?.toString())
           .toSet();
       for (final approval in _inlineApprovals.values) {
-        if (!liveIds.contains(approval.id)) approval.resolve();
+        final project = _projects
+            .where((p) => p.id == approval.request['project_id'])
+            .firstOrNull;
+        final authoritative =
+            project?.isRemote != true ||
+            _remoteHostStatus[project?.sshHostAlias] == 'online';
+        if (authoritative && !liveIds.contains(approval.id)) approval.resolve();
       }
       _pendingPermissionIds.removeWhere((id) => !liveIds.contains(id));
       _permissionQueue.removeWhere(
@@ -3364,6 +3436,9 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
         projectName: _selectedProject.name,
         projectRoot: _selectedProject.path,
         prompt: prompt,
+        executionProfile: _settingsForProject(
+          _selectedProject.id,
+        ).protocolValue,
       );
       final run = response['AgentStarted'];
       final session = _agentSessionFromRuntime(run, const []);
@@ -3408,6 +3483,15 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
   }
 
   Future<bool> _prepareSelectedProjectForCodex() async {
+    if (!_runtimeSupportsAppServerSessions) {
+      _showProjectSetupResult(
+        title: 'Runtime update required',
+        message:
+            'Restart Ditch with the updated runtime before starting a new turn. Existing sessions can still be stopped or approved.',
+        isError: true,
+      );
+      return false;
+    }
     if (_selectedProject.isRemote) {
       try {
         final alias = _selectedProject.sshHostAlias;
@@ -3554,7 +3638,11 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
       return;
     }
 
-    if (session.originCodexHome != null &&
+    final remoteSession = _projects.any(
+      (p) => p.id == session.projectId && p.isRemote,
+    );
+    if (!remoteSession &&
+        session.originCodexHome != null &&
         _effectiveRuntimeCodexHome != null &&
         session.originCodexHome != _effectiveRuntimeCodexHome) {
       _addAttentionRequired(
@@ -3574,11 +3662,19 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
       session.updatedAt = DateTime.now();
     });
     _scheduleStatusBarUpdate();
+    final submittedProfile = session.executionSettings.protocolValue;
     try {
       await _runtimeClient.promptAgent(
         agentId: session.localId,
         prompt: cleanPrompt,
+        executionProfile: submittedProfile,
       );
+      if (mapEquals(
+        session.executionSettings.protocolValue,
+        submittedProfile,
+      )) {
+        session.executionSettings.edited = false;
+      }
       _resolveAttentionForSession(session);
     } on Object catch (error) {
       setState(() {
@@ -4112,16 +4208,13 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
           },
         ),
       );
+      approval.updateRequest(request);
       if (!session.approvals.contains(approval)) {
         setState(() => session.approvals.add(approval));
       }
       return;
     }
-    if (!_projects.any(
-      (project) => project.id == projectId && project.isRemote,
-    )) {
-      return;
-    }
+    if (request['response_pending'] == true) return;
     if (!_pendingPermissionIds.add(requestId)) return;
     _permissionQueue.add(request);
     unawaited(_showNextRemotePermission());
@@ -4217,7 +4310,20 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
             } on Object catch (error) {
               if (mounted) {
                 ScaffoldMessenger.of(context).showSnackBar(
-                  SnackBar(content: Text('Could not send answers: $error')),
+                  SnackBar(
+                    content: Text('Could not confirm answers: $error'),
+                    action: SnackBarAction(
+                      label: 'Check status',
+                      onPressed: () async {
+                        try {
+                          final snapshot = await _runtimeClient.snapshot();
+                          if (mounted) _hydrateRuntimeSnapshot(snapshot);
+                        } on Object {
+                          /* Keep the request available for reconnect. */
+                        }
+                      },
+                    ),
+                  ),
                 );
               }
             }
@@ -4252,6 +4358,9 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
     return AgentSession(
       localId: agentId,
       projectId: agentJson['project_id']?.toString(),
+      executionSettings: AgentExecutionSettings(
+        profile: agentJson['execution_profile'] as Map?,
+      ),
       provider: AgentProvider.codex,
       status: _agentStatusFromRuntime(state),
       messages: List<AgentChatMessage>.from(messages),
@@ -4915,43 +5024,56 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
                 _minimumInspectorWidth,
                 _maximumInspectorWidth(constraints.maxWidth, showSidebar),
               );
-              final agentsSurface = AgentsSurface(
-                sessions: _visibleSessions,
-                expandedAgentLocalId: _expandedAgentLocalId,
-                focusedAgentLocalId: _focusedAgentLocalId,
-                chatViewport: _chatViewport,
-                agentListController: _agentListController,
-                composerKey: _idleComposerKey,
-                composerKeyForAgent: _composerKeyForAgent,
-                headerKeyForAgent: _agentHeaderKey,
-                initialPrompt: _defaultStartPrompt,
-                effectiveCodexHome: _effectiveRuntimeCodexHome,
-                onStartCodex: _startCodex,
-                onStartPrompt: _startCodexRuntime,
-                onSubmitPrompt: _submitComposer,
-                onLoadMessages: _loadAgentMessages,
-                onStopCodex: _stopCodex,
-                onDeleteAgent: _deleteAgent,
-                onRenameAgent: _renameAgent,
-                hasUnreadResult: (session) => unreadResultAttentionIdsForAgent(
-                  attention: _attention,
-                  agentId: session.localId,
-                  readAttentionIds: _readAttentionIds,
-                ).isNotEmpty,
-                onFocusAgent: (session) {
-                  if (session != null) _markAgentResultsRead(session);
-                  setState(() {
-                    _focusedAgentLocalId = session?.localId;
-                    if (session != null) {
-                      _expandedAgentLocalId = session.localId;
+              final modelProjectId = _selectedProject.id;
+              final agentsSurface = AgentSettingsScope(
+                settings: _settingsForProject(_selectedProject.id),
+                loadModels:
+                    presentation.connection == RuntimeConnectionPhase.connected
+                    ? () => _runtimeClient.listCodexModels(
+                        projectId: modelProjectId,
+                      )
+                    : null,
+                child: AgentsSurface(
+                  sessions: _visibleSessions,
+                  expandedAgentLocalId: _expandedAgentLocalId,
+                  focusedAgentLocalId: _focusedAgentLocalId,
+                  chatViewport: _chatViewport,
+                  agentListController: _agentListController,
+                  composerKey: _idleComposerKey,
+                  composerKeyForAgent: _composerKeyForAgent,
+                  headerKeyForAgent: _agentHeaderKey,
+                  initialPrompt: _defaultStartPrompt,
+                  effectiveCodexHome: _selectedProject.isRemote
+                      ? null
+                      : _effectiveRuntimeCodexHome,
+                  onStartCodex: _startCodex,
+                  onStartPrompt: _startCodexRuntime,
+                  onSubmitPrompt: _submitComposer,
+                  onLoadMessages: _loadAgentMessages,
+                  onStopCodex: _stopCodex,
+                  onDeleteAgent: _deleteAgent,
+                  onRenameAgent: _renameAgent,
+                  hasUnreadResult: (session) =>
+                      unreadResultAttentionIdsForAgent(
+                        attention: _attention,
+                        agentId: session.localId,
+                        readAttentionIds: _readAttentionIds,
+                      ).isNotEmpty,
+                  onFocusAgent: (session) {
+                    if (session != null) _markAgentResultsRead(session);
+                    setState(() {
+                      _focusedAgentLocalId = session?.localId;
+                      if (session != null) {
+                        _expandedAgentLocalId = session.localId;
+                      }
+                    });
+                    final agentId = session?.localId ?? _expandedAgentLocalId;
+                    if (agentId != null) {
+                      _focusAgentComposerAfterLayout(agentId);
                     }
-                  });
-                  final agentId = session?.localId ?? _expandedAgentLocalId;
-                  if (agentId != null) {
-                    _focusAgentComposerAfterLayout(agentId);
-                  }
-                },
-                onToggleExpanded: _toggleExpandedAgent,
+                  },
+                  onToggleExpanded: _toggleExpandedAgent,
+                ),
               );
               final selectedTerminal = _selectedProject.id == null
                   ? null
@@ -8323,6 +8445,7 @@ class ExpandableAgentPanel extends StatelessWidget {
         );
         Widget buildChatPanel() => AgentChatPanel(
           conversationId: session.localId,
+          executionSettings: session.executionSettings,
           messages: session.messages,
           approvals: session.approvals,
           viewport: chatViewport!,
@@ -8488,6 +8611,7 @@ class AgentChatPanel extends StatelessWidget {
     required this.onStopCodex,
     this.onEnlarge,
     this.autofocusAfterInitialPositioning = false,
+    this.executionSettings,
     super.key,
   });
 
@@ -8498,6 +8622,7 @@ class AgentChatPanel extends StatelessWidget {
   final bool enlarged;
   final GlobalKey<AgentComposerState> composerKey;
   final String initialPrompt;
+  final AgentExecutionSettings? executionSettings;
   final bool hasSession;
   final bool isWorking;
   final bool canStop;
@@ -8549,6 +8674,7 @@ class AgentChatPanel extends StatelessWidget {
         ),
       AgentComposer(
         key: composerKey,
+        executionSettings: executionSettings,
         initialText: initialPrompt,
         hasSession: hasSession,
         isWorking: isWorking,
@@ -8959,10 +9085,12 @@ class AgentComposer extends StatefulWidget {
     required this.onStop,
     this.onEnlarge,
     this.onEscape,
+    this.executionSettings,
     super.key,
   });
 
   final String initialText;
+  final AgentExecutionSettings? executionSettings;
   final bool hasSession;
   final bool isWorking;
   final bool canStop;
@@ -8983,6 +9111,31 @@ class AgentComposerState extends State<AgentComposer> {
   late String _draftText;
   double _editorHeight = _minimumEditorHeight;
   bool _composerHasFocus = false;
+  AgentExecutionSettings? _loadedSettings;
+  AgentSettingsScope? _scope;
+  AgentExecutionSettings get _settings =>
+      widget.executionSettings ?? _scope?.settings ?? agentExecutionSettings;
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    _scope = AgentSettingsScope.of(context);
+    _loadTargetModels();
+  }
+
+  void _loadTargetModels() {
+    if (_scope?.loadModels == null) {
+      _loadedSettings = null;
+      return;
+    }
+    if (identical(_loadedSettings, _settings)) return;
+    _loadedSettings = _settings;
+    final settings = _settings;
+    final load = _scope!.loadModels!;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) unawaited(settings.loadModels(load));
+    });
+  }
 
   @override
   void initState() {
@@ -8993,6 +9146,7 @@ class AgentComposerState extends State<AgentComposer> {
   @override
   void didUpdateWidget(AgentComposer oldWidget) {
     super.didUpdateWidget(oldWidget);
+    _loadTargetModels();
     if (oldWidget.initialText != widget.initialText &&
         _draftText.trim().isEmpty) {
       _draftText = widget.initialText;
@@ -9053,7 +9207,7 @@ class AgentComposerState extends State<AgentComposer> {
           icon: const Icon(Icons.warning_amber_rounded),
           title: const Text('Enable Full Access?'),
           content: const Text(
-            'Codex will run without approval prompts or sandbox restrictions and can access the internet and files on this Mac.',
+            'Codex will run without approval prompts or sandbox restrictions and can access the internet and files on the computer running this project.',
           ),
           actions: [
             TextButton(
@@ -9069,7 +9223,7 @@ class AgentComposerState extends State<AgentComposer> {
       );
       if (confirmed != true) return;
     }
-    agentExecutionSettings.setApproval(value);
+    _settings.setApproval(value);
   }
 
   @override
@@ -9099,7 +9253,7 @@ class AgentComposerState extends State<AgentComposer> {
           ),
           padding: const EdgeInsets.all(10),
           child: ListenableBuilder(
-            listenable: agentExecutionSettings,
+            listenable: _settings,
             builder: (context, _) => Column(
               mainAxisSize: MainAxisSize.min,
               children: [
@@ -9171,7 +9325,7 @@ class AgentComposerState extends State<AgentComposer> {
                           width: controlWidth,
                           child: DropdownButtonHideUnderline(
                             child: DropdownButton<AgentApprovalPreset>(
-                              value: agentExecutionSettings.approval,
+                              value: _settings.approval,
                               isDense: true,
                               isExpanded: true,
                               onChanged: (value) {
@@ -9182,8 +9336,7 @@ class AgentComposerState extends State<AgentComposer> {
                               items: const [
                                 DropdownMenuItem(
                                   value: AgentApprovalPreset.ask,
-                                  enabled: false,
-                                  child: Text('Ask for approval — unavailable'),
+                                  child: Text('Ask for approval'),
                                 ),
                                 DropdownMenuItem(
                                   value: AgentApprovalPreset.approveForMe,
@@ -9204,29 +9357,51 @@ class AgentComposerState extends State<AgentComposer> {
                               Expanded(
                                 child: DropdownButtonHideUnderline(
                                   child: DropdownButton<String?>(
-                                    value: agentExecutionSettings.model,
+                                    value: _settings.model,
                                     hint: const Text('Default model'),
                                     isDense: true,
                                     isExpanded: true,
-                                    onChanged: agentExecutionSettings.setModel,
-                                    items: agentExecutionSettings.models
-                                        .map(
-                                          (model) => DropdownMenuItem<String?>(
-                                            value: model.id,
-                                            child: Text(model.displayName),
-                                          ),
-                                        )
-                                        .toList(),
+                                    onChanged: _settings.setModel,
+                                    items: [
+                                      const DropdownMenuItem<String?>(
+                                        value: null,
+                                        child: Text('Default model'),
+                                      ),
+                                      if (_settings.model != null &&
+                                          !_settings.models.any(
+                                            (m) => m.id == _settings.model,
+                                          ))
+                                        DropdownMenuItem<String?>(
+                                          value: _settings.model,
+                                          child: Text(_settings.model!),
+                                        ),
+                                      ..._settings.models.map(
+                                        (model) => DropdownMenuItem<String?>(
+                                          value: model.id,
+                                          child: Text(model.displayName),
+                                        ),
+                                      ),
+                                    ],
                                   ),
                                 ),
                               ),
                               const SizedBox(width: 6),
                               ContextWindowIndicator(
-                                model: agentExecutionSettings.selectedModel,
+                                model: _settings.selectedModel,
                               ),
                             ],
                           ),
                         ),
+                        if (_settings.loadingModels)
+                          const Text('Loading models…'),
+                        if (_settings.modelError != null)
+                          TextButton(
+                            onPressed: _scope?.loadModels == null
+                                ? null
+                                : () =>
+                                      _settings.loadModels(_scope!.loadModels!),
+                            child: Text(_settings.modelError!),
+                          ),
                         if (widget.isWorking || widget.canStop)
                           const Text('Applies next turn'),
                       ],

@@ -194,6 +194,17 @@ impl RemoteConnectionManager {
                 | ClientRequest::GetPermissionRequest { .. }
                 | ClientRequest::ListFilesystemDirectory { .. }
         );
+        // Recovery controls must remain usable for already-running older sessions.
+        // Only new turns need the policy/model/confirmation contract.
+        let needs_session_controls = matches!(
+            request,
+            ClientRequest::StartRemoteCodexAppServerSession { .. }
+                | ClientRequest::ResumeRemoteCodexAppServerSession { .. }
+                | ClientRequest::PromptRemoteCodexAppServerAgent { .. }
+                | ClientRequest::StartCodexSession { .. }
+                | ClientRequest::ResumeCodexSession { .. }
+                | ClientRequest::PromptAgent { .. }
+        );
         let operation_id = if read_only {
             Uuid::new_v4()
         } else {
@@ -217,13 +228,18 @@ impl RemoteConnectionManager {
                     Err(_) => std::thread::sleep(Duration::from_millis(5)),
                 }
             };
-            if !read_only && !bridge.verified {
+            if !read_only && (!bridge.verified || needs_session_controls) {
                 match bridge.exchange(ClientRequest::RuntimeStatus, deadline, true)? {
                     ServerResponse::RuntimeStatus(status)
                         if status
                             .capabilities
                             .iter()
-                            .any(|c| c == "remote_runtime_protocol_v4") =>
+                            .any(|c| c == "remote_runtime_protocol_v4")
+                            && (!needs_session_controls
+                                || status
+                                    .capabilities
+                                    .iter()
+                                    .any(|c| c == "app_server_sessions_v2")) =>
                     {
                         bridge.verified = true
                     }
@@ -794,6 +810,10 @@ pub fn check_setup(
                 .capabilities
                 .iter()
                 .any(|c| c == "remote_runtime_protocol_v4")
+                && status
+                    .capabilities
+                    .iter()
+                    .any(|c| c == "app_server_sessions_v2")
                 && status.build_identifier
                     == option_env!("DITCH_BUILD_IDENTIFIER").unwrap_or(env!("CARGO_PKG_VERSION"));
             daemon_epoch = Some(status.instance_id);

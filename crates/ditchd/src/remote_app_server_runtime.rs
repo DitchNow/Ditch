@@ -1,13 +1,7 @@
-// SSH-only runtime adapter for Codex App Server. This file is included in the
-// shared runtime module so it can reuse the existing durable agent state and
-// event helpers without changing the local Codex execution path.
+// Shared local/SSH adapter for Codex App Server, using the runtime
+// durable agent state, approval controls, and event helpers.
 
-fn guarded_remote_profile(mut profile: AgentExecutionProfile) -> AgentExecutionProfile {
-    profile.approval = AgentApprovalPreset::Ask;
-    profile
-}
-
-fn start_remote_app_server_session(
+fn start_app_server_session(
     state: Arc<Mutex<RuntimeState>>,
     project_id: ProjectId,
     project_name: String,
@@ -20,19 +14,23 @@ fn start_remote_app_server_session(
         let state = state
             .lock()
             .expect("runtime state lock should not be poisoned");
-        if !state.remote_runtime {
-            return protocol_error(
-                "ssh_app_server_only",
-                "Codex App Server launches are accepted only by an SSH runtime",
-            );
-        }
+
         let Some(project) = state
             .projects
             .values()
             .find(|project| project.id == project_id)
             .cloned()
+            .or_else(|| {
+                (!state.remote_runtime).then(|| {
+                    let root = canonical_project_root(Path::new(&project_root));
+                    let mut project = load_project_config(&root)
+                        .unwrap_or_else(|_| Project::new(project_name.clone(), root));
+                    project.id = project_id;
+                    project
+                })
+            })
         else {
-            return protocol_error("project_not_found", "remote project was not found");
+            return protocol_error("project_not_found", "project was not found");
         };
         project
     };
@@ -40,8 +38,8 @@ fn start_remote_app_server_session(
         || project.root != canonical_project_root(Path::new(&project_root))
     {
         return protocol_error(
-            "remote_project_mismatch",
-            "the SSH project identity does not match the remote runtime",
+            "project_identity_mismatch",
+            "The project identity does not match this runtime",
         );
     }
     if let Some(thread_id) = resume_thread.as_deref()
@@ -56,7 +54,14 @@ fn start_remote_app_server_session(
         return error;
     }
 
-    let execution_profile = guarded_remote_profile(execution_profile);
+    {
+        let mut guard = state.lock().unwrap();
+        if let Err(error) = guard.store.upsert_project(&project) {
+            return protocol_error("project_store_failed", error.to_string());
+        }
+        guard.projects.insert(project.root_key(), project.clone());
+        guard.broadcast(ServerEvent::ProjectChanged(project.clone()));
+    }
     let now = Utc::now();
     let mut run = AgentRun {
         id: AgentId::new(),
@@ -79,7 +84,7 @@ fn start_remote_app_server_session(
             "Starting Codex App Server".to_owned()
         }),
         state_confidence: 0.9,
-        state_evidence: "The SSH runtime accepted an App Server session.".to_owned(),
+        state_evidence: "The runtime accepted an App Server session.".to_owned(),
         started_at: now,
         updated_at: now,
         finished_at: None,
@@ -100,7 +105,7 @@ fn start_remote_app_server_session(
             run,
             user_message,
             allow_non_git,
-            "No working Codex CLI installation was found on the SSH host.".to_owned(),
+            "No working Codex CLI installation was found for this project.".to_owned(),
         );
     };
     let (event_tx, event_rx) = mpsc::channel();
@@ -139,7 +144,7 @@ fn start_remote_app_server_session(
     run.state = AgentState::Working;
     run.can_stop = true;
     run.updated_at = Utc::now();
-    run.state_evidence = "Codex App Server is running on the SSH host.".to_owned();
+    run.state_evidence = "Codex App Server is running for this project.".to_owned();
 
     {
         let mut state = state
@@ -199,22 +204,44 @@ impl Drop for RemoteLaunchReservation {
     }
 }
 
-fn prompt_remote_app_server_agent(
+fn prompt_app_server_agent(
     state: Arc<Mutex<RuntimeState>>,
     agent_id: AgentId,
     prompt: String,
     execution_profile: AgentExecutionProfile,
 ) -> ServerResponse {
+    // turn/completed can reach the UI before the app-server process has closed
+    // its thread writer. Let an immediate next prompt wait for that bounded
+    // cleanup instead of failing with agent_busy or racing thread/resume.
+    let finalizing = {
+        let guard = state.lock().unwrap();
+        guard
+            .children
+            .get(&agent_id)
+            .filter(|child| child.app_server)
+            .filter(|_| {
+                guard.agents.get(&agent_id).is_some_and(|record| {
+                    matches!(
+                        record.run.state,
+                        AgentState::Completed | AgentState::Failed | AgentState::Interrupted
+                    )
+                })
+            })
+            .map(|child| child.run_id)
+    };
+    if let Some(run_id) = finalizing
+        && !wait_for_run_finalization(&state, agent_id, run_id, Duration::from_secs(3))
+    {
+        return protocol_error(
+            "agent_finalizing",
+            "The previous turn is still closing; try again shortly",
+        );
+    }
     let (project_id, project_root, thread_id) = {
         let mut state = state
             .lock()
             .expect("runtime state lock should not be poisoned");
-        if !state.remote_runtime {
-            return protocol_error(
-                "ssh_app_server_only",
-                "Codex App Server prompts are accepted only by an SSH runtime",
-            );
-        }
+
         let Some(record) = state.agents.get(&agent_id) else {
             return protocol_error("agent_not_found", "agent session was not found");
         };
@@ -250,11 +277,10 @@ fn prompt_remote_app_server_agent(
         state: state.clone(),
         agent_id,
     };
-    let execution_profile = guarded_remote_profile(execution_profile);
     let Some(binary) = active_codex_binary(&state) else {
         return protocol_error(
             "codex_not_found",
-            "No working Codex CLI installation was found on the SSH host",
+            "No working Codex CLI installation was found for this project",
         );
     };
     let (event_tx, event_rx) = mpsc::channel();
@@ -379,7 +405,9 @@ fn attach_remote_app_server_turn(
                     Some(run_id),
                 );
                 let mut guard = state.lock().unwrap();
-                guard.app_server_turns.remove(&agent_id);
+                if is_current_run(&guard, agent_id, run_id) {
+                    guard.app_server_turns.remove(&agent_id);
+                }
                 terminal = true;
                 cleanup_started = Some(Instant::now());
             }
@@ -437,6 +465,18 @@ fn handle_remote_app_server_event(
                 state.broadcast(ServerEvent::AgentChanged(run));
             }
         }
+        codex_app_server::Event::EffectiveModel(model) => {
+            let mut guard = state.lock().unwrap();
+            if !is_current_run(&guard, agent_id, run_id) {
+                return true;
+            }
+            if let Some(record) = guard.agents.get_mut(&agent_id) {
+                record.run.execution_profile.model = Some(model);
+                let run = record.run.clone();
+                guard.persist_agent(agent_id);
+                guard.broadcast(ServerEvent::AgentChanged(run));
+            }
+        }
         codex_app_server::Event::ThreadReady(thread_id) => {
             let mut state = state
                 .lock()
@@ -447,6 +487,9 @@ fn handle_remote_app_server_event(
             let Some(record) = state.agents.get_mut(&agent_id) else {
                 return true;
             };
+            if let Some(title) = codex_title_from_state(&thread_id) {
+                record.run.codex_title = Some(title);
+            }
             record.run.native_session_id = Some(thread_id);
             record.run.resume_block_reason = None;
             record.run.updated_at = Utc::now();
@@ -523,6 +566,14 @@ fn handle_remote_app_server_event(
             let Some(record) = state.agents.get_mut(&agent_id) else {
                 return true;
             };
+            if let Some(title) = record
+                .run
+                .native_session_id
+                .as_deref()
+                .and_then(codex_title_from_state)
+            {
+                record.run.codex_title = Some(title);
+            }
             record.run.can_stop = false;
             record.run.updated_at = Utc::now();
             record.run.finished_at = Some(record.run.updated_at);
@@ -557,6 +608,9 @@ fn handle_remote_app_server_event(
             let mut state = state
                 .lock()
                 .expect("runtime state lock should not be poisoned");
+            if !is_current_run(&state, agent_id, run_id) {
+                return true;
+            }
             state.app_server_turns.remove(&agent_id);
             clear_agent_permissions(&mut state, agent_id);
             return true;
@@ -594,16 +648,7 @@ fn respond_permission_for_target(
             },
         };
         return match connections.request(&alias, request) {
-            Ok(response) => {
-                if matches!(response, ServerResponse::Accepted) {
-                    let mut state = state
-                        .lock()
-                        .expect("runtime state lock should not be poisoned");
-                    state.remote_permission_hosts.remove(&request_id);
-                    state.pending_permissions.remove(&request_id);
-                }
-                response
-            }
+            Ok(response) => response,
             Err(error) => protocol_error("remote_unavailable", error.to_string()),
         };
     }
@@ -624,6 +669,9 @@ fn respond_permission_for_target(
     if let Err(error) = control.respond(request_id, decision) {
         return protocol_error("permission_response_failed", error.to_string());
     }
+    if decision == codex_app_server::PermissionDecision::Deny {
+        let _ = control.interrupt();
+    }
     let mut state = state
         .lock()
         .expect("runtime state lock should not be poisoned");
@@ -632,34 +680,20 @@ fn respond_permission_for_target(
     {
         return ServerResponse::Accepted;
     }
-    state.app_server_permission_agents.remove(&request_id);
-    state.pending_permissions.remove(&request_id);
-    resolve_permission_attention(&mut state, request_id);
-    let still_waiting = state
-        .pending_permissions
-        .values()
-        .any(|request| request.agent_id == Some(agent_id));
+    if let Some(request) = state.pending_permissions.get_mut(&request_id) {
+        request.response_pending = true;
+        let request = request.clone();
+        state.broadcast(ServerEvent::PermissionRequested(request));
+    }
     if let Some(record) = state.agents.get_mut(&agent_id) {
-        record.run.state = if still_waiting {
-            AgentState::AwaitingApproval
-        } else {
-            AgentState::Working
-        };
-        record.run.last_visible_action = Some(
-            match decision {
-                codex_app_server::PermissionDecision::ApproveOnce => "Permission granted once",
-                codex_app_server::PermissionDecision::ApproveForSession => {
-                    "Permission granted for this session"
-                }
-                codex_app_server::PermissionDecision::Deny => "Permission denied",
-            }
-            .to_owned(),
-        );
+        record.run.last_visible_action =
+            Some("Response sent; waiting for Codex confirmation".into());
         record.run.updated_at = Utc::now();
         let run = record.run.clone();
         state.persist_agent(agent_id);
         state.broadcast(ServerEvent::AgentChanged(run));
     }
+
     ServerResponse::Accepted
 }
 
@@ -718,24 +752,51 @@ fn answer_agent_questions(
     if let Err(error) = control.answer(request_id, answers) {
         return protocol_error("invalid_answers", error.to_string());
     }
-    guard.app_server_permission_agents.remove(&request_id);
-    guard.pending_permissions.remove(&request_id);
-    resolve_permission_attention(&mut guard, request_id);
-    let waiting = guard
-        .pending_permissions
-        .values()
-        .any(|request| request.agent_id == Some(agent_id));
-    if let Some(record) = guard.agents.get_mut(&agent_id) {
-        record.run.state = if waiting {
-            AgentState::AwaitingApproval
-        } else {
-            AgentState::Working
-        };
-        record.run.updated_at = Utc::now();
-        record.run.last_visible_action = Some("Answer sent to Codex".into());
-        let run = record.run.clone();
-        guard.persist_agent(agent_id);
-        guard.broadcast(ServerEvent::AgentChanged(run));
+    if let Some(request) = guard.pending_permissions.get_mut(&request_id) {
+        request.response_pending = true;
+        let request = request.clone();
+        guard.broadcast(ServerEvent::PermissionRequested(request));
     }
+
     ServerResponse::Accepted
+}
+
+fn start_remote_app_server_session(
+    state: Arc<Mutex<RuntimeState>>,
+    project_id: ProjectId,
+    project_name: String,
+    project_root: String,
+    thread: Option<String>,
+    prompt: String,
+    profile: AgentExecutionProfile,
+) -> ServerResponse {
+    if !state.lock().unwrap().remote_runtime {
+        return protocol_error(
+            "ssh_app_server_only",
+            "Internal SSH launches require a remote runtime",
+        );
+    }
+    start_app_server_session(
+        state,
+        project_id,
+        project_name,
+        project_root,
+        thread,
+        prompt,
+        profile,
+    )
+}
+fn prompt_remote_app_server_agent(
+    state: Arc<Mutex<RuntimeState>>,
+    agent_id: AgentId,
+    prompt: String,
+    profile: AgentExecutionProfile,
+) -> ServerResponse {
+    if !state.lock().unwrap().remote_runtime {
+        return protocol_error(
+            "ssh_app_server_only",
+            "Internal SSH prompts require a remote runtime",
+        );
+    }
+    prompt_app_server_agent(state, agent_id, prompt, profile)
 }

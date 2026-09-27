@@ -326,3 +326,260 @@ fn another_ssh_host_cannot_replace_an_existing_agent_identity() {
             .contains_key(&agent)
     );
 }
+
+fn wait_for_session(state: &Arc<Mutex<RuntimeState>>, check: impl Fn(&RuntimeState) -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if check(&state.lock().unwrap()) {
+            return;
+        }
+        assert!(Instant::now() < deadline, "session transition timed out");
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn local_and_remote_app_server_approval_rejoin_model_and_stop_lifecycle() {
+    for remote in [false, true] {
+        let mut runtime = test_runtime();
+        runtime.remote_runtime = remote;
+        let root = runtime.paths.data_dir.join("workspace");
+        fs::create_dir_all(&root).unwrap();
+        let root = fs::canonicalize(root).unwrap();
+        let binary = root.join("fake-codex");
+        fs::write(&binary, r#"#!/usr/bin/python3
+import json, sys, time
+if '--version' in sys.argv:
+    print('codex-cli 0.154.0'); sys.exit(0)
+def read(): return json.loads(sys.stdin.readline())
+def send(v): print(json.dumps(v), flush=True)
+read(); send({'id':'ditch:initialize','result':{}})
+read(); request=read()
+with open('requests.jsonl','a') as f: f.write(json.dumps(request)+'\n')
+assert request['method'] in ['thread/start','thread/resume']
+if request['method']=='thread/resume': assert request['params']['threadId']=='fixture-thread'
+send({'id':'ditch:thread','result':{'thread':{'id':'fixture-thread'},'model':request['params']['model']}})
+turn=read()
+with open('requests.jsonl','a') as f: f.write(json.dumps(turn)+'\n')
+prompt=turn['params']['input'][0]['text']
+send({'id':'ditch:turn','result':{'turn':{'id':'fixture-turn'}}})
+send({'method':'turn/started','params':{'turn':{'id':'fixture-turn'}}})
+if prompt=='ask':
+    for i in [1,2]:
+        send({'id':i,'method':'item/commandExecution/requestApproval','params':{'itemId':str(i),'command':'printf test'}})
+        answer=read()
+        assert answer['id']==i
+        assert answer['result']['decision']==('accept' if i==1 else 'acceptForSession')
+        time.sleep(0.2)
+        send({'method':'serverRequest/resolved','params':{'requestId':i}})
+if prompt=='stop':
+    send({'id':3,'method':'item/commandExecution/requestApproval','params':{'itemId':'3','command':'printf stop'}})
+    interrupt=read()
+    assert interrupt['method']=='turn/interrupt'
+    assert interrupt['params']=={'threadId':'fixture-thread','turnId':'fixture-turn'}
+    send({'id':interrupt['id'],'result':{}})
+if prompt=='cancel':
+    send({'id':4,'method':'item/commandExecution/requestApproval','params':{'itemId':'4','command':'printf cancel'}})
+    answer=read(); assert answer['result']['decision']=='cancel'
+    interrupt=read(); assert interrupt['method']=='turn/interrupt'
+    send({'id':interrupt['id'],'result':{}})
+send({'method':'item/agentMessage/delta','params':{'delta':'Progress'}})
+send({'method':'item/completed','params':{'item':{'type':'agentMessage','id':'message','text':'Fixture done'}}})
+send({'method':'turn/completed','params':{'turn':{'status':'interrupted' if prompt in ['stop','cancel'] else 'completed'}}})
+time.sleep(0.3) # Keep the thread writer alive briefly after turn completion.
+"#).unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+        runtime.codex_binary = Some(binary.to_string_lossy().into_owned());
+        let mut project = Project::new("Lifecycle fixture", &root);
+        project.git_policy = ProjectGitPolicy::AllowOutsideGit;
+        runtime.store.upsert_project(&project).unwrap();
+        runtime.projects.insert(project.root_key(), project.clone());
+        let state = Arc::new(Mutex::new(runtime));
+        let response = handle_request(
+            ClientRequest::StartCodexSession {
+                project_id: Some(project.id),
+                project_name: project.name.clone(),
+                project_root: root.to_string_lossy().into_owned(),
+                prompt: "ask".into(),
+                mode: CodexLaunchMode::Exec,
+                execution_profile: AgentExecutionProfile {
+                    model: Some("model-a".into()),
+                    approval: AgentApprovalPreset::Ask,
+                    ..Default::default()
+                },
+            },
+            state.clone(),
+        );
+        let ServerResponse::AgentStarted(run) = response else {
+            panic!("start failed: {response:?}");
+        };
+        let id = run.id;
+        wait_for_session(&state, |s| s.pending_permissions.len() == 1);
+        assert!(handle_remote_app_server_event(
+            &state,
+            id,
+            Uuid::new_v4(),
+            codex_app_server::Event::Failed("late old failure".into())
+        ));
+        assert_eq!(state.lock().unwrap().pending_permissions.len(), 1);
+        assert!(state.lock().unwrap().app_server_turns.contains_key(&id));
+        let first = *state
+            .lock()
+            .unwrap()
+            .pending_permissions
+            .keys()
+            .next()
+            .unwrap();
+        assert_eq!(
+            respond_permission_for_target(
+                state.clone(),
+                first,
+                codex_app_server::PermissionDecision::ApproveOnce
+            ),
+            ServerResponse::Accepted
+        );
+        // Mac/UI reconnect must see a response in flight, not an already-resolved request.
+        let ServerResponse::AgentRejoined { permissions, .. } = handle_request(
+            ClientRequest::RejoinAgent {
+                agent_id: id,
+                after_sequence: 0,
+            },
+            state.clone(),
+        ) else {
+            panic!("rejoin failed");
+        };
+        assert!(
+            permissions
+                .iter()
+                .any(|p| p.id == first && p.response_pending)
+        );
+        assert_eq!(
+            state.lock().unwrap().agents[&id].run.state,
+            AgentState::AwaitingApproval
+        );
+        // Replaying a response while confirmation is pending cannot write it twice.
+        assert_eq!(
+            respond_permission_for_target(
+                state.clone(),
+                first,
+                codex_app_server::PermissionDecision::ApproveOnce
+            ),
+            ServerResponse::Accepted
+        );
+        wait_for_session(&state, |s| {
+            !s.pending_permissions.contains_key(&first) && s.pending_permissions.len() == 1
+        });
+        let second = *state
+            .lock()
+            .unwrap()
+            .pending_permissions
+            .keys()
+            .next()
+            .unwrap();
+        assert_ne!(first, second);
+        assert_eq!(
+            respond_permission_for_target(
+                state.clone(),
+                second,
+                codex_app_server::PermissionDecision::ApproveForSession
+            ),
+            ServerResponse::Accepted
+        );
+        wait_for_session(&state, |s| s.agents[&id].run.state == AgentState::Completed);
+        assert!(state.lock().unwrap().children.contains_key(&id));
+        assert_eq!(
+            state.lock().unwrap().agents[&id].run.state,
+            AgentState::Completed
+        );
+        for (prompt, approval, model) in [
+            ("automatic", AgentApprovalPreset::ApproveForMe, "model-b"),
+            ("stop", AgentApprovalPreset::Ask, "model-b"),
+            ("cancel", AgentApprovalPreset::FullAccess, "model-a"),
+        ] {
+            assert_eq!(
+                handle_request(
+                    ClientRequest::PromptAgent {
+                        agent_id: id,
+                        prompt: prompt.into(),
+                        execution_profile: AgentExecutionProfile {
+                            model: Some(model.into()),
+                            approval,
+                            ..Default::default()
+                        }
+                    },
+                    state.clone()
+                ),
+                ServerResponse::Accepted
+            );
+            if prompt == "stop" || prompt == "cancel" {
+                wait_for_session(&state, |s| s.pending_permissions.len() == 1);
+                if prompt == "stop" {
+                    assert_eq!(stop_agent(state.clone(), id), ServerResponse::Accepted);
+                } else {
+                    let request = *state
+                        .lock()
+                        .unwrap()
+                        .pending_permissions
+                        .keys()
+                        .next()
+                        .unwrap();
+                    assert_eq!(
+                        respond_permission_for_target(
+                            state.clone(),
+                            request,
+                            codex_app_server::PermissionDecision::Deny
+                        ),
+                        ServerResponse::Accepted
+                    );
+                }
+            }
+            wait_for_session(&state, |s| !s.children.contains_key(&id));
+            let guard = state.lock().unwrap();
+            assert!(guard.pending_permissions.is_empty());
+            assert!(
+                !guard
+                    .attention
+                    .iter()
+                    .any(|a| a.kind == AttentionKind::ApprovalRequired)
+            );
+            assert_eq!(
+                guard.agents[&id].run.native_session_id.as_deref(),
+                Some("fixture-thread")
+            );
+            assert_eq!(
+                guard.agents[&id].run.execution_profile.model.as_deref(),
+                Some(model)
+            );
+            assert_eq!(
+                guard.agents[&id].run.state,
+                if prompt == "automatic" {
+                    AgentState::Completed
+                } else {
+                    AgentState::Interrupted
+                }
+            );
+        }
+        let requests: Vec<Value> = fs::read_to_string(root.join("requests.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|s| serde_json::from_str(s).unwrap())
+            .collect();
+        for (index, (policy, model, sandbox)) in [
+            ("on-request", "model-a", "workspaceWrite"),
+            ("never", "model-b", "workspaceWrite"),
+            ("on-request", "model-b", "workspaceWrite"),
+            ("never", "model-a", "dangerFullAccess"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(requests[index * 2]["params"]["approvalPolicy"], policy);
+            assert_eq!(requests[index * 2 + 1]["params"]["approvalPolicy"], policy);
+            assert_eq!(requests[index * 2 + 1]["params"]["model"], model);
+            assert_eq!(
+                requests[index * 2 + 1]["params"]["sandboxPolicy"]["type"],
+                sandbox
+            );
+        }
+    }
+}
