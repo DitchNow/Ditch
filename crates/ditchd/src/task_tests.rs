@@ -27,6 +27,64 @@ mod task_tests {
             operation,
         }
     }
+    #[test]
+    fn backlog_admission_and_board_membership_do_not_launch_work() {
+        let (state, project) = fixture();
+        let task = changed(handle_task_request(state.clone(), req(&project, TaskOperation::CreateBacklog { draft: draft("New scope") })));
+        assert_eq!(task.column(), TaskColumn::Backlog);
+        let remote = Project::new_remote(ProjectId::new(), "Child", "/work", Uuid::new_v4(), "child");
+        {
+            let mut s = state.lock().unwrap();
+            s.store.upsert_project(&remote).unwrap();
+            s.projects.insert(remote.root_key(), remote.clone());
+        }
+        let members = req(&project, TaskOperation::BoardProjects { members: Some(vec![remote.id,remote.id]) });
+        assert_eq!(handle_task_request(state.clone(), members), ServerResponse::TaskResponse(TaskResponse::BoardProjects(vec![remote.id])));
+        assert_eq!(handle_task_request(state.clone(), req(&project, TaskOperation::BoardProjects { members: None })), ServerResponse::TaskResponse(TaskResponse::BoardProjects(vec![remote.id])));
+        let remote_task = changed(handle_task_request(state.clone(), req(&remote, TaskOperation::CreateBacklog { draft: draft("SSH scope") })));
+        assert!(remote_task.remote_pending);
+        let remote_task = changed(handle_task_request(state.clone(), req(&remote, TaskOperation::Move { task_id: remote_task.id, expected_revision: remote_task.revision, column: TaskColumn::Todo, before_id: None })));
+        assert_eq!(remote_task.column(), TaskColumn::Todo);
+        let mut snapshot = state.lock().unwrap().snapshot();
+        snapshot.tasks.clear();
+        reconcile_remote_snapshot(&state, "child", std::slice::from_ref(&remote), Uuid::new_v4(), snapshot, 0);
+        let s = state.lock().unwrap();
+        assert!(s.tasks.contains_key(&remote_task.id));
+        assert!(s.agents.is_empty());
+    }
+    #[test]
+    fn ssh_board_materialization_preserves_approved_scope_and_revision() {
+        let (state, project) = fixture();
+        let mut task = Task::new(project.id, draft("Approved scope"), 1024).unwrap();
+        task.remote_pending = true;
+        task.coordinator_group = Some(Uuid::new_v4());
+        task.revision = 7;
+        let request = req(&project, TaskOperation::CreateIdentified {
+            task_id: task.id, coordinator_group: task.coordinator_group, continue_agent_id: None,
+            draft: draft("Approved scope"), board_task: Some(Box::new(task.clone())),
+        });
+        let remote = changed(handle_task_request(state.clone(), request.clone()));
+        task.remote_pending = false;
+        assert_eq!(task, remote);
+        assert_eq!(changed(handle_task_request(state.clone(), request)), task);
+        assert!(state.lock().unwrap().agents.is_empty());
+    }
+    #[test]
+    fn community_ssh_board_materialization_does_not_require_coordinator_ownership() {
+        let (state, project) = fixture();
+        let mut task = Task::new(project.id, draft("Manual scope"), 1024).unwrap();
+        task.remote_pending = true;
+        task.revision = 4;
+        let request = req(&project, TaskOperation::CreateIdentified {
+            task_id: task.id, coordinator_group: None, continue_agent_id: None,
+            draft: draft("Manual scope"), board_task: Some(Box::new(task.clone())),
+        });
+        let remote = changed(handle_task_request(state.clone(), request));
+        task.remote_pending = false;
+        assert_eq!(remote, task);
+        assert!(remote.coordinator_group.is_none());
+        assert!(state.lock().unwrap().agents.is_empty());
+    }
     fn changed(response: ServerResponse) -> Task {
         match response {
             ServerResponse::TaskResponse(TaskResponse::Changed(t)) => t,
@@ -212,35 +270,43 @@ mod task_tests {
         assert!(!state.lock().unwrap().tasks.contains_key(&draft.id));
     }
     #[test]
-    fn same_and_nested_workspaces_conflict_but_separate_projects_can_run() {
+    fn manual_agents_are_independent_and_coordinator_projects_are_serialized() {
         let (state, project) = fixture();
         let profile = AgentExecutionProfile::default();
-        let first = WriterGuard::acquire(&state, AgentId::new(), &project, &profile).unwrap();
+        let group = Some(Uuid::new_v4());
+        let first = WriterGuard::acquire_for_group(&state, AgentId::new(), &project, &profile, group).unwrap();
+        let manual = WriterGuard::acquire(&state, AgentId::new(), &project, &profile).unwrap();
+        let full = AgentExecutionProfile { approval: AgentApprovalPreset::FullAccess, ..profile.clone() };
+        let second_manual = WriterGuard::acquire(&state, AgentId::new(), &project, &full).unwrap();
         let mut alias = project.clone();
         alias.id = ProjectId::new();
-        assert!(WriterGuard::acquire(&state, AgentId::new(), &alias, &profile).is_err());
-        fs::create_dir_all(project.root.join("nested")).unwrap();
-        alias.root = project.root.join("nested");
-        assert!(WriterGuard::acquire(&state, AgentId::new(), &alias, &profile).is_err());
-        alias.root = project.root.with_file_name("other");
-        fs::create_dir_all(&alias.root).unwrap();
-        let second = WriterGuard::acquire(&state, AgentId::new(), &alias, &profile).unwrap();
-        let full = AgentExecutionProfile {
-            approval: AgentApprovalPreset::FullAccess,
-            ..profile.clone()
-        };
-        assert!(WriterGuard::acquire(&state, AgentId::new(), &alias, &full).is_err());
-        drop(first);
-        drop(second);
-        let exclusive = WriterGuard::acquire(&state, AgentId::new(), &alias, &full).unwrap();
-        assert!(WriterGuard::acquire(&state, AgentId::new(), &project, &profile).is_err());
-        drop(exclusive);
+        assert!(WriterGuard::acquire_for_group(&state, AgentId::new(), &alias, &profile, group).is_err());
         let symlink = project.root.with_file_name("alias");
         std::os::unix::fs::symlink(&project.root, &symlink).unwrap();
         alias.root = symlink;
-        let first = WriterGuard::acquire(&state, AgentId::new(), &project, &profile).unwrap();
-        assert!(WriterGuard::acquire(&state, AgentId::new(), &alias, &profile).is_err());
-        drop(first);
+        assert!(WriterGuard::acquire_for_group(&state, AgentId::new(), &alias, &profile, group).is_err());
+        alias.root = project.root.join("nested");
+        fs::create_dir_all(&alias.root).unwrap();
+        let separate = WriterGuard::acquire_for_group(&state, AgentId::new(), &alias, &full, group).unwrap();
+        drop((first, manual, second_manual, separate));
+        assert!(state.lock().unwrap().writer_leases.is_empty());
+    }
+
+    #[test]
+    fn remote_and_full_access_reservations_are_scoped_to_coordinator_projects() {
+        let (state, local) = fixture();
+        let host = Uuid::new_v4();
+        let group = Some(Uuid::new_v4());
+        let remote = Project::new_remote(ProjectId::new(), "Remote", "/srv/one", host, "host");
+        let other = Project::new_remote(ProjectId::new(), "Other", "/srv/two", host, "host");
+        let profile = AgentExecutionProfile { approval: AgentApprovalPreset::FullAccess, ..Default::default() };
+        let one = WriterGuard::acquire_for_group(&state, AgentId::new(), &remote, &profile, group).unwrap();
+        assert!(WriterGuard::acquire_for_group(&state, AgentId::new(), &remote, &profile, group).is_err());
+        let two = WriterGuard::acquire_for_group(&state, AgentId::new(), &other, &profile, group).unwrap();
+        let three = WriterGuard::acquire_for_group(&state, AgentId::new(), &local, &profile, group).unwrap();
+        let manual = WriterGuard::acquire(&state, AgentId::new(), &remote, &profile).unwrap();
+        drop((one, two, three, manual));
+        assert!(state.lock().unwrap().writer_leases.is_empty());
     }
     #[test]
     fn reorder_persists_and_events_match_snapshot() {
@@ -399,11 +465,11 @@ mod task_tests {
         assert_eq!(task.condition, TaskCondition::Blocked);
     }
     #[test]
-    fn restart_keeps_a_surviving_process_group_exclusive_until_it_exits() {
+    fn restart_keeps_a_coordinator_project_reserved_until_process_exit() {
         let (state, project) = fixture();
         let id = AgentId::new();
-        let writer =
-            WriterGuard::acquire(&state, id, &project, &AgentExecutionProfile::default()).unwrap();
+        let group = Some(Uuid::new_v4());
+        let writer = WriterGuard::acquire_for_group(&state, id, &project, &AgentExecutionProfile::default(), group).unwrap();
         let mut child = Command::new("sleep")
             .arg("60")
             .process_group(0)
@@ -414,11 +480,8 @@ mod task_tests {
         let paths = state.lock().unwrap().paths.clone();
         drop(state);
         let restored = Arc::new(Mutex::new(RuntimeState::new(paths, false).unwrap()));
-        let result = WriterGuard::acquire(
-            &restored,
-            AgentId::new(),
-            &project,
-            &AgentExecutionProfile::default(),
+        let result = WriterGuard::acquire_for_group(
+            &restored, AgentId::new(), &project, &AgentExecutionProfile::default(), group,
         );
         let blocked = result.is_err();
         drop(result);
@@ -443,8 +506,9 @@ mod task_tests {
         );
     }
     #[test]
-    fn concurrent_claims_have_exactly_one_workspace_owner() {
+    fn concurrent_claims_have_exactly_one_coordinator_project_owner() {
         let (state, project) = fixture();
+        let group = Some(Uuid::new_v4());
         let barrier = Arc::new(std::sync::Barrier::new(17));
         let (tx, rx) = mpsc::channel();
         let mut workers = Vec::new();
@@ -454,11 +518,8 @@ mod task_tests {
             let barrier = Arc::clone(&barrier);
             let tx = tx.clone();
             workers.push(thread::spawn(move || {
-                let writer = WriterGuard::acquire(
-                    &state,
-                    AgentId::new(),
-                    &project,
-                    &AgentExecutionProfile::default(),
+                let writer = WriterGuard::acquire_for_group(
+                    &state, AgentId::new(), &project, &AgentExecutionProfile::default(), group,
                 );
                 tx.send(writer.is_ok()).unwrap();
                 barrier.wait();

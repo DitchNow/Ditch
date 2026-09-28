@@ -7,6 +7,7 @@ pub fn initial_task_revision() -> u64 {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum TaskColumn {
+    Backlog,
     Todo,
     InProgress,
     InReview,
@@ -45,6 +46,8 @@ pub enum TaskActor {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum TaskAction {
+    Prioritize,
+    ReturnToBacklog,
     Start,
     Submit { summary: String },
     RequestChanges { feedback: String },
@@ -95,6 +98,7 @@ pub struct TaskRequest {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum TaskOperation {
+    BoardProjects { members: Option<Vec<ProjectId>> },
     ConfigureAcceptance {
         task_id: TaskId,
         expected_revision: u64,
@@ -125,8 +129,15 @@ pub enum TaskOperation {
     Get {
         task_id: TaskId,
     },
+    CreateBacklog { draft: TaskDraft },
     CreateIdentified {
+        #[serde(default)]
+        board_task: Option<Box<Task>>,
         task_id: TaskId,
+        #[serde(default)]
+        coordinator_group: Option<Uuid>,
+        #[serde(default)]
+        continue_agent_id: Option<AgentId>,
         draft: TaskDraft,
     },
     Create {
@@ -166,6 +177,7 @@ pub enum TaskOperation {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum TaskResponse {
+    BoardProjects(Vec<ProjectId>),
     Diff { text: String },
     TestPresets(std::collections::BTreeMap<String, CommandCheck>),
     Tasks(Vec<Task>),
@@ -234,6 +246,10 @@ impl Task {
         draft.validate()?;
         let now = Utc::now();
         Ok(Self {
+            remote_pending: false,
+            github_source: None,
+            coordinator_group: None,
+            continue_agent_id: None,
             acceptance: TaskAcceptance::default(),
             skills: draft.skills.clone(),
             id: TaskId::new(),
@@ -262,6 +278,7 @@ impl Task {
     /// Preserve existing serialized state names; map legacy execution states explicitly.
     pub fn column(&self) -> TaskColumn {
         match self.state {
+            TaskState::Backlog => TaskColumn::Backlog,
             TaskState::Draft | TaskState::Ready | TaskState::Cancelled => TaskColumn::Todo,
             TaskState::Running | TaskState::Blocked | TaskState::Rejected => TaskColumn::InProgress,
             TaskState::InReview => TaskColumn::InReview,
@@ -322,6 +339,14 @@ impl Task {
         let user = actor == TaskActor::User;
         let active = !self.archived && self.condition != TaskCondition::Cancelled;
         let name = match action {
+            TaskAction::Prioritize if user && active && column == TaskColumn::Backlog => {
+                next.state = TaskState::Ready;
+                "prioritize"
+            }
+            TaskAction::ReturnToBacklog if user && active && column == TaskColumn::Todo => {
+                next.state = TaskState::Backlog;
+                "return_to_backlog"
+            }
             TaskAction::Start
                 if active && matches!(column, TaskColumn::Todo | TaskColumn::InProgress) =>
             {
@@ -413,16 +438,18 @@ impl Task {
 /// the execution host, never by treating an SSH path as a local path.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct WorkspaceLease {
+    #[serde(default)]
+    pub coordinator_group: Option<Uuid>,
     pub target: String,
     pub root: PathBuf,
     pub unconfined: bool,
 }
 impl WorkspaceLease {
     pub fn conflicts(&self, other: &Self) -> bool {
-        self.unconfined
-            || other.unconfined
-            || (self.target == other.target
-                && (self.root.starts_with(&other.root) || other.root.starts_with(&self.root)))
+        self.coordinator_group.is_some()
+            && self.coordinator_group == other.coordinator_group
+            && self.target == other.target
+            && self.root == other.root
     }
 }
 
@@ -585,8 +612,9 @@ mod tests {
         );
     }
     #[test]
-    fn leases_conflict_on_ancestors_and_unconfined_access_not_string_prefixes() {
+    fn leases_only_conflict_for_the_same_coordinator_project() {
         let local = WorkspaceLease {
+            coordinator_group: Some(Uuid::new_v4()),
             target: "host-a".into(),
             root: "/work/a".into(),
             unconfined: false,
@@ -594,14 +622,20 @@ mod tests {
         let mut other = local.clone();
         assert!(local.conflicts(&other));
         other.root = "/work/a/nested".into();
-        assert!(local.conflicts(&other));
-        assert!(other.conflicts(&local));
+        assert!(!local.conflicts(&other));
+        assert!(!other.conflicts(&local));
         other.root = "/work/another".into();
         assert!(!local.conflicts(&other));
         other.root = local.root.clone();
         other.target = "host-b".into();
         assert!(!local.conflicts(&other));
         other.unconfined = true;
+        assert!(!local.conflicts(&other));
+        other.target = local.target.clone();
         assert!(local.conflicts(&other));
+        other.coordinator_group = None;
+        assert!(!local.conflicts(&other));
+        other.coordinator_group = Some(Uuid::new_v4());
+        assert!(!local.conflicts(&other));
     }
 }

@@ -5,6 +5,7 @@ pub(super) fn recovery_agent(runtime: &mut RuntimeState) -> AgentId {
     runtime.projects.insert(project.root_key(), project.clone());
     let now = Utc::now();
     let run = AgentRun {
+        coordinator_group: None,
         id: AgentId::new(),
         provider: AgentProvider::Codex,
         state: AgentState::Working,

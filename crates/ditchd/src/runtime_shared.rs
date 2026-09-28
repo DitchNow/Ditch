@@ -300,6 +300,7 @@ struct SetupTerminalRecord {
     exited: Arc<AtomicBool>,
 }
 
+#[derive(Clone)]
 struct AgentRecord {
     run: AgentRun,
     project_root: PathBuf,
@@ -443,6 +444,8 @@ impl RuntimeState {
             "tasks_v1".to_owned(),
             "acceptance_v1".to_owned(),
             "identified_tasks_v1".to_owned(),
+            "board_workflow_v1".to_owned(),
+            "coordinator_concurrency_v1".to_owned(),
             "bounded_context_v1".to_owned(),
             "persistent_sessions_v1".to_owned(),
             "app_server_sessions_v2".to_owned(),
@@ -1016,7 +1019,7 @@ fn reconcile_remote_snapshot_locked(
 
     if *state.remote_task_generation.get(alias).unwrap_or(&0) == task_generation {
         let remote_ids:HashSet<_>=snapshot.tasks.iter().map(|t|t.id).collect();
-        state.tasks.retain(|id,t|!project_ids.contains(&t.project_id) || remote_ids.contains(id));
+        state.tasks.retain(|id,t|t.remote_pending || !project_ids.contains(&t.project_id) || remote_ids.contains(id));
         for task in snapshot.tasks.into_iter().filter(|t|project_ids.contains(&t.project_id)) { state.update_remote_task(task); }
     }
     let uncertain:Vec<_>=state.remote_write_uncertain.iter().filter_map(|(id,host)|(host == alias).then_some(*id)).collect();
@@ -1188,6 +1191,12 @@ fn handle_client(mut stream: UnixStream, state: Arc<Mutex<RuntimeState>>) -> io:
 
     let request_id = request.id;
     let request = request.body;
+    if matches!(request, ClientRequest::GitHub(_)) && !github::native_peer(&stream) {
+        let response = Envelope::new(protocol_error("client_not_authorized", "GitHub integration requires the Ditch native client"));
+        serde_json::to_writer(&mut stream, &response)?;
+        stream.write_all(b"\n")?;
+        return Ok(());
+    }
     if let Err(message)=edition::authorize_client(&stream,&request,&state) {
         let response=Envelope::new(protocol_error("client_not_authorized",message));
         stream.write_all(serde_json::to_string(&response).map_err(io::Error::other)?.as_bytes())?;
@@ -1840,6 +1849,7 @@ fn handle_request(request: ClientRequest, state: Arc<Mutex<RuntimeState>>) -> Se
         }
         ClientRequest::SkillRequest(request) => handle_skill_request(state,request),
         ClientRequest::TaskRequest(request) => handle_task_request(state,request),
+        ClientRequest::GitHub(request) => github::handle(state, request),
         ClientRequest::DeleteProject { project_id } => delete_project_for_target(state, project_id),
         ClientRequest::StartCodexSession {
             project_id,
@@ -3704,6 +3714,7 @@ fn start_codex_session_linked(
 
     let now = Utc::now();
     let mut run = AgentRun {
+        coordinator_group: None,
         id: binding.map(|b|b.1).unwrap_or_default(),
         provider: AgentProvider::Codex,
         state: AgentState::Starting,
@@ -3728,6 +3739,7 @@ fn start_codex_session_linked(
         resume_block_reason: None,
     };
 
+    run.coordinator_group = state.lock().unwrap().agent_coordinator_group(run.id);
     let writer = match WriterGuard::acquire(&state,run.id,&project,&execution_profile) { Ok(w) => w, Err(e) => return protocol_error("workspace_busy",e) };
     if let Err(error) = verify_project_git_policy(&project) {
         return error;
@@ -3893,13 +3905,15 @@ fn persist_launch_failure(
         return protocol_error("agent_store_failed", store_error.to_string());
     }
     state.projects.insert(project.root_key(), project.clone());
+    let mut messages = state.agents.get(&run.id).map(|r| r.messages.clone()).unwrap_or_default();
+    messages.extend([user_message.clone(), system_message.clone()]);
     state.agents.insert(
         run.id,
         AgentRecord {
             run: run.clone(),
             project_root: project.root.clone(),
             allow_non_git,
-            messages: vec![user_message.clone(), system_message.clone()],
+            messages,
             terminal_failure: Some(error.clone()),
         },
     );
@@ -3981,6 +3995,7 @@ fn resume_codex_session(
 
     let now = Utc::now();
     let mut run = AgentRun {
+        coordinator_group: None,
         id: AgentId::new(),
         provider: AgentProvider::Codex,
         state: AgentState::Starting,
@@ -4026,6 +4041,7 @@ fn resume_codex_session(
             "No working Codex CLI installation was found. Choose an existing installation in Ditch settings.".to_owned(),
         );
     };
+    run.coordinator_group = state.lock().unwrap().agent_coordinator_group(run.id);
     let writer = match WriterGuard::acquire(&state,run.id,&project,&execution_profile) { Ok(w) => w, Err(e) => return protocol_error("workspace_busy",e) };
     let child = match spawn_codex_child(
         &binary,
@@ -6879,6 +6895,7 @@ esac
             agent_id,
             AgentRecord {
                 run: AgentRun {
+                    coordinator_group: None,
                     id: agent_id,
                     provider: AgentProvider::Codex,
                     state: AgentState::Stopping,
@@ -6961,6 +6978,7 @@ esac
             agent_id,
             AgentRecord {
                 run: AgentRun {
+                    coordinator_group: None,
                     id: agent_id,
                     provider: AgentProvider::Codex,
                     state: AgentState::Working,
@@ -7065,6 +7083,7 @@ esac
             agent_id,
             AgentRecord {
                 run: AgentRun {
+                    coordinator_group: None,
                     id: agent_id,
                     provider: AgentProvider::Codex,
                     state: AgentState::Working,
@@ -7147,6 +7166,7 @@ esac
             agent_id,
             AgentRecord {
                 run: AgentRun {
+                    coordinator_group: None,
                     id: agent_id,
                     provider: AgentProvider::Codex,
                     state: AgentState::Working,
@@ -7208,6 +7228,7 @@ esac
             agent_id,
             AgentRecord {
                 run: AgentRun {
+                    coordinator_group: None,
                     id: agent_id,
                     provider: AgentProvider::Codex,
                     state: AgentState::Working,
@@ -7284,6 +7305,7 @@ esac
             agent_id,
             AgentRecord {
                 run: AgentRun {
+                    coordinator_group: None,
                     id: agent_id,
                     provider: AgentProvider::Codex,
                     state: AgentState::Working,
@@ -7347,6 +7369,7 @@ esac
             agent_id,
             AgentRecord {
                 run: AgentRun {
+                    coordinator_group: None,
                     id: agent_id,
                     provider: AgentProvider::Codex,
                     state: AgentState::Failed,

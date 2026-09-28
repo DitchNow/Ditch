@@ -1,3 +1,4 @@
+import 'github_inbox.dart';
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
@@ -227,6 +228,16 @@ abstract interface class EditionWorkspaceProvider {
   List<EditionWorkspace> workspaces();
 }
 
+abstract interface class EditionBoardProvider {
+  Future<void> runBoardTasks(DitchRuntimeClient client, String requestId, List<Map<String, dynamic>> tasks);
+  Future<void> pauseBoardWork(DitchRuntimeClient client);
+}
+
+EditionSettingsSection githubIntegrationSettingsSection() => EditionSettingsSection(
+  id: 'github', icon: Icons.code, title: 'GitHub', subtitle: 'Repository issues and task imports',
+  dialogBuilder: (client) => GitHubSettingsDialog(request: client.request),
+);
+
 abstract interface class EditionSurface {
   const EditionSurface();
 
@@ -238,6 +249,7 @@ class CommunityEditionSurface implements EditionSurface {
 
   @override
   List<EditionSettingsSection> settingsSections(DitchRuntimeClient client) => [
+    githubIntegrationSettingsSection(),
     EditionSettingsSection(
       id: 'remote-mobile',
       icon: Icons.phone_iphone,
@@ -710,6 +722,7 @@ class AgentSession {
     required this.status,
     required this.messages,
     this.projectId,
+    this.coordinatorGroup,
     AgentExecutionSettings? executionSettings,
     this.codexThreadId,
     this.codexTitle,
@@ -736,6 +749,7 @@ class AgentSession {
   final String localId;
   AgentExecutionSettings executionSettings;
   final String? projectId;
+  String? coordinatorGroup;
   final AgentProvider provider;
   final DateTime createdAt;
   AgentStatus status;
@@ -796,6 +810,7 @@ void reconcileAgentSession(List<AgentSession> sessions, AgentSession incoming) {
   existing.executionSettings.syncProfile(
     incoming.executionSettings.protocolValue,
   );
+  existing.coordinatorGroup = incoming.coordinatorGroup;
   existing.status = incoming.status;
   existing.attachedSkills = incoming.attachedSkills;
   existing.codexThreadId = incoming.codexThreadId;
@@ -4521,6 +4536,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
               .toList(),
       localId: agentId,
       projectId: agentJson['project_id']?.toString(),
+      coordinatorGroup: agentJson['coordinator_group']?.toString(),
       executionSettings: AgentExecutionSettings(
         profile: agentJson['execution_profile'] as Map?,
       ),
@@ -5550,6 +5566,13 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
                                   presentation.connection ==
                                   RuntimeConnectionPhase.connected,
                               initialProjectId: _boardProjectId,
+                              onRunSelected: widget.editionSurface is EditionBoardProvider
+                                  ? (requestId, tasks) => (widget.editionSurface as EditionBoardProvider).runBoardTasks(
+                                      _runtimeClient, requestId, [for (final t in tasks) {'task_id': t.id, 'revision': t.revision}])
+                                  : null,
+                              onPause: widget.editionSurface is EditionBoardProvider
+                                  ? () => (widget.editionSurface as EditionBoardProvider).pauseBoardWork(_runtimeClient)
+                                  : null,
                               executionProfile: () => _settingsForProject(
                                 _selectedProject.id,
                               ).protocolValue,
@@ -8654,7 +8677,19 @@ class ExpandableAgentPanel extends StatelessWidget {
                     ],
                   ),
                   const SizedBox(height: 2),
-                  AgentStatusChip(status: session.status),
+                  Wrap(
+                    spacing: 8,
+                    crossAxisAlignment: WrapCrossAlignment.center,
+                    children: [
+                      AgentStatusChip(status: session.status),
+                      Text(
+                        session.coordinatorGroup == null
+                            ? 'User agent'
+                            : 'Ditchmaster agent',
+                        style: Theme.of(context).textTheme.bodySmall,
+                      ),
+                    ],
+                  ),
                   if (session.lastVisibleAction != null) ...[
                     const SizedBox(height: 2),
                     Text(

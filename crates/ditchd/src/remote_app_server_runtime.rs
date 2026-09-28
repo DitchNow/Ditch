@@ -85,11 +85,13 @@ fn start_remote_app_server_session_linked(
         guard.projects.insert(project.root_key(), project.clone());
         guard.broadcast(ServerEvent::ProjectChanged(project.clone()));
     }
+    let previous = binding.and_then(|(_, id)| state.lock().unwrap().agents.get(&id).cloned());
     let remote = state.lock().unwrap().remote_runtime;
     let mut execution_profile = execution_profile;
     execution_profile.transport = ditch_core::AgentTransport::AppServer;
     let now = Utc::now();
     let mut run = AgentRun {
+        coordinator_group: None,
         id: binding.map(|b| b.1).unwrap_or_default(),
         provider: AgentProvider::Codex,
         state: AgentState::Starting,
@@ -122,6 +124,12 @@ fn start_remote_app_server_session_linked(
         exit_code: None,
         resume_block_reason: None,
     };
+    if let Some(previous) = &previous {
+        run.started_at = previous.run.started_at;
+        run.codex_title = previous.run.codex_title.clone();
+        run.user_title = previous.run.user_title.clone();
+    }
+    run.coordinator_group = state.lock().unwrap().agent_coordinator_group(run.id);
     let writer = match WriterGuard::acquire(&state, run.id, &project, &execution_profile) {
         Ok(w) => w,
         Err(e) => return protocol_error("workspace_busy", e),
@@ -222,7 +230,11 @@ fn start_remote_app_server_session_linked(
                 run: run.clone(),
                 project_root: project.root.clone(),
                 allow_non_git,
-                messages: vec![user_message.clone()],
+                messages: {
+                    let mut messages = previous.as_ref().map(|p| p.messages.clone()).unwrap_or_default();
+                    messages.push(user_message.clone());
+                    messages
+                },
                 terminal_failure: None,
             },
         );
@@ -847,20 +859,9 @@ fn respond_permission_for_target(
         let Some(mut lease) = locked.writer_leases.get(&agent_id).cloned() else {
             return protocol_error("workspace_busy", "Writer reservation is missing");
         };
-        // An explicit approval may grant filesystem/network permissions beyond
-        // the base sandbox. Reserve exclusive ownership before delivering it.
+        // Record the expanded scope without excluding independent agents.
         if !lease.unconfined {
             lease.unconfined = true;
-            if locked
-                .writer_leases
-                .iter()
-                .any(|(id, other)| *id != agent_id && lease.conflicts(other))
-            {
-                return protocol_error(
-                    "workspace_busy",
-                    "This approval may expand access. Stop other writers before approving, or deny this request.",
-                );
-            }
             if let Err(error) = locked.store.update_writer_lease(agent_id, &lease) {
                 return protocol_error("writer_store_failed", error.to_string());
             }

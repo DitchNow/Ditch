@@ -3132,6 +3132,65 @@ void main() {
     );
   });
 
+  testWidgets(
+    'New Agent remains available beside active user and Ditchmaster agents',
+    (tester) async {
+      final viewport = ConversationViewportController();
+      final listController = ScrollController();
+      addTearDown(viewport.dispose);
+      addTearDown(listController.dispose);
+      final sessions = [
+        AgentSession(
+          localId: 'manual-concurrent',
+          projectId: 'one',
+          provider: AgentProvider.codex,
+          status: AgentStatus.working,
+          canStop: true,
+          messages: [],
+        ),
+        AgentSession(
+          localId: 'managed-concurrent',
+          projectId: 'one',
+          coordinatorGroup: 'master-group',
+          provider: AgentProvider.codex,
+          status: AgentStatus.working,
+          canStop: true,
+          messages: [],
+        ),
+      ];
+      var starts = 0;
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: AgentsSurface(
+              sessions: sessions,
+              expandedAgentLocalId: null,
+              focusedAgentLocalId: null,
+              chatViewport: viewport,
+              agentListController: listController,
+              composerKey: GlobalKey<AgentComposerState>(),
+              headerKeyForAgent: _testAgentHeaderKey,
+              initialPrompt: '',
+              onStartCodex: () => starts++,
+              onSubmitPrompt: (_, _) {},
+              onStopCodex: (_) {},
+              onDeleteAgent: (_) {},
+              onRenameAgent: (_, _) {},
+              onFocusAgent: (_) {},
+              onToggleExpanded: (_) {},
+            ),
+          ),
+        ),
+      );
+      await tester.tap(find.byKey(const Key('agents-new-agent-button')));
+      await tester.tap(find.byKey(const Key('agents-new-agent-button')));
+      expect(starts, 2);
+      expect(find.text('User agent'), findsOneWidget);
+      expect(find.text('Ditchmaster agent'), findsOneWidget);
+      await tester.pumpWidget(const SizedBox());
+    },
+  );
+
   testWidgets('new agent action lives in the Agents header', (tester) async {
     await tester.pumpWidget(_testApp());
 

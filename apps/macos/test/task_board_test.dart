@@ -26,6 +26,69 @@ Map<String, dynamic> taskJson({
   'archived': false,
 };
 void main() {
+  test('backlog remains distinct from ready work', () {
+    expect(
+      TaskDto.fromJson(taskJson(state: 'Backlog')).column,
+      TaskColumn.backlog,
+    );
+    expect(TaskDto.fromJson(taskJson()).column, TaskColumn.todo);
+  });
+  testWidgets(
+    'Run requires selection and confirmation and retries the same authorization',
+    (tester) async {
+      await tester.binding.setSurfaceSize(const Size(1400, 900));
+      final c = TaskBoardController(
+        request: (_) async => {
+          'TaskResponse': {
+            'Tasks': [taskJson()],
+          },
+        },
+      );
+      c.replaceSnapshot({
+        'tasks': [taskJson()],
+        'agents': [],
+      });
+      final ids = <String>[];
+      await tester.pumpWidget(
+        MaterialApp(
+          theme: ThemeData(extensions: const [DitchTokens.light]),
+          home: Scaffold(
+            body: TaskBoard(
+              controller: c,
+              projects: const [TaskProjectOption('project', 'Project')],
+              connected: true,
+              executionProfile: () => {'approval': 'Ask'},
+              onOpenAgent: (_) {},
+              onPause: () async {},
+              onRunSelected: (id, tasks) async {
+                ids.add(id);
+                expect(tasks.single.id, 'one');
+                if (ids.length == 1) throw StateError('Connection interrupted');
+              },
+            ),
+          ),
+        ),
+      );
+      expect(ids, isEmpty);
+      await tester.tap(find.text('Select for Run'));
+      await tester.pump();
+      await tester.tap(find.text('Run selected (1)'));
+      await tester.pumpAndSettle();
+      expect(ids, isEmpty);
+      expect(find.textContaining('Project: Task one'), findsOneWidget);
+      await tester.tap(find.text('Run selected'));
+      await tester.pumpAndSettle();
+      expect(ids.length, 1);
+      await tester.tap(find.text('Retry Run request'));
+      await tester.pumpAndSettle();
+      expect(ids.length, 2);
+      expect(ids[0], ids[1]);
+      expect(tester.takeException(), isNull);
+      await tester.pumpWidget(const SizedBox());
+      c.dispose();
+      await tester.binding.setSurfaceSize(null);
+    },
+  );
   test('legacy states map without fabricating review evidence', () {
     for (final state in [
       'Draft',

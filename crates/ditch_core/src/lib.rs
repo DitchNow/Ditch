@@ -9,6 +9,7 @@ mod skills;
 pub use skills::*;
 mod tasks;
 pub use tasks::*;
+pub mod github;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 pub struct ProjectId(pub Uuid);
@@ -50,6 +51,7 @@ id_newtype!(RuntimePaneId);
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum TaskState {
     Draft,
+    Backlog,
     Ready,
     Running,
     Blocked,
@@ -219,6 +221,17 @@ impl Project {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Task {
+    /// Admitted on this Mac, not yet materialized on its SSH execution host.
+    #[serde(default)]
+    pub remote_pending: bool,
+    #[serde(default)]
+    pub github_source: Option<github::GitHubTaskSource>,
+    /// Runtime-assigned coordinator group. None denotes user-managed work.
+    #[serde(default)]
+    pub coordinator_group: Option<Uuid>,
+    /// Continue this conversation while retaining independent task evidence.
+    #[serde(default)]
+    pub continue_agent_id: Option<AgentId>,
     #[serde(default)]
     pub acceptance: TaskAcceptance,
     #[serde(default)]
@@ -262,6 +275,8 @@ pub struct Task {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AgentRun {
+    #[serde(default)]
+    pub coordinator_group: Option<Uuid>,
     pub id: AgentId,
     pub provider: AgentProvider,
     pub state: AgentState,

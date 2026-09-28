@@ -21,6 +21,16 @@ impl WriterGuard {
         project: &Project,
         profile: &AgentExecutionProfile,
     ) -> Result<Self, String> {
+        let group = state.lock().unwrap().agent_coordinator_group(agent_id);
+        Self::acquire_for_group(state, agent_id, project, profile, group)
+    }
+    fn acquire_for_group(
+        state: &Arc<Mutex<RuntimeState>>,
+        agent_id: AgentId,
+        project: &Project,
+        profile: &AgentExecutionProfile,
+        coordinator_group: Option<uuid::Uuid>,
+    ) -> Result<Self, String> {
         let root = if project.is_remote() {
             project.root.clone()
         } else {
@@ -53,29 +63,30 @@ impl WriterGuard {
             } => remote_machine_id.to_string(),
         };
         let lease = WorkspaceLease {
+            coordinator_group,
             target,
             root,
             unconfined: locked.remote_runtime
                 || project.is_remote()
                 || profile.approval == AgentApprovalPreset::FullAccess,
         };
-        let remote_live = locked.agents.values().any(|r| {
-            r.run.can_stop
-                && locked
-                    .projects
-                    .values()
-                    .any(|p| p.id == r.run.project_id && p.is_remote())
-        });
-        if remote_live
+        if locked.children.contains_key(&agent_id)
+            || locked.agents.get(&agent_id).is_some_and(|a| a.run.can_stop)
             || locked.writer_leases.contains_key(&agent_id)
             || locked
                 .writer_leases
                 .values()
                 .any(|other| lease.conflicts(other))
         {
-            return Err("Another agent owns a conflicting workspace. Stop it or wait for completion. Full Access and unconfined SSH work require exclusive access.".into());
+            return Err("This agent is still active, or Ditchmaster already has a worker in this project. Wait for it to finish or stop it.".into());
         }
-        if let Some(task_id) = locked.agents.get(&agent_id).and_then(|r| r.run.task_id) {
+        if let Some(task_id) = locked
+            .tasks
+            .values()
+            .find(|t| t.assigned_agent_id == Some(agent_id) && t.condition == TaskCondition::Queued)
+            .map(|t| t.id)
+            .or_else(|| locked.agents.get(&agent_id).and_then(|r| r.run.task_id))
+        {
             let task = locked
                 .tasks
                 .get(&task_id)
@@ -149,6 +160,84 @@ impl Drop for WriterGuard {
 }
 
 impl RuntimeState {
+    fn agent_coordinator_group(&self, id: AgentId) -> Option<uuid::Uuid> {
+        self.tasks
+            .values()
+            .find(|t| t.assigned_agent_id == Some(id) && t.coordinator_group.is_some())
+            .and_then(|t| t.coordinator_group)
+            .or_else(|| self.agents.get(&id).and_then(|a| a.run.coordinator_group))
+    }
+    fn continuation_thread(
+        &self,
+        task: &Task,
+        profile: &AgentExecutionProfile,
+    ) -> Result<Option<String>, String> {
+        let Some(id) = task.continue_agent_id else {
+            return Ok(None);
+        };
+        let record = self
+            .agents
+            .get(&id)
+            .ok_or("The selected conversation no longer exists; choose a new agent")?;
+        let run = &record.run;
+        if task.coordinator_group.is_none()
+            || run.coordinator_group != task.coordinator_group
+            || run.project_id != task.project_id
+        {
+            return Err(
+                "Continue requires a Ditchmaster agent from the same group and project".into(),
+            );
+        }
+        if run.can_stop
+            || self.children.contains_key(&id)
+            || self.writer_leases.contains_key(&id)
+            || self.tasks.values().any(|other| {
+                other.id != task.id
+                    && other.assigned_agent_id == Some(id)
+                    && matches!(
+                        other.condition,
+                        TaskCondition::Queued
+                            | TaskCondition::Running
+                            | TaskCondition::AwaitingApproval
+                    )
+            })
+        {
+            return Err("The selected conversation is still active".into());
+        }
+        let original = &run.execution_profile;
+        let same_skills = original.skills.len() == profile.skills.len()
+            && original.skills.iter().zip(&profile.skills).all(|(a, b)| {
+                a.identity == b.identity
+                    && a.path == b.path
+                    && a.content_hash == b.content_hash
+                    && a.revision == b.revision
+            });
+        if original.transport != profile.transport
+            || original.model != profile.model
+            || original.reasoning_effort != profile.reasoning_effort
+            || original.approval != profile.approval
+            || !same_skills
+            || run.resume_block_reason.is_some()
+        {
+            return Err("The selected conversation cannot resume with these execution settings; choose a new agent".into());
+        }
+        let home = self
+            .codex_home
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned());
+        // A desktop projection cannot compare its account path with an SSH host's.
+        // The authoritative host validates its own home immediately before launch.
+        let remote_project = self
+            .projects
+            .values()
+            .any(|p| p.id == task.project_id && p.is_remote());
+        if !remote_project && run.origin_codex_home != home {
+            return Err("The selected conversation belongs to a different Codex account; choose a new agent".into());
+        }
+        run.native_session_id.clone().map(Some).ok_or_else(|| {
+            "The selected conversation has no resumable thread; choose a new agent".into()
+        })
+    }
     fn release_writer(&mut self, id: AgentId) {
         if self.acceptance_owners.contains(&id)
             || self.tasks.values().any(|t| {
@@ -204,7 +293,8 @@ impl RuntimeState {
     fn task_live(&self, task: &Task) -> bool {
         self.acceptance_controls.contains_key(&task.id)
             || task.assigned_agent_id.is_some_and(|id| {
-                self.children.contains_key(&id) || self.writer_leases.contains_key(&id)
+                self.agents.get(&id).is_none_or(|a| a.run.task_id == Some(task.id))
+                    && (self.children.contains_key(&id) || self.writer_leases.contains_key(&id))
             })
             || matches!(
                 task.condition,
@@ -390,13 +480,103 @@ impl RuntimeState {
     }
 }
 
+fn prepare_remote_board_task(
+    state: &Arc<Mutex<RuntimeState>>, project: &Project, task_id: TaskId, expected_revision: u64,
+) -> Result<(), String> {
+    if !project.is_remote() {
+        return Ok(());
+    }
+    let task = state
+        .lock()
+        .unwrap()
+        .tasks
+        .get(&task_id)
+        .cloned()
+        .ok_or("Task disappeared")?;
+    if !task.remote_pending {
+        return Ok(());
+    }
+    if expected_revision != task.revision || task.column() != TaskColumn::Todo {
+        return Err("Task scope changed before SSH materialization; review and start again".into());
+    }
+    let response = handle_task_request(
+        state.clone(),
+        TaskRequest {
+            project_id: Some(project.id),
+            request_id: task_id.0,
+            operation: TaskOperation::CreateIdentified {
+                board_task: Some(Box::new(task.clone())),
+                task_id,
+                coordinator_group: task.coordinator_group,
+                continue_agent_id: task.continue_agent_id,
+                draft: ditch_core::TaskDraft {
+                    skills: task.skills.clone(),
+                    title: task.title.clone(),
+                    description: task.description.clone(),
+                    acceptance_criteria: task.acceptance_criteria.clone(),
+                    priority: task.priority,
+                },
+            },
+        },
+    );
+    let ServerResponse::TaskResponse(TaskResponse::Changed(remote)) = response else {
+        return Err(format!("Remote task materialization failed: {response:?}"));
+    };
+    let mut expected = task.clone();
+    expected.remote_pending = false;
+    // Preserve approved scope and its revision across hosts. Never rebind to an
+    // arbitrary remote version or let a concurrent edit inherit authorization.
+    if remote != expected {
+        return Err("SSH runtime did not preserve the approved task; update both runtimes".into());
+    }
+    let mut s = state.lock().unwrap();
+    if s.tasks.get(&task.id) != Some(&task) {
+        return Err("Task changed while SSH was being prepared; no launch authorized".into());
+    }
+    let audit = remote.audit(
+        TaskActor::Daemon,
+        "remote_materialized",
+        Some(TaskColumn::Todo),
+        None,
+    );
+    let changes = vec![(remote, audit)];
+    s.store
+        .save_task_changes(&changes, None, None)
+        .map_err(|e| e.to_string())?;
+    s.publish_tasks(changes);
+    Ok(())
+}
+
 fn handle_task_request(state: Arc<Mutex<RuntimeState>>, request: TaskRequest) -> ServerResponse {
+    if matches!(request.operation, TaskOperation::BoardProjects { .. }) {
+        return match prepare_task_request(&state, &request) {
+            Ok((response, _)) => ServerResponse::TaskResponse(response),
+            Err(error) => ServerResponse::TaskResponse(TaskResponse::Error(error)),
+        };
+    }
+    // Draft/admitted SSH work remains on the Mac until explicit Start or Run.
+    let local_pending = {
+        let s = state.lock().unwrap();
+        match &request.operation {
+            TaskOperation::CreateBacklog { .. } => true,
+            TaskOperation::Get { task_id } | TaskOperation::Update { task_id, .. }
+            | TaskOperation::Move { task_id, .. } | TaskOperation::Delete { task_id, .. }
+            | TaskOperation::Transition { task_id, .. } =>
+                s.tasks.get(task_id).is_some_and(|t| t.remote_pending),
+            _ => false,
+        }
+    };
     // Route by stable project identity, never by a remote path interpreted locally.
     if let Some(project) = request
         .project_id
         .and_then(|id| project_by_id(&state, id))
-        .filter(Project::is_remote)
+        .filter(|p| p.is_remote() && !local_pending)
     {
+        if let TaskOperation::Start { task_id, expected_revision, .. } = &request.operation {
+            if let Err(e) = prepare_remote_board_task(&state, &project, *task_id, *expected_revision) {
+                return task_error(TaskErrorCode::InvalidInput, e);
+            }
+        }
         let alias = ssh_remote::remote_alias(&project).unwrap().to_owned();
         let connections = state
             .lock()
@@ -405,10 +585,17 @@ fn handle_task_request(state: Arc<Mutex<RuntimeState>>, request: TaskRequest) ->
             .clone();
         // Additive capability probe preserves v3 SSH interoperability and avoids sending
         // unknown enum variants to an older remote runtime.
+        let managed = match &request.operation {
+            TaskOperation::CreateIdentified { coordinator_group, .. } => coordinator_group.is_some(),
+            TaskOperation::Start { task_id, .. } | TaskOperation::Revalidate { task_id, .. }
+            | TaskOperation::Transition { task_id, .. } =>
+                state.lock().unwrap().tasks.get(task_id).is_some_and(|t| t.coordinator_group.is_some()),
+            _ => false,
+        };
         match connections.request(&alias, ClientRequest::RuntimeStatus) {
             Ok(ServerResponse::RuntimeStatus(status))
-                if status.capabilities.iter().any(|c| {
-                    c == if matches!(request.operation, TaskOperation::CreateIdentified { .. }) { "identified_tasks_v1" } else if matches!(
+                if (!managed || status.capabilities.iter().any(|c| c == "coordinator_concurrency_v1")) && status.capabilities.iter().any(|c| {
+                    c == if matches!(request.operation, TaskOperation::CreateIdentified { board_task: Some(_), .. }) { "board_workflow_v1" } else if matches!(request.operation, TaskOperation::CreateIdentified { .. }) { "identified_tasks_v1" } else if matches!(
                         request.operation,
                         TaskOperation::List { .. }
                             | TaskOperation::Get { .. }
@@ -454,7 +641,7 @@ fn handle_task_request(state: Arc<Mutex<RuntimeState>>, request: TaskRequest) ->
     if let Some(response) = acceptance_request(&state, &request) {
         return response;
     }
-    if let TaskOperation::Create { draft } | TaskOperation::CreateIdentified { draft, .. } | TaskOperation::Update { draft, .. } =
+    if let TaskOperation::CreateBacklog { draft } | TaskOperation::Create { draft } | TaskOperation::CreateIdentified { draft, .. } | TaskOperation::Update { draft, .. } =
         &request.operation
         && !draft.skills.is_empty()
     {
@@ -484,6 +671,25 @@ fn prepare_task_request(
     state.reap_orphan_writers();
     let storage =
         |e: ditch_store::StoreError| TaskError::new(TaskErrorCode::Storage, e.to_string());
+    if let TaskOperation::BoardProjects { members } = &request.operation {
+        let parent = request.project_id.ok_or_else(|| TaskError::new(TaskErrorCode::InvalidInput, "Select the parent board"))?;
+        if !state.projects.values().any(|p| p.id == parent && p.archived_at.is_none()) {
+            return Err(TaskError::new(TaskErrorCode::NotFound, "Board project is unavailable"));
+        }
+        let key = format!("board_projects:{}", parent.0);
+        if let Some(members) = members {
+            if members.len() > 64 || members.iter().any(|id| *id == parent || !state.projects.values().any(|p| p.id == *id && p.archived_at.is_none())) {
+                return Err(TaskError::new(TaskErrorCode::InvalidInput, "Choose up to 64 available subprojects"));
+            }
+            let mut seen = std::collections::HashSet::new();
+            let members: Vec<_> = members.iter().copied().filter(|id| seen.insert(*id)).collect();
+            state.store.set_setting(&key, &serde_json::to_string(&members).map_err(|e| TaskError::new(TaskErrorCode::InvalidInput, e.to_string()))?).map_err(storage)?;
+            return Ok((TaskResponse::BoardProjects(members), None));
+        }
+        let members = state.store.setting(&key).map_err(storage)?.map(|v| serde_json::from_str(&v)).transpose()
+            .map_err(|e| TaskError::new(TaskErrorCode::Storage, format!("Invalid board membership: {e}")))?.unwrap_or_default();
+        return Ok((TaskResponse::BoardProjects(members), None));
+    }
     if !matches!(
         request.operation,
         TaskOperation::List { .. } | TaskOperation::Get { .. }
@@ -521,7 +727,7 @@ fn prepare_task_request(
         .find(|p| p.id == project_id && p.archived_at.is_none())
         .cloned()
         .ok_or_else(|| TaskError::new(TaskErrorCode::NotFound, "Project not found."))?;
-    if let TaskOperation::Create { draft } | TaskOperation::CreateIdentified { draft, .. } = &request.operation {
+    if let TaskOperation::CreateBacklog { draft } | TaskOperation::Create { draft } | TaskOperation::CreateIdentified { draft, .. } = &request.operation {
         let order = state
             .tasks
             .values()
@@ -530,11 +736,37 @@ fn prepare_task_request(
             .unwrap_or(0)
             .saturating_add(1024);
         let mut task = Task::new(project_id, draft.clone(), order)?;
-        if let TaskOperation::CreateIdentified { task_id, .. } = &request.operation {
+        if let TaskOperation::CreateIdentified { task_id, coordinator_group, continue_agent_id, .. } = &request.operation {
             if state.tasks.contains_key(task_id) { return Err(TaskError::new(TaskErrorCode::IdempotencyConflict, "Task identity already exists")); }
             task.id = *task_id;
+            task.coordinator_group = *coordinator_group;
+            task.continue_agent_id = *continue_agent_id;
+            if coordinator_group.is_some() { task.creator = TaskActor::Ditchmaster; }
         }
-        for binding in &mut task.skills {
+        if matches!(request.operation, TaskOperation::CreateBacklog { .. }) {
+            task.state = ditch_core::TaskState::Backlog;
+            task.remote_pending = project.is_remote() && !state.remote_runtime;
+        }
+        if let TaskOperation::CreateIdentified { board_task: Some(incoming), .. } = &request.operation {
+            incoming.acceptance.config.validate().map_err(|e| TaskError::new(TaskErrorCode::InvalidInput, e))?;
+            if incoming.id != task.id || incoming.project_id != project_id
+                || incoming.title != draft.title || incoming.description != draft.description
+                || incoming.acceptance_criteria != draft.acceptance_criteria || incoming.skills != draft.skills
+                || incoming.priority != draft.priority || incoming.coordinator_group != task.coordinator_group
+                || incoming.continue_agent_id != task.continue_agent_id
+                || !incoming.remote_pending
+                || incoming.column() != TaskColumn::Todo || incoming.condition != TaskCondition::Idle
+                || incoming.archived || incoming.assigned_agent_id.is_some()
+                || !incoming.acceptance.attempts.is_empty() || !incoming.acceptance.submissions.is_empty()
+                || incoming.acceptance.current_submission.is_some() || incoming.revision == 0
+                || incoming.acceptance.config.criteria.iter().any(|c| !matches!(c.kind, ditch_core::CriterionKind::Human))
+            {
+                return Err(TaskError::new(TaskErrorCode::InvalidInput, "Only a fresh, approved board task with human criteria can be materialized"));
+            }
+            task = *incoming.clone();
+            task.remote_pending = false;
+        }
+        for binding in task.skills.iter_mut().filter(|_| !matches!(request.operation, TaskOperation::CreateIdentified { board_task: Some(_), .. })) {
             binding.origin = TaskActor::User;
             binding.reason = None;
             binding.created_at = Utc::now();
@@ -659,7 +891,10 @@ fn prepare_task_request(
             } else {
                 // Review and acceptance always use their explicit, evidence-bearing actions.
                 let action = match (task.column(), column) {
-                    (TaskColumn::Todo, TaskColumn::InProgress) => TaskAction::Start,
+                    (TaskColumn::Backlog, TaskColumn::Todo) => TaskAction::Prioritize,
+                    (TaskColumn::Todo, TaskColumn::Backlog) => TaskAction::ReturnToBacklog,
+                    (TaskColumn::Todo, TaskColumn::InProgress) => return Err(TaskError::new(
+                        TaskErrorCode::IllegalTransition, "Use Run selected or Start Task Agent to begin execution.")) ,
                     (TaskColumn::InProgress, TaskColumn::Todo) => TaskAction::ReturnToTodo {
                         reason: "Moved back to Todo by user".into(),
                     },
@@ -738,7 +973,9 @@ fn prepare_task_request(
             let (value, mut audit) =
                 task.transition(&TaskAction::Start, TaskActor::User, task.revision, false)?;
             next = value;
-            next.assigned_agent_id = Some(AgentId::new());
+            state.continuation_thread(&task, execution_profile)
+                .map_err(|e| TaskError::new(TaskErrorCode::InvalidInput, e))?;
+            next.assigned_agent_id = Some(task.continue_agent_id.unwrap_or_default());
             audit.agent_id = next.assigned_agent_id;
             next.condition = TaskCondition::Queued;
             start = Some((next.clone(), project, execution_profile.clone()));
@@ -770,6 +1007,9 @@ fn prepare_task_request(
             let (value, _) =
                 task.transition(&TaskAction::Start, TaskActor::User, task.revision, false)?;
             next = value;
+            if task.coordinator_group != record.run.coordinator_group {
+                return Err(TaskError::new(TaskErrorCode::InvalidInput, "Task and agent ownership must match"));
+            }
             next.assigned_agent_id = Some(*agent_id);
             let mut run = record.run.clone();
             run.task_id = Some(task.id);
@@ -816,8 +1056,30 @@ fn remote_writer_request(
     project: &Project,
     request: ClientRequest,
 ) -> ServerResponse {
-    let owner = AgentId::new();
-    let guard = match WriterGuard::acquire(state, owner, project, &AgentExecutionProfile::default())
+    let owner = match &request {
+        ClientRequest::PromptRemoteCodexAppServerAgent { agent_id, .. } => *agent_id,
+        _ => AgentId::new(),
+    };
+    let group = {
+        let locked = state.lock().unwrap();
+        match &request {
+            ClientRequest::TaskRequest(r) => {
+                let id = match &r.operation {
+                    TaskOperation::Start { task_id, .. } | TaskOperation::Revalidate { task_id, .. }
+                    | TaskOperation::Transition { task_id, .. } => Some(task_id), _ => None,
+                };
+                id.and_then(|id| locked.tasks.get(id)).and_then(|t| t.coordinator_group)
+            }
+            ClientRequest::PromptRemoteCodexAppServerAgent { agent_id, .. } => {
+                if locked.agents.get(agent_id).is_some_and(|a| a.run.can_stop) || locked.writer_leases.contains_key(agent_id) {
+                    return protocol_error("workspace_busy", "This agent is still active");
+                }
+                locked.agent_coordinator_group(*agent_id)
+            }
+            _ => None,
+        }
+    };
+    let guard = match WriterGuard::acquire_for_group(state, owner, project, &AgentExecutionProfile::default(), group)
     {
         Ok(guard) => guard,
         Err(e) => return protocol_error("workspace_busy", e),

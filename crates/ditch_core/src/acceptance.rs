@@ -278,3 +278,28 @@ mod tests {
         );
     }
 }
+
+
+// A report permits submission for human review; it never proves acceptance.
+pub fn execution_report_ready(summary: Option<&str>) -> bool {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Report { summary: String, changes: Vec<String>, checks: Vec<String>, remaining_work: Vec<String> }
+    summary.filter(|s| s.len() <= 65536)
+        .and_then(|s| serde_json::from_str::<Report>(s).ok())
+        .is_some_and(|r| !r.summary.trim().is_empty() && r.summary.len() <= 16384
+            && r.changes.len() <= 100 && r.checks.len() <= 100
+            && r.changes.iter().chain(&r.checks).all(|v| !v.trim().is_empty() && v.len() <= 4096)
+            && (!r.changes.is_empty() || !r.checks.is_empty()) && r.remaining_work.is_empty())
+}
+
+#[cfg(test)]
+mod execution_report_tests {
+    #[test]
+    fn unfinished_work_is_not_review_ready() {
+        assert!(super::execution_report_ready(Some(r#"{"summary":"Implemented","changes":["src/lib.rs"],"checks":["unit tests passed"],"remaining_work":[]}"#)));
+        assert!(!super::execution_report_ready(Some(r#"{"summary":"Tests pass","changes":[],"checks":["tests"],"remaining_work":["implement feature"]}"#)));
+        assert!(!super::execution_report_ready(Some(r#"{"summary":"Done","changes":[],"checks":[],"remaining_work":[]}"#)));
+        assert!(!super::execution_report_ready(Some("Done")));
+    }
+}

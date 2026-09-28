@@ -7,11 +7,11 @@ agent conversations remain available.
 
 ## Workflow
 
-- Create a task with a title, description, acceptance criteria and priority.
+- Create a Backlog task with a title, description, acceptance criteria and priority; prioritize it into To Do before execution.
 - Reorder cards by dragging or using their menu. Cross-project ordering is not
   supported; select a project to order its work.
 - Start a task agent, or link an existing idle, unlinked agent in the project.
-- Execution condition is independent of the four columns: Todo, In Progress,
+- Execution condition is independent of the five columns: Backlog, To Do, In Progress,
   In Review and Done. A failed or stopped agent does not finish its task.
 - Successful linked execution submits its final summary to In Review only
   after the child exits. Missing summaries require manual review/submission.
@@ -51,10 +51,11 @@ remote task state.
 
 ## Workspace ownership
 
-Both task-linked and ordinary writers reserve their workspace before launch.
-Canonical local paths, including symlinks and nested roots, conflict. Separate
-local roots can run concurrently. Full Access and the existing unconfined SSH
-execution mode require exclusive writer access within the coordinating daemon.
+Both task-linked and ordinary agents reserve their process identity before launch.
+User-created agents may run concurrently in the same project, including Full Access
+and SSH sessions. Coordinator-owned workers share one slot per coordinator group
+and canonical project folder; aliases of the same folder share that slot.
+Reservations survive uncertain stops and reconnects so the same agent cannot launch twice.
 Independent daemon installations are not a distributed lock service.
 
 Local workspace-write launches clear additional writable roots and exclude
@@ -66,7 +67,7 @@ Local process-group ownership is persisted before the launch gate opens.
 Surviving groups keep their reservation across a daemon restart until they
 exit. Ambiguous remote transport failures retain ownership until an
 authoritative snapshot reconciles it; a retry may report busy in the meantime.
-This favors preventing a second writer over automatically retrying work.
+This prevents duplicate execution of uncertain work while allowing independent user agents.
 
 Task API actor attribution records application actions. It is not an
 authentication boundary against another process with access to the same user's
@@ -77,3 +78,14 @@ Phase 3 supersedes summary-only automatic submission for newly started task
 workers. See [Bounded acceptance and review](ACCEPTANCE_ENGINE.md) for durable
 attempts, validators, retries, immutable submissions, and stale-workspace
 acceptance checks. Existing text criteria remain human criteria.
+
+
+## Approved backlog and GitHub workflow (2026-09-28)
+
+New tasks created in the native board start in **Backlog**. Legacy `Create` callers retain their previous To Do default. Backlog → To Do is prioritization only. Dragging into In Progress opens the inspector; execution requires explicit Start Task Agent or Commercial Run selected. In Review and Done still require evidence and human acceptance.
+
+A project board can persist an explicit set of registered subprojects. Combined views preserve every task's owning execution project and provide project/repository filters. Source issue metadata is optional and compatible with older local tasks.
+
+The shared GitHub inbox supports linked-repository issue pages, selected import with stable issue identity, and source metadata refresh preserving local content, revision and review history. Closed GitHub issues remain Backlog with a closed source badge; they do not imply Ditch acceptance. Remote issue writes are absent. GitHub authentication is currently blocked: the pinned upstream CLI shares Keychain entries with other installations, and credential isolation has not been established. The UI displays that blocker and disables Connect. The live GitHub product flow is therefore not release-ready.
+
+Fresh SSH backlog tasks remain local until materialization and are retained through remote snapshots. Capability `board_workflow_v1` requires the matching remote runtime; it validates a fresh approved task snapshot, including its exact revision. Older SSH-host tasks continue to use the existing host task controls.

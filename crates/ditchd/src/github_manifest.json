@@ -1,0 +1,17 @@
+{
+  "version": "2.101.0",
+  "source": "https://github.com/cli/cli/releases/tag/v2.101.0",
+  "verified_at": "2026-09-28",
+  "artifacts": {
+    "aarch64": {
+      "url": "https://github.com/cli/cli/releases/download/v2.101.0/gh_2.101.0_macOS_arm64.zip",
+      "sha256": "e4303e39d8f07141c4bad4b99b01079f05029c59b27076e8fbc825c985ecdd8b",
+      "directory": "gh_2.101.0_macOS_arm64"
+    },
+    "x86_64": {
+      "url": "https://github.com/cli/cli/releases/download/v2.101.0/gh_2.101.0_macOS_amd64.zip",
+      "sha256": "a6fd66c88e2f07d6e4e058173db341d07dd74d58cf8f19ae668293d2bb614ca3",
+      "directory": "gh_2.101.0_macOS_amd64"
+    }
+  }
+}

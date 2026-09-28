@@ -547,7 +547,11 @@ fn acceptance_cycle(
     let deadline = Instant::now() + Duration::from_secs(config.policy.deadline_seconds);
     let cycle = Uuid::new_v4();
     let mut previous_failure = None;
-    let mut resume = None;
+    let mut resume = if !validation_only {
+        // Only the explicitly selected conversation resumes. Later Request Changes
+        // cycles allocate a new owner and use their own retry policy.
+        initial.continue_agent_id.filter(|id| *id == owner).and_then(|id| state.lock().unwrap().agents.get(&id).and_then(|a| a.run.native_session_id.clone()))
+    } else { None };
     let mut feedback = initial.last_reason.clone().unwrap_or_default();
     let max = if config.policy.enabled && !validation_only {
         config.policy.max_attempts
@@ -624,7 +628,7 @@ fn acceptance_cycle(
             task.condition = TaskCondition::Queued;
             acceptance_save(&mut locked, task, "retry_queued").map_err(fail)?;
         }
-        let prompt = format!(
+        let mut prompt = format!(
             "Task: {}\n\n{}\n\nAcceptance criteria:\n{}\nStructured checks:\n{}\n\nReviewer feedback and exact previous failures:\n{}\n\nWork only in the assigned project. Do not change permissions, reset user work, or mark Done. End with an accurate summary; Ditch validates the result.",
             initial.title,
             initial.description,
@@ -632,6 +636,9 @@ fn acceptance_cycle(
             serde_json::to_string(&config.criteria).unwrap(),
             feedback
         );
+        if initial.coordinator_group.is_some() {
+            prompt.push_str("\nExecute the approved task through implementation and checks until reviewable. Do not spawn other agents or invoke coordinator controls. Your final response must be a JSON object with summary (string), changes (array of strings), checks (array of strings), and remaining_work (array of strings). Describe unfinished or blocked work honestly; never claim success while work remains. Human acceptance is separate.");
+        }
         if prompt.len() > 65536 {
             return Err(("prompt_limit".into(),"Task instructions and validator definitions exceed 64 KiB; narrow this task before execution".into()));
         }
@@ -821,7 +828,7 @@ fn acceptance_cycle(
                 "Wall-clock deadline reached during validation".into(),
             ));
         }
-        let failures = attempt
+        let mut failures = attempt
             .validators
             .iter()
             .filter(|v| v.criterion.required && v.status == CheckStatus::Failed)
@@ -842,8 +849,13 @@ fn acceptance_cycle(
                 "Required workspace change was not observed".into(),
             ));
         }
+        let coordinated = initial.coordinator_group.is_some();
+        let report_ready = ditch_core::execution_report_ready(attempt.summary.as_deref());
+        if coordinated && !report_ready {
+            failures.push("The final execution report is missing, invalid, or lists unfinished work. Complete the approved scope and return the required JSON report; disclose real blockers rather than inventing success.".into());
+        }
         if failures.is_empty()
-            && (automatic || validation_only || edition::report_ready(&state.lock().unwrap(), id, attempt.summary.as_deref()))
+            && (automatic || validation_only || (coordinated && report_ready) || edition::report_ready(&state.lock().unwrap(), id, attempt.summary.as_deref()))
             && attempt
                 .summary
                 .as_ref()
@@ -898,7 +910,7 @@ fn acceptance_cycle(
             message: failure.clone(),
         });
         attempt_update(state, id, attempt.clone()).map_err(fail)?;
-        if !automatic || attempt.summary.as_ref().is_none_or(|s| s.trim().is_empty()) {
+        if !coordinated && (!automatic || attempt.summary.as_ref().is_none_or(|s| s.trim().is_empty())) {
             return Err(("human_review_required".into(),"Automatic checks and a final summary are required for automatic submission. Inspect the chat and explicitly submit/revalidate.".into()));
         }
         if config.policy.require_change && base.fingerprint == after.fingerprint {
@@ -1199,7 +1211,7 @@ fn acceptance_workspace(
 
 impl RuntimeState {
     fn update_remote_task(&mut self, task: Task) {
-        if self.tasks.get(&task.id).is_some_and(|old|old.revision>=task.revision){return;}
+        if self.tasks.get(&task.id).is_some_and(|old|old.remote_pending || old.revision>=task.revision){return;}
         let old = self.tasks.get(&task.id).and_then(|t| t.assigned_agent_id);
         let new = task.assigned_agent_id;
         if let (Some(old), Some(new)) = (old, new)

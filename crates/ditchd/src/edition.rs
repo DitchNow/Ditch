@@ -50,8 +50,8 @@ pub fn task_turn_allowed(_state: &RuntimeState, _id: ditch_core::TaskId) -> bool
     true
 }
 
-pub fn restricted_agent(_state: &RuntimeState, _id: ditch_core::AgentId) -> bool {
-    false
+pub fn restricted_agent(state: &RuntimeState, id: ditch_core::AgentId) -> bool {
+    state.agent_coordinator_group(id).is_some()
 }
 
 pub fn report_ready(

@@ -466,7 +466,7 @@ impl DitchStore {
     ) -> Result<(), StoreError> {
         let tx = self.connection.transaction()?;
         upsert_agent_tx(&tx, run, None, codex_home)?;
-        tx.execute("INSERT INTO agent_messages(agent_id,sequence,message_json,created_at) VALUES(?1,1,?2,?3)", params![run.id.0.to_string(), to_json(message)?, message.created_at.to_rfc3339()])?;
+        tx.execute("INSERT INTO agent_messages(agent_id,sequence,message_json,created_at) SELECT ?1,COALESCE(MAX(sequence),0)+1,?2,?3 FROM agent_messages WHERE agent_id=?1", params![run.id.0.to_string(), to_json(message)?, message.created_at.to_rfc3339()])?;
         tx.commit()?;
         Ok(())
     }
@@ -481,7 +481,8 @@ impl DitchStore {
     ) -> Result<(), StoreError> {
         let tx = self.connection.transaction()?;
         upsert_agent_tx(&tx, run, Some(&system_message.text), codex_home)?;
-        for (sequence, message) in [(1_i64, user_message), (2_i64, system_message)] {
+        let last: i64 = tx.query_row("SELECT COALESCE(MAX(sequence),0) FROM agent_messages WHERE agent_id=?1", [run.id.0.to_string()], |r| r.get(0))?;
+        for (sequence, message) in [(last + 1, user_message), (last + 2, system_message)] {
             tx.execute(
                 "INSERT INTO agent_messages(agent_id,sequence,message_json,created_at) VALUES(?1,?2,?3,?4)",
                 params![run.id.0.to_string(), sequence, to_json(message)?, message.created_at.to_rfc3339()],
@@ -631,7 +632,8 @@ fn upsert_agent_tx(
     terminal_failure: Option<&str>,
     codex_home: Option<&str>,
 ) -> Result<(), StoreError> {
-    tx.execute("INSERT INTO agents(id,provider,state,launch_mode,project_id,native_session_id,current_prompt,last_visible_action,state_confidence,state_evidence,started_at,updated_at,run_json,terminal_failure,codex_home,task_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)", params![run.id.0.to_string(),to_json(&run.provider)?,to_json(&run.state)?,to_json(&run.launch_mode)?,run.project_id.0.to_string(),run.native_session_id,run.current_prompt,run.last_visible_action,run.state_confidence,run.state_evidence,run.started_at.to_rfc3339(),run.updated_at.to_rfc3339(),to_json(run)?,terminal_failure,codex_home,run.task_id.map(|id| id.0.to_string())])?;
+    tx.execute("INSERT INTO agents(id,provider,state,launch_mode,project_id,native_session_id,current_prompt,last_visible_action,state_confidence,state_evidence,started_at,updated_at,run_json,terminal_failure,codex_home,task_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)
+        ON CONFLICT(id) DO UPDATE SET task_id=excluded.task_id,state=excluded.state,native_session_id=excluded.native_session_id,current_prompt=excluded.current_prompt,last_visible_action=excluded.last_visible_action,state_confidence=excluded.state_confidence,state_evidence=excluded.state_evidence,updated_at=excluded.updated_at,run_json=excluded.run_json,terminal_failure=excluded.terminal_failure,codex_home=COALESCE(agents.codex_home,excluded.codex_home)", params![run.id.0.to_string(),to_json(&run.provider)?,to_json(&run.state)?,to_json(&run.launch_mode)?,run.project_id.0.to_string(),run.native_session_id,run.current_prompt,run.last_visible_action,run.state_confidence,run.state_evidence,run.started_at.to_rfc3339(),run.updated_at.to_rfc3339(),to_json(run)?,terminal_failure,codex_home,run.task_id.map(|id| id.0.to_string())])?;
     Ok(())
 }
 
@@ -964,6 +966,7 @@ mod tests {
         let project = Project::new("Persistent", root.join("project"));
         let now = Utc::now();
         let run = AgentRun {
+            coordinator_group: None,
             id: ditch_core::AgentId::new(),
             provider: ditch_core::AgentProvider::Codex,
             state: AgentState::Working,

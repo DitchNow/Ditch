@@ -33,6 +33,7 @@ impl<T> Envelope<T> {
 pub enum ClientRequest {
     SkillRequest(ditch_core::SkillRequest),
     TaskRequest(ditch_core::TaskRequest),
+    GitHub(ditch_core::github::GitHubRequest),
     Health,
     RuntimeStatus,
     Snapshot,
@@ -320,6 +321,7 @@ pub enum ServerResponse {
     PermissionDetails(ditch_core::PermissionRequest),
     SkillResponse(ditch_core::SkillResponse),
     TaskResponse(ditch_core::TaskResponse),
+    GitHub(serde_json::Value),
     Health(HealthResponse),
     RuntimeStatus(RuntimeStatus),
     Snapshot(Snapshot),

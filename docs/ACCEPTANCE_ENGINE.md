@@ -71,14 +71,14 @@ exhaustion stops dispatch and raises distinct task attention. No automatic path
 sets Done. Runtime status includes reserved validation work, so an upgrade
 cannot mistake validation for an idle runtime.
 
-The existing canonical workspace lease spans worker completion, validation,
-and retry dispatch. Different project roots can run concurrently; aliases and
-nested roots conflict. Local Full Access and unconfined SSH retain global
-exclusive ownership. SSH task updates transfer/release the desktop reservation
-as remote attempt owners change. Retries reuse the original execution profile
-and pinned skills. Any interactive approval stops further automatic retries at
-the attempt boundary, preventing session permissions from carrying forward
-silently.
+Process reservations span worker completion, validation, and retries. A coordinator
+group retains its project slot throughout that cycle; user-created agents can run
+independently in the same project. Workspace fingerprints still invalidate stale
+evidence when concurrent edits occur. Stops retain ownership until child processes
+exit, and SSH task updates transfer/release their own desktop reservation without
+blocking unrelated agents. Retries reuse the original execution profile and pinned
+skills. Any interactive approval stops further automatic retries at the attempt
+boundary, preventing session permissions from carrying forward silently.
 
 ## Validator process ownership
 

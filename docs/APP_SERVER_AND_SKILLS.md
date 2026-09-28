@@ -33,9 +33,9 @@ recorded skills. Start a fresh thread to attach a different skill set.
 
 Workspace-write permits network access and excludes implicit `/tmp` and
 `TMPDIR` writable roots. SSH hosts must support the selected sandbox; failure
-is surfaced without silently removing containment. SSH writer reservations
-remain conservatively exclusive. An approval that could expand access also
-requires exclusive writer ownership. Denial and cancellation remain available.
+is surfaced without silently removing containment. SSH reservations track each agent independently. Approvals that expand access
+record the changed scope without excluding other user agents. Coordinator-owned
+work retains one active worker per group and project. Denial and cancellation remain available.
 Local acceptance tasks additionally protect Ditch state, configuration, and
 application files with a named restricted permission profile.
 

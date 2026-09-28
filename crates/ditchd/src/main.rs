@@ -8,6 +8,7 @@ mod acceptance_evidence;
 mod app_server_client;
 mod codex_app_server;
 mod edition;
+mod github;
 mod skill_files;
 mod ssh_remote;
 

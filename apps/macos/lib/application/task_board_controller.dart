@@ -18,6 +18,20 @@ class TaskBoardController extends ChangeNotifier {
   int _generation = 0;
   final Set<String> _deleted = {};
   bool get canRetry => _retry != null;
+  Future<List<String>> boardProjects(
+    String projectId, {
+    List<String>? members,
+  }) async {
+    final result = await _send({
+      'project_id': projectId,
+      'request_id': newRequestId(),
+      'operation': {
+        'BoardProjects': {'members': members},
+      },
+    });
+    return List<String>.from(result['BoardProjects'] as List);
+  }
+
   List<TaskDto> get tasks => _tasks.values.toList()
     ..sort((a, b) {
       final order = a.orderKey.compareTo(b.orderKey);

@@ -1,6 +1,7 @@
 import 'package:flutter/foundation.dart';
 
 enum TaskColumn {
+  backlog('Backlog', 'Backlog'),
   todo('Todo', 'Todo'),
   inProgress('InProgress', 'In Progress'),
   inReview('InReview', 'In Review'),
@@ -30,6 +31,7 @@ class TaskDto {
     this.summary,
     this.skills = const [],
     this.acceptance = const {},
+    this.githubSource,
   });
   factory TaskDto.fromJson(Map<String, dynamic> json) {
     String requiredString(String key) {
@@ -43,6 +45,7 @@ class TaskDto {
     final state = requiredString('state');
     if (!const {
       'Draft',
+      'Backlog',
       'Ready',
       'Running',
       'Blocked',
@@ -55,6 +58,9 @@ class TaskDto {
     }
     return TaskDto(
       acceptance: Map<String, dynamic>.from(json["acceptance"] as Map? ?? {}),
+      githubSource: json['github_source'] is Map
+          ? Map<String, dynamic>.from(json['github_source'] as Map)
+          : null,
       skills: (json['skills'] as List? ?? [])
           .map((s) => Map<String, dynamic>.from(s as Map))
           .toList(),
@@ -82,10 +88,12 @@ class TaskDto {
   final List<String> criteria;
   final List<Map<String, dynamic>> skills;
   final Map<String, dynamic> acceptance;
+  final Map<String, dynamic>? githubSource;
   final int orderKey, revision;
   final bool archived;
   final String? agentId, reason, summary;
   TaskColumn get column => switch (state) {
+    'Backlog' => TaskColumn.backlog,
     'InReview' => TaskColumn.inReview,
     'Accepted' => TaskColumn.done,
     'Running' || 'Blocked' || 'Rejected' => TaskColumn.inProgress,

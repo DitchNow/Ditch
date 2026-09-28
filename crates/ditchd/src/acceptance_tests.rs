@@ -422,7 +422,7 @@ for line in sys.stdin:
         assert!(!task.acceptance.attempts[0].approvals.is_empty());
     }
     #[test]
-    fn validation_keeps_workspace_lease_and_other_projects_can_run() {
+    fn validation_tracks_its_process_without_blocking_manual_agents() {
         let (state, project, task) = fixture(CriterionKind::Command(CommandCheck {
             argv: vec!["wait-validation".into()],
             cwd: ".".into(),
@@ -438,7 +438,7 @@ for line in sys.stdin:
                 &project,
                 &AgentExecutionProfile::default()
             )
-            .is_err()
+            .is_ok()
         );
         let root = project.root.parent().unwrap().join("other-project");
         fs::create_dir_all(&root).unwrap();
@@ -461,7 +461,7 @@ for line in sys.stdin:
                     ..Default::default()
                 }
             )
-            .is_err()
+            .is_ok()
         );
         wait(&state, task.id);
     }
