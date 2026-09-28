@@ -6253,6 +6253,8 @@ class _DitchUpdateDialogState extends State<DitchUpdateDialog> {
           'This source build cannot use DitchNow hosted services. Install an official signed Community build to check prices, licenses, and hosted updates.',
         'commercial_release_unavailable' =>
           'No compatible ${_usesCommercialUpdates ? 'Commercial' : 'Community'} update is currently available.',
+        'commercial_release_incompatible' =>
+          'This update requires a newer installed version of Ditch. Manually install the latest official app to continue.',
         'commercial_entitlement_failed' =>
           'Ditch could not load the current license from the Relay.',
         _ => error.message,
@@ -6681,7 +6683,7 @@ class _CommercialUpgradeDialogState extends State<CommercialUpgradeDialog> {
         'commercial_release_authorization_expired' =>
           'The secure download authorization expired before installation started. Try again to request a fresh authorization.',
         'commercial_release_incompatible' =>
-          'The available Commercial build is not compatible with this Community build. Update Community first, then try again.',
+          'This update requires a newer installed version of Ditch. Manually install the latest official app to continue.',
         'commercial_release_downgrade_refused' =>
           'Ditch refused to install an older Commercial build over this installation.',
         'commercial_release_signature_invalid' ||
