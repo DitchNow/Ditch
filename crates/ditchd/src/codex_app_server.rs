@@ -364,7 +364,11 @@ pub fn spawn_turn(launch: Launch<'_>, events: Sender<Event>) -> io::Result<Spawn
                 break;
             }
             let line = match incoming.recv_timeout(Duration::from_millis(100)) {
-                Ok(line) => line,
+                Ok(Ok(line)) => line,
+                Ok(Err(error)) => {
+                    let _ = reader_events.send(Event::Failed(error.to_string()));
+                    break;
+                }
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     if let Some(step) = waiting_for
@@ -1397,6 +1401,43 @@ printf '%s\n' '{{"method":"turn/completed","params":{{"turn":{{"id":"turn_remote
             Some("workspaceWrite")
         );
         let _ = spawned.child.lock().unwrap().wait();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn broken_resume_reports_transport_error_before_output_closed() {
+        let root = std::env::temp_dir().join(format!("ditch-broken-resume-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let binary = root.join("fake-codex");
+        fs::write(&binary, r#"#!/bin/sh
+read initialize
+printf '%s\n' '{"id":1,"result":{}}'
+read initialized
+read resume
+printf '%s' '{"id":"ditch:thread","result":'
+"#).unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+        let (project_id, agent_id) = ids();
+        let (tx, rx) = mpsc::channel();
+        let spawned = spawn_turn(Launch {
+            restricted: false,
+            protected_roots: vec![],
+            remote: false,
+            extra_roots: &[],
+            on_spawn: None,
+            binary: binary.to_str().unwrap(),
+            cwd: &root,
+            project_id,
+            agent_id,
+            prompt: "Continue",
+            resume_thread: Some("old-thread"),
+            execution_profile: &AgentExecutionProfile::default(),
+            codex_home: None,
+        }, tx).unwrap();
+        assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Event::Failed("Codex App Server output ended in the middle of a message".into()));
+        assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap(), Event::OutputClosed);
+        spawned.child.lock().unwrap().wait().unwrap();
         fs::remove_dir_all(root).unwrap();
     }
 

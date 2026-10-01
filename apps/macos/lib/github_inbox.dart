@@ -308,11 +308,12 @@ class GitHubSettingsDialog extends StatefulWidget {
 
 class _GitHubSettingsState extends State<GitHubSettingsDialog> {
   Map<String, dynamic>? status;
-  String? error, openedGeneration;
-  bool sending = false, polling = false;
+  String? error, attemptedGeneration;
+  bool sending = false, polling = false, browserFailed = false;
   int statusEpoch = 0;
   Timer? timer;
   bool get active => status?['busy'] == true;
+
   @override
   void initState() {
     super.initState();
@@ -334,6 +335,26 @@ class _GitHubSettingsState extends State<GitHubSettingsDialog> {
     super.dispose();
   }
 
+  Future<void> openBrowser() async {
+    final epoch = statusEpoch;
+    try {
+      await githubRequest(widget.request, 'OpenBrowser');
+      if (mounted && epoch == statusEpoch) {
+        setState(() {
+          browserFailed = false;
+          error = null;
+        });
+      }
+    } on Object catch (_) {
+      if (mounted && epoch == statusEpoch) {
+        setState(() {
+          browserFailed = true;
+          error = 'Could not open your browser. Try again below.';
+        });
+      }
+    }
+  }
+
   Future<void> poll() async {
     if (polling || sending) return;
     polling = true;
@@ -341,25 +362,29 @@ class _GitHubSettingsState extends State<GitHubSettingsDialog> {
     try {
       final result = await githubRequest(widget.request, 'Status');
       if (!mounted || epoch != statusEpoch) return;
-      setState(() => status = result);
+      setState(() {
+        status = result;
+        if (result['connected'] == true) error = null;
+      });
       if (result['browser_ready'] == true &&
-          openedGeneration != result['generation']) {
-        openedGeneration = result['generation'] as String?;
-        await githubRequest(widget.request, 'OpenBrowser');
+          attemptedGeneration != result['generation']) {
+        attemptedGeneration = result['generation'] as String?;
+        await openBrowser();
       }
     } on Object catch (e) {
-      if (mounted) setState(() => error = '$e');
+      if (mounted && epoch == statusEpoch) setState(() => error = '$e');
     } finally {
       polling = false;
     }
   }
 
-  Future<void> action(Object operation) async {
+  Future<void> action(String operation) async {
     if (sending) return;
     statusEpoch++;
     setState(() {
       sending = true;
       error = null;
+      browserFailed = false;
     });
     try {
       final result = await githubRequest(widget.request, operation);
@@ -371,182 +396,115 @@ class _GitHubSettingsState extends State<GitHubSettingsDialog> {
     }
   }
 
-  Future<void> connect() async {
-    final path = TextEditingController(
-      text: status?['config_path'] as String? ?? '',
-    );
-    final accepted = await showDialog<bool>(
-      context: context,
-      builder: (context) => AlertDialog(
-        title: const Text('Use your GitHub CLI sign-in'),
-        content: SizedBox(
-          width: 460,
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              const Text(
-                "Ditch installs its own GitHub CLI and uses your Mac's GitHub CLI sign-in. Signing in may update that shared sign-in. Disconnecting Ditch will leave it available to other tools.",
-              ),
-              const SizedBox(height: 16),
-              ExpansionTile(
-                title: const Text('Custom configuration directory'),
-                children: [
-                  TextField(
-                    controller: path,
-                    decoration: const InputDecoration(
-                      labelText: 'Absolute configuration path',
-                      helperText:
-                          'Leave empty for ~/.config/gh. Select any custom gh/XDG path explicitly.',
-                    ),
-                  ),
-                ],
-              ),
-            ],
-          ),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context, false),
-            child: const Text('Cancel'),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.pop(context, true),
-            child: const Text('Agree and continue'),
-          ),
-        ],
-      ),
-    );
-    final selected = path.text.trim();
-    path.dispose();
-    if (accepted == true && mounted) {
-      await action({
-        'AcceptConsent': {'config_path': selected.isEmpty ? null : selected},
-      });
-    }
-  }
-
   @override
   Widget build(BuildContext context) {
     final phase = status?['connection_state'];
+    final connected = status?['connected'] == true;
     final account = status?['account'] as Map?;
     final code = status?['device_code'] as String?;
-    return AlertDialog(
-      title: const Text('GitHub integration'),
-      content: SizedBox(
-        width: 480,
-        child: SingleChildScrollView(
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              if (active || sending || status == null)
-                const LinearProgressIndicator(),
-              Text(
-                status?['installed'] == true
-                    ? 'Managed GitHub CLI is installed.'
-                    : 'Ditch installs GitHub CLI for you. No terminal setup required.',
-              ),
-              const SizedBox(height: 12),
-              if (account != null)
-                Text(
-                  'GitHub account: ${account['login']}',
-                  style: Theme.of(context).textTheme.titleMedium,
-                ),
-              if (status?['detail'] != null) Text('${status!['detail']}'),
-              if (error != null)
-                Text(
-                  error!,
-                  style: TextStyle(color: Theme.of(context).colorScheme.error),
-                ),
-              if (code != null) ...[
+    final failed =
+        phase == 'failed' || phase == 'account_changed' || error != null;
+    return PopScope(
+      canPop: !sending,
+      child: AlertDialog(
+        title: const Text('GitHub'),
+        content: SizedBox(
+          width: 440,
+          child: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                if (active || sending || status == null) ...[
+                  const LinearProgressIndicator(),
+                  const SizedBox(height: 16),
+                ],
+                if (connected)
+                  Text(
+                    'Connected as @${account?['login'] ?? 'GitHub user'}',
+                    style: Theme.of(context).textTheme.titleMedium,
+                  )
+                else if (code != null) ...[
+                  const Text(
+                    'Enter this code in your browser to connect GitHub.',
+                  ),
+                  const SizedBox(height: 12),
+                  SelectableText(
+                    code,
+                    style: Theme.of(context).textTheme.headlineSmall,
+                  ),
+                  Wrap(
+                    children: [
+                      TextButton(
+                        onPressed: () =>
+                            Clipboard.setData(ClipboardData(text: code)),
+                        child: const Text('Copy code'),
+                      ),
+                      TextButton(
+                        onPressed: sending ? null : openBrowser,
+                        child: Text(
+                          browserFailed ? 'Open browser' : 'Open browser again',
+                        ),
+                      ),
+                    ],
+                  ),
+                ] else if (active || failed)
+                  Text(
+                    status?['detail'] as String? ??
+                        'Preparing browser sign-in…',
+                  )
+                else
+                  const Text(
+                    'Connect GitHub in your browser to browse issues and add them to Backlog.',
+                  ),
+                if (error != null) ...[
+                  const SizedBox(height: 12),
+                  Text(
+                    error!,
+                    style: TextStyle(
+                      color: Theme.of(context).colorScheme.error,
+                    ),
+                  ),
+                ],
                 const SizedBox(height: 16),
-                SelectableText(
-                  code,
-                  style: Theme.of(context).textTheme.headlineSmall,
+                const Text(
+                  'Imports do not start agents or change GitHub issues.',
                 ),
-                Wrap(
-                  children: [
-                    TextButton(
-                      onPressed: () =>
-                          Clipboard.setData(ClipboardData(text: code)),
-                      child: const Text('Copy code'),
-                    ),
-                    TextButton(
-                      onPressed: sending ? null : () => action('OpenBrowser'),
-                      child: const Text('Open GitHub'),
-                    ),
-                  ],
+                const SizedBox(height: 12),
+                Text(
+                  connected
+                      ? 'Disconnecting Ditch keeps the shared GitHub sign-in available to other tools.'
+                      : 'Connecting may update the GitHub CLI sign-in shared with other tools on this Mac.',
                 ),
               ],
-              const SizedBox(height: 12),
-              const Text(
-                'Ditch only reads GitHub. Imports create Backlog tasks; no agents start automatically.',
-              ),
-              if (phase == 'connected')
-                const Padding(
-                  padding: EdgeInsets.only(top: 12),
-                  child: Text(
-                    'Repository access is checked separately when you link or browse a repository.',
-                  ),
-                ),
-              const SizedBox(height: 12),
-              const Text(
-                'Disconnect leaves the shared sign-in available to other tools. Global sign-out and revocation affect other tools; see the instructions below:',
-              ),
-              TextButton(
-                onPressed: sending ? null : () => action('OpenRevocationHelp'),
-                child: const Text('Global sign-out and revocation help'),
-              ),
-            ],
-          ),
-        ),
-      ),
-      actions: [
-        TextButton(
-          onPressed: () => Navigator.pop(context),
-          child: const Text('Close'),
-        ),
-        if (active)
-          TextButton(
-            onPressed: sending ? null : () => action('Cancel'),
-            child: const Text('Cancel'),
-          ),
-        if (!active && phase != 'connected' && phase != 'awaiting_account')
-          FilledButton(
-            onPressed: sending || status == null ? null : connect,
-            child: Text(
-              status?['installed'] == true
-                  ? 'Connect GitHub'
-                  : 'Install & Connect',
             ),
           ),
-        if (!active && phase == 'awaiting_account')
-          FilledButton(
-            onPressed: sending
-                ? null
-                : () => action({
-                    'UseAccount': {'generation': status!['generation']},
-                  }),
-            child: const Text('Use this account'),
-          ),
-        if (!active &&
-            status?['consent'] == true &&
-            status?['installed'] == true)
-          TextButton(
-            onPressed: sending ? null : () => action('BrowserLogin'),
-            child: const Text('Sign in with browser'),
-          ),
-        if (!active && phase == 'connected')
-          TextButton(
-            onPressed: sending ? null : () => action('Disconnect'),
-            child: const Text('Disconnect'),
-          ),
-        if (!active && status?['installed'] == true)
-          TextButton(
-            onPressed: sending ? null : () => action('Install'),
-            child: const Text('Repair CLI'),
-          ),
-      ],
+        ),
+        actions: [
+          if (!active)
+            TextButton(
+              onPressed: sending ? null : () => Navigator.pop(context),
+              child: Text(connected ? 'Done' : 'Close'),
+            ),
+          if (active)
+            TextButton(
+              onPressed: sending ? null : () => action('Cancel'),
+              child: const Text('Cancel'),
+            )
+          else if (connected)
+            TextButton(
+              onPressed: sending ? null : () => action('Disconnect'),
+              child: const Text('Disconnect'),
+            )
+          else
+            FilledButton(
+              onPressed: sending
+                  ? null
+                  : () => status == null ? poll() : action('Connect'),
+              child: Text(failed ? 'Try again' : 'Connect GitHub'),
+            ),
+        ],
+      ),
     );
   }
 }
@@ -575,7 +533,8 @@ class _GitHubInboxState extends State<GitHubInbox> {
   String? error, lastSync;
   bool busy = false, hasMore = false;
   bool connected = false, checkingConnection = false;
-  String? connectionGeneration, importRequestId;
+  String? connectionGeneration, importRequestId, readProgress;
+  bool linksLoaded = false, loadingLinks = false;
   int requestGeneration = 0;
   Map<String, dynamic> imported = {};
   Timer? connectionTimer;
@@ -614,6 +573,9 @@ class _GitHubInboxState extends State<GitHubInbox> {
       final next = result['connected'] == true;
       final changed =
           result['generation'] != connectionGeneration || next != connected;
+      if (busy && readProgress != result['read_progress']) {
+        setState(() => readProgress = result['read_progress'] as String?);
+      }
       if (changed) {
         final dialog = privateDialogContext;
         if (dialog != null && dialog.mounted) Navigator.pop(dialog);
@@ -623,6 +585,8 @@ class _GitHubInboxState extends State<GitHubInbox> {
           connectionGeneration = result['generation'] as String?;
           requestGeneration++;
           links = [];
+          linksLoaded = false;
+          readProgress = null;
           issues = [];
           link = null;
           selected.clear();
@@ -636,8 +600,8 @@ class _GitHubInboxState extends State<GitHubInbox> {
               ? null
               : 'Connect GitHub to browse issues. Imported tasks remain on your board.';
         });
-        if (next) await loadLinks();
       }
+      if (next && !linksLoaded) await loadLinks();
     } on Object catch (e) {
       if (mounted) setState(() => error = '$e');
     } finally {
@@ -646,6 +610,8 @@ class _GitHubInboxState extends State<GitHubInbox> {
   }
 
   Future<void> loadLinks() async {
+    if (loadingLinks) return;
+    loadingLinks = true;
     final generation = requestGeneration;
     try {
       final result = await githubRequest(widget.request, {
@@ -654,13 +620,19 @@ class _GitHubInboxState extends State<GitHubInbox> {
       if (!mounted || generation != requestGeneration) return;
       final visible = widget.projects.map((p) => p.id).toSet();
       setState(() {
+        linksLoaded = true;
+        error = null;
         links = (result['repositories'] as List)
             .map((v) => Map<String, dynamic>.from(v as Map))
             .where((v) => visible.contains(v['project_id']))
             .toList();
       });
     } on Object catch (e) {
-      if (mounted) setState(() => error = '$e');
+      if (mounted && generation == requestGeneration) {
+        setState(() => error = '$e');
+      }
+    } finally {
+      loadingLinks = false;
     }
   }
 
@@ -684,6 +656,7 @@ class _GitHubInboxState extends State<GitHubInbox> {
     final generation = requestGeneration;
     setState(() {
       busy = true;
+      readProgress = null;
       error = null;
     });
     try {
@@ -755,6 +728,7 @@ class _GitHubInboxState extends State<GitHubInbox> {
     importRequestId ??= TaskBoardController.newRequestId();
     setState(() {
       busy = true;
+      readProgress = 'Preparing import…';
       error = null;
     });
     try {
@@ -884,6 +858,7 @@ class _GitHubInboxState extends State<GitHubInbox> {
         ),
         if (busy) ...[
           const LinearProgressIndicator(),
+          if (readProgress != null) Text(readProgress!),
           TextButton(
             onPressed: cancelLoading,
             child: const Text('Cancel loading'),
@@ -893,6 +868,11 @@ class _GitHubInboxState extends State<GitHubInbox> {
           Text(
             error!,
             style: TextStyle(color: Theme.of(context).colorScheme.error),
+          ),
+        if (connected && !linksLoaded)
+          TextButton(
+            onPressed: loadingLinks ? null : loadLinks,
+            child: const Text('Retry repositories'),
           ),
         if (lastSync != null) Text('Last refreshed: $lastSync'),
         if (links.isEmpty)

@@ -99,65 +99,149 @@ void main() {
       await tester.pumpWidget(const SizedBox());
     },
   );
-  testWidgets('Connect requires disclosure before any account operation', (
+  testWidgets('one Connect click starts browser login with inline disclosure', (
     tester,
   ) async {
     final calls = <Object>[];
-    Map<String, dynamic> status = {
-      'installed': false,
-      'connected': false,
-      'connection_state': 'disconnected',
-      'generation': 'initial',
-      'consent': false,
-    };
+    var connected = false;
     await tester.pumpWidget(
       MaterialApp(
         home: Scaffold(
           body: GitHubSettingsDialog(
             request: (request) async {
-              calls.add(request);
               final operation = (request as Map)['GitHub'];
-              if (operation is Map && operation.containsKey('AcceptConsent')) {
-                status = {
-                  'installed': true,
-                  'connected': false,
-                  'connection_state': 'awaiting_account',
-                  'generation': 'candidate',
-                  'consent': true,
-                  'account': {'id': 1, 'login': 'alice'},
-                };
-              }
-              if (operation is Map && operation.containsKey('UseAccount')) {
-                status = {
-                  ...status,
-                  'connected': true,
-                  'connection_state': 'connected',
-                };
-              }
-              return {'GitHub': status};
+              calls.add(operation);
+              if (operation == 'Connect') connected = true;
+              return {
+                'GitHub': {
+                  'installed': connected,
+                  'connected': connected,
+                  'connection_state': connected ? 'connected' : 'disconnected',
+                  'generation': connected ? 'bound' : 'initial',
+                  'account': connected ? {'id': 1, 'login': 'alice'} : null,
+                },
+              };
             },
           ),
         ),
       ),
     );
     await tester.pumpAndSettle();
-    expect(calls.every((v) => (v as Map)['GitHub'] == 'Status'), isTrue);
-    await tester.tap(find.text('Install & Connect'));
+    expect(calls.every((v) => v == 'Status'), isTrue);
+    expect(find.textContaining('shared with other tools'), findsOneWidget);
+    for (final removed in [
+      'Use this account',
+      'Repair CLI',
+      'Sign in with browser',
+      'Agree and continue',
+      'Install & Connect',
+    ]) {
+      expect(find.text(removed), findsNothing);
+    }
+    await tester.tap(find.text('Connect GitHub'));
     await tester.pumpAndSettle();
-    expect(
-      find.textContaining("uses your Mac's GitHub CLI sign-in"),
-      findsOneWidget,
-    );
-    expect(calls.every((v) => (v as Map)['GitHub'] == 'Status'), isTrue);
-    await tester.tap(find.text('Agree and continue'));
-    await tester.pumpAndSettle();
-    expect(find.text('GitHub account: alice'), findsOneWidget);
-    expect(calls.where((v) => (v as Map)['GitHub'] is Map).length, 1);
-    await tester.tap(find.text('Use this account'));
-    await tester.pumpAndSettle();
+    expect(calls.where((v) => v != 'Status'), ['Connect']);
+    expect(find.text('Connected as @alice'), findsOneWidget);
     expect(find.text('Disconnect'), findsOneWidget);
     await tester.pumpWidget(const SizedBox());
-    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets(
+    'browser launch failure offers a working retry without restarting login',
+    (tester) async {
+      var opens = 0;
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: GitHubSettingsDialog(
+              request: (request) async {
+                final operation = (request as Map)['GitHub'];
+                if (operation == 'OpenBrowser' && ++opens == 1) {
+                  return {
+                    'Error': {'message': 'launch failed'},
+                  };
+                }
+                return {
+                  'GitHub': {
+                    'connected': false,
+                    'busy': true,
+                    'generation': 'login',
+                    'connection_state': 'authenticating',
+                    'device_code': 'ABCD-1234',
+                    'browser_ready': true,
+                  },
+                };
+              },
+            ),
+          ),
+        ),
+      );
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 100));
+      expect(
+        find.textContaining('Could not open your browser'),
+        findsOneWidget,
+      );
+      await tester.pump(const Duration(seconds: 2));
+      expect(opens, 1);
+      await tester.tap(find.text('Open browser'));
+      await tester.pump();
+      expect(opens, 2);
+      expect(find.textContaining('Could not open your browser'), findsNothing);
+      await tester.pumpWidget(const SizedBox());
+    },
+  );
+
+  testWidgets('inbox retries a failed repository list without reconnecting', (
+    tester,
+  ) async {
+    var loads = 0;
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: SizedBox(
+            width: 350,
+            child: GitHubInbox(
+              projects: const [TaskProjectOption('project', 'Project')],
+              onImported: () async {},
+              request: (request) async {
+                final operation = (request as Map)['GitHub'];
+                if (operation == 'Status') {
+                  return {
+                    'GitHub': {'connected': true, 'generation': 'same'},
+                  };
+                }
+                if (operation is Map && operation.containsKey('Links')) {
+                  if (++loads == 1) {
+                    return {
+                      'Error': {'message': 'Temporary read failure'},
+                    };
+                  }
+                  return {
+                    'GitHub': {
+                      'repositories': [
+                        {
+                          'project_id': 'project',
+                          'repository': {'id': 42, 'full_name': 'org/repo'},
+                        },
+                      ],
+                    },
+                  };
+                }
+                throw StateError('Unexpected operation');
+              },
+            ),
+          ),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+    expect(find.text('Retry repositories'), findsOneWidget);
+    await tester.pump(const Duration(seconds: 2));
+    await tester.pumpAndSettle();
+    expect(loads, 2);
+    expect(find.text('Retry repositories'), findsNothing);
+    await tester.pumpWidget(const SizedBox());
   });
 
   testWidgets('Disconnect uses only the local runtime operation', (

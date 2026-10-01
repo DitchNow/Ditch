@@ -347,8 +347,12 @@ fn local_and_remote_app_server_approval_rejoin_model_and_stop_lifecycle() {
         fs::create_dir_all(&root).unwrap();
         let root = fs::canonicalize(root).unwrap();
         let binary = root.join("fake-codex");
+        if remote {
+            // Also exercise an older execution host that ignores excludeTurns.
+            fs::write(root.join("legacy-resume-history"), "").unwrap();
+        }
         fs::write(&binary, r#"#!/usr/bin/python3
-import json, sys, time
+import json, pathlib, sys, time
 if '--version' in sys.argv:
     print('codex-cli 0.154.0'); sys.exit(0)
 def read(): return json.loads(sys.stdin.readline())
@@ -357,8 +361,14 @@ initialize=read(); send({'id':initialize['id'],'result':{}})
 read(); request=read()
 with open('requests.jsonl','a') as f: f.write(json.dumps(request)+'\n')
 assert request['method'] in ['thread/start','thread/resume']
-if request['method']=='thread/resume': assert request['params']['threadId']=='fixture-thread'
-send({'id':'ditch:thread','result':{'thread':{'id':'fixture-thread'},'model':request['params']['model']}})
+history=[]
+if request['method']=='thread/resume':
+    assert request['params']['threadId']=='fixture-thread'
+    # A long saved thread exceeds the former 4 MiB transport limit unless
+    # the client requests metadata only. Codex keeps this history internally.
+    history=[{'text':'x'*(12*1024*1024)}] if pathlib.Path('legacy-resume-history').exists() or not request['params'].get('excludeTurns') else []
+    assert request['params'].get('excludeTurns') is True
+send({'id':'ditch:thread','result':{'thread':{'id':'fixture-thread','turns':history},'model':request['params']['model']}})
 turn=read()
 with open('requests.jsonl','a') as f: f.write(json.dumps(turn)+'\n')
 prompt=turn['params']['input'][0]['text']

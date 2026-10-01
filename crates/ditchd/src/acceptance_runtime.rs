@@ -1043,7 +1043,8 @@ fn run_acceptance_validator(
                     .unwrap()
                     .recv_timeout(Duration::from_millis(25))
                 {
-                    Ok(line) => line,
+                    Ok(Ok(line)) => line,
+                    Ok(Err(error)) => return Err(error.to_string()),
                     Err(mpsc::RecvTimeoutError::Timeout) => continue,
                     Err(_) => return Err("Validator connection closed".into()),
                 };

@@ -23,6 +23,8 @@ Approve once, session approval, and Cancel are protocol responses, not chat prom
 
 ## Confirmation and recovery
 
+Every App Server resume requests `excludeTurns: true`. Codex retains the full conversation context, while the response contains metadata instead of replaying the entire history that Ditch already persists. This applies through the shared client to local and SSH agents, task workers, and coordinator conversations. Older servers that ignore this option can return messages up to 64 MiB; the incoming queue holds only one message. Oversized, truncated, invalid UTF-8, and failed reads report specific transport errors. For an oversized resume on an older server, update Codex on the execution host; no thread migration is needed.
+
 An accepted Ditch command means its response was sent to Codex. The request remains visible with `response_pending: true` until `serverRequest/resolved`, completion of its corresponding item, or turn termination. Repeated identical responses while pending do not write twice; conflicting responses are rejected. A response still unconfirmed after 30 seconds fails and closes that turn instead of leaving an indefinite approval wait.
 
 Snapshots and rejoin include pending responses. Missing requests from an offline SSH host are not treated as confirmed resolutions; a recovered live request can replace a stale UI resolution. The inline card can refresh an uncertain outcome: a resolved request stays closed; an unsent request becomes actionable; a sent response stays disabled until confirmation. A second approval has its own ID and remains actionable even when it immediately follows the first one.
@@ -40,6 +42,8 @@ Existing running local CLI turns are not converted in place. They can finish or 
 ## Validation
 
 Run both editions' runtime tests and the shared desktop tests. `local_and_remote_app_server_approval_rejoin_model_and_stop_lifecycle` covers both runtime modes, immediate consecutive approvals, pending-response rejoin, duplicate responses, model/policy changes on the same thread, Stop and Cancel. The lifecycle test also covers requests carrying Legacy profiles and migration of saved conversations. `model_discovery_uses_project_and_codex_home_on_both_targets` covers discovery context and pagination. The existing SSH receipt/replay tests cover transport recovery.
+
+The lifecycle fixture checks compact resumes and an older server returning 12 MiB of history. Reader tests cover message limits, truncation, encoding, and I/O errors; a broken-resume test checks that the actual error reaches the turn before output closes. The ignored `live_large_history_resume` test can validate a copied historical rollout without starting a model turn: set `DITCH_TEST_CODEX_BINARY`, `DITCH_TEST_PROJECT_ROOT`, `DITCH_TEST_CODEX_HOME`, and `DITCH_TEST_RESUME_THREAD` to disposable test locations and run it with `--ignored --nocapture`. Never point it at the original Codex home.
 
 The opt-in live test uses a disposable project and separate Codex home. It copies the existing authentication file only on its own machine, then deletes the copy and temporary project. It makes real model requests. Defaults require access to `gpt-6-astra` and `gpt-5.6-sol`.
 

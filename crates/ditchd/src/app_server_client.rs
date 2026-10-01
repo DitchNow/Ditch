@@ -8,12 +8,14 @@ use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
-pub const MAX_MESSAGE: usize = 4 * 1024 * 1024;
+// Compatibility allowance for servers that still return hydrated resume history.
+// Keep the queue small so this limit cannot multiply by 128 buffered messages.
+pub const MAX_MESSAGE: usize = 64 * 1024 * 1024;
 pub struct Client {
     pub child: Option<Arc<Mutex<Child>>>,
     pub writer: Option<Arc<Mutex<ChildStdin>>>,
     pub graceful: bool,
-    pub incoming: Option<mpsc::Receiver<String>>,
+    pub incoming: Option<mpsc::Receiver<io::Result<String>>>,
     next_id: u64,
 }
 impl Client {
@@ -49,7 +51,7 @@ impl Client {
             .take()
             .ok_or_else(|| io::Error::other("missing stdout"))?;
         let child = Arc::new(Mutex::new(child));
-        let (tx, rx) = mpsc::sync_channel(128);
+        let (tx, rx) = mpsc::sync_channel(1);
         let mut client = Self {
             child: Some(child),
             writer: Some(writer),
@@ -63,18 +65,13 @@ impl Client {
         std::thread::spawn(move || {
             let mut reader = BufReader::new(stdout);
             loop {
-                let mut bytes = Vec::new();
-                let result = reader
-                    .by_ref()
-                    .take((MAX_MESSAGE + 1) as u64)
-                    .read_until(b'\n', &mut bytes);
-                if !matches!(result, Ok(n) if n > 0 && n <= MAX_MESSAGE) {
-                    break;
-                }
-                let Ok(line) = String::from_utf8(bytes) else {
-                    break;
+                let message = match read_message(&mut reader, MAX_MESSAGE) {
+                    Ok(Some(line)) => Ok(line),
+                    Ok(None) => break,
+                    Err(error) => Err(error),
                 };
-                if tx.send(line).is_err() {
+                let failed = message.is_err();
+                if tx.send(message).is_err() || failed {
                     break;
                 }
             }
@@ -84,6 +81,17 @@ impl Client {
         Ok(client)
     }
     pub fn send(&self, value: &Value) -> io::Result<()> {
+        // Ditch renders its own persisted transcript. This only omits history
+        // from the RPC response; Codex still loads the full model context.
+        // Centralize this for user agents, workers, and coordinator resumes.
+        let mut compact_resume;
+        let value = if value.get("method").and_then(Value::as_str) == Some("thread/resume") {
+            compact_resume = value.clone();
+            compact_resume["params"]["excludeTurns"] = json!(true);
+            &compact_resume
+        } else {
+            value
+        };
         let mut writer = self
             .writer
             .as_ref()
@@ -120,7 +128,7 @@ impl Client {
                 .as_ref()
                 .unwrap()
                 .recv_timeout(timeout)
-                .map_err(|e| io::Error::other(format!("App Server {method}: {e}")))?;
+                .map_err(|e| io::Error::other(format!("App Server {method}: {e}")))??;
             let Ok(value) = serde_json::from_str::<Value>(&line) else {
                 continue;
             };
@@ -145,6 +153,42 @@ impl Client {
         }
         Ok(())
     }
+}
+
+fn read_message(reader: &mut impl BufRead, limit: usize) -> io::Result<Option<String>> {
+    let mut bytes = Vec::new();
+    let count = reader
+        .take((limit + 1) as u64)
+        .read_until(b'\n', &mut bytes)
+        .map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("Codex App Server output read failed: {error}"),
+            )
+        })?;
+    if count == 0 {
+        return Ok(None);
+    }
+    if count > limit {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "Codex App Server output exceeded the {limit}-byte message limit. If this happened while resuming a conversation, update Codex on the execution host to a version supporting thread/resume excludeTurns."
+            ),
+        ));
+    }
+    if bytes.last() != Some(&b'\n') {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "Codex App Server output ended in the middle of a message",
+        ));
+    }
+    String::from_utf8(bytes).map(Some).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Codex App Server output is not valid UTF-8: {error}"),
+        )
+    })
 }
 impl Drop for Client {
     fn drop(&mut self) {
@@ -182,6 +226,104 @@ impl Drop for Client {
 mod hardening_tests {
     use super::*;
     #[test]
+    fn reader_accepts_large_legacy_resume_and_preserves_next_message() {
+        let response = json!({"id":"ditch:thread","result":{"thread":{
+            "id":"old-thread","turns":[{"text":"x".repeat(12 * 1024 * 1024)}]
+        }}})
+        .to_string();
+        let mut input = io::Cursor::new(format!("{response}\n{{}}\n"));
+        assert_eq!(
+            read_message(&mut input, MAX_MESSAGE)
+                .unwrap()
+                .unwrap()
+                .trim_end(),
+            response
+        );
+        assert_eq!(
+            read_message(&mut input, MAX_MESSAGE).unwrap().unwrap(),
+            "{}\n"
+        );
+        assert!(read_message(&mut input, MAX_MESSAGE).unwrap().is_none());
+    }
+
+    #[test]
+    fn reader_reports_size_truncation_utf8_and_io_errors() {
+        let mut input = io::Cursor::new(b"12345678\n");
+        assert_eq!(read_message(&mut input, 9).unwrap().unwrap(), "12345678\n");
+        input.set_position(0);
+        let error = read_message(&mut input, 8).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("8-byte message limit"));
+        assert_eq!(
+            read_message(&mut io::Cursor::new(b"{}"), 8)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+        assert_eq!(
+            read_message(&mut io::Cursor::new(b"\xff\n"), 8)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        struct Broken;
+        impl Read for Broken {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::new(io::ErrorKind::BrokenPipe, "fixture failure"))
+            }
+        }
+        let error = read_message(&mut BufReader::new(Broken), 8).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+        assert!(
+            error
+                .to_string()
+                .contains("output read failed: fixture failure")
+        );
+    }
+
+    /// Resume only: no model request and no modification of the source session.
+    #[test]
+    #[ignore = "requires a disposable copy of a Codex home and thread"]
+    fn live_large_history_resume() {
+        let binary = std::env::var("DITCH_TEST_CODEX_BINARY").unwrap();
+        let root = std::env::var("DITCH_TEST_PROJECT_ROOT").unwrap();
+        let home = std::env::var("DITCH_TEST_CODEX_HOME").unwrap();
+        let thread = std::env::var("DITCH_TEST_RESUME_THREAD").unwrap();
+        for policy in ["on-request", "never"] {
+            let mut client =
+                Client::open(&binary, Path::new(&root), Some(Path::new(&home)), None).unwrap();
+            let result = client
+                .call(
+                    "thread/resume",
+                    json!({
+                        "threadId":thread,"cwd":root,"approvalPolicy":policy,
+                        "sandbox":"workspace-write","model":"gpt-6-astra"
+                    }),
+                )
+                .unwrap();
+            assert_eq!(result["thread"]["id"], thread);
+            assert_eq!(result["model"], "gpt-6-astra");
+            assert_eq!(result["approvalPolicy"], policy);
+            assert!(result["thread"]["turns"].as_array().unwrap().is_empty());
+            assert!(
+                client
+                    .child
+                    .as_ref()
+                    .unwrap()
+                    .lock()
+                    .unwrap()
+                    .try_wait()
+                    .unwrap()
+                    .is_none()
+            );
+            eprintln!(
+                "{policy}: resumed existing thread; response {} bytes",
+                result.to_string().len()
+            );
+        }
+    }
+
+    #[test]
     fn expired_rpc_deadline_rejects_even_an_already_queued_reply() {
         let mut child = Command::new("/bin/cat")
             .process_group(0)
@@ -191,9 +333,10 @@ mod hardening_tests {
             .unwrap();
         let writer = child.stdin.take().unwrap();
         let (tx, rx) = mpsc::sync_channel(2);
-        tx.send(json!({"method":"irrelevant/notification"}).to_string())
+        tx.send(Ok(json!({"method":"irrelevant/notification"}).to_string()))
             .unwrap();
-        tx.send(json!({"id":1,"result":{}}).to_string()).unwrap();
+        tx.send(Ok(json!({"id":1,"result":{}}).to_string()))
+            .unwrap();
         let mut client = Client {
             child: Some(Arc::new(Mutex::new(child))),
             writer: Some(Arc::new(Mutex::new(writer))),

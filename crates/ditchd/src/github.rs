@@ -17,6 +17,7 @@ static RATE_LIMIT: Mutex<Option<Instant>> = Mutex::new(None);
 /// Replaceable for deterministic tests; application IPC never exposes this method.
 trait GitHubService {
     fn get(&self, path: &str) -> Result<Value, String>;
+    fn progress(&self, _detail: &str) {}
     fn check_commit(&self, _state: &RuntimeState) -> Result<(), String> {
         Ok(())
     }
@@ -26,6 +27,9 @@ struct GhCli {
     binding: auth::Binding,
 }
 impl GitHubService for GhCli {
+    fn progress(&self, detail: &str) {
+        self.binding.progress(detail);
+    }
     fn get(&self, path: &str) -> Result<Value, String> {
         if let Some(until) = *RATE_LIMIT.lock().unwrap() {
             if until > Instant::now() {
@@ -579,13 +583,8 @@ fn handle_inner(state: Arc<Mutex<RuntimeState>>, request: GitHubRequest) -> Resu
     if matches!(
         request,
         GitHubRequest::Status
-            | GitHubRequest::Install
             | GitHubRequest::Connect
-            | GitHubRequest::AcceptConsent { .. }
-            | GitHubRequest::UseAccount { .. }
-            | GitHubRequest::BrowserLogin
             | GitHubRequest::OpenBrowser
-            | GitHubRequest::OpenRevocationHelp
             | GitHubRequest::Cancel
             | GitHubRequest::CancelRead
             | GitHubRequest::Disconnect
@@ -610,13 +609,8 @@ fn handle_service(
 ) -> Result<Value, String> {
     match request {
         GitHubRequest::Status
-        | GitHubRequest::Install
         | GitHubRequest::Connect
-        | GitHubRequest::AcceptConsent { .. }
-        | GitHubRequest::UseAccount { .. }
-        | GitHubRequest::BrowserLogin
         | GitHubRequest::OpenBrowser
-        | GitHubRequest::OpenRevocationHelp
         | GitHubRequest::Cancel
         | GitHubRequest::CancelRead
         | GitHubRequest::Disconnect => auth::control(state, request),
@@ -705,7 +699,9 @@ fn handle_service(
             let repo = verified_repository(&state, service, project_id, repository_id)?;
             let name = repository_name(&repo.full_name)?;
             let mut issues = Vec::new();
-            for number in numbers {
+            let total = numbers.len();
+            for (index, number) in numbers.into_iter().enumerate() {
+                service.progress(&format!("Importing issue {} of {total}…", index + 1));
                 let raw = service.get(&format!("repos/{name}/issues/{number}"))?;
                 if raw.get("pull_request").is_some() {
                     return Err("Pull requests cannot be imported as issues".into());
@@ -718,6 +714,7 @@ fn handle_service(
                 }
                 issues.push(issue);
             }
+            service.progress("Saving tasks to Backlog…");
             let mut s = state.lock().unwrap();
             service.check_commit(&s)?;
             import_issues(&mut s, project_id, &repo, issues, request_id)

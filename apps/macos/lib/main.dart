@@ -14,6 +14,7 @@ import 'application/task_board_controller.dart';
 import 'data/task_models.dart';
 import 'task_board.dart';
 import 'skills_directory.dart';
+import 'release_ui_visibility.dart';
 import 'application/skills_controller.dart';
 import 'data/commercial_models.dart';
 import 'data/runtime_models.dart';
@@ -2782,7 +2783,9 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
       _runtimeClient,
     );
     final settingsSections = [
-      ...editionSections,
+      ...editionSections.where(
+        (section) => showUnfinishedFeatureControls || section.id != 'github',
+      ),
       EditionSettingsSection(
         id: 'license-plans',
         icon: Icons.verified_outlined,
@@ -5477,15 +5480,17 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
                                 in (widget.editionSurface
                                         as EditionWorkspaceProvider)
                                     .workspaces())
-                              item.navigationBuilder(
-                                _runtimeClient,
-                                _editionWorkspace?.id == item.id,
-                                () => setState(() {
-                                  _editionWorkspace = item;
-                                  _showBoard = false;
-                                  _showSkills = false;
-                                }),
-                              ),
+                              if (showUnfinishedFeatureControls ||
+                                  item.id != 'ditchmaster')
+                                item.navigationBuilder(
+                                  _runtimeClient,
+                                  _editionWorkspace?.id == item.id,
+                                  () => setState(() {
+                                    _editionWorkspace = item;
+                                    _showBoard = false;
+                                    _showSkills = false;
+                                  }),
+                                ),
                         ],
                         onOpenBoard: () => _openBoard(),
                         boardSelected: _showBoard,
@@ -7911,7 +7916,7 @@ class ProjectSidebar extends StatelessWidget {
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 ...editionNavigation,
-                if (onOpenBoard != null) ...[
+                if (showUnfinishedFeatureControls && onOpenBoard != null) ...[
                   ListTile(
                     dense: true,
                     selected: boardSelected,
@@ -8247,7 +8252,7 @@ class AgentsSurface extends StatelessWidget {
                       style: Theme.of(context).textTheme.headlineSmall,
                     ),
                   ),
-                  if (onOpenBoard != null)
+                  if (showUnfinishedFeatureControls && onOpenBoard != null)
                     IconButton(
                       onPressed: onOpenBoard,
                       tooltip: 'Project Board — $projectWriteDisclosure',
@@ -8825,7 +8830,9 @@ class ExpandableAgentPanel extends StatelessWidget {
                             ),
                     ),
                   ),
-                  if (expanded && session.attachedSkills.isNotEmpty)
+                  if (showUnfinishedFeatureControls &&
+                      expanded &&
+                      session.attachedSkills.isNotEmpty)
                     Align(
                       alignment: Alignment.centerLeft,
                       child: Tooltip(
@@ -12394,7 +12401,9 @@ class _StartCodexSessionDialogState extends State<StartCodexSessionDialog> {
               settings: settings,
               loadModels: widget.loadModels,
             ),
-            if (widget.skillsController != null && widget.projectId != null)
+            if (showUnfinishedFeatureControls &&
+                widget.skillsController != null &&
+                widget.projectId != null)
               SkillChips(
                 skills: selectedSkills,
                 onEdit: () async {
@@ -12415,7 +12424,7 @@ class _StartCodexSessionDialogState extends State<StartCodexSessionDialog> {
         ),
       ),
       actions: [
-        if (widget.onTask != null)
+        if (showUnfinishedFeatureControls && widget.onTask != null)
           TextButton(
             onPressed: widget.onTask,
             child: const Text("Create / select task…"),

@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'github_inbox.dart';
+import 'release_ui_visibility.dart';
 import 'skills_directory.dart';
 import 'acceptance_review.dart';
 import 'package:flutter/material.dart';
@@ -1053,7 +1054,8 @@ class _TaskEditorState extends State<_TaskEditor> {
                       .toList(),
                   onChanged: (v) => setState(() => priority = v!),
                 ),
-                SkillChips(skills: skills, onEdit: selectSkills),
+                if (showUnfinishedFeatureControls)
+                  SkillChips(skills: skills, onEdit: selectSkills),
                 if (widget.controller.error != null)
                   TaskErrorBanner(controller: widget.controller),
               ],
@@ -1284,10 +1286,11 @@ class _TaskInspectorState extends State<_TaskInspector> {
               crossAxisAlignment: CrossAxisAlignment.start,
               mainAxisSize: MainAxisSize.min,
               children: [
-                SkillChips(
-                  skills: task.skills,
-                  onEdit: disabled ? null : () => selectSkills(task),
-                ),
+                if (showUnfinishedFeatureControls)
+                  SkillChips(
+                    skills: task.skills,
+                    onEdit: disabled ? null : () => selectSkills(task),
+                  ),
                 SwitchListTile(
                   contentPadding: EdgeInsets.zero,
                   title: const Text('Use local App Server'),

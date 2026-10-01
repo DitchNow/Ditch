@@ -6,20 +6,11 @@ use serde::{Deserialize, Serialize};
 #[serde(deny_unknown_fields)]
 pub enum GitHubRequest {
     Status,
-    Install,
+    /// Native UI only: the explicit browser sign-in action accepts the inline disclosure.
     Connect,
-    /// Native UI only: records disclosure acceptance before any credential lookup.
-    AcceptConsent {
-        config_path: Option<String>,
-    },
-    UseAccount {
-        generation: String,
-    },
-    BrowserLogin,
     Cancel,
     CancelRead,
     OpenBrowser,
-    OpenRevocationHelp,
     Disconnect,
     Repositories {
         page: u32,

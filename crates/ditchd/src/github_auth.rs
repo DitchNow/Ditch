@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 const SETTING: &str = "github_connection_v1";
 const DEVICE_URL: &str = "https://github.com/login/device";
 const STORAGE_ERROR: &str = "GitHub CLI is not using secure Keychain storage. Ditch remains disconnected. Shared credentials were not deleted or rewritten; unlock your Mac login Keychain and retry browser sign-in. Review any plaintext shared hosts.yml credential using GitHub CLI. Browser login may have saved a plaintext credential if Keychain failed.";
+const INVALID_AUTH: &str = "GitHub sign-in expired or was revoked. Connect GitHub again.";
 const CANCEL_DETAIL: &str = "Ditch is disconnected. Browser authorization may still have updated the shared GitHub CLI sign-in; it remains available to other tools.";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -39,6 +40,7 @@ struct Session {
     code: Option<String>,
     browser_ready: bool,
     running: bool,
+    read_progress: Option<String>,
 }
 static SESSIONS: OnceLock<Mutex<HashMap<PathBuf, Session>>> = OnceLock::new();
 fn sessions() -> &'static Mutex<HashMap<PathBuf, Session>> {
@@ -63,15 +65,12 @@ fn root(s: &RuntimeState) -> PathBuf {
     s.paths.data_dir.join("tools/github")
 }
 
-// Overrides must be explicitly selected in the consent panel, never inherited.
-fn config_path(s: &RuntimeState, selected: Option<String>) -> Result<PathBuf, String> {
+// Browser sign-in uses the standard Mac gh configuration, never inherited overrides.
+fn config_path(s: &RuntimeState) -> Result<PathBuf, String> {
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .ok_or("Mac home directory unavailable")?;
-    let path = selected
-        .filter(|v| !v.trim().is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home.join(".config/gh"));
+    let path = home.join(".config/gh");
     if !path.is_absolute()
         || path
             .components()
@@ -111,7 +110,7 @@ pub(super) fn status(state: &Arc<Mutex<RuntimeState>>) -> Result<Value, String> 
     let job = jobs.get(&root).filter(|j| j.generation == c.generation);
     if matches!(
         c.phase.as_str(),
-        "installing" | "checking" | "authenticating"
+        "installing" | "checking" | "authenticating" | "verifying" | "awaiting_account"
     ) && !job.is_some_and(|j| j.running)
     {
         c.phase = "disconnected".into();
@@ -123,7 +122,7 @@ pub(super) fn status(state: &Arc<Mutex<RuntimeState>>) -> Result<Value, String> 
         json!({"version":VERSION,"installed":root.join("active/gh").is_file(),"connected":c.phase=="connected",
         "connection_state":c.phase,"consent":c.consent,"generation":c.generation,"account":c.account,
         "detail":c.detail,"config_path":c.config,"device_code":job.and_then(|j|j.code.clone()),
-        "browser_ready":job.is_some_and(|j|j.browser_ready),"busy":job.is_some_and(|j|j.running)}),
+        "browser_ready":job.is_some_and(|j|j.browser_ready),"read_progress":job.and_then(|j|j.read_progress.clone()),"busy":job.is_some_and(|j|j.running)}),
     )
 }
 pub(super) fn control(
@@ -154,73 +153,31 @@ pub(super) fn control(
                 job.browser_ready = false;
             }
         }
-        GitHubRequest::AcceptConsent {
-            config_path: selected,
-        } => {
-            let mut s = state.lock().unwrap();
-            let mut c = read(&s)?;
-            if sessions()
-                .lock()
-                .unwrap()
-                .get(&root(&s))
-                .is_some_and(|j| j.running)
+        GitHubRequest::Connect => return start(state),
+        GitHubRequest::OpenBrowser => {
             {
-                return Err("Cancel the current attempt first".into());
-            }
-            c.config = config_path(&s, selected)?;
-            c.consent = true;
-            c.account = None;
-            c.phase = "disconnected".into();
-            c.generation = Uuid::new_v4().to_string();
-            save(&mut s, &c)?;
-            drop(s);
-            return start(state, Job::Connect);
-        }
-        GitHubRequest::Connect => return start(state, Job::Connect),
-        GitHubRequest::BrowserLogin => return start(state, Job::Login),
-        GitHubRequest::Install => return start(state, Job::Install),
-        GitHubRequest::UseAccount { generation } => return start(state, Job::Use(generation)),
-        GitHubRequest::OpenBrowser | GitHubRequest::OpenRevocationHelp => {
-            let help = matches!(request, GitHubRequest::OpenRevocationHelp);
-            let s = state.lock().unwrap();
-            let c = read(&s)?;
-            let jobs = sessions().lock().unwrap();
-            if !help
-                && !jobs.get(&root(&s)).is_some_and(|j| {
+                let s = state.lock().unwrap();
+                let c = read(&s)?;
+                let jobs = sessions().lock().unwrap();
+                if !jobs.get(&root(&s)).is_some_and(|j| {
                     j.generation == c.generation
                         && j.browser_ready
                         && !j.cancel.load(Ordering::SeqCst)
-                })
-            {
-                return Err("No active GitHub device authorization".into());
+                }) {
+                    return Err("No active GitHub device authorization".into());
+                }
             }
-            // Fixed URL. No executable or URL emitted by a subprocess is trusted.
-            let mut child = Command::new("/usr/bin/open")
-                .arg(if help {
-                    "https://cli.github.com/manual/gh_auth_logout"
-                } else {
-                    DEVICE_URL
-                })
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .map_err(|_| "Could not open GitHub in the browser")?;
-            thread::spawn(move || {
-                let _ = child.wait();
-            });
+            // Fixed URL only. Check the launcher result without holding runtime locks.
+            let mut command = Command::new("/usr/bin/open");
+            command.arg(DEVICE_URL).stdin(Stdio::null());
+            bounded_output_cancel(command, 5, 4096, &AtomicBool::new(false))
+                .map_err(|_| "Could not open your browser. Try Open browser again.")?;
         }
         _ => return Err("Unsupported connection operation".into()),
     }
     status(&state)
 }
-enum Job {
-    Connect,
-    Login,
-    Install,
-    Use(String),
-}
-fn start(state: Arc<Mutex<RuntimeState>>, job: Job) -> Result<Value, String> {
+fn start(state: Arc<Mutex<RuntimeState>>) -> Result<Value, String> {
     let (root, c, cancel) = {
         let mut s = state.lock().unwrap();
         let root = root(&s);
@@ -229,30 +186,15 @@ fn start(state: Arc<Mutex<RuntimeState>>, job: Job) -> Result<Value, String> {
         if jobs.get(&root).is_some_and(|j| j.running) {
             return Err("A GitHub operation is running; cancel or wait for it".into());
         }
-        if !matches!(job, Job::Install) && !c.consent {
-            return Err("Accept the shared GitHub CLI disclosure first".into());
-        }
-        if let Job::Use(ref generation) = job {
-            if c.phase != "awaiting_account" || &c.generation != generation || c.account.is_none() {
-                return Err("Account confirmation expired; reconnect".into());
-            }
-        }
+        // Connect is the sole, explicit authorization action in the native UI.
+        c.config = config_path(&s)?;
+        c.consent = true;
         if let Some(previous) = jobs.get(&root) {
             previous.cancel.store(true, Ordering::SeqCst);
         }
-        if matches!(job, Job::Install) && c.phase != "connected" {
-            c.account = None;
-        }
         c.generation = Uuid::new_v4().to_string();
-        if !matches!(job, Job::Install | Job::Use(_)) {
-            c.account = None;
-        }
-        c.phase = if matches!(job, Job::Install) || !root.join("active/gh").is_file() {
-            "installing"
-        } else {
-            "checking"
-        }
-        .into();
+        c.account = None;
+        c.phase = "checking".into();
         c.detail = "Preparing GitHub connection…".into();
         save(&mut s, &c)?;
         let cancel = Arc::new(AtomicBool::new(false));
@@ -264,13 +206,14 @@ fn start(state: Arc<Mutex<RuntimeState>>, job: Job) -> Result<Value, String> {
                 code: None,
                 browser_ready: false,
                 running: true,
+                read_progress: None,
             },
         );
         (root, c, cancel)
     };
     let background = state.clone();
     thread::spawn(move || {
-        if let Err(error) = run_job(&background, &root, &c, &cancel, &job) {
+        if let Err(error) = run_job(&background, &root, &c, &cancel) {
             let _ = update(&background, &c.generation, "failed", None, &error);
         }
         let mut jobs = sessions().lock().unwrap();
@@ -304,79 +247,51 @@ fn run_job(
     root: &Path,
     c: &Connection,
     cancel: &Arc<AtomicBool>,
-    job: &Job,
 ) -> Result<(), String> {
-    if matches!(job, Job::Install) || !root.join("active/gh").is_file() {
+    let binary = root.join("active/gh");
+    if verify_version(&binary, root, &c.config, cancel).is_err() {
+        check_cancel(cancel)?;
         let _install = INSTALL.lock().unwrap();
         check_cancel(cancel)?;
         install(root, cancel, &|message| {
             let _ = update(state, &c.generation, "installing", None, message);
         })?;
-    }
-    check_cancel(cancel)?;
-    if matches!(job, Job::Install) {
-        return update(
-            state,
-            &c.generation,
-            if c.account.is_some() {
-                "connected"
-            } else {
-                "disconnected"
-            },
-            c.account.clone(),
-            "Managed CLI ready. Credentials were preserved.",
-        );
-    }
-    let binary = root.join("active/gh");
-    verify_version(&binary, root, &c.config, cancel)?;
-    if let Job::Use(_) = job {
-        let account = probe(&binary, root, &c.config, cancel)?
-            .ok_or("No authenticated account; sign in again")?;
-        if c.account.as_ref() != Some(&account) {
-            return update(
-                state,
-                &c.generation,
-                "account_changed",
-                None,
-                "The active account changed. Reconnect to confirm it.",
-            );
-        }
-        return update(
-            state,
-            &c.generation,
-            "connected",
-            Some(account),
-            "Connected using your shared GitHub CLI sign-in.",
-        );
-    }
-    if !matches!(job, Job::Login) {
-        if let Some(account) = probe(&binary, root, &c.config, cancel)? {
-            return update(
-                state,
-                &c.generation,
-                "awaiting_account",
-                Some(account),
-                "Confirm the active account, or sign in through your browser.",
-            );
-        }
+        verify_version(&binary, root, &c.config, cancel)?;
     }
     update(
         state,
         &c.generation,
         "authenticating",
         None,
-        "Complete GitHub authorization in your browser.",
+        "Preparing browser sign-in…",
     )?;
+    // Never silently adopt an existing account. Every Connect runs the browser flow.
     login(root, c, cancel)?;
     check_cancel(cancel)?;
-    let account = probe(&binary, root, &c.config, cancel)?
-        .ok_or("Login ended without a verified GitHub account")?;
+    if let Some(job) = sessions()
+        .lock()
+        .unwrap()
+        .get_mut(root)
+        .filter(|j| j.generation == c.generation)
+    {
+        job.code = None;
+        job.browser_ready = false;
+    }
     update(
         state,
         &c.generation,
-        "awaiting_account",
+        "verifying",
+        None,
+        "Verifying your GitHub account…",
+    )?;
+    let account = probe(&binary, root, &c.config, cancel)?
+        .ok_or("Login ended without a verified GitHub account. Try again.")?;
+    update(
+        state,
+        &c.generation,
+        "connected",
         Some(account),
-        "Sign-in verified. Confirm this account to connect Ditch.",
+        "GitHub is connected.",
     )
 }
 pub(super) fn check_cancel(cancel: &AtomicBool) -> Result<(), String> {
@@ -418,7 +333,7 @@ fn safe_status(
         "--json",
         "hosts",
         "--jq",
-        "[.hosts[\"github.com\"][]? | {state,active,host,login,tokenSource,gitProtocol}]",
+        "[.hosts[\"github.com\"][]? | {state,active,host,login,tokenSource,gitProtocol, invalidCredential: ((.error // \"\") | test(\"HTTP 401|Bad credentials\"; \"i\"))}]",
     ]);
     serde_json::from_slice(&bounded_output_cancel(cmd, 30, 32768, cancel)?)
         .map_err(|_| "Invalid GitHub authentication status".into())
@@ -437,9 +352,11 @@ fn active_entry(value: &Value) -> Result<Option<&Value>, String> {
     }
     let v = entries[0];
     if v["state"] != "success" {
-        return Err(
-            "GitHub sign-in is invalid or unavailable. Retry or choose browser sign-in.".into(),
-        );
+        return Err(if v["invalidCredential"] == true {
+            INVALID_AUTH.into()
+        } else {
+            "Could not verify GitHub right now. Check your connection and try again.".into()
+        });
     }
     if v["tokenSource"] != "keyring" {
         return Err(STORAGE_ERROR.into());
@@ -487,6 +404,7 @@ pub(super) struct Binding {
     pub config: PathBuf,
     pub cancel: Arc<AtomicBool>,
     root: PathBuf,
+    deadline: Instant,
 }
 impl Binding {
     pub fn capture(state: Arc<Mutex<RuntimeState>>) -> Result<Self, String> {
@@ -503,11 +421,13 @@ impl Binding {
             code: None,
             browser_ready: false,
             running: false,
+            read_progress: None,
         });
         if session.generation != c.generation || session.cancel.load(Ordering::SeqCst) {
             session.generation = c.generation.clone();
             session.cancel = Arc::new(AtomicBool::new(false));
         }
+        session.read_progress = None;
         Ok(Self {
             state: state.clone(),
             generation: c.generation,
@@ -515,10 +435,14 @@ impl Binding {
             config: c.config,
             cancel: session.cancel.clone(),
             root,
+            deadline: Instant::now() + Duration::from_secs(600),
         })
     }
     pub fn check_commit(&self, s: &RuntimeState) -> Result<(), String> {
         check_cancel(&self.cancel)?;
+        if Instant::now() >= self.deadline {
+            return Err("GitHub request took too long. Try again.".into());
+        }
         let c = read(s)?;
         if c.phase != "connected"
             || c.generation != self.generation
@@ -527,6 +451,16 @@ impl Binding {
             return Err("Connection changed; discarded this result".into());
         }
         Ok(())
+    }
+    pub fn progress(&self, detail: &str) {
+        if let Some(job) = sessions()
+            .lock()
+            .unwrap()
+            .get_mut(&self.root)
+            .filter(|j| j.generation == self.generation && !j.cancel.load(Ordering::SeqCst))
+        {
+            job.read_progress = Some(detail.into());
+        }
     }
     pub fn verify(&self) -> Result<(), String> {
         self.check_commit(&self.state.lock().unwrap())?;
@@ -551,9 +485,25 @@ impl Binding {
                 Err("GitHub account changed; reconnect".into())
             }
             Err(e) => {
-                let _ = update(&self.state, &self.generation, "failed", None, &e);
+                // Cancellation and transient network failures must not revoke a connection.
+                if e == INVALID_AUTH || e == STORAGE_ERROR {
+                    let _ = update(&self.state, &self.generation, "failed", None, &e);
+                }
                 Err(e)
             }
+        }
+    }
+}
+
+impl Drop for Binding {
+    fn drop(&mut self) {
+        if let Some(job) = sessions()
+            .lock()
+            .unwrap()
+            .get_mut(&self.root)
+            .filter(|j| j.generation == self.generation && Arc::ptr_eq(&j.cancel, &self.cancel))
+        {
+            job.read_progress = None;
         }
     }
 }
@@ -562,8 +512,6 @@ impl Binding {
 struct LoginParser {
     text: String,
     escape: u8,
-    git_answered: bool,
-    browser_answered: bool,
 }
 impl LoginParser {
     fn feed(&mut self, bytes: &[u8]) -> Result<(), String> {
@@ -611,25 +559,6 @@ impl LoginParser {
         }
         Ok(())
     }
-    fn response(&mut self) -> Option<&'static [u8]> {
-        if !self.git_answered
-            && self
-                .text
-                .contains("Authenticate Git with your GitHub credentials?")
-        {
-            self.git_answered = true;
-            return Some(b"n\r");
-        }
-        if !self.browser_answered
-            && self
-                .text
-                .contains("Press Enter to open https://github.com/login/device in your browser...")
-        {
-            self.browser_answered = true;
-            return Some(b"\r");
-        }
-        None
-    }
     fn code(&self) -> Option<String> {
         let code = self
             .text
@@ -646,119 +575,110 @@ impl LoginParser {
         .then(|| code.to_string())
     }
 }
-fn login(root: &Path, c: &Connection, cancel: &Arc<AtomicBool>) -> Result<(), String> {
-    let binary = root.join("active/gh");
-    let mut cmd = managed_command(&binary, root, &c.config);
-    cmd.args(["config", "get", "git_protocol", "--host", "github.com"]);
-    let bytes = bounded_output_cancel(cmd, 10, 128, cancel)?;
-    let protocol = match std::str::from_utf8(&bytes).unwrap_or("").trim() {
-        "https" => "https",
-        "ssh" => "ssh",
-        _ => return Err("Unsupported Git protocol preference".into()),
-    };
-    let pair = native_pty_system()
-        .openpty(PtySize {
-            rows: 24,
-            cols: 160,
-            pixel_width: 0,
-            pixel_height: 0,
-        })
-        .map_err(|_| "Cannot open GitHub sign-in session")?;
-    let mut command = CommandBuilder::new(&binary);
-    command.env_clear();
-    let environment = managed_command(&binary, root, &c.config);
-    for (key, value) in environment.get_envs() {
-        if let Some(value) = value {
-            command.env(key, value);
-        }
-    }
-    command.env_remove("GH_PROMPT_DISABLED");
-    command.env("TERM", "xterm-256color");
-    command.env("GH_BROWSER", "/usr/bin/true");
-    command.cwd(root);
+fn login_command(binary: &Path, root: &Path, config: &Path) -> Command {
+    let mut command = managed_command(binary, root, config);
+    // Pipes + GH_PROMPT_DISABLED avoid survey's terminal queries entirely.
+    // Omitting --git-protocol preserves existing preferences; noninteractive
+    // login skips credential-helper and SSH-key setup.
     command.args([
         "auth",
         "login",
         "--hostname",
         "github.com",
         "--web",
-        "--git-protocol",
-        protocol,
         "--skip-ssh-key",
         "--clipboard=false",
     ]);
-    let mut reader = pair
-        .master
-        .try_clone_reader()
-        .map_err(|_| "Cannot read GitHub sign-in")?;
-    let mut writer = pair
-        .master
-        .take_writer()
-        .map_err(|_| "Cannot control GitHub sign-in")?;
-    let mut child = pair
-        .slave
-        .spawn_command(command)
+    command
+}
+fn login(root: &Path, c: &Connection, cancel: &Arc<AtomicBool>) -> Result<(), String> {
+    let mut command = login_command(&root.join("active/gh"), root, &c.config);
+    command
+        .process_group(0)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command
+        .spawn()
         .map_err(|_| "Could not start GitHub sign-in")?;
-    drop(pair.slave);
     let (sender, receiver) = mpsc::sync_channel(16);
-    let reading = thread::spawn(move || {
-        let mut bytes = [0; 2048];
-        while let Ok(n) = reader.read(&mut bytes) {
-            if n == 0 || sender.send(bytes[..n].to_vec()).is_err() {
-                break;
+    let readers = [
+        child
+            .stdout
+            .take()
+            .map(|r| Box::new(r) as Box<dyn Read + Send>),
+        child
+            .stderr
+            .take()
+            .map(|r| Box::new(r) as Box<dyn Read + Send>),
+    ]
+    .into_iter()
+    .flatten()
+    .map(|mut reader| {
+        let sender = sender.clone();
+        thread::spawn(move || {
+            let mut bytes = [0; 2048];
+            while let Ok(n) = reader.read(&mut bytes) {
+                if n == 0 || sender.send(bytes[..n].to_vec()).is_err() {
+                    break;
+                }
             }
-        }
-    });
+        })
+    })
+    .collect::<Vec<_>>();
+    drop(sender);
     let mut parser = LoginParser::default();
     let deadline = Instant::now() + Duration::from_secs(600);
-    let result =
-        (|| {
-            loop {
-                check_cancel(cancel)?;
-                if Instant::now() >= deadline {
-                    return Err("GitHub sign-in expired; reconnect".into());
-                }
-                if let Ok(bytes) = receiver.recv_timeout(Duration::from_millis(40)) {
-                    parser.feed(&bytes)?;
-                    while let Some(answer) = parser.response() {
-                        writer
-                            .write_all(answer)
-                            .map_err(|_| "Cannot answer GitHub prompt")?;
-                        writer.flush().map_err(|_| "Cannot answer GitHub prompt")?;
-                    }
-                    if let Some(job) = sessions().lock().unwrap().get_mut(root).filter(|j| {
+    let result = (|| {
+        loop {
+            check_cancel(cancel)?;
+            if Instant::now() >= deadline {
+                return Err("GitHub sign-in expired. Try again.".into());
+            }
+            if let Ok(bytes) = receiver.recv_timeout(Duration::from_millis(40)) {
+                parser.feed(&bytes)?;
+                if let Some(job) =
+                    sessions().lock().unwrap().get_mut(root).filter(|j| {
                         j.generation == c.generation && !j.cancel.load(Ordering::SeqCst)
-                    }) {
-                        job.code = parser.code();
-                        job.browser_ready = parser.browser_answered && job.code.is_some();
-                    }
-                }
-                if let Some(status) = child
-                    .try_wait()
-                    .map_err(|_| "Cannot monitor GitHub sign-in")?
+                    })
                 {
-                    while let Ok(bytes) = receiver.try_recv() {
-                        parser.feed(&bytes)?;
-                    }
-                    return if status.success() {
-                        Ok(())
-                    } else {
-                        Err("GitHub sign-in was denied or failed. Retry in your browser.".into())
-                    };
+                    job.code = parser.code();
+                    job.browser_ready = job.code.is_some();
                 }
             }
-        })();
-    if let Some(pid) = child.process_id() {
-        unsafe {
-            libc::kill(-(pid as i32), libc::SIGKILL);
+            if let Some(status) = child
+                .try_wait()
+                .map_err(|_| "Cannot monitor GitHub sign-in")?
+            {
+                // Drain until EOF so the final Keychain warning cannot race child exit.
+                // A stuck descendant remains bounded and cancellable.
+                loop {
+                    check_cancel(cancel)?;
+                    if Instant::now() >= deadline {
+                        return Err("GitHub sign-in expired. Try again.".into());
+                    }
+                    match receiver.recv_timeout(Duration::from_millis(40)) {
+                        Ok(bytes) => parser.feed(&bytes)?,
+                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                        Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                    }
+                }
+                return if status.success() {
+                    Ok(())
+                } else {
+                    Err("GitHub browser sign-in could not finish. Check your connection and try again.".into())
+                };
+            }
         }
+    })();
+    unsafe {
+        libc::kill(-(child.id() as i32), libc::SIGKILL);
     }
     let _ = child.kill();
     let _ = child.wait();
     drop(receiver);
-    drop(writer);
-    drop(pair.master);
-    let _ = reading.join();
+    for reader in readers {
+        let _ = reader.join();
+    }
     result
 }
 
@@ -766,22 +686,15 @@ fn login(root: &Path, c: &Connection, cancel: &Arc<AtomicBool>) -> Result<(), St
 mod tests {
     use super::*;
     #[test]
-    fn confirming_existing_account_connects_without_login_or_switch() {
-        let (state, root, mut c) = fixture();
-        c.phase = "awaiting_account".into();
-        save(&mut state.lock().unwrap(), &c).unwrap();
-        run_job(
-            &state,
-            &root,
-            &c,
-            &Arc::new(AtomicBool::new(false)),
-            &Job::Use(c.generation.clone()),
-        )
-        .unwrap();
+    fn connect_always_uses_browser_and_binds_verified_account_without_confirmation() {
+        let (state, root, c) = fixture();
+        run_job(&state, &root, &c, &Arc::new(AtomicBool::new(false))).unwrap();
         assert_eq!(status(&state).unwrap()["connected"], true);
         let calls = fs::read_to_string(c.config.join("calls")).unwrap();
-        assert!(!calls.contains("auth login"));
+        let login = calls.find("auth login").unwrap();
+        assert!(login < calls.find("auth status").unwrap());
         assert!(!calls.contains("auth switch"));
+        assert!(!calls.contains("config get"));
     }
     #[test]
     fn cancelling_a_read_does_not_disconnect_or_allow_its_commit() {
@@ -794,42 +707,64 @@ mod tests {
         next.check_commit(&state.lock().unwrap()).unwrap();
     }
     #[test]
-    fn dedicated_pty_answers_git_setup_no_and_expected_browser_prompt() {
-        let (state, root, c) = fixture();
-        let binary = root.join("active/gh");
+    fn browser_login_uses_pipes_and_never_answers_interactive_prompts() {
+        let (_, root, c) = fixture();
         fs::write(
-            &binary,
+            root.join("active/gh"),
             r#"#!/bin/sh
-case "$1 $2" in
-  "config get") printf 'https\n' ;;
-  "auth login")
-    printf 'Authenticate Git with your GitHub credentials? (Y/n) '
-    read -r answer
-    [ "$answer" = n ] || exit 70
-    printf '! First copy your one-time code: ABCD-1234\n'
-    printf 'Press Enter to open https://github.com/login/device in your browser... '
-    read -r answer
-    [ -z "$answer" ] || exit 71
-    ;;
-  *) exit 72 ;;
-esac
+[ ! -t 0 ] && [ ! -t 1 ] && [ ! -t 2 ] || exit 70
+[ "$GH_PROMPT_DISABLED" = 1 ] || exit 71
+printf '! First copy your one-time code: ABCD-1234\n' >&2
+printf 'Open this URL to continue in your web browser: https://github.com/login/device\n' >&2
 "#,
         )
         .unwrap();
-        let cancel = Arc::new(AtomicBool::new(false));
-        sessions().lock().unwrap().insert(
-            root.clone(),
-            Session {
-                generation: c.generation.clone(),
-                cancel: cancel.clone(),
-                code: None,
-                browser_ready: false,
-                running: true,
-            },
+        login(&root, &c, &Arc::new(AtomicBool::new(false))).unwrap();
+    }
+    #[test]
+    fn final_plaintext_warning_is_not_lost_when_login_exits() {
+        let (_, root, c) = fixture();
+        fs::write(
+            root.join("active/gh"),
+            "#!/bin/sh\nprintf 'Authentication credentials saved in plain text' >&2\n",
+        )
+        .unwrap();
+        assert_eq!(
+            login(&root, &c, &Arc::new(AtomicBool::new(false))).unwrap_err(),
+            STORAGE_ERROR
         );
-        login(&root, &c, &cancel).unwrap();
-        assert_eq!(read(&state.lock().unwrap()).unwrap().phase, "connected");
-        sessions().lock().unwrap().remove(&root);
+    }
+    #[test]
+    #[ignore = "Set DITCH_GITHUB_TEST_BINARY to the real managed CLI; no account or external network is used"]
+    fn real_cli_noninteractive_login_reaches_device_request_without_terminal_queries() {
+        let (_, root, c) = fixture();
+        let binary = PathBuf::from(std::env::var("DITCH_GITHUB_TEST_BINARY").unwrap());
+        let mut command = login_command(&binary, &root, &c.config);
+        // Isolated config, no auth files, and all HTTPS directed at a closed local port.
+        command.env("HTTPS_PROXY", "http://127.0.0.1:1");
+        command
+            .process_group(0)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command.spawn().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if child.try_wait().unwrap().is_some() {
+                break;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("Real gh hung before the device authorization request");
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        let result = child.wait_with_output().unwrap();
+        assert!(!result.status.success());
+        let error = String::from_utf8_lossy(&result.stderr);
+        assert!(error.contains("/login/device/code"), "{error}");
+        assert!(!error.contains("Authenticate Git"));
+        assert!(!result.stderr.windows(4).any(|v| v == b"\x1b[6n"));
     }
     fn fixture() -> (Arc<Mutex<RuntimeState>>, PathBuf, Connection) {
         let state = Arc::new(Mutex::new(super::super::super::tests::test_runtime()));
@@ -845,7 +780,7 @@ case "$1 $2" in
   "--version ") printf 'gh version 2.101.0 (fixture)\n' ;;
   "auth status") /bin/cat "$GH_CONFIG_DIR/status.json" ;;
   "api --hostname") /bin/cat "$GH_CONFIG_DIR/user.json" ;;
-  "config get") printf 'https\n' ;;
+  "auth login") printf '! First copy your one-time code: ABCD-1234\n' >&2 ;;
   *) exit 74 ;;
 esac
 "#;
@@ -866,28 +801,56 @@ esac
         (state, root, c)
     }
     #[test]
-    fn parser_handles_every_chunk_boundary_and_only_known_prompts() {
-        let output=b"\x1b[32m? Authenticate Git with your GitHub credentials?\x1b[0m (Y/n)\n! First copy your one-time code: ABCD-1234\nPress Enter to open https://github.com/login/device in your browser... ";
+    fn parser_handles_every_chunk_boundary_without_terminal_interaction() {
+        let output = b"! First copy your one-time code: ABCD-1234\nOpen this URL to continue in your web browser: https://github.com/login/device\n";
         for split in 0..=output.len() {
             let mut parser = LoginParser::default();
-            let mut responses = Vec::new();
-            for chunk in [&output[..split], &output[split..]] {
-                parser.feed(chunk).unwrap();
-                while let Some(value) = parser.response() {
-                    responses.push(value.to_vec());
-                }
-            }
-            assert_eq!(responses, vec![b"n\r".to_vec(), b"\r".to_vec()]);
+            parser.feed(&output[..split]).unwrap();
+            parser.feed(&output[split..]).unwrap();
             assert_eq!(parser.code().as_deref(), Some("ABCD-1234"));
         }
         let mut parser = LoginParser::default();
-        parser.feed(b"Upload a key? Press Enter to open https://evil.test/login/device in your browser...").unwrap();
-        assert!(parser.response().is_none());
+        parser.feed(b"\x1b[6nUnknown terminal prompt").unwrap();
+        assert!(parser.code().is_none());
         assert!(
             parser
                 .feed(b"Authentication credentials saved in plain text")
                 .is_err()
         );
+    }
+    #[test]
+    fn transient_verification_failure_preserves_connection_but_revocation_does_not() {
+        let (state, _, c) = fixture();
+        let binding = Binding::capture(state.clone()).unwrap();
+        fs::write(
+            c.config.join("status.json"),
+            r#"[{"active":true,"host":"github.com","state":"timeout"}]"#,
+        )
+        .unwrap();
+        assert!(binding.verify().is_err());
+        assert_eq!(status(&state).unwrap()["connected"], true);
+        fs::write(
+            c.config.join("status.json"),
+            r#"[{"active":true,"host":"github.com","state":"error","invalidCredential":true}]"#,
+        )
+        .unwrap();
+        assert_eq!(binding.verify().unwrap_err(), INVALID_AUTH);
+        assert_eq!(status(&state).unwrap()["connected"], false);
+    }
+    #[test]
+    fn cancellation_during_probe_preserves_connection() {
+        let (state, root, c) = fixture();
+        let binding = Binding::capture(state.clone()).unwrap();
+        fs::write(root.join("active/gh"), "#!/bin/sh\nexec /bin/sleep 20\n").unwrap();
+        let cancel = binding.cancel.clone();
+        let worker = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(100));
+            cancel.store(true, Ordering::SeqCst);
+        });
+        assert!(binding.verify().is_err());
+        worker.join().unwrap();
+        assert_eq!(status(&state).unwrap()["connected"], true);
+        assert!(fs::read(c.config.join("status.json")).is_ok());
     }
     #[test]
     fn status_schema_checks_state_and_storage_even_with_successful_exit() {
@@ -915,7 +878,9 @@ esac
         );
         let calls = fs::read_to_string(c.config.join("calls")).unwrap();
         assert!(calls.contains("--json hosts --jq"));
-        assert!(calls.contains("{state,active,host,login,tokenSource,gitProtocol}"));
+        assert!(
+            calls.contains("{state,active,host,login,tokenSource,gitProtocol, invalidCredential:")
+        );
         for forbidden in [
             "--show-token",
             "auth token",
@@ -966,13 +931,12 @@ esac
         assert!(Binding::capture(state).is_err());
     }
     #[test]
-    fn no_credential_probe_before_consent_and_restart_does_not_resume_login() {
+    fn status_never_probes_credentials_and_restart_does_not_resume_login() {
         let (state, root, mut c) = fixture();
         c.consent = false;
         c.phase = "disconnected".into();
         c.account = None;
         save(&mut state.lock().unwrap(), &c).unwrap();
-        assert!(control(state.clone(), GitHubRequest::Connect).is_err());
         status(&state).unwrap();
         assert!(!c.config.join("calls").exists());
         c.phase = "authenticating".into();
@@ -982,7 +946,7 @@ esac
         assert!(!c.config.join("calls").exists());
     }
     #[test]
-    fn duplicate_clicks_and_stale_account_confirmation_cannot_launch() {
+    fn duplicate_connect_clicks_cannot_launch() {
         let (state, root, c) = fixture();
         sessions().lock().unwrap().insert(
             root.clone(),
@@ -992,31 +956,22 @@ esac
                 code: None,
                 browser_ready: false,
                 running: true,
+                read_progress: None,
             },
         );
-        assert!(control(state.clone(), GitHubRequest::BrowserLogin).is_err());
+        assert!(control(state.clone(), GitHubRequest::Connect).is_err());
         sessions().lock().unwrap().remove(&root);
-        assert!(
-            control(
-                state,
-                GitHubRequest::UseAccount {
-                    generation: "stale".into()
-                }
-            )
-            .is_err()
-        );
-        assert!(!c.config.join("calls").exists());
     }
+
     #[test]
-    fn config_resolver_rejects_project_paths_and_relative_overrides() {
+    fn default_config_must_remain_outside_registered_projects() {
         let (state, _, _) = fixture();
         let mut s = state.lock().unwrap();
-        let project = Project::new("fixture", s.paths.data_dir.join("project"));
-        fs::create_dir_all(&project.root).unwrap();
-        s.projects.insert(project.root_key(), project.clone());
-        assert!(config_path(&s, Some(project.root.join("gh").display().to_string())).is_err());
-        assert!(config_path(&s, Some("../gh".into())).is_err());
-        assert!(config_path(&s, None).unwrap().ends_with(".config/gh"));
+        let path = config_path(&s).unwrap();
+        assert!(path.ends_with(".config/gh"));
+        let project = Project::new("fixture", path);
+        s.projects.insert(project.root_key(), project);
+        assert!(config_path(&s).is_err());
     }
     #[test]
     fn subprocess_cancellation_and_output_limits_are_enforced() {
