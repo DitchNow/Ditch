@@ -19,3 +19,15 @@ Community retains one runtime/process owner and one SQLite connection owner. The
 No skill import should mutate global Codex configuration or copy authentication material. Installation and synchronization operate on explicit Ditch-managed revisions. Provider-owned Codex history is separate from Ditch's bounded UI projections.
 
 The practical concurrency tests do not replace ThreadSanitizer or formal verification. Real SSH trust behavior, historical provider versions, native accessibility, and sustained multi-project load require environment-specific validation before release.
+
+## GitHub integration boundary (2026-09-29)
+
+GitHub operations retain the native-peer check before runtime dispatch; the shared helper is also used by Commercial Ditchmaster. Worker tools and the typed mobile command surface do not expose GitHub connection/import operations. No caller-provided actor flag authorizes them.
+
+The integration executes only the pinned managed CLI and internally constructed GET requests. It removes inherited tokens and browser/editor/pager overrides. Authentication uses a separate ephemeral PTY; only the expected device code and fixed github.com device URL reach the native panel. Authentication output is not published as events or agent scrollback.
+
+Consent and a stable GitHub user ID, configuration path, and connection generation are stored without credentials. Active-account/storage verification runs before and after each private GET, and the generation is checked under the store lock before publishing or committing. External shared-account changes require reconfirmation. These checks detect practical drift but cannot transactionally isolate the account from another same-user process.
+
+Disconnect never runs logout, deletes shared config, or revokes authorization. It invalidates pending work and clears transient browsing views; imported task/source snapshots are deliberate retained local copies. An observed plaintext fallback rejects the connection and reports that shared credentials were not erased. Ditch does not attempt unsafe cleanup of a shared configuration file.
+
+The broker is not OS isolation from unrestricted same-user shell processes. Agent/project permissions are unchanged. Imported issue content is task data and is explicitly identified as untrusted in execution prompts; it cannot authorize tools or override user/project instructions. Bodies/comments are displayed as literal Markdown text, with no executable HTML or automatic external-resource fetches.

@@ -138,7 +138,6 @@ fn start_remote_app_server_session_linked(
         return protocol_error("skill_unavailable", error);
     }
     let extra_roots = selected_skill_roots(&execution_profile.skills);
-    let allow_non_git = project.git_policy == ProjectGitPolicy::AllowOutsideGit;
     let user_message = AgentChatMessage {
         agent_id: run.id,
         role: AgentChatRole::User,
@@ -151,7 +150,6 @@ fn start_remote_app_server_session_linked(
             project,
             run,
             user_message,
-            allow_non_git,
             "No working Codex CLI installation was found for this project.".to_owned(),
         );
     };
@@ -189,7 +187,6 @@ fn start_remote_app_server_session_linked(
                 project,
                 run,
                 user_message,
-                allow_non_git,
                 format!("Failed to start Codex App Server: {error}"),
             );
         }
@@ -229,7 +226,6 @@ fn start_remote_app_server_session_linked(
             AgentRecord {
                 run: run.clone(),
                 project_root: project.root.clone(),
-                allow_non_git,
                 messages: {
                     let mut messages = previous.as_ref().map(|p| p.messages.clone()).unwrap_or_default();
                     messages.push(user_message.clone());
@@ -325,7 +321,7 @@ fn prompt_app_server_agent(
         let Some(thread_id) = record.run.native_session_id.clone() else {
             return protocol_error(
                 "agent_not_resumable",
-                "Codex App Server never created a thread for this agent",
+                "This session has no saved Codex thread. Start a new agent instead.",
             );
         };
         if record.run.origin_codex_home

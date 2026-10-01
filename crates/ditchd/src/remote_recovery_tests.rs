@@ -45,7 +45,6 @@ pub(super) fn recovery_agent(runtime: &mut RuntimeState) -> AgentId {
         AgentRecord {
             run,
             project_root: project.root,
-            allow_non_git: false,
             messages: vec![message],
             terminal_failure: None,
         },
@@ -404,7 +403,8 @@ time.sleep(0.3) # Keep the thread writer alive briefly after turn completion.
                 prompt: "ask".into(),
                 mode: CodexLaunchMode::Exec,
                 execution_profile: AgentExecutionProfile {
-                    transport: ditch_core::AgentTransport::AppServer,
+                    // Old clients and saved profiles cannot create another CLI turn.
+                    transport: ditch_core::AgentTransport::Legacy,
                     model: Some("model-a".into()),
                     approval: AgentApprovalPreset::Ask,
                     ..Default::default()
@@ -416,6 +416,7 @@ time.sleep(0.3) # Keep the thread writer alive briefly after turn completion.
             panic!("start failed: {response:?}");
         };
         let id = run.id;
+        assert_eq!(run.execution_profile.transport, ditch_core::AgentTransport::AppServer);
         wait_for_session(&state, |s| s.pending_permissions.len() == 1);
         assert!(handle_remote_app_server_event(
             &state,
@@ -493,6 +494,17 @@ time.sleep(0.3) # Keep the thread writer alive briefly after turn completion.
             state.lock().unwrap().agents[&id].run.state,
             AgentState::Completed
         );
+        // Simulate a persisted conversation from before App Server. The next
+        // prompt must preserve its thread, identity, title, and transcript.
+        let history_len = {
+            let mut guard = state.lock().unwrap();
+            let record = guard.agents.get_mut(&id).unwrap();
+            record.run.execution_profile.transport = ditch_core::AgentTransport::Legacy;
+            record.run.user_title = Some("Saved conversation".into());
+            let len = record.messages.len();
+            guard.persist_agent(id);
+            len
+        };
         for (prompt, approval, model) in [
             ("automatic", AgentApprovalPreset::ApproveForMe, "model-b"),
             ("stop", AgentApprovalPreset::Ask, "model-b"),
@@ -538,6 +550,9 @@ time.sleep(0.3) # Keep the thread writer alive briefly after turn completion.
             }
             wait_for_session(&state, |s| !s.children.contains_key(&id));
             let guard = state.lock().unwrap();
+            assert_eq!(guard.agents[&id].run.execution_profile.transport, ditch_core::AgentTransport::AppServer);
+            assert_eq!(guard.agents[&id].run.user_title.as_deref(), Some("Saved conversation"));
+            assert!(guard.agents[&id].messages.len() > history_len);
             assert!(guard.pending_permissions.is_empty());
             assert!(
                 !guard

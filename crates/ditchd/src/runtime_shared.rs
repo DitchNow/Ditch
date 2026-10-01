@@ -304,7 +304,6 @@ struct SetupTerminalRecord {
 struct AgentRecord {
     run: AgentRun,
     project_root: PathBuf,
-    allow_non_git: bool,
     messages: Vec<AgentChatMessage>,
     terminal_failure: Option<String>,
 }
@@ -360,7 +359,6 @@ impl RuntimeState {
                     AgentRecord {
                         run,
                         project_root: project.root.clone(),
-                        allow_non_git: project.git_policy == ProjectGitPolicy::AllowOutsideGit,
                         messages: agent.messages,
                         terminal_failure: agent.terminal_failure,
                     },
@@ -456,7 +454,7 @@ impl RuntimeState {
             "always_on_web_access_v1".to_owned(),
             "ssh_remote_runtime_v1".to_owned(),
             "skills_v1".to_owned(),
-            "local_app_server_opt_in_v1".to_owned(),
+            "app_server_only_v1".to_owned(),
             "remote_directory_picker_v1".to_owned(),
             format!(
                 "remote_runtime_protocol_v{}",
@@ -1067,7 +1065,6 @@ fn reconcile_remote_snapshot_locked(
             AgentRecord {
                 run,
                 project_root: project.root.clone(),
-                allow_non_git: project.git_policy == ProjectGitPolicy::AllowOutsideGit,
                 messages,
                 terminal_failure: None,
             },
@@ -1899,9 +1896,6 @@ fn handle_request(request: ClientRequest, state: Arc<Mutex<RuntimeState>>) -> Se
                 let project = project_id
                     .and_then(|id| project_by_id(&state, id))
                     .unwrap_or_else(|| project_for_launch(&state, project_name, project_root));
-                if execution_profile.transport == ditch_core::AgentTransport::Legacy {
-                    start_codex_session(state, project.name, project.root.to_string_lossy().into_owned(), prompt, mode, execution_profile)
-                } else {
                 start_app_server_session(
                     state,
                     project.id,
@@ -1911,7 +1905,6 @@ fn handle_request(request: ClientRequest, state: Arc<Mutex<RuntimeState>>) -> Se
                     prompt,
                     execution_profile,
                 )
-                }
             }
         }
         ClientRequest::ResumeCodexSession {
@@ -1955,9 +1948,6 @@ fn handle_request(request: ClientRequest, state: Arc<Mutex<RuntimeState>>) -> Se
                 let project = project_id
                     .and_then(|id| project_by_id(&state, id))
                     .unwrap_or_else(|| project_for_launch(&state, project_name, project_root));
-                if execution_profile.transport == ditch_core::AgentTransport::Legacy {
-                    resume_codex_session(state, project.name, project.root.to_string_lossy().into_owned(), thread_id, prompt, execution_profile)
-                } else {
                 start_app_server_session(
                     state,
                     project.id,
@@ -1967,7 +1957,6 @@ fn handle_request(request: ClientRequest, state: Arc<Mutex<RuntimeState>>) -> Se
                     prompt,
                     execution_profile,
                 )
-                }
             }
         }
         ClientRequest::StartRemoteCodexAppServerSession {
@@ -2028,7 +2017,7 @@ fn handle_request(request: ClientRequest, state: Arc<Mutex<RuntimeState>>) -> Se
                     },
                 )
             } else {
-                list_agent_models(state, provider)
+                list_agent_models(state, provider, project_id)
             }
         }
         ClientRequest::OpenProjectTerminal {
@@ -3015,7 +3004,6 @@ fn cache_remote_agent(
         AgentRecord {
             run: run.clone(),
             project_root: project.root.clone(),
-            allow_non_git: project.git_policy == ProjectGitPolicy::AllowOutsideGit,
             messages: Vec::new(),
             terminal_failure: None,
         },
@@ -3343,18 +3331,34 @@ fn shutdown_runtime(state: Arc<Mutex<RuntimeState>>) -> ServerResponse {
     ServerResponse::Accepted
 }
 
-fn list_agent_models(state: Arc<Mutex<RuntimeState>>, provider: AgentProvider) -> ServerResponse {
+fn list_agent_models(
+    state: Arc<Mutex<RuntimeState>>,
+    provider: AgentProvider,
+    project_id: Option<ProjectId>,
+) -> ServerResponse {
     if provider != AgentProvider::Codex {
         return ServerResponse::AgentModels(Vec::new());
     }
-    let binary = active_codex_binary(&state);
-    let Some(binary) = binary else {
+    let cwd = match project_id {
+        Some(id) => match project_by_id(&state, id) {
+            Some(project) => project.root,
+            None => {
+                return protocol_error("project_not_found", "The selected project no longer exists");
+            }
+        },
+        None => match std::env::current_dir() {
+            Ok(cwd) => cwd,
+            Err(error) => return protocol_error("codex_models_failed", error.to_string()),
+        },
+    };
+    let Some(binary) = active_codex_binary(&state) else {
         return protocol_error(
             "codex_not_found",
             "No working Codex CLI installation was found for this user",
         );
     };
-    match discover_codex_models(&binary) {
+    let home = state.lock().unwrap().codex_home.clone();
+    match discover_codex_models(&binary, &cwd, home.as_deref()) {
         Ok(models) => ServerResponse::AgentModels(models),
         Err(error) => protocol_error("codex_models_failed", error.to_string()),
     }
@@ -3556,120 +3560,78 @@ fn close_project_terminal(
     ServerResponse::Accepted
 }
 
-fn discover_codex_models(binary: &str) -> io::Result<Vec<AgentModel>> {
-    let mut command = Command::new(binary);
-    command.args(["app-server", "--stdio"]);
-    if let Some(path) = effective_path_for_binary(Path::new(binary)) {
-        command.env("PATH", path);
-    }
-    let mut child = command
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()?;
-    let mut stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| io::Error::other("missing app-server stdin"))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| io::Error::other("missing app-server stdout"))?;
-    writeln!(
-        stdin,
-        "{}",
-        serde_json::json!({"id":1,"method":"initialize","params":{"clientInfo":{"name":"the_ditch","title":"The Ditch","version":env!("CARGO_PKG_VERSION")}}})
-    )?;
-    writeln!(
-        stdin,
-        "{}",
-        serde_json::json!({"method":"initialized","params":{}})
-    )?;
-    writeln!(
-        stdin,
-        "{}",
-        serde_json::json!({"id":2,"method":"model/list","params":{"limit":100,"includeHidden":false}})
-    )?;
-    stdin.flush()?;
-    let (tx, rx) = mpsc::channel();
-    thread::spawn(move || {
-        for line in BufReader::new(stdout).lines() {
-            if tx.send(line).is_err() {
-                break;
-            }
-        }
-    });
+fn discover_codex_models(
+    binary: &str,
+    cwd: &Path,
+    home: Option<&Path>,
+) -> io::Result<Vec<AgentModel>> {
+    let mut client = app_server_client::Client::open(binary, cwd, home, None)?;
     let mut models = Vec::new();
-    let deadline = Instant::now() + Duration::from_secs(15);
-    let result: io::Result<()> = (|| {
-        loop {
-            let line = rx
-                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-                .map_err(|_| {
-                    io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "Codex model discovery timed out or disconnected",
-                    )
-                })??;
-            let value: Value = serde_json::from_str(&line)?;
-            if value.get("id").and_then(Value::as_i64) != Some(2) {
+    let mut cursor: Option<String> = None;
+    let mut seen_cursors = HashSet::new();
+    loop {
+        let result = client.call(
+            "model/list",
+            serde_json::json!({"limit":100,"includeHidden":false,"cursor":cursor}),
+        )?;
+        for item in result
+            .get("data")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let Some(id) = item.get("id").and_then(Value::as_str) else {
                 continue;
-            }
-            if let Some(error) = value.get("error") {
-                let _ = child.kill();
-                return Err(io::Error::other(error.to_string()));
-            }
-            for item in value
-                .pointer("/result/data")
+            };
+            let efforts = item
+                .get("supportedReasoningEfforts")
                 .and_then(Value::as_array)
                 .into_iter()
                 .flatten()
-            {
-                let Some(id) = item.get("id").and_then(Value::as_str) else {
-                    continue;
-                };
-                let efforts = item
-                    .get("supportedReasoningEfforts")
-                    .and_then(Value::as_array)
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|entry| entry.get("reasoningEffort").and_then(Value::as_str))
-                    .map(str::to_owned)
-                    .collect();
-                models.push(AgentModel {
-                    id: id.to_owned(),
-                    display_name: item
-                        .get("displayName")
-                        .and_then(Value::as_str)
-                        .unwrap_or(id)
-                        .to_owned(),
-                    is_default: item
-                        .get("isDefault")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false),
-                    default_reasoning_effort: item
-                        .get("defaultReasoningEffort")
-                        .and_then(Value::as_str)
-                        .map(str::to_owned),
-                    supported_reasoning_efforts: efforts,
-                    context_window_tokens: item
-                        .get("contextWindowTokens")
-                        .or_else(|| item.get("contextWindow"))
-                        .or_else(|| item.get("context_window_tokens"))
-                        .and_then(|value| {
-                            value
-                                .as_u64()
-                                .or_else(|| value.as_str().and_then(|text| text.parse().ok()))
-                        }),
-                });
-            }
-            break;
+                .filter_map(|entry| entry.get("reasoningEffort").and_then(Value::as_str))
+                .map(str::to_owned)
+                .collect();
+            models.push(AgentModel {
+                id: id.to_owned(),
+                display_name: item
+                    .get("displayName")
+                    .and_then(Value::as_str)
+                    .unwrap_or(id)
+                    .to_owned(),
+                is_default: item
+                    .get("isDefault")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                default_reasoning_effort: item
+                    .get("defaultReasoningEffort")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                supported_reasoning_efforts: efforts,
+                context_window_tokens: item
+                    .get("contextWindowTokens")
+                    .or_else(|| item.get("contextWindow"))
+                    .or_else(|| item.get("context_window_tokens"))
+                    .and_then(|value| {
+                        value
+                            .as_u64()
+                            .or_else(|| value.as_str().and_then(|text| text.parse().ok()))
+                    }),
+            });
         }
-        Ok(())
-    })();
-    let _ = child.kill();
-    let _ = child.wait();
-    result?;
+        cursor = result
+            .get("nextCursor")
+            .and_then(Value::as_str)
+            .filter(|cursor| !cursor.is_empty())
+            .map(str::to_owned);
+        let Some(next) = cursor.as_ref() else {
+            break;
+        };
+        if !seen_cursors.insert(next.clone()) {
+            return Err(io::Error::other(
+                "Codex model discovery repeated a pagination cursor",
+            ));
+        }
+    }
     Ok(models)
 }
 
@@ -3678,184 +3640,11 @@ include!("acceptance_runtime.rs");
 include!("skill_runtime.rs");
 include!("remote_app_server_runtime.rs");
 
-fn start_codex_session(state: Arc<Mutex<RuntimeState>>, project_name:String, project_root:String, prompt:String, mode:CodexLaunchMode, execution_profile:AgentExecutionProfile) -> ServerResponse {
-    start_codex_session_linked(state,project_name,project_root,prompt,mode,execution_profile,None)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn start_codex_session_linked(
-    state: Arc<Mutex<RuntimeState>>,
-    project_name: String,
-    project_root: String,
-    prompt: String,
-    mode: CodexLaunchMode,
-    execution_profile: ditch_core::AgentExecutionProfile,
-    binding: Option<(TaskId,AgentId)>,
-) -> ServerResponse {
-    let project = if let Some((task_id,_)) = binding {
-        let locked=state.lock().expect("runtime lock poisoned");
-        let project=locked.tasks.get(&task_id).and_then(|task|locked.projects.values().find(|p|p.id==task.project_id)).cloned();
-        let Some(project)=project else {return protocol_error("project_not_found","The task project is no longer registered");};project
-    } else { project_for_launch(&state, project_name, project_root) };
-    if execution_profile.transport == ditch_core::AgentTransport::AppServer {
-        if let Err(error)=skill_client(&state,&project) {
-            if !execution_profile.skills.is_empty(){return protocol_error("skills_require_app_server",format!("App Server unavailable: {error}. Selected skills were not launched."));}
-            let mut fallback=execution_profile.clone();fallback.transport=ditch_core::AgentTransport::Legacy;
-            let response=start_codex_session_linked(Arc::clone(&state),project.name,project.root.to_string_lossy().into_owned(),prompt,mode,fallback,binding);
-            if let ServerResponse::AgentStarted(run)=&response {append_message(&state,run.id,AgentChatRole::Tool,format!("App Server unavailable; using legacy execution without interactive approvals or skills. {error}"),None);}
-            return response;
-        }
-        return start_remote_app_server_session_linked(state,project.id,project.name,project.root.to_string_lossy().into_owned(),None,prompt,execution_profile,binding);
-    }
-    if !execution_profile.skills.is_empty() { return protocol_error("skills_require_app_server", "Selected skills require App Server. Enable it or remove the selection."); }
-    if let Err(error) = ensure_project_metadata(&project) {
-        return protocol_error("project_metadata_failed", error.to_string());
-    }
-
-    let now = Utc::now();
-    let mut run = AgentRun {
-        coordinator_group: None,
-        id: binding.map(|b|b.1).unwrap_or_default(),
-        provider: AgentProvider::Codex,
-        state: AgentState::Starting,
-        can_stop: false,
-        launch_mode: mode.clone(),
-        execution_profile: execution_profile.clone(),
-        project_id: project.id,
-        task_id: binding.map(|b|b.0),
-        pane_id: None,
-        native_session_id: None,
-        codex_title: None,
-        user_title: None,
-        origin_codex_home: std::env::var("CODEX_HOME").ok(),
-        current_prompt: Some(prompt.clone()),
-        last_visible_action: Some("Starting Codex".to_owned()),
-        state_confidence: 0.8,
-        state_evidence: "Ditch Runtime accepted the session and is launching Codex.".to_owned(),
-        started_at: now,
-        updated_at: now,
-        finished_at: None,
-        exit_code: None,
-        resume_block_reason: None,
-    };
-
-    run.coordinator_group = state.lock().unwrap().agent_coordinator_group(run.id);
-    let writer = match WriterGuard::acquire(&state,run.id,&project,&execution_profile) { Ok(w) => w, Err(e) => return protocol_error("workspace_busy",e) };
-    if let Err(error) = verify_project_git_policy(&project) {
-        return error;
-    }
-    let allow_non_git = project.git_policy == ProjectGitPolicy::AllowOutsideGit;
-    let user_message = AgentChatMessage {
-        agent_id: run.id,
-        role: AgentChatRole::User,
-        text: prompt.clone(),
-        created_at: Utc::now(),
-    };
-    let binary = active_codex_binary(&state);
-    let Some(binary) = binary else {
-        return persist_launch_failure(
-            &state,
-            project,
-            run,
-            user_message,
-            allow_non_git,
-            "No working Codex CLI installation was found. Choose an existing installation in Ditch settings.".to_owned(),
-        );
-    };
-    let child = match spawn_codex_child(
-        &binary,
-        &project.root,
-        &prompt,
-        &mode,
-        None,
-        allow_non_git,
-        &execution_profile,
-        &writer,
-    ) {
-        Ok(child) => Arc::new(Mutex::new(child)),
-        Err(error) => {
-            return persist_launch_failure(
-                &state,
-                project,
-                run,
-                user_message,
-                allow_non_git,
-                error.to_string(),
-            );
-        }
-    };
-    let process_group_id = child
-        .lock()
-        .expect("child lock should not be poisoned")
-        .id() as i32;
-
-    let run_id = uuid::Uuid::new_v4();
-    run.state = AgentState::Working;
-    run.can_stop = true;
-    run.updated_at = Utc::now();
-    run.state_evidence = "Codex process is running under Ditch Runtime.".to_owned();
-
-    {
-        let mut state = state
-            .lock()
-            .expect("runtime state lock should not be poisoned");
-        if let Err(error) = state.store.upsert_project(&project) {
-            let _ = child
-                .lock()
-                .expect("child lock should not be poisoned")
-                .kill();
-            return protocol_error("project_store_failed", error.to_string());
-        }
-        let home = state
-            .codex_home
-            .as_ref()
-            .map(|value| value.to_string_lossy().into_owned());
-        if let Err(error) = state
-            .store
-            .persist_new_agent(&run, &user_message, home.as_deref())
-        {
-            let _ = child
-                .lock()
-                .expect("child lock should not be poisoned")
-                .kill();
-            return protocol_error("agent_store_failed", error.to_string());
-        }
-        state.projects.insert(project.root_key(), project.clone());
-        state.agents.insert(
-            run.id,
-            AgentRecord {
-                run: run.clone(),
-                project_root: project.root.clone(),
-                allow_non_git,
-                messages: vec![user_message.clone()],
-                terminal_failure: None,
-            },
-        );
-        state.children.insert(
-            run.id,
-            ActiveAgentChild {
-                run_id,
-                process_group_id,
-                child: Arc::clone(&child),
-                app_server: false,
-            },
-        );
-        state.broadcast(ServerEvent::ProjectChanged(project));
-        state.broadcast(ServerEvent::AgentChanged(run.clone()));
-        state.broadcast(ServerEvent::AgentMessageAppended(user_message));
-    }
-
-    writer.retain();
-    attach_codex_io(Arc::clone(&state), run.id, run_id, child);
-    ServerResponse::AgentStarted(run)
-}
-
 fn persist_launch_failure(
     state: &Arc<Mutex<RuntimeState>>,
     project: Project,
     mut run: AgentRun,
     user_message: AgentChatMessage,
-    allow_non_git: bool,
     error: String,
 ) -> ServerResponse {
     run.state = AgentState::Failed;
@@ -3912,7 +3701,6 @@ fn persist_launch_failure(
         AgentRecord {
             run: run.clone(),
             project_root: project.root.clone(),
-            allow_non_git,
             messages,
             terminal_failure: Some(error.clone()),
         },
@@ -3964,173 +3752,6 @@ fn verify_project_git_policy(project: &Project) -> Result<(), ServerResponse> {
     }
 }
 
-fn resume_codex_session(
-    state: Arc<Mutex<RuntimeState>>,
-    project_name: String,
-    project_root: String,
-    thread_id: String,
-    prompt: String,
-    execution_profile: ditch_core::AgentExecutionProfile,
-) -> ServerResponse {
-    let project = project_for_launch(&state, project_name, project_root);
-    if !execution_profile.skills.is_empty() { return protocol_error("skill_thread_changed", "Attach skills to a fresh agent or task attempt, not an imported thread."); }
-    if execution_profile.transport == ditch_core::AgentTransport::AppServer {
-        if let Err(error) = skill_client(&state, &project) {
-            let mut fallback = execution_profile.clone();
-            fallback.transport = ditch_core::AgentTransport::Legacy;
-            let response = resume_codex_session(Arc::clone(&state), project.name, project.root.to_string_lossy().into_owned(), thread_id, prompt, fallback);
-            if let ServerResponse::AgentStarted(run) = &response {
-                append_message(&state, run.id, AgentChatRole::Tool, format!("App Server unavailable; using legacy execution without interactive approvals or skills. {error}"), None);
-            }
-            return response;
-        }
-        return start_remote_app_server_session_linked(state,project.id,project.name,project.root.to_string_lossy().into_owned(),Some(thread_id),prompt,execution_profile,None);
-    }
-    if let Err(message) = validate_thread_project(&state, &thread_id, &project.root) {
-        return protocol_error("codex_thread_project_mismatch", message);
-    }
-    if let Err(error) = ensure_project_metadata(&project) {
-        return protocol_error("project_metadata_failed", error.to_string());
-    }
-
-    let now = Utc::now();
-    let mut run = AgentRun {
-        coordinator_group: None,
-        id: AgentId::new(),
-        provider: AgentProvider::Codex,
-        state: AgentState::Starting,
-        can_stop: false,
-        launch_mode: CodexLaunchMode::Exec,
-        execution_profile: execution_profile.clone(),
-        project_id: project.id,
-        task_id: None,
-        pane_id: None,
-        native_session_id: Some(thread_id.clone()),
-        codex_title: None,
-        user_title: None,
-        origin_codex_home: std::env::var("CODEX_HOME").ok(),
-        current_prompt: Some(prompt.clone()),
-        last_visible_action: Some("Resuming Codex".to_owned()),
-        state_confidence: 0.8,
-        state_evidence: "Ditch Runtime accepted the session and is resuming Codex.".to_owned(),
-        started_at: now,
-        updated_at: now,
-        finished_at: None,
-        exit_code: None,
-        resume_block_reason: None,
-    };
-
-    if let Err(error) = verify_project_git_policy(&project) {
-        return error;
-    }
-    let allow_non_git = project.git_policy == ProjectGitPolicy::AllowOutsideGit;
-    let user_message = AgentChatMessage {
-        agent_id: run.id,
-        role: AgentChatRole::User,
-        text: prompt.clone(),
-        created_at: Utc::now(),
-    };
-    let binary = active_codex_binary(&state);
-    let Some(binary) = binary else {
-        return persist_launch_failure(
-            &state,
-            project,
-            run,
-            user_message,
-            allow_non_git,
-            "No working Codex CLI installation was found. Choose an existing installation in Ditch settings.".to_owned(),
-        );
-    };
-    run.coordinator_group = state.lock().unwrap().agent_coordinator_group(run.id);
-    let writer = match WriterGuard::acquire(&state,run.id,&project,&execution_profile) { Ok(w) => w, Err(e) => return protocol_error("workspace_busy",e) };
-    let child = match spawn_codex_child(
-        &binary,
-        &project.root,
-        &prompt,
-        &CodexLaunchMode::Exec,
-        Some(&thread_id),
-        allow_non_git,
-        &execution_profile,
-        &writer,
-    ) {
-        Ok(child) => Arc::new(Mutex::new(child)),
-        Err(error) => {
-            return persist_launch_failure(
-                &state,
-                project,
-                run,
-                user_message,
-                allow_non_git,
-                error.to_string(),
-            );
-        }
-    };
-    let process_group_id = child
-        .lock()
-        .expect("child lock should not be poisoned")
-        .id() as i32;
-
-    let run_id = uuid::Uuid::new_v4();
-    run.state = AgentState::Working;
-    run.can_stop = true;
-    run.updated_at = Utc::now();
-    run.state_evidence = "Codex resume process is running under Ditch Runtime.".to_owned();
-
-    {
-        let mut state = state
-            .lock()
-            .expect("runtime state lock should not be poisoned");
-        if let Err(error) = state.store.upsert_project(&project) {
-            let _ = child
-                .lock()
-                .expect("child lock should not be poisoned")
-                .kill();
-            return protocol_error("project_store_failed", error.to_string());
-        }
-        let home = state
-            .codex_home
-            .as_ref()
-            .map(|value| value.to_string_lossy().into_owned());
-        if let Err(error) = state
-            .store
-            .persist_new_agent(&run, &user_message, home.as_deref())
-        {
-            let _ = child
-                .lock()
-                .expect("child lock should not be poisoned")
-                .kill();
-            return protocol_error("agent_store_failed", error.to_string());
-        }
-        state.projects.insert(project.root_key(), project.clone());
-        state.agents.insert(
-            run.id,
-            AgentRecord {
-                run: run.clone(),
-                project_root: project.root.clone(),
-                allow_non_git,
-                messages: vec![user_message.clone()],
-                terminal_failure: None,
-            },
-        );
-        state.children.insert(
-            run.id,
-            ActiveAgentChild {
-                run_id,
-                process_group_id,
-                child: Arc::clone(&child),
-                app_server: false,
-            },
-        );
-        state.broadcast(ServerEvent::ProjectChanged(project));
-        state.broadcast(ServerEvent::AgentChanged(run.clone()));
-        state.broadcast(ServerEvent::AgentMessageAppended(user_message));
-    }
-
-    writer.retain();
-    attach_codex_io(Arc::clone(&state), run.id, run_id, child);
-    ServerResponse::AgentStarted(run)
-}
-
 fn validate_thread_project(
     state: &Arc<Mutex<RuntimeState>>,
     thread_id: &str,
@@ -4160,144 +3781,11 @@ fn prompt_agent(
     state: Arc<Mutex<RuntimeState>>,
     agent_id: AgentId,
     prompt: String,
-    mut execution_profile: ditch_core::AgentExecutionProfile,
+    execution_profile: AgentExecutionProfile,
 ) -> ServerResponse {
-    if state.lock().unwrap().acceptance_owners.contains(&agent_id) {return protocol_error("attempt_active","Use Cancel loop before changing its worker prompt.");}
-
-    let original = state.lock().unwrap().agents.get(&agent_id).map(|r|r.run.execution_profile.clone());
-    if let Some(original) = original {
-        execution_profile.skills = original.skills.clone();
-        execution_profile.transport = original.transport.clone();
-        if original.transport == ditch_core::AgentTransport::AppServer {
-            return prompt_app_server_agent(state,agent_id,prompt,execution_profile);
-        }
-        if !execution_profile.skills.is_empty() || execution_profile.transport != original.transport {
-            return protocol_error("skill_thread_changed", "Start a fresh agent to switch transport or attach skills.");
-        }
-    }
-    let (project_root, thread_id, allow_non_git) = {
-        let state = state
-            .lock()
-            .expect("runtime state lock should not be poisoned");
-        let Some(record) = state.agents.get(&agent_id) else {
-            return protocol_error("agent_not_found", "agent session was not found");
-        };
-        if state.children.contains_key(&agent_id)
-            || matches!(
-                record.run.state,
-                AgentState::Starting | AgentState::Working | AgentState::Stopping
-            )
-        {
-            return protocol_error("agent_busy", "agent session is already working");
-        }
-        if record.run.native_session_id.is_none()
-            && matches!(
-                record.run.state,
-                AgentState::Failed | AgentState::Interrupted | AgentState::Stale
-            )
-        {
-            return protocol_error(
-                "agent_not_resumable",
-                "This session cannot accept another prompt because Codex never created a thread. Start a new agent instead.",
-            );
-        }
-        let current_home = state
-            .codex_home
-            .as_ref()
-            .map(|value| value.to_string_lossy());
-        if record.run.origin_codex_home.as_deref() != current_home.as_deref() {
-            return protocol_error(
-                "codex_home_mismatch",
-                "This session belongs to a different CODEX_HOME. Start a new agent with the current Codex account.",
-            );
-        }
-        (
-            record.project_root.clone(),
-            record.run.native_session_id.clone(),
-            record.allow_non_git,
-        )
-    };
-
-    let project = { let locked = state.lock().expect("runtime state lock poisoned");
-        locked.agents.get(&agent_id).and_then(|a|locked.projects.values().find(|p|p.id == a.run.project_id)).cloned() };
-    let Some(project) = project else { return protocol_error("project_not_found","Project is not registered"); };
-    let writer = match WriterGuard::acquire(&state,agent_id,&project,&execution_profile) { Ok(w) => w, Err(e) => return protocol_error("workspace_busy",e) };
-    let binary = active_codex_binary(&state);
-    let Some(binary) = binary else {
-        let message = "No working Codex CLI installation was found. Choose an existing installation in Ditch settings.".to_owned();
-        record_terminal_failure(&state, agent_id, message.clone(), None);
-        finish_agent(&state, agent_id, None, Some(1));
-        return protocol_error("codex_not_found", message);
-    };
-
-    let child = match spawn_codex_child(
-        &binary,
-        &project_root,
-        &prompt,
-        &CodexLaunchMode::Exec,
-        thread_id.as_deref(),
-        allow_non_git,
-        &execution_profile,
-        &writer,
-    ) {
-        Ok(child) => Arc::new(Mutex::new(child)),
-        Err(error) => {
-            let message = error.to_string();
-            record_terminal_failure(&state, agent_id, message.clone(), None);
-            finish_agent(&state, agent_id, None, Some(1));
-            return protocol_error("codex_start_failed", message);
-        }
-    };
-
-    let user_message = AgentChatMessage {
-        agent_id,
-        role: AgentChatRole::User,
-        text: prompt.clone(),
-        created_at: Utc::now(),
-    };
-    let run_id = uuid::Uuid::new_v4();
-    let process_group_id = child
-        .lock()
-        .expect("child lock should not be poisoned")
-        .id() as i32;
-
-    {
-        let mut state = state
-            .lock()
-            .expect("runtime state lock should not be poisoned");
-        let Some(record) = state.agents.get_mut(&agent_id) else {
-            return protocol_error("agent_not_found", "agent session was not found");
-        };
-        record.run.state = AgentState::Working;
-        record.run.can_stop = true;
-        record.run.execution_profile = execution_profile;
-        record.run.current_prompt = Some(prompt);
-        record.run.last_visible_action = Some("Prompt sent to Codex".to_owned());
-        record.run.updated_at = Utc::now();
-        record.run.finished_at = None;
-        record.run.exit_code = None;
-        record.run.resume_block_reason = None;
-        record.terminal_failure = None;
-        record.messages.push(user_message.clone());
-        let run = record.run.clone();
-        state.persist_message(&user_message);
-        state.persist_agent(agent_id);
-        state.children.insert(
-            agent_id,
-            ActiveAgentChild {
-                run_id,
-                process_group_id,
-                child: Arc::clone(&child),
-                app_server: false,
-            },
-        );
-        state.broadcast(ServerEvent::AgentChanged(run));
-        state.broadcast(ServerEvent::AgentMessageAppended(user_message));
-    }
-
-    writer.retain();
-    attach_codex_io(Arc::clone(&state), agent_id, run_id, child);
-    ServerResponse::Accepted
+    // Historical Legacy profiles remain readable. Every subsequent turn resumes
+    // the saved native thread through App Server with the newly selected profile.
+    prompt_app_server_agent(state, agent_id, prompt, execution_profile)
 }
 
 fn stop_agent(state: Arc<Mutex<RuntimeState>>, agent_id: AgentId) -> ServerResponse {
@@ -4635,6 +4123,9 @@ fn rename_agent(
     ServerResponse::Accepted
 }
 
+// Historical CLI output fixtures exercise persisted-session and Stop behavior.
+// Production turns use the App Server event adapter.
+#[cfg(test)]
 fn attach_codex_io(
     state: Arc<Mutex<RuntimeState>>,
     agent_id: AgentId,
@@ -4732,6 +4223,7 @@ fn attach_codex_io(
     });
 }
 
+#[cfg(test)]
 fn handle_codex_stdout_line(
     state: &Arc<Mutex<RuntimeState>>,
     agent_id: AgentId,
@@ -4892,6 +4384,7 @@ fn handle_codex_stdout_line(
     }
 }
 
+#[cfg(test)]
 fn codex_session_title(value: &Value) -> Option<String> {
     [
         value.get("title"),
@@ -4930,6 +4423,7 @@ fn codex_title_from_state(thread_id: &str) -> Option<String> {
         .filter(|title| !title.is_empty())
 }
 
+#[cfg(test)]
 fn looks_like_diagnostic(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
     lower.starts_with("error")
@@ -4938,17 +4432,20 @@ fn looks_like_diagnostic(text: &str) -> bool {
         || lower.contains("usage limit")
 }
 
+#[cfg(test)]
 fn is_terminal_codex_stderr(text: &str) -> bool {
     text.starts_with("Error:")
         || text.starts_with("Failed to create session:")
         || text.starts_with("failed to initialize thread persistence:")
 }
 
+#[cfg(test)]
 fn is_transient_reconnect(message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
     lower.contains("reconnecting...") && lower.contains("stream disconnected before completion")
 }
 
+#[cfg(test)]
 fn extract_diagnostic_message(value: &Value) -> Option<String> {
     let error = value
         .get("error")
@@ -4995,6 +4492,7 @@ fn extract_diagnostic_message(value: &Value) -> Option<String> {
     }
 }
 
+#[cfg(test)]
 fn extract_explicit_error(value: &Value) -> Option<String> {
     if value.get("error").is_some()
         || value.pointer("/item/error").is_some()
@@ -5378,136 +4876,6 @@ fn notification_summary(value: &str) -> String {
     summary
 }
 
-#[allow(clippy::too_many_arguments)]
-fn spawn_codex_child(
-    binary: &str,
-    cwd: &Path,
-    prompt: &str,
-    mode: &CodexLaunchMode,
-    resume_thread: Option<&str>,
-    allow_non_git: bool,
-    execution_profile: &AgentExecutionProfile,
-    writer: &WriterGuard,
-) -> io::Result<Child> {
-    // The gate cannot execute Codex until its process-group lease is durable.
-    // EOF on daemon death exits the gate without running project work.
-    let mut command = Command::new("/bin/sh");
-    command.args(["-c", "IFS= read -r ditch_launch_gate || exit 125; exec \"$@\"", "ditch-launch", binary]);
-    // A dedicated process group lets Stop terminate Codex and every helper it
-    // launches. Killing only the direct CLI process can orphan the app-server
-    // process that owns the thread-store writer lock.
-    command.process_group(0);
-    if execution_profile.approval != AgentApprovalPreset::FullAccess {
-        // Do not inherit extra writable roots from a user's global Codex config.
-        // Codex automatically includes the explicit cwd in workspace-write mode.
-        command.args(["--config","sandbox_workspace_write.writable_roots=[]",
-            "--config","sandbox_workspace_write.exclude_slash_tmp=true",
-            "--config","sandbox_workspace_write.exclude_tmpdir_env_var=true"]);
-    }
-    command.args(codex_child_args(
-        cwd,
-        mode,
-        resume_thread,
-        allow_non_git,
-        execution_profile,
-    ));
-    command.current_dir(cwd);
-    command.env("TERM", "xterm-256color");
-    if let Some(path) = effective_path_for_binary(Path::new(binary)) {
-        command.env("PATH", path);
-    }
-    if let Some(codex_home) = std::env::var_os("CODEX_HOME") {
-        command.env("CODEX_HOME", codex_home);
-    }
-    command.stdin(Stdio::piped());
-    command.stdout(Stdio::piped());
-    command.stderr(Stdio::piped());
-
-    let mut child = command.spawn()?;
-    let ready = writer.started(child.id() as i32).and_then(|_| {
-        let mut stdin=child.stdin.take().ok_or_else(||io::Error::other("missing Codex stdin"))?;
-        stdin.write_all(b"start\n")?;
-        stdin.write_all(prompt.as_bytes())?;
-        stdin.write_all(b"\n")?;
-        stdin.flush()
-    });
-    if let Err(error)=ready { signal_process_group(child.id() as i32,libc::SIGKILL); let _=child.wait(); return Err(error); }
-    Ok(child)
-}
-
-fn codex_child_args(
-    cwd: &Path,
-    mode: &CodexLaunchMode,
-    resume_thread: Option<&str>,
-    allow_non_git: bool,
-    execution_profile: &AgentExecutionProfile,
-) -> Vec<String> {
-    let mut args = Vec::new();
-    match execution_profile.approval {
-        AgentApprovalPreset::Ask => args.extend([
-            "--sandbox".to_owned(),
-            "workspace-write".to_owned(),
-            "--ask-for-approval".to_owned(),
-            "on-request".to_owned(),
-        ]),
-        AgentApprovalPreset::ApproveForMe => args.extend([
-            "--sandbox".to_owned(),
-            "workspace-write".to_owned(),
-            "--ask-for-approval".to_owned(),
-            "never".to_owned(),
-        ]),
-        AgentApprovalPreset::FullAccess => {
-            args.push("--dangerously-bypass-approvals-and-sandbox".to_owned())
-        }
-    }
-    if execution_profile.approval != AgentApprovalPreset::FullAccess {
-        args.extend([
-            "--config".to_owned(),
-            "sandbox_workspace_write.network_access=true".to_owned(),
-        ]);
-    }
-    args.extend([
-        "--config".to_owned(),
-        "web_search=\"live\"".to_owned(),
-        "--config".to_owned(),
-        "tools.web_search=true".to_owned(),
-    ]);
-    if let Some(model) = execution_profile.model.as_deref() {
-        args.extend(["--model".to_owned(), model.to_owned()]);
-    }
-    if let Some(effort) = execution_profile.reasoning_effort.as_deref() {
-        args.extend([
-            "--config".to_owned(),
-            format!("model_reasoning_effort=\"{effort}\""),
-        ]);
-    }
-    if resume_thread.is_none() {
-        args.extend(["--cd".to_owned(), cwd.to_string_lossy().into_owned()]);
-    }
-    args.push("exec".to_owned());
-    if allow_non_git {
-        args.push("--skip-git-repo-check".to_owned());
-    }
-    if let Some(thread_id) = resume_thread {
-        args.extend([
-            "resume".to_owned(),
-            "--json".to_owned(),
-            thread_id.to_owned(),
-            "-".to_owned(),
-        ]);
-    } else {
-        match mode {
-            CodexLaunchMode::Exec | CodexLaunchMode::InteractiveTui => args.extend([
-                "--json".to_owned(),
-                "--color".to_owned(),
-                "never".to_owned(),
-                "-".to_owned(),
-            ]),
-        }
-    }
-    args
-}
-
 fn canonical_project_root(root: &Path) -> PathBuf {
     root.canonicalize().unwrap_or_else(|_| root.to_path_buf())
 }
@@ -5774,18 +5142,6 @@ fn check_codex_readiness(binary: Option<&str>) -> CodexReadiness {
         Duration::from_secs(5),
         path.clone(),
     );
-    let exec_help = command_text(
-        executable,
-        &["exec", "--help"],
-        Duration::from_secs(5),
-        path.clone(),
-    );
-    let resume_help = command_text(
-        executable,
-        &["exec", "resume", "--help"],
-        Duration::from_secs(5),
-        path.clone(),
-    );
     let update_supported = root_help
         .as_deref()
         .is_some_and(|help| help.contains("update"));
@@ -5796,93 +5152,8 @@ fn check_codex_readiness(binary: Option<&str>) -> CodexReadiness {
     if version.is_none() {
         issues.push("The selected executable did not report a Codex version.".to_owned());
     }
-    let required_global_flags = [
-        "--ask-for-approval",
-        "--sandbox",
-        "--cd",
-        "--model",
-        "--config",
-        "--dangerously-bypass-approvals-and-sandbox",
-    ];
-    match root_help.as_deref() {
-        Some(help) => {
-            let missing = required_global_flags
-                .iter()
-                .filter(|flag| !help.contains(**flag))
-                .copied()
-                .collect::<Vec<_>>();
-            if !missing.is_empty() {
-                issues.push(format!(
-                    "This Codex CLI is missing required global options: {}.",
-                    missing.join(", ")
-                ));
-            }
-        }
-        None => issues.push("The selected Codex CLI does not provide command help.".to_owned()),
-    }
-    let required_exec_flags = ["--json", "--color", "--skip-git-repo-check"];
-    match exec_help.as_deref() {
-        Some(help) => {
-            let missing = required_exec_flags
-                .iter()
-                .filter(|flag| !help.contains(**flag))
-                .copied()
-                .collect::<Vec<_>>();
-            if !missing.is_empty() {
-                issues.push(format!(
-                    "This Codex CLI is missing required exec options: {}.",
-                    missing.join(", ")
-                ));
-            }
-        }
-        None => issues.push("The selected Codex CLI does not provide `codex exec`.".to_owned()),
-    }
-    if resume_help.is_none() {
-        issues.push("The selected Codex CLI does not support resumable exec sessions.".to_owned());
-    }
-    let launch_probes: [(&str, &[&str]); 3] = [
-        (
-            "automatic workspace launch",
-            &[
-                "--sandbox",
-                "workspace-write",
-                "--ask-for-approval",
-                "never",
-                "--config",
-                "sandbox_workspace_write.network_access=true",
-                "--config",
-                "web_search=\"live\"",
-                "--config",
-                "tools.web_search=true",
-                "exec",
-                "--help",
-            ],
-        ),
-        (
-            "approval-based resumed launch",
-            &[
-                "--sandbox",
-                "workspace-write",
-                "--ask-for-approval",
-                "on-request",
-                "exec",
-                "resume",
-                "--help",
-            ],
-        ),
-        (
-            "full-access launch",
-            &[
-                "--dangerously-bypass-approvals-and-sandbox",
-                "exec",
-                "--help",
-            ],
-        ),
-    ];
-    for (label, args) in launch_probes {
-        if let Err(detail) = codex_argument_probe(executable, args, path.clone()) {
-            issues.push(format!("Codex rejected Ditch's {label}: {detail}"));
-        }
+    if let Err(detail) = codex_argument_probe(executable, &["app-server", "--help"], path.clone()) {
+        issues.push(format!("Codex App Server is unavailable: {detail}"));
     }
     if !root_help
         .as_deref()
@@ -5914,8 +5185,6 @@ fn check_codex_readiness(binary: Option<&str>) -> CodexReadiness {
         .unwrap_or_else(|| "Codex diagnostics could not be completed.".to_owned())
     });
     let compatible = version.is_some()
-        && exec_help.is_some()
-        && resume_help.is_some()
         && !issues.iter().any(|issue| !issue.contains("not signed in"));
 
     CodexReadiness {
@@ -6416,11 +5685,8 @@ mod tests {
             r#"#!/bin/sh
 case "$1 $2 $3" in
   "--version  ") echo "codex-cli 1.2.3" ;;
-  "--help  ") echo "exec app-server doctor update login --ask-for-approval --sandbox --cd --model --config --dangerously-bypass-approvals-and-sandbox" ;;
-  "exec --help ") echo "--json --color --skip-git-repo-check" ;;
-  "exec resume --help") echo "resume" ;;
-  "--sandbox workspace-write --ask-for-approval") echo "accepted" ;;
-  "--dangerously-bypass-approvals-and-sandbox exec --help") echo "accepted" ;;
+  "--help  ") echo "app-server doctor update login" ;;
+  "app-server --help ") echo "App Server" ;;
   "login status ") echo "Logged in" ;;
   "doctor --json ") echo '{}' ;;
   *) exit 2 ;;
@@ -6452,7 +5718,7 @@ esac
             r#"#!/bin/sh
 case "$1 $2 $3" in
   "--version  ") echo "codex-cli 0.1.0" ;;
-  "--help  ") echo "exec app-server login" ;;
+  "--help  ") echo "exec login" ;;
   "exec --help ") echo "--json --color --skip-git-repo-check" ;;
   "exec resume --help") echo "resume" ;;
   "login status ") echo "Logged in" ;;
@@ -6472,7 +5738,7 @@ esac
             readiness
                 .issues
                 .iter()
-                .any(|issue| issue.contains("missing required global options"))
+                .any(|issue| issue.contains("lacks app-server support"))
         );
         assert!(
             readiness
@@ -6484,6 +5750,7 @@ esac
     }
 
     include!("remote_recovery_tests.rs");
+    include!("model_discovery_tests.rs");
 
     pub(super) fn test_runtime() -> RuntimeState {
         let root = std::env::temp_dir().join(format!("ditchd-test-{}", uuid::Uuid::new_v4()));
@@ -6680,184 +5947,6 @@ esac
     }
 
     #[test]
-    fn new_codex_session_disables_color_output() {
-        let args = codex_child_args(
-            Path::new("/tmp/project"),
-            &CodexLaunchMode::Exec,
-            None,
-            false,
-            &AgentExecutionProfile::default(),
-        );
-
-        assert_eq!(
-            args,
-            vec![
-                "--sandbox",
-                "workspace-write",
-                "--ask-for-approval",
-                "never",
-                "--config",
-                "sandbox_workspace_write.network_access=true",
-                "--config",
-                "web_search=\"live\"",
-                "--config",
-                "tools.web_search=true",
-                "--cd",
-                "/tmp/project",
-                "exec",
-                "--json",
-                "--color",
-                "never",
-                "-"
-            ]
-        );
-    }
-
-    #[test]
-    fn resumed_codex_session_does_not_pass_color_flag() {
-        let args = codex_child_args(
-            Path::new("/tmp/project"),
-            &CodexLaunchMode::Exec,
-            Some("thread-123"),
-            false,
-            &AgentExecutionProfile::default(),
-        );
-
-        assert_eq!(
-            args,
-            vec![
-                "--sandbox",
-                "workspace-write",
-                "--ask-for-approval",
-                "never",
-                "--config",
-                "sandbox_workspace_write.network_access=true",
-                "--config",
-                "web_search=\"live\"",
-                "--config",
-                "tools.web_search=true",
-                "exec",
-                "resume",
-                "--json",
-                "thread-123",
-                "-"
-            ]
-        );
-        assert!(!args.iter().any(|arg| arg == "--color"));
-    }
-
-    #[test]
-    fn explicit_non_git_policy_adds_skip_check_to_new_and_resumed_sessions() {
-        let fresh = codex_child_args(
-            Path::new("/tmp/project"),
-            &CodexLaunchMode::Exec,
-            None,
-            true,
-            &AgentExecutionProfile::default(),
-        );
-        let resumed = codex_child_args(
-            Path::new("/tmp/project"),
-            &CodexLaunchMode::Exec,
-            Some("thread-123"),
-            true,
-            &AgentExecutionProfile::default(),
-        );
-
-        assert_eq!(
-            fresh[fresh.iter().position(|arg| arg == "exec").unwrap() + 1],
-            "--skip-git-repo-check"
-        );
-        assert_eq!(
-            resumed[resumed.iter().position(|arg| arg == "exec").unwrap() + 1],
-            "--skip-git-repo-check"
-        );
-    }
-
-    #[test]
-    fn codex_execution_profile_maps_approval_and_model_flags() {
-        let ask = AgentExecutionProfile {
-            transport: ditch_core::AgentTransport::Legacy,
-            skills: vec![],
-            model: Some("gpt-test".to_owned()),
-            reasoning_effort: Some("high".to_owned()),
-            approval: AgentApprovalPreset::Ask,
-        };
-        let ask_args = codex_child_args(
-            Path::new("/tmp/project"),
-            &CodexLaunchMode::Exec,
-            None,
-            false,
-            &ask,
-        );
-        assert!(
-            ask_args
-                .windows(2)
-                .any(|args| args == ["--model", "gpt-test"])
-        );
-        assert!(
-            ask_args
-                .windows(2)
-                .any(|args| args == ["--sandbox", "workspace-write"])
-        );
-        assert!(
-            ask_args
-                .windows(2)
-                .any(|args| args == ["--ask-for-approval", "on-request"])
-        );
-        assert!(
-            ask_args.windows(2).any(|args| {
-                args == ["--config", "sandbox_workspace_write.network_access=true"]
-            })
-        );
-        for setting in ["web_search=\"live\"", "tools.web_search=true"] {
-            assert!(
-                ask_args
-                    .windows(2)
-                    .any(|args| args == ["--config", setting])
-            );
-        }
-        let ask_exec = ask_args.iter().position(|arg| arg == "exec").unwrap();
-        for global in ["--ask-for-approval", "--sandbox", "--model", "--config"] {
-            assert!(ask_args.iter().position(|arg| arg == global).unwrap() < ask_exec);
-        }
-
-        let full_access = AgentExecutionProfile {
-            approval: AgentApprovalPreset::FullAccess,
-            ..Default::default()
-        };
-        let full_access_args = codex_child_args(
-            Path::new("/tmp/project"),
-            &CodexLaunchMode::Exec,
-            Some("thread-123"),
-            false,
-            &full_access,
-        );
-        assert!(
-            full_access_args
-                .iter()
-                .any(|arg| arg == "--dangerously-bypass-approvals-and-sandbox")
-        );
-        for setting in ["web_search=\"live\"", "tools.web_search=true"] {
-            assert!(
-                full_access_args
-                    .windows(2)
-                    .any(|args| args == ["--config", setting])
-            );
-        }
-        assert!(
-            full_access_args
-                .iter()
-                .position(|arg| arg == "--dangerously-bypass-approvals-and-sandbox")
-                .unwrap()
-                < full_access_args
-                    .iter()
-                    .position(|arg| arg == "exec")
-                    .unwrap()
-        );
-        assert!(!full_access_args.iter().any(|arg| arg == "--approve-for-me"));
-    }
-
-    #[test]
     fn workspace_permission_denials_are_recognized() {
         assert!(is_workspace_permission_denial(
             "patch rejected: writing is blocked by read-only sandbox; rejected by user approval settings"
@@ -6920,7 +6009,6 @@ esac
                     resume_block_reason: None,
                 },
                 project_root: project.root,
-                allow_non_git: false,
                 messages: Vec::new(),
                 terminal_failure: None,
             },
@@ -7003,7 +6091,6 @@ esac
                     resume_block_reason: None,
                 },
                 project_root: project.root,
-                allow_non_git: false,
                 messages: Vec::new(),
                 terminal_failure: None,
             },
@@ -7108,7 +6195,6 @@ esac
                     resume_block_reason: None,
                 },
                 project_root: project.root,
-                allow_non_git: false,
                 messages: vec![AgentChatMessage {
                     agent_id,
                     role: AgentChatRole::System,
@@ -7191,7 +6277,6 @@ esac
                     resume_block_reason: None,
                 },
                 project_root: project.root,
-                allow_non_git: false,
                 messages: Vec::new(),
                 terminal_failure: None,
             },
@@ -7253,7 +6338,6 @@ esac
                     resume_block_reason: None,
                 },
                 project_root: project.root,
-                allow_non_git: false,
                 messages: Vec::new(),
                 terminal_failure: None,
             },
@@ -7330,7 +6414,6 @@ esac
                     resume_block_reason: None,
                 },
                 project_root: project.root,
-                allow_non_git: false,
                 messages: Vec::new(),
                 terminal_failure: None,
             },
@@ -7394,7 +6477,6 @@ esac
                     resume_block_reason: None,
                 },
                 project_root: project.root,
-                allow_non_git: false,
                 messages: Vec::new(),
                 terminal_failure: None,
             },

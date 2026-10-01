@@ -384,7 +384,7 @@ for line in sys.stdin:
         }
     }
     #[test]
-    fn unavailable_app_server_falls_back_without_claiming_skills() {
+    fn unavailable_app_server_fails_without_falling_back_to_legacy() {
         let (state, project, _) = fixture();
         let binary = state.lock().unwrap().codex_binary.clone().unwrap();
         fs::write(
@@ -392,24 +392,28 @@ for line in sys.stdin:
             "#!/bin/sh\nif [ \"$1\" = --version ]; then echo codex-cli 0.153.4; exit 0; fi\nif [ \"$1\" = app-server ]; then exit 1; fi\nexit 0\n",
         )
         .unwrap();
-        let response = start_codex_session(
+        let response = start_app_server_session(
             Arc::clone(&state),
+            project.id,
             project.name.clone(),
             project.root.to_string_lossy().into(),
+            None,
             "work".into(),
-            CodexLaunchMode::Exec,
             AgentExecutionProfile {
                 transport: ditch_core::AgentTransport::AppServer,
                 ..Default::default()
             },
         );
-        let ServerResponse::AgentStarted(run) = response else {
-            panic!("{response:?}")
-        };
+        assert!(matches!(response, ServerResponse::Error(ProtocolError { ref code, .. }) if code == "codex_start_failed"));
+        let locked = state.lock().unwrap();
+        let run = &locked.agents.values().next().unwrap().run;
         assert_eq!(
             run.execution_profile.transport,
-            ditch_core::AgentTransport::Legacy
+            ditch_core::AgentTransport::AppServer
         );
+        assert_eq!(run.state, AgentState::Failed);
+        assert!(run.state_evidence.contains("App Server"));
+        assert!(locked.children.is_empty());
         assert!(run.execution_profile.skills.is_empty());
     }
 
@@ -423,12 +427,13 @@ for line in sys.stdin:
             skills: vec![skill.clone()],
             ..Default::default()
         };
-        let response = start_codex_session(
+        let response = start_app_server_session(
             Arc::clone(&state),
+            project.id,
             project.name.clone(),
             project.root.to_string_lossy().into(),
+            None,
             "work".into(),
-            CodexLaunchMode::Exec,
             profile,
         );
         let ServerResponse::AgentStarted(run) = response else {

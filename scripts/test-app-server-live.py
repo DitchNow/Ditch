@@ -5,6 +5,7 @@ Requires existing Codex authentication. Copies auth only into the temporary
 home on the same machine and removes it after testing. Never uses a Ditch DB.
 """
 import argparse
+import json
 import os
 from pathlib import Path
 import shlex
@@ -15,9 +16,13 @@ import tempfile
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--ssh', help='Existing SSH config alias; requires Python 3 and Codex')
 parser.add_argument('--codex', default=shutil.which('codex'))
+parser.add_argument('--legacy-first', action='store_true',
+                    help='Create a disposable local CLI thread, then resume it through App Server')
 parser.add_argument('--manifest-path', default=str(Path(__file__).resolve().parents[1] / 'Cargo.toml'))
 args = parser.parse_args()
-root = Path(tempfile.mkdtemp(prefix='ditch-session-smoke-', dir='/tmp'))
+if args.legacy_first and args.ssh:
+    parser.error('--legacy-first currently tests local CLI migration; omit --ssh')
+root = Path(tempfile.mkdtemp(prefix='ditch-session-smoke-', dir='/tmp' if args.ssh else None))
 env = dict(os.environ, DITCH_TEST_PROJECT_ROOT=str(root))
 ssh = ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', args.ssh] if args.ssh else None
 remote_created = False
@@ -50,6 +55,22 @@ except BaseException:
         shutil.copyfile(source, home / 'auth.json')
         (home / 'auth.json').chmod(0o600)
         env.update(DITCH_TEST_CODEX_BINARY=args.codex, DITCH_TEST_CODEX_HOME=str(home))
+        if args.legacy_first:
+            seed = subprocess.run([
+                args.codex, '--sandbox', 'workspace-write', '--ask-for-approval', 'never',
+                'exec', '--skip-git-repo-check', '--json', '--model', 'gpt-6-astra', '-',
+            ], cwd=root, env=dict(env, CODEX_HOME=str(home)),
+                input='Reply exactly DITCH_MIGRATION_READY. Do not use any tools.',
+                capture_output=True, text=True, timeout=120)
+            if seed.returncode:
+                raise RuntimeError('Disposable CLI turn failed: ' + seed.stderr[-2000:])
+            events = [json.loads(line) for line in seed.stdout.splitlines() if line.startswith('{')]
+            thread = next((event.get('thread_id') for event in events
+                           if event.get('type') == 'thread.started'), None)
+            if not thread:
+                raise RuntimeError('Disposable CLI turn did not return a native thread ID')
+            env['DITCH_TEST_RESUME_THREAD'] = thread
+            print('Created disposable CLI thread; testing App Server resumption.', flush=True)
     result = subprocess.run(['cargo', 'test', '--manifest-path', args.manifest_path,
                              '-p', 'ditchd', '--lib', 'live_app_server_session_smoke',
                              '--', '--ignored', '--nocapture'], env=env)

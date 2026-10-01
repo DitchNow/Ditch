@@ -7,6 +7,19 @@ fn task_error(code: TaskErrorCode, message: impl Into<String>) -> ServerResponse
     ServerResponse::TaskResponse(TaskResponse::Error(TaskError::new(code, message)))
 }
 
+/// Shared admission path for native Backlog creation and selected issue imports.
+fn new_backlog_task(
+    project_id: ProjectId,
+    draft: ditch_core::TaskDraft,
+    order: i64,
+    remote_pending: bool,
+) -> Result<Task, TaskError> {
+    let mut task = Task::new(project_id, draft, order)?;
+    task.state = ditch_core::TaskState::Backlog;
+    task.remote_pending = remote_pending;
+    Ok(task)
+}
+
 /// A reservation exists before spawning, closing the concurrent-start race.
 struct WriterGuard {
     state: Arc<Mutex<RuntimeState>>,
@@ -212,8 +225,7 @@ impl RuntimeState {
                     && a.content_hash == b.content_hash
                     && a.revision == b.revision
             });
-        if original.transport != profile.transport
-            || original.model != profile.model
+        if original.model != profile.model
             || original.reasoning_effort != profile.reasoning_effort
             || original.approval != profile.approval
             || !same_skills
@@ -548,6 +560,19 @@ fn prepare_remote_board_task(
 }
 
 fn handle_task_request(state: Arc<Mutex<RuntimeState>>, request: TaskRequest) -> ServerResponse {
+    if let TaskOperation::Start { task_id, .. } = &request.operation {
+        let s = state.lock().unwrap();
+        if s.tasks.get(task_id).is_some_and(|task| {
+            task.github_source.is_some()
+                && task.acceptance_criteria.is_empty()
+                && task.acceptance.config.criteria.is_empty()
+        }) {
+            return task_error(
+                TaskErrorCode::InvalidInput,
+                "Add acceptance criteria to this imported issue before starting work.",
+            );
+        }
+    }
     if matches!(request.operation, TaskOperation::BoardProjects { .. }) {
         return match prepare_task_request(&state, &request) {
             Ok((response, _)) => ServerResponse::TaskResponse(response),
@@ -735,17 +760,19 @@ fn prepare_task_request(
             .max()
             .unwrap_or(0)
             .saturating_add(1024);
-        let mut task = Task::new(project_id, draft.clone(), order)?;
+        let mut task = if matches!(request.operation, TaskOperation::CreateBacklog { .. }) {
+            new_backlog_task(
+                project_id, draft.clone(), order, project.is_remote() && !state.remote_runtime,
+            )?
+        } else {
+            Task::new(project_id, draft.clone(), order)?
+        };
         if let TaskOperation::CreateIdentified { task_id, coordinator_group, continue_agent_id, .. } = &request.operation {
             if state.tasks.contains_key(task_id) { return Err(TaskError::new(TaskErrorCode::IdempotencyConflict, "Task identity already exists")); }
             task.id = *task_id;
             task.coordinator_group = *coordinator_group;
             task.continue_agent_id = *continue_agent_id;
             if coordinator_group.is_some() { task.creator = TaskActor::Ditchmaster; }
-        }
-        if matches!(request.operation, TaskOperation::CreateBacklog { .. }) {
-            task.state = ditch_core::TaskState::Backlog;
-            task.remote_pending = project.is_remote() && !state.remote_runtime;
         }
         if let TaskOperation::CreateIdentified { board_task: Some(incoming), .. } = &request.operation {
             incoming.acceptance.config.validate().map_err(|e| TaskError::new(TaskErrorCode::InvalidInput, e))?;

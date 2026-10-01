@@ -8,6 +8,18 @@ pub enum GitHubRequest {
     Status,
     Install,
     Connect,
+    /// Native UI only: records disclosure acceptance before any credential lookup.
+    AcceptConsent {
+        config_path: Option<String>,
+    },
+    UseAccount {
+        generation: String,
+    },
+    BrowserLogin,
+    Cancel,
+    CancelRead,
+    OpenBrowser,
+    OpenRevocationHelp,
     Disconnect,
     Repositories {
         page: u32,
@@ -29,6 +41,14 @@ pub enum GitHubRequest {
         project_id: ProjectId,
         repository_id: u64,
         numbers: Vec<u64>,
+        #[serde(default)]
+        request_id: Option<String>,
+    },
+    Comments {
+        project_id: ProjectId,
+        repository_id: u64,
+        number: u64,
+        page: u32,
     },
     Refresh {
         task_id: TaskId,
@@ -124,6 +144,16 @@ pub fn repository_name(input: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn integration_requests_cannot_select_commands_endpoints_or_actor_authority() {
+        for request in [
+            serde_json::json!({"Execute":{"args":["auth","token"]}}),
+            serde_json::json!({"Api":{"path":"user","method":"POST"}}),
+            serde_json::json!({"AcceptConsent":{"config_path":null,"actor":"user"}}),
+        ] {
+            assert!(serde_json::from_value::<GitHubRequest>(request).is_err());
+        }
+    }
     #[test]
     fn repository_inputs_cannot_be_commands_or_other_hosts() {
         for good in [

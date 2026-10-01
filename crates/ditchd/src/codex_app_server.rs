@@ -1408,7 +1408,7 @@ printf '%s\n' '{{"method":"turn/completed","params":{{"turn":{{"id":"turn_remote
         let binary = std::env::var("DITCH_TEST_CODEX_BINARY").expect("set test executable");
         let root = std::env::var("DITCH_TEST_PROJECT_ROOT").expect("set disposable project root");
         let home = std::env::var_os("DITCH_TEST_CODEX_HOME");
-        let mut thread = None;
+        let mut thread = std::env::var("DITCH_TEST_RESUME_THREAD").ok();
         for (index, approval, model, prompt) in [
             (
                 0,

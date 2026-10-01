@@ -1,40 +1,66 @@
 //! Managed GitHub boundary. Credentials never enter IPC or the task database.
 use super::*;
 use ditch_core::github::*;
-use ditch_core::{Task, TaskActor, TaskDraft, TaskPriority, TaskState};
+use ditch_core::{TaskActor, TaskDraft, TaskPriority};
 use rusqlite::{OptionalExtension, params};
 use serde_json::json;
 use sha2::{Digest, Sha256};
+#[path = "github_auth.rs"]
+mod auth;
 
 const NS: &str = "github";
 const VERSION: &str = "2.101.0";
-const COEXISTENCE: &str = "GitHub connection is unavailable: this GitHub CLI version shares macOS Keychain entries with other gh installations. An isolated credential arrangement must be verified before Ditch can connect or log out.";
 static OPERATION: Mutex<()> = Mutex::new(());
+static INSTALL: Mutex<()> = Mutex::new(());
+static RATE_LIMIT: Mutex<Option<Instant>> = Mutex::new(None);
 
 /// Replaceable for deterministic tests; application IPC never exposes this method.
 trait GitHubService {
     fn get(&self, path: &str) -> Result<Value, String>;
+    fn check_commit(&self, _state: &RuntimeState) -> Result<(), String> {
+        Ok(())
+    }
 }
 struct GhCli {
     root: PathBuf,
+    binding: auth::Binding,
 }
 impl GitHubService for GhCli {
     fn get(&self, path: &str) -> Result<Value, String> {
-        // Intentionally fail closed. GH_CONFIG_DIR does not isolate upstream's
-        // "gh:github.com" Keychain service. No hidden opt-in bypass.
-        verify_credential_isolation()?;
+        if let Some(until) = *RATE_LIMIT.lock().unwrap() {
+            if until > Instant::now() {
+                return Err(format!(
+                    "GitHub rate limit: retry in {} seconds",
+                    until
+                        .saturating_duration_since(Instant::now())
+                        .as_secs()
+                        .max(1)
+                ));
+            }
+        }
+        self.binding.verify()?;
         let binary = self.root.join("active/gh");
-        let mut command = managed_command(&binary, &self.root);
-        command.args(["api", "--hostname", "github.com", "--method", "GET", path]);
-        serde_json::from_slice(&bounded_output(command, 30, 4 * 1024 * 1024)?)
-            .map_err(|_| "GitHub returned invalid JSON".into())
+        let mut command = managed_command(&binary, &self.root, &self.binding.config);
+        command.args([
+            "api",
+            "--hostname",
+            "github.com",
+            "--method",
+            "GET",
+            "--include",
+            path,
+        ]);
+        let bytes = bounded_output_cancel(command, 30, 4 * 1024 * 1024, &self.binding.cancel)?;
+        self.binding.verify()?;
+        let (_, body) = http_parts(&bytes);
+        serde_json::from_slice(body).map_err(|_| "GitHub returned invalid JSON".into())
+    }
+    fn check_commit(&self, state: &RuntimeState) -> Result<(), String> {
+        self.binding.check_commit(state)
     }
 }
-fn verify_credential_isolation() -> Result<(), String> {
-    Err(COEXISTENCE.into())
-}
 
-fn managed_command(binary: &Path, root: &Path) -> Command {
+fn managed_command(binary: &Path, root: &Path, config: &Path) -> Command {
     let mut command = Command::new(binary);
     command.env_clear();
     for key in [
@@ -50,7 +76,7 @@ fn managed_command(binary: &Path, root: &Path) -> Command {
     }
     command
         .env("PATH", "/usr/bin:/bin")
-        .env("GH_CONFIG_DIR", root.join("config"))
+        .env("GH_CONFIG_DIR", config)
         .env("GH_HOST", "github.com")
         .env("GH_PROMPT_DISABLED", "1")
         .env("GH_NO_UPDATE_NOTIFIER", "1")
@@ -59,13 +85,22 @@ fn managed_command(binary: &Path, root: &Path) -> Command {
         .env("TERM", "dumb")
         .env("PAGER", "/bin/cat")
         .env("GH_PAGER", "/bin/cat")
+        .env("GH_BROWSER", "/usr/bin/true")
+        .env("GH_EDITOR", "/usr/bin/true")
+        .env("LANG", "en_US.UTF-8")
         .current_dir(root)
         .stdin(Stdio::null());
     command
 }
 
 /// Drain both pipes with hard caps, bound time, and kill the subprocess group.
-fn bounded_output(mut command: Command, seconds: u64, limit: usize) -> Result<Vec<u8>, String> {
+fn bounded_output_cancel(
+    mut command: Command,
+    seconds: u64,
+    limit: usize,
+    cancel: &AtomicBool,
+) -> Result<Vec<u8>, String> {
+    auth::check_cancel(cancel)?;
     command
         .process_group(0)
         .stdout(Stdio::piped())
@@ -88,6 +123,9 @@ fn bounded_output(mut command: Command, seconds: u64, limit: usize) -> Result<Ve
     });
     let deadline = Instant::now() + Duration::from_secs(seconds);
     let status = loop {
+        if cancel.load(Ordering::SeqCst) {
+            break Err("GitHub operation cancelled");
+        }
         match child.try_wait() {
             Ok(Some(status)) => break Ok(status),
             Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(20)),
@@ -111,12 +149,85 @@ fn bounded_output(mut command: Command, seconds: u64, limit: usize) -> Result<Ve
         return Err("GitHub response exceeded its limit".into());
     }
     if !status?.success() {
-        return Err("GitHub request failed. Check account access or retry later; diagnostic output was withheld to protect credentials.".into());
+        let (headers, _) = http_parts(&bytes);
+        let message = String::from_utf8_lossy(&errors);
+        let headers = headers.to_ascii_lowercase();
+        if headers.contains(" 429 ")
+            || headers.contains("retry-after:")
+            || headers.contains("x-ratelimit-remaining: 0")
+            || message.to_ascii_lowercase().contains("rate limit")
+        {
+            let delay = retry_delay(&headers);
+            *RATE_LIMIT.lock().unwrap() = Some(Instant::now() + Duration::from_secs(delay));
+            return Err(format!("GitHub rate limit: retry in {delay} seconds"));
+        }
+        if headers.contains(" 401 ") || message.contains("HTTP 401") {
+            return Err("GitHub sign-in expired or was revoked; reconnect".into());
+        }
+        if headers.contains(" 403 ") || message.contains("HTTP 403") {
+            return Err("GitHub denied access. Check organization/SSO authorization.".into());
+        }
+        if headers.contains(" 404 ") || message.contains("HTTP 404") {
+            return Err(
+                "Repository or issue was not found or is inaccessible to this account.".into(),
+            );
+        }
+        return Err("GitHub request failed. Check your network and account access, then retry. Private diagnostic output was withheld.".into());
     }
     Ok(bytes)
 }
 
-fn install(root: &Path) -> Result<(), String> {
+fn http_parts(bytes: &[u8]) -> (String, &[u8]) {
+    if !bytes.starts_with(b"HTTP/") {
+        return (String::new(), bytes);
+    }
+    for separator in [b"\r\n\r\n".as_slice(), b"\n\n".as_slice()] {
+        if let Some(end) = bytes.windows(separator.len()).position(|v| v == separator) {
+            return (
+                String::from_utf8_lossy(&bytes[..end]).into_owned(),
+                &bytes[end + separator.len()..],
+            );
+        }
+    }
+    (String::new(), bytes)
+}
+fn retry_delay(headers: &str) -> u64 {
+    let field = |name: &str| {
+        headers
+            .lines()
+            .find_map(|line| line.strip_prefix(name)?.trim().parse::<u64>().ok())
+    };
+    field("retry-after:")
+        .or_else(|| {
+            field("x-ratelimit-reset:")
+                .map(|epoch| epoch.saturating_sub(Utc::now().timestamp().max(0) as u64))
+        })
+        .unwrap_or(60)
+        .clamp(1, 3600)
+}
+
+fn verify_archive(bytes: &[u8], expected: &str) -> Result<(), String> {
+    if bytes.len() > 80 * 1024 * 1024 || format!("{:x}", Sha256::digest(bytes)) != expected {
+        return Err("GitHub CLI checksum verification failed".into());
+    }
+    Ok(())
+}
+fn verify_macho(bytes: &[u8], architecture: &str) -> Result<(), String> {
+    let cpu = match architecture {
+        "aarch64" => 0x0100000cu32,
+        "x86_64" => 0x01000007u32,
+        _ => return Err("Unsupported Mac architecture".into()),
+    };
+    if bytes.len() < 8
+        || bytes[..4] != [0xcf, 0xfa, 0xed, 0xfe]
+        || u32::from_le_bytes(bytes[4..8].try_into().unwrap()) != cpu
+    {
+        return Err("GitHub executable architecture verification failed".into());
+    }
+    Ok(())
+}
+
+fn install(root: &Path, cancel: &AtomicBool, progress: &dyn Fn(&str)) -> Result<(), String> {
     if !cfg!(target_os = "macos") {
         return Err("Managed GitHub CLI currently requires macOS".into());
     }
@@ -128,28 +239,54 @@ fn install(root: &Path) -> Result<(), String> {
     fs::create_dir_all(root).map_err(|_| "Cannot create managed tool directory")?;
     fs::set_permissions(root, fs::Permissions::from_mode(0o700))
         .map_err(|_| "Cannot protect managed tool directory")?;
+    // A crashed download may leave a private staging directory. Only installer
+    // UUID directories are disposable; active and previous versions are retained.
+    if let Ok(entries) = fs::read_dir(root) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            if name
+                .to_str()
+                .and_then(|v| v.strip_prefix("install-"))
+                .is_some_and(|v| Uuid::parse_str(v).is_ok())
+                && entry.file_type().is_ok_and(|kind| kind.is_dir())
+            {
+                let _ = fs::remove_dir_all(entry.path());
+            }
+        }
+    }
     let stage = root.join(format!("install-{}", Uuid::new_v4()));
     fs::create_dir(&stage).map_err(|_| "Cannot stage GitHub CLI")?;
     fs::set_permissions(&stage, fs::Permissions::from_mode(0o700))
         .map_err(|_| "Cannot protect staging directory")?;
     let result = (|| {
+        auth::check_cancel(cancel)?;
+        progress("Downloading the verified GitHub CLI release…");
         let response = ureq::AgentBuilder::new()
             .timeout(Duration::from_secs(90))
+            .timeout_connect(Duration::from_secs(5))
+            .timeout_read(Duration::from_secs(5))
             .build()
             .get(artifact["url"].as_str().unwrap())
             .call()
             .map_err(|_| "GitHub CLI download failed")?;
         let mut bytes = Vec::new();
-        response
-            .into_reader()
-            .take(80 * 1024 * 1024 + 1)
-            .read_to_end(&mut bytes)
-            .map_err(|_| "GitHub CLI download interrupted")?;
-        if bytes.len() > 80 * 1024 * 1024
-            || format!("{:x}", Sha256::digest(&bytes)) != artifact["sha256"].as_str().unwrap()
-        {
-            return Err("GitHub CLI checksum verification failed".into());
+        let mut reader = response.into_reader();
+        let mut chunk = [0; 65536];
+        loop {
+            auth::check_cancel(cancel)?;
+            let n = reader
+                .read(&mut chunk)
+                .map_err(|_| "GitHub CLI download interrupted")?;
+            if n == 0 {
+                break;
+            }
+            bytes.extend_from_slice(&chunk[..n]);
+            if bytes.len() > 80 * 1024 * 1024 {
+                return Err("GitHub CLI download exceeded its limit".into());
+            }
         }
+        progress("Verifying download checksum and executable…");
+        verify_archive(&bytes, artifact["sha256"].as_str().unwrap())?;
         let archive = stage.join("download.zip");
         fs::write(&archive, bytes).map_err(|_| "Could not save verified archive")?;
         // Extract only known regular file bytes to paths we create ourselves.
@@ -158,44 +295,41 @@ fn install(root: &Path) -> Result<(), String> {
             ("bin/gh", "gh", 100 * 1024 * 1024),
             ("LICENSE", "LICENSE", 65536),
         ] {
-            let mut command = Command::new("/usr/bin/unzip");
+            let mut command = managed_command(
+                Path::new("/usr/bin/unzip"),
+                root,
+                &root.join("unused-config"),
+            );
             command.args(["-p"]).arg(&archive).arg(format!(
                 "{}/{}",
                 artifact["directory"].as_str().unwrap(),
                 entry
             ));
-            let bytes = bounded_output(command, 30, cap)?;
+            let bytes = bounded_output_cancel(command, 30, cap, cancel)?;
             if destination == "gh" {
-                let cpu = if architecture == "aarch64" {
-                    0x0100000cu32
-                } else {
-                    0x01000007u32
-                };
-                if bytes.len() < 8
-                    || bytes[..4] != [0xcf, 0xfa, 0xed, 0xfe]
-                    || u32::from_le_bytes(bytes[4..8].try_into().unwrap()) != cpu
-                {
-                    return Err("GitHub executable architecture verification failed".into());
-                }
+                verify_macho(&bytes, architecture)?;
             }
             fs::write(stage.join(destination), bytes)
                 .map_err(|_| "Cannot write managed GitHub tool")?;
         }
         fs::set_permissions(stage.join("gh"), fs::Permissions::from_mode(0o700))
             .map_err(|_| "Cannot set GitHub executable permissions")?;
-        let mut command = managed_command(&stage.join("gh"), root);
+        let mut command = managed_command(&stage.join("gh"), root, &root.join("unused-config"));
         command.arg("--version");
-        let output = bounded_output(command, 10, 4096)?;
+        let output = bounded_output_cancel(command, 10, 4096, cancel)?;
         if !String::from_utf8_lossy(&output).starts_with(&format!("gh version {VERSION} ")) {
             return Err("GitHub executable version verification failed".into());
         }
         let version = root.join(format!("gh-{VERSION}-{architecture}-{}", Uuid::new_v4()));
+        auth::check_cancel(cancel)?;
+        progress("Activating the verified GitHub CLI…");
         fs::remove_file(&archive).map_err(|_| "Cannot finish staging")?;
         fs::rename(&stage, &version).map_err(|_| "Cannot activate GitHub CLI")?;
         let next = root.join("active.next");
         let _ = fs::remove_file(&next);
         std::os::unix::fs::symlink(&version, &next)
             .map_err(|_| "Cannot stage active GitHub link")?;
+        auth::check_cancel(cancel)?;
         fs::rename(&next, root.join("active"))
             .map_err(|_| "Cannot atomically activate GitHub CLI")?;
         Ok(())
@@ -208,6 +342,7 @@ fn initialize(store: &DitchStore) -> Result<(), String> {
     store.with_extension_connection(NS, |c| {
         c.execute_batch("CREATE TABLE IF NOT EXISTS github_links(project_id TEXT NOT NULL REFERENCES projects(id),repository_id TEXT NOT NULL,json TEXT NOT NULL,PRIMARY KEY(project_id,repository_id));
         CREATE TABLE IF NOT EXISTS github_sources(project_id TEXT NOT NULL REFERENCES projects(id),host TEXT NOT NULL,issue_id TEXT NOT NULL,repository_id TEXT NOT NULL,number TEXT NOT NULL,task_id TEXT NOT NULL UNIQUE REFERENCES tasks(id),snapshot TEXT NOT NULL,PRIMARY KEY(project_id,host,issue_id));")?;
+        c.execute_batch("CREATE TABLE IF NOT EXISTS github_import_receipts(request_id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, result TEXT NOT NULL);")?;
         Ok(())
     }).map_err(|e| e.to_string())
 }
@@ -226,12 +361,81 @@ fn repository(s: &RuntimeState, project: ProjectId, repo: u64) -> Result<GitHubR
     serde_json::from_str(&raw.ok_or("Link this repository to the selected project first")?)
         .map_err(|_| "Invalid saved repository".into())
 }
+fn verified_repository(
+    state: &Arc<Mutex<RuntimeState>>,
+    service: &dyn GitHubService,
+    project: ProjectId,
+    id: u64,
+) -> Result<GitHubRepository, String> {
+    let previous = repository(&state.lock().unwrap(), project, id)?;
+    // Stable repository identity follows renames without guessing from a remote URL.
+    let repo: GitHubRepository =
+        serde_json::from_value(service.get(&format!("repositories/{id}"))?)
+            .map_err(|_| "Invalid repository response")?;
+    if repo.id != id || !repo.has_issues {
+        return Err("Repository is unavailable or issues are disabled".into());
+    }
+    repository_name(&repo.full_name)?;
+    let s = state.lock().unwrap();
+    service.check_commit(&s)?;
+    if repo != previous {
+        s.store
+            .with_extension_connection(NS, |c| {
+                c.execute(
+                    "UPDATE github_links SET json=?3 WHERE project_id=?1 AND repository_id=?2",
+                    params![
+                        project.0.to_string(),
+                        id.to_string(),
+                        serde_json::to_string(&repo).unwrap()
+                    ],
+                )?;
+                Ok(())
+            })
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(repo)
+}
 fn import_issues(
     s: &mut RuntimeState,
     project: ProjectId,
     repo: &GitHubRepository,
     issues: Vec<GitHubIssue>,
+    request_id: Option<String>,
 ) -> Result<Value, String> {
+    if !s
+        .projects
+        .values()
+        .any(|p| p.id == project && p.archived_at.is_none())
+    {
+        return Err("Project is unavailable".into());
+    }
+    let mut identity: Vec<_> = issues.iter().map(|i| (i.id, i.number)).collect();
+    identity.sort_unstable();
+    identity.dedup();
+    let fingerprint = serde_json::to_string(&(project, repo.id, &identity)).unwrap();
+    let receipt = match request_id {
+        Some(id) => Uuid::parse_str(&id)
+            .map_err(|_| "Invalid import request ID")?
+            .to_string(),
+        None => format!("legacy-{:x}", Sha256::digest(fingerprint.as_bytes())),
+    };
+    let prior: Option<(String, String)> = s
+        .store
+        .with_extension_connection(NS, |c| {
+            Ok(c.query_row(
+                "SELECT fingerprint,result FROM github_import_receipts WHERE request_id=?1",
+                [&receipt],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?)
+        })
+        .map_err(|e| e.to_string())?;
+    if let Some((saved, result)) = prior {
+        if saved != fingerprint {
+            return Err("Import request ID was reused for different issues".into());
+        }
+        return serde_json::from_str(&result).map_err(|_| "Invalid import receipt".into());
+    }
     let mut changes = Vec::new();
     let mut sources = Vec::new();
     let mut ids = Vec::new();
@@ -245,10 +449,33 @@ fn import_issues(
                 params![project.0.to_string(),issue.id.to_string()], |r| r.get(0)).optional()?)
         }).map_err(|e| e.to_string())?;
         if let Some(id) = prior {
+            let task_id =
+                TaskId(Uuid::parse_str(&id).map_err(|_| "Invalid imported task identity")?);
+            let mut task = s
+                .tasks
+                .get(&task_id)
+                .cloned()
+                .ok_or("Imported task is unavailable")?;
+            if task.github_source.as_ref().is_none_or(|source| {
+                source.repository_id != repo.id || source.number != issue.number
+            }) {
+                task.github_source = Some(issue_source(repo, &issue));
+                let audit = task.audit(
+                    TaskActor::User,
+                    "github_relink",
+                    Some(task.column()),
+                    Some(
+                        "Explicit import reconciled the transferred issue by stable identity"
+                            .into(),
+                    ),
+                );
+                sources.push((task.id, issue));
+                changes.push((task, audit));
+            }
             ids.push(id);
             continue;
         }
-        let mut task = Task::new(
+        let mut task = new_backlog_task(
             project,
             TaskDraft {
                 title: issue.title.clone(),
@@ -263,24 +490,14 @@ fn import_issues(
                 .max()
                 .unwrap_or(0)
                 .saturating_add((changes.len() as i64 + 1) * 1024),
+            s.projects
+                .values()
+                .any(|p| p.id == project && p.is_remote()),
         )
         .map_err(|e| e.to_string())?;
         // Import is explicit scope admission, not execution or Ditch acceptance.
         // A remotely closed issue remains Backlog with its remote state badge.
-        task.state = TaskState::Backlog;
-        task.remote_pending = s
-            .projects
-            .values()
-            .any(|p| p.id == project && p.is_remote());
-        task.github_source = Some(GitHubTaskSource {
-            repository_id: repo.id,
-            issue_id: issue.id,
-            repository: repo.full_name.clone(),
-            number: issue.number,
-            url: issue.html_url.clone(),
-            state: issue.state.clone(),
-            last_synced_at: Utc::now().to_rfc3339(),
-        });
+        task.github_source = Some(issue_source(repo, &issue));
         ids.push(task.id.0.to_string());
         sources.push((task.id, issue));
         let audit = task.audit(
@@ -294,11 +511,12 @@ fn import_issues(
         );
         changes.push((task, audit));
     }
+    let result = json!({"task_ids":ids});
     s.store
         .save_task_group(NS, &changes, |tx| {
             for (id, issue) in &sources {
                 tx.execute(
-                    "INSERT INTO github_sources VALUES(?1,'github.com',?2,?3,?4,?5,?6)",
+                    "INSERT INTO github_sources VALUES(?1,'github.com',?2,?3,?4,?5,?6) ON CONFLICT(project_id,host,issue_id) DO UPDATE SET repository_id=excluded.repository_id,number=excluded.number,snapshot=excluded.snapshot",
                     params![
                         project.0.to_string(),
                         issue.id.to_string(),
@@ -309,11 +527,38 @@ fn import_issues(
                     ],
                 )?;
             }
+            tx.execute(
+                "INSERT INTO github_import_receipts VALUES(?1,?2,?3)",
+                params![
+                    receipt,
+                    fingerprint,
+                    serde_json::to_string(&result).unwrap()
+                ],
+            )?;
             Ok(())
         })
         .map_err(|e| e.to_string())?;
     s.publish_tasks(changes);
-    Ok(json!({"task_ids":ids}))
+    Ok(result)
+}
+
+fn issue_source(repo: &GitHubRepository, issue: &GitHubIssue) -> GitHubTaskSource {
+    GitHubTaskSource {
+        repository_id: repo.id,
+        issue_id: issue.id,
+        repository: repo.full_name.clone(),
+        number: issue.number,
+        url: issue.html_url.clone(),
+        state: issue.state.clone(),
+        last_synced_at: Utc::now().to_rfc3339(),
+    }
+}
+fn imported_ids(s: &RuntimeState, project: ProjectId, repository_id: u64) -> Result<Value, String> {
+    s.store.with_extension_connection(NS, |c| {
+        let mut q = c.prepare("SELECT issue_id,task_id FROM github_sources WHERE project_id=?1 AND host='github.com' AND repository_id=?2")?;
+        let pairs = q.query_map(params![project.0.to_string(),repository_id.to_string()], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?)))?.collect::<Result<Vec<_>,_>>()?;
+        Ok(Value::Object(pairs.into_iter().map(|(id,task)|(id,Value::String(task))).collect()))
+    }).map_err(|e|e.to_string())
 }
 
 pub fn handle(state: Arc<Mutex<RuntimeState>>, request: GitHubRequest) -> ServerResponse {
@@ -323,9 +568,6 @@ pub fn handle(state: Arc<Mutex<RuntimeState>>, request: GitHubRequest) -> Server
     }
 }
 fn handle_inner(state: Arc<Mutex<RuntimeState>>, request: GitHubRequest) -> Result<Value, String> {
-    let _operation = OPERATION
-        .try_lock()
-        .map_err(|_| "Another GitHub operation is in progress")?;
     let root = {
         let s = state.lock().unwrap();
         if s.remote_runtime {
@@ -334,35 +576,53 @@ fn handle_inner(state: Arc<Mutex<RuntimeState>>, request: GitHubRequest) -> Resu
         initialize(&s.store)?;
         s.paths.data_dir.join("tools/github")
     };
-    let service = GhCli { root: root.clone() };
+    if matches!(
+        request,
+        GitHubRequest::Status
+            | GitHubRequest::Install
+            | GitHubRequest::Connect
+            | GitHubRequest::AcceptConsent { .. }
+            | GitHubRequest::UseAccount { .. }
+            | GitHubRequest::BrowserLogin
+            | GitHubRequest::OpenBrowser
+            | GitHubRequest::OpenRevocationHelp
+            | GitHubRequest::Cancel
+            | GitHubRequest::CancelRead
+            | GitHubRequest::Disconnect
+    ) {
+        return auth::control(state, request);
+    }
+    let _operation = OPERATION
+        .try_lock()
+        .map_err(|_| "Another GitHub read is in progress")?;
+    let binding = auth::Binding::capture(state.clone())?;
+    let service = GhCli {
+        root: root.clone(),
+        binding,
+    };
     handle_service(state, request, &service, &root)
 }
 fn handle_service(
     state: Arc<Mutex<RuntimeState>>,
     request: GitHubRequest,
     service: &dyn GitHubService,
-    root: &Path,
+    _root: &Path,
 ) -> Result<Value, String> {
     match request {
-        GitHubRequest::Status => Ok(
-            json!({"version":VERSION,"installed":root.join("active/gh").is_file(),"connected":false,
-            "connection_state":"unsupported_coexistence","detail":COEXISTENCE}),
-        ),
-        GitHubRequest::Install => {
-            install(&root)?;
-            Ok(
-                json!({"installed":true,"connected":false,"connection_state":"unsupported_coexistence","detail":COEXISTENCE}),
-            )
-        }
-        GitHubRequest::Connect => {
-            verify_credential_isolation()?;
-            unreachable!()
-        }
-        GitHubRequest::Disconnect => Ok(
-            json!({"connected":false,"detail":"No GitHub credentials were changed. Imported tasks are retained."}),
-        ),
+        GitHubRequest::Status
+        | GitHubRequest::Install
+        | GitHubRequest::Connect
+        | GitHubRequest::AcceptConsent { .. }
+        | GitHubRequest::UseAccount { .. }
+        | GitHubRequest::BrowserLogin
+        | GitHubRequest::OpenBrowser
+        | GitHubRequest::OpenRevocationHelp
+        | GitHubRequest::Cancel
+        | GitHubRequest::CancelRead
+        | GitHubRequest::Disconnect => auth::control(state, request),
         GitHubRequest::Links { project_id } => {
             let s = state.lock().unwrap();
+            service.check_commit(&s)?;
             let values = s.store.with_extension_connection(NS, |c| {
                 let mut q = c.prepare("SELECT project_id,json FROM github_links WHERE (?1 IS NULL OR project_id=?1)")?;
                 Ok(q.query_map([project_id.map(|id| id.0.to_string())], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?)))?.collect::<Result<Vec<_>,_>>()?)
@@ -373,9 +633,12 @@ fn handle_service(
         }
         GitHubRequest::Repositories { page } => {
             valid_page(page)?;
-            Ok(
-                json!({"repositories":service.get(&format!("user/repos?affiliation=owner,collaborator,organization_member&per_page=50&page={page}"))?,"page":page}),
-            )
+            let repositories = service.get(&format!("user/repos?affiliation=owner,collaborator,organization_member&per_page=50&page={page}"))?;
+            let rows = repositories
+                .as_array()
+                .ok_or("Invalid repositories response")?;
+            service.check_commit(&state.lock().unwrap())?;
+            Ok(json!({"repositories":repositories,"page":page,"has_more":rows.len()==50}))
         }
         GitHubRequest::Link {
             project_id,
@@ -390,6 +653,7 @@ fn handle_service(
                 return Err("Issues are disabled for this repository".into());
             }
             let s = state.lock().unwrap();
+            service.check_commit(&s)?;
             s.store.with_extension_connection(NS, |c| {
                 c.execute("INSERT INTO github_links VALUES(?1,?2,?3) ON CONFLICT(project_id,repository_id) DO UPDATE SET json=excluded.json",
                     params![project_id.0.to_string(),repo.id.to_string(),serde_json::to_string(&repo).unwrap()])?; Ok(())
@@ -404,7 +668,7 @@ fn handle_service(
         } => {
             check_registered(&state, project_id)?;
             valid_page(page)?;
-            let repo = repository(&state.lock().unwrap(), project_id, repository_id)?;
+            let repo = verified_repository(&state, service, project_id, repository_id)?;
             let name = repository_name(&repo.full_name)?;
             let filter = match filter {
                 IssueFilter::Open => "open",
@@ -421,20 +685,24 @@ fn handle_service(
                 .map(|v| serde_json::from_value::<GitHubIssue>(v.clone()))
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|_| "Invalid issue fields")?;
+            let s = state.lock().unwrap();
+            service.check_commit(&s)?;
+            let imported = imported_ids(&s, project_id, repository_id)?;
             Ok(
-                json!({"issues":issues,"page":page,"has_more":rows.len()==50,"last_synced_at":Utc::now()}),
+                json!({"issues":issues,"imported":imported,"page":page,"has_more":rows.len()==50,"last_synced_at":Utc::now()}),
             )
         }
         GitHubRequest::Import {
             project_id,
             repository_id,
             numbers,
+            request_id,
         } => {
             check_registered(&state, project_id)?;
             if numbers.is_empty() || numbers.len() > 50 || numbers.contains(&0) {
                 return Err("Select 1–50 issues".into());
             }
-            let repo = repository(&state.lock().unwrap(), project_id, repository_id)?;
+            let repo = verified_repository(&state, service, project_id, repository_id)?;
             let name = repository_name(&repo.full_name)?;
             let mut issues = Vec::new();
             for number in numbers {
@@ -442,9 +710,46 @@ fn handle_service(
                 if raw.get("pull_request").is_some() {
                     return Err("Pull requests cannot be imported as issues".into());
                 }
-                issues.push(serde_json::from_value(raw).map_err(|_| "Invalid issue response")?);
+                let issue: GitHubIssue =
+                    serde_json::from_value(raw).map_err(|_| "Invalid issue response")?;
+                let expected = format!("https://github.com/{name}/issues/{number}");
+                if issue.number != number || !issue.html_url.eq_ignore_ascii_case(&expected) {
+                    return Err("An issue moved. Link its destination repository and select it there before importing.".into());
+                }
+                issues.push(issue);
             }
-            import_issues(&mut state.lock().unwrap(), project_id, &repo, issues)
+            let mut s = state.lock().unwrap();
+            service.check_commit(&s)?;
+            import_issues(&mut s, project_id, &repo, issues, request_id)
+        }
+        GitHubRequest::Comments {
+            project_id,
+            repository_id,
+            number,
+            page,
+        } => {
+            check_registered(&state, project_id)?;
+            valid_page(page)?;
+            if number == 0 {
+                return Err("Invalid issue number".into());
+            }
+            let repo = verified_repository(&state, service, project_id, repository_id)?;
+            let name = repository_name(&repo.full_name)?;
+            let comments = service.get(&format!(
+                "repos/{name}/issues/{number}/comments?per_page=50&page={page}"
+            ))?;
+            let rows = comments.as_array().ok_or("Invalid comments response")?;
+            let expected =
+                format!("https://github.com/{name}/issues/{number}#").to_ascii_lowercase();
+            if rows.iter().any(|row| {
+                !row["html_url"]
+                    .as_str()
+                    .is_some_and(|url| url.to_ascii_lowercase().starts_with(&expected))
+            }) {
+                return Err("The issue moved or its comments could not be verified in this linked repository.".into());
+            }
+            service.check_commit(&state.lock().unwrap())?;
+            Ok(json!({"comments":comments,"has_more":rows.len()==50,"page":page}))
         }
         GitHubRequest::Refresh { task_id } => {
             let (project, source) = {
@@ -458,7 +763,7 @@ fn handle_service(
                 )
             };
             check_registered(&state, project)?;
-            let repo = repository(&state.lock().unwrap(), project, source.repository_id)?;
+            let repo = verified_repository(&state, service, project, source.repository_id)?;
             let name = repository_name(&repo.full_name)?;
             let raw = service.get(&format!("repos/{name}/issues/{}", source.number))?;
             let issue: GitHubIssue =
@@ -466,10 +771,21 @@ fn handle_service(
             if issue.id != source.issue_id {
                 return Err("Issue identity changed; relink explicitly".into());
             }
+            let expected_url = format!(
+                "https://github.com/{}/issues/{}",
+                repo.full_name, source.number
+            );
+            if issue.number != source.number || !issue.html_url.eq_ignore_ascii_case(&expected_url)
+            {
+                return Err("This issue moved. Link its destination repository and import it again to update the source without duplicating local work.".into());
+            }
             let mut s = state.lock().unwrap();
+            service.check_commit(&s)?;
             let mut task = s.tasks.get(&task_id).cloned().ok_or("Task was removed")?;
             let source = task.github_source.as_mut().ok_or("Source was removed")?;
             source.state = issue.state.clone();
+            source.url = issue.html_url.clone();
+            source.repository = repo.full_name.clone();
             source.last_synced_at = Utc::now().to_rfc3339();
             // Remote metadata does not change the execution scope or local revision.
             let audit = task.audit(TaskActor::User, "github_refresh", Some(task.column()), None);
@@ -515,6 +831,229 @@ fn check_registered(state: &Arc<Mutex<RuntimeState>>, id: ProjectId) -> Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn explicit_transfer_relink_preserves_existing_task_identity_and_revision() {
+        let (state, project, mut fake) = fixture();
+        let original = call(
+            &state,
+            &fake,
+            GitHubRequest::Import {
+                project_id: project.id,
+                repository_id: 42,
+                numbers: vec![7],
+                request_id: None,
+            },
+        )
+        .unwrap();
+        let before = {
+            let mut s = state.lock().unwrap();
+            let task = s.tasks.values_mut().next().unwrap();
+            task.title = "Local edit".into();
+            task.state = ditch_core::TaskState::Ready;
+            task.touch();
+            task.clone()
+        };
+        let moved_repo = json!({"id":43,"full_name":"owner/moved","html_url":"https://github.com/owner/moved","has_issues":true});
+        fake.0
+            .insert("repos/owner/moved".into(), moved_repo.clone());
+        fake.0.insert("repositories/43".into(), moved_repo);
+        let mut issue = fake.0["repos/owner/repo/issues/7"].clone();
+        issue["number"] = json!(19);
+        issue["html_url"] = json!("https://github.com/owner/moved/issues/19");
+        fake.0
+            .insert("repos/owner/repo/issues/7".into(), issue.clone());
+        assert!(call(&state, &fake, GitHubRequest::Refresh { task_id: before.id }).is_err());
+        fake.0.insert("repos/owner/moved/issues/19".into(), issue);
+        call(
+            &state,
+            &fake,
+            GitHubRequest::Link {
+                project_id: project.id,
+                repository: "owner/moved".into(),
+            },
+        )
+        .unwrap();
+        let result = call(
+            &state,
+            &fake,
+            GitHubRequest::Import {
+                project_id: project.id,
+                repository_id: 43,
+                numbers: vec![19],
+                request_id: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(result, original);
+        let s = state.lock().unwrap();
+        let task = &s.tasks[&before.id];
+        assert_eq!(s.tasks.len(), 1);
+        assert_eq!(task.title, before.title);
+        assert_eq!(task.revision, before.revision);
+        assert_eq!(task.state, before.state);
+        assert_eq!(task.github_source.as_ref().unwrap().repository_id, 43);
+        assert_eq!(task.github_source.as_ref().unwrap().number, 19);
+    }
+    #[test]
+    fn invalid_archives_and_wrong_architectures_fail_verification() {
+        assert!(verify_archive(b"malicious payload", &"0".repeat(64)).is_err());
+        for (arch, cpu) in [("aarch64", 0x0100000cu32), ("x86_64", 0x01000007u32)] {
+            let mut header = vec![0xcf, 0xfa, 0xed, 0xfe];
+            header.extend_from_slice(&cpu.to_le_bytes());
+            verify_macho(&header, arch).unwrap();
+            assert!(
+                verify_macho(
+                    &header,
+                    if arch == "aarch64" {
+                        "x86_64"
+                    } else {
+                        "aarch64"
+                    }
+                )
+                .is_err()
+            );
+        }
+        assert!(verify_macho(b"#!/bin/sh", "aarch64").is_err());
+        assert!(verify_macho(&[], "unsupported").is_err());
+    }
+
+    #[test]
+    fn import_receipts_reject_reuse_and_project_identity_is_independent() {
+        let (state, project, mut fake) = fixture();
+        let receipt = Uuid::new_v4().to_string();
+        let first = GitHubRequest::Import {
+            project_id: project.id,
+            repository_id: 42,
+            numbers: vec![7],
+            request_id: Some(receipt.clone()),
+        };
+        let result = call(&state, &fake, first.clone()).unwrap();
+        assert_eq!(result, call(&state, &fake, first).unwrap());
+        let mut other = fake.0["repos/owner/repo/issues/7"].clone();
+        other["id"] = json!(80);
+        other["number"] = json!(8);
+        other["html_url"] = json!("https://github.com/owner/repo/issues/8");
+        fake.0.insert("repos/owner/repo/issues/8".into(), other);
+        assert!(
+            call(
+                &state,
+                &fake,
+                GitHubRequest::Import {
+                    project_id: project.id,
+                    repository_id: 42,
+                    numbers: vec![8],
+                    request_id: Some(receipt)
+                }
+            )
+            .is_err()
+        );
+        let second = {
+            let mut s = state.lock().unwrap();
+            let p = Project::new("Second", s.paths.data_dir.join("second"));
+            s.store.upsert_project(&p).unwrap();
+            s.projects.insert(p.root_key(), p.clone());
+            p
+        };
+        call(
+            &state,
+            &fake,
+            GitHubRequest::Link {
+                project_id: second.id,
+                repository: "owner/repo".into(),
+            },
+        )
+        .unwrap();
+        let result2 = call(
+            &state,
+            &fake,
+            GitHubRequest::Import {
+                project_id: second.id,
+                repository_id: 42,
+                numbers: vec![7],
+                request_id: None,
+            },
+        )
+        .unwrap();
+        assert_ne!(result, result2);
+        assert_eq!(state.lock().unwrap().tasks.len(), 2);
+    }
+    #[test]
+    fn pagination_beyond_one_hundred_and_repository_rename_preserve_identity() {
+        let (state, project, mut fake) = fixture();
+        let mut renamed = fake.0["repositories/42"].clone();
+        renamed["full_name"] = json!("org/renamed");
+        fake.0.insert("repositories/42".into(), renamed);
+        for page in 1..=3 {
+            fake.0.insert(
+                format!("repos/org/renamed/issues?state=open&per_page=50&page={page}"),
+                json!(
+                    (0..50)
+                        .map(|n| {
+                            let mut i = fake.0["repos/owner/repo/issues/7"].clone();
+                            i["id"] = json!(page * 50 + n);
+                            i["number"] = json!(page * 50 + n);
+                            i
+                        })
+                        .collect::<Vec<_>>()
+                ),
+            );
+        }
+        let mut total = 0;
+        for page in 1..=3 {
+            let result = call(
+                &state,
+                &fake,
+                GitHubRequest::Issues {
+                    project_id: project.id,
+                    repository_id: 42,
+                    state: IssueFilter::Open,
+                    page,
+                },
+            )
+            .unwrap();
+            total += result["issues"].as_array().unwrap().len();
+        }
+        assert_eq!(total, 150);
+        assert_eq!(
+            repository(&state.lock().unwrap(), project.id, 42)
+                .unwrap()
+                .full_name,
+            "org/renamed"
+        );
+    }
+    #[test]
+    fn http_headers_and_backoff_are_bounded() {
+        let (_, body) = http_parts(b"HTTP/2.0 200 OK\r\nX-Test: true\r\n\r\n[{\"id\":1}]");
+        assert_eq!(
+            serde_json::from_slice::<Value>(body).unwrap(),
+            json!([{"id":1}])
+        );
+        assert_eq!(retry_delay("retry-after: 120"), 120);
+        assert_eq!(retry_delay("retry-after: 9999999"), 3600);
+        assert_eq!(retry_delay("missing"), 60);
+    }
+    #[test]
+    #[ignore = "Explicit network smoke test: official release, isolated app directory, no authentication"]
+    fn official_managed_install_smoke() {
+        let (state, _, _) = fixture();
+        let root = state
+            .lock()
+            .unwrap()
+            .paths
+            .data_dir
+            .join("official-installer");
+        let _lock = INSTALL.lock().unwrap();
+        install(&root, &AtomicBool::new(false), &|_| {}).unwrap();
+        let previous = fs::read_link(root.join("active")).unwrap();
+        assert!(previous.join("LICENSE").is_file());
+        assert!(install(&root, &AtomicBool::new(true), &|_| {}).is_err());
+        assert_eq!(fs::read_link(root.join("active")).unwrap(), previous);
+        install(&root, &AtomicBool::new(false), &|_| {}).unwrap();
+        assert_ne!(fs::read_link(root.join("active")).unwrap(), previous);
+        assert!(previous.join("gh").is_file());
+    }
+
+    #[derive(Clone)]
     struct Fake(HashMap<String, Value>);
     impl GitHubService for Fake {
         fn get(&self, path: &str) -> Result<Value, String> {
@@ -530,7 +1069,7 @@ mod tests {
         let project = Project::new("GitHub fixture", s.paths.data_dir.join("repo"));
         s.store.upsert_project(&project).unwrap();
         s.projects.insert(project.root_key(), project.clone());
-        let fake = Fake(HashMap::from([
+        let mut fake = Fake(HashMap::from([
             (
                 "repos/owner/repo".into(),
                 json!({"id":42,"full_name":"owner/repo","html_url":"https://github.com/owner/repo","has_issues":true}),
@@ -540,6 +1079,8 @@ mod tests {
                 json!({"id":70,"number":7,"title":"Original title","body":"Original body","state":"closed","state_reason":"completed","html_url":"https://github.com/owner/repo/issues/7","updated_at":"2026-09-28T00:00:00Z"}),
             ),
         ]));
+        fake.0
+            .insert("repositories/42".into(), fake.0["repos/owner/repo"].clone());
         let state = Arc::new(Mutex::new(s));
         call(
             &state,
@@ -566,6 +1107,7 @@ mod tests {
             project_id: project.id,
             repository_id: 42,
             numbers: vec![7, 7],
+            request_id: None,
         };
         let first = call(&state, &fake, request.clone()).unwrap();
         assert_eq!(first, call(&state, &fake, request).unwrap());
@@ -595,6 +1137,72 @@ mod tests {
         assert_eq!(refreshed.github_source.as_ref().unwrap().state, "open");
     }
     #[test]
+    fn concurrent_imports_share_one_task_and_disconnect_retains_local_copy() {
+        let (state, project, fake) = fixture();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let jobs: Vec<_> = (0..2)
+            .map(|_| {
+                let state = state.clone();
+                let fake = fake.clone();
+                let barrier = barrier.clone();
+                thread::spawn(move || {
+                    barrier.wait();
+                    call(
+                        &state,
+                        &fake,
+                        GitHubRequest::Import {
+                            project_id: project.id,
+                            repository_id: 42,
+                            numbers: vec![7],
+                            request_id: Some(Uuid::new_v4().to_string()),
+                        },
+                    )
+                    .unwrap()
+                })
+            })
+            .collect();
+        let results: Vec<_> = jobs.into_iter().map(|j| j.join().unwrap()).collect();
+        assert_eq!(results[0], results[1]);
+        auth::control(state.clone(), GitHubRequest::Disconnect).unwrap();
+        let s = state.lock().unwrap();
+        assert_eq!(s.tasks.len(), 1);
+        assert!(s.tasks.values().next().unwrap().github_source.is_some());
+        assert_eq!(s.store.load_tasks().unwrap().len(), 1);
+    }
+    #[test]
+    fn imported_tasks_require_criteria_before_native_start() {
+        let (state, project, fake) = fixture();
+        call(
+            &state,
+            &fake,
+            GitHubRequest::Import {
+                project_id: project.id,
+                repository_id: 42,
+                numbers: vec![7],
+                request_id: None,
+            },
+        )
+        .unwrap();
+        let task = state.lock().unwrap().tasks.values().next().unwrap().clone();
+        let response = handle_task_request(
+            state.clone(),
+            TaskRequest {
+                project_id: Some(project.id),
+                request_id: Uuid::new_v4(),
+                operation: TaskOperation::Start {
+                    task_id: task.id,
+                    expected_revision: task.revision,
+                    execution_profile: AgentExecutionProfile::default(),
+                },
+            },
+        );
+        let ServerResponse::TaskResponse(TaskResponse::Error(error)) = response else {
+            panic!("Expected missing criteria rejection")
+        };
+        assert!(error.message.contains("acceptance criteria"));
+        assert!(state.lock().unwrap().agents.is_empty());
+    }
+    #[test]
     fn pull_requests_and_partial_fetch_failures_cannot_create_tasks() {
         let (state, project, mut fake) = fixture();
         assert!(
@@ -604,7 +1212,8 @@ mod tests {
                 GitHubRequest::Import {
                     project_id: project.id,
                     repository_id: 42,
-                    numbers: vec![7, 8]
+                    numbers: vec![7, 8],
+                    request_id: None,
                 }
             )
             .is_err()
@@ -619,7 +1228,8 @@ mod tests {
                 GitHubRequest::Import {
                     project_id: project.id,
                     repository_id: 42,
-                    numbers: vec![7]
+                    numbers: vec![7],
+                    request_id: None,
                 }
             )
             .is_err()
@@ -650,9 +1260,12 @@ mod tests {
         assert_eq!(result["issues"].as_array().unwrap().len(), 1);
     }
     #[test]
-    fn credential_coexistence_is_a_hard_block_and_token_environment_is_absent() {
-        assert!(verify_credential_isolation().is_err());
-        let command = managed_command(Path::new("/owned/gh"), Path::new("/owned"));
+    fn inherited_credentials_and_execution_overrides_are_absent() {
+        let command = managed_command(
+            Path::new("/owned/gh"),
+            Path::new("/owned"),
+            Path::new("/shared/gh"),
+        );
         let env: HashMap<_, _> = command
             .get_envs()
             .map(|(k, v)| (k.to_string_lossy().into_owned(), v))
@@ -666,7 +1279,7 @@ mod tests {
         ] {
             assert!(!env.contains_key(key));
         }
-        assert_eq!(env["GH_CONFIG_DIR"].unwrap(), "/owned/config");
+        assert_eq!(env["GH_CONFIG_DIR"].unwrap(), "/shared/gh");
         assert_eq!(env["GH_PAGER"].unwrap(), "/bin/cat");
     }
 }

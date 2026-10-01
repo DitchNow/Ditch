@@ -17,7 +17,7 @@ Today it can register multiple local or SSH-hosted projects, run concurrent Code
 Current limitations are:
 
 - macOS and Codex are the only working platform/provider combination.
-- Local projects run through a separate `codex exec` process for each turn and do not yet support interactive approvals. SSH projects use Codex App Server and route its command, file, and network approval requests to the Mac.
+- Local and SSH projects use Codex App Server for every new turn. Both honor the composer's model and approval selection and route interactive approval requests to the Mac.
 - Closing the foreground window preserves work, but explicitly quitting the menu-bar runtime stops active agents. After an unexpected runtime restart, previously active runs are marked stale and can only be continued when Codex supplied a resumable thread ID.
 - The repository contains types and placeholder directories for other providers, hooks, MCP, tasks, and worktrees, but those are not complete user-facing features.
 - Community CI and release workflows are committed; official distribution still requires DitchNow's Apple signing/notarization credentials and published verification keys.
@@ -50,7 +50,7 @@ To compile the application yourself, follow [Build From Source](#build-from-sour
 
 1. Open Ditch and let the setup screen check the available Codex installations, authentication, and notification permission.
 2. Add a local repository, or choose an OpenSSH host and remote directory. The default policy requires an existing Git repository; the add-project dialog can instead initialize Git or explicitly allow Codex outside Git.
-3. Select the project, choose **New Agent**, enter a prompt, and start the session. For SSH projects, respond to App Server requests with **Deny**, **Allow Once**, or **Allow for Session** when approval is needed.
+3. Select the project, choose **New Agent**, enter a prompt, and start the session. For either target, respond to inline requests with **Cancel**, **Approve once**, or **Approve in this session** when approval is needed.
 4. Open another project or start another agent while the first one runs.
 5. Return from the project list, notification panel, or macOS notification when a run completes or fails. Send a follow-up to continue the saved Codex thread.
 
@@ -84,7 +84,7 @@ The project browser lists files while excluding common generated and internal di
 
 ### Set the next Codex turn's execution profile
 
-The composer discovers available models from the selected Codex installation and can apply model, network-access, and approval presets to the next turn. For local projects, **Approve for me** uses Codex's workspace-write sandbox without interactive approval, **Full Access** disables the sandbox after explicit confirmation, and interactive **Ask for approval** remains unavailable in the local transport. SSH projects do not inherit the desktop **Full Access** setting: they always use Codex App Server's interactive approval policy.
+The composer and New Agent dialog share model and approval controls. Model discovery uses the selected project's runtime, working directory, and Codex home. On both local and SSH projects, **Ask for approval** enables interactive approvals, **Approve for me** uses the workspace-write sandbox without interactive approval, and **Full Access** disables the sandbox after explicit confirmation. Changes apply to the next turn; they do not resolve an already pending approval. App Server is required, with no legacy execution fallback.
 
 ## How It Works
 
@@ -223,7 +223,7 @@ The production path concentrates in `apps/macos`, `ditchd`, `ditch_protocol`, an
 
 ## Roadmap
 
-The repository does not maintain a committed public roadmap. SSH projects now use Codex App Server with interactive approvals, while local projects retain the process-per-turn transport. Current implementation notes focus on bringing equivalent approval handling to local sessions and making per-turn prompt/model controls more complete. These are active design directions, not release commitments.
+The repository does not maintain a committed public roadmap. Local and SSH sessions share App Server execution and per-turn model and approval controls. See [runtime sessions](docs/runtime-sessions.md) for behavior, migration, and validation.
 
 Use [GitHub Issues](https://github.com/DitchNow/TheDitch/issues) for reproducible bugs, regressions, and concrete actionable improvements. Use [GitHub Discussions](https://github.com/DitchNow/TheDitch/discussions) for broader ideas, workflow feedback, architecture discussion, and exploratory proposals.
 
@@ -235,7 +235,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, issue guidelines, 
 
 ## Security
 
-Ditch can execute processes and read or write files inside registered projects, and local **Full Access** deliberately removes Codex's sandbox restrictions. SSH sessions always use App Server's interactive approval policy; when App Server requests approval, Ditch shows the action, command, and target before returning the user's decision. Approved remote actions have the SSH account's existing permissions and receive no additional privileges from Ditch. Review the selected project, execution profile, host, and prompt before starting a turn. See [SECURITY.md](SECURITY.md) for vulnerability-reporting guidance.
+Ditch can execute processes and read or write files inside registered projects, and **Full Access** deliberately removes Codex's sandbox restrictions on the selected execution host. Local and SSH sessions honor the selected approval preset; when App Server requests approval, Ditch shows the action, command, and target before returning the user's decision. Approved remote actions have the SSH account's existing permissions and receive no additional privileges from Ditch. Review the selected project, execution profile, host, and prompt before starting a turn. See [SECURITY.md](SECURITY.md) for vulnerability-reporting guidance.
 
 ## Community / Support
 

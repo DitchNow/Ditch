@@ -15,6 +15,65 @@ class RecordingClient extends DitchRuntimeClient {
 
 void main() {
   test(
+    'legacy profiles retain choices but always submit through App Server',
+    () {
+      final settings = AgentExecutionSettings(
+        profile: {
+          'transport': 'Legacy',
+          'approval': 'Ask',
+          'model': 'saved-model',
+        },
+      );
+      expect(settings.protocolValue['transport'], 'AppServer');
+      expect(settings.protocolValue['approval'], 'Ask');
+      expect(settings.protocolValue['model'], 'saved-model');
+    },
+  );
+
+  testWidgets('new session exposes the same approval and model controls', (
+    tester,
+  ) async {
+    final settings = AgentExecutionSettings();
+    var loads = 0;
+    await tester.pumpWidget(
+      MaterialApp(
+        theme: DitchTheme.light(),
+        home: Scaffold(
+          body: StartCodexSessionDialog(
+            initialPrompt: 'Implement the change',
+            settings: settings,
+            loadModels: () async {
+              loads++;
+              return const [
+                AgentModelOption(
+                  id: 'project-model',
+                  displayName: 'Project model',
+                ),
+              ];
+            },
+          ),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+    expect(loads, 1);
+    expect(find.text('Use App Server'), findsNothing);
+    expect(find.byType(AgentExecutionControls), findsOneWidget);
+    await tester.tap(find.byType(DropdownButton<AgentApprovalPreset>));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Ask for approval').last);
+    await tester.pumpAndSettle();
+    await tester.tap(find.byType(DropdownButton<String?>));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Project model').last);
+    await tester.pumpAndSettle();
+    expect(settings.protocolValue['approval'], 'Ask');
+    expect(settings.protocolValue['model'], 'project-model');
+    expect(settings.protocolValue['transport'], 'AppServer');
+    expect(tester.takeException(), isNull);
+  });
+
+  test(
     'each session restores its own profile and preserves next-turn edits',
     () {
       final first = AgentExecutionSettings(

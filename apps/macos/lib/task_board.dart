@@ -281,6 +281,10 @@ class _TaskBoardState extends State<TaskBoard> {
                     )
                     .toList(),
                 onImported: widget.controller.refresh,
+                onOpenTask: (id) {
+                  final task = widget.controller.task(id);
+                  if (task != null) inspect(task);
+                },
               ),
             ),
           Expanded(
@@ -1502,7 +1506,9 @@ class _TaskInspectorState extends State<_TaskInspector> {
                     }),
               child: const Text('Cancel / Archive'),
             ),
-          if (task.revision == 1 && task.agentId == null)
+          if (task.revision == 1 &&
+              task.agentId == null &&
+              task.githubSource == null)
             TextButton(
               onPressed: disabled
                   ? null

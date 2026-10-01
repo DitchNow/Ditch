@@ -606,7 +606,6 @@ class AgentExecutionSettings extends ChangeNotifier {
   bool edited = false;
   bool loadingModels = false;
   String? modelError;
-  bool appServer = true;
   List<Map<String, dynamic>> launchSkills = [];
   AgentApprovalPreset approval = AgentApprovalPreset.approveForMe;
 
@@ -614,7 +613,6 @@ class AgentExecutionSettings extends ChangeNotifier {
     if (profile == null || edited) return;
     model = profile['model']?.toString();
     reasoningEffort = profile['reasoning_effort']?.toString();
-    appServer = profile['transport'] != 'Legacy';
     launchSkills = ((profile['skills'] as List?) ?? [])
         .map((s) => Map<String, dynamic>.from(s as Map))
         .toList();
@@ -647,7 +645,7 @@ class AgentExecutionSettings extends ChangeNotifier {
   List<AgentModelOption> models = const [];
 
   Map<String, dynamic> get protocolValue => {
-    'transport': appServer ? 'AppServer' : 'Legacy',
+    'transport': 'AppServer',
     'skills': launchSkills,
     'model': model,
     'reasoning_effort': reasoningEffort,
@@ -3575,6 +3573,11 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
       builder: (context) => StartCodexSessionDialog(
         initialPrompt: _defaultStartPrompt,
         settings: _settingsForProject(_selectedProject.id),
+        loadModels:
+            _presentation.value.connection == RuntimeConnectionPhase.connected
+            ? () =>
+                  _runtimeClient.listCodexModels(projectId: _selectedProject.id)
+            : null,
         skillsController: _tasks.skills,
         projectId: _selectedProject.id,
         onTask: () {
@@ -9432,7 +9435,6 @@ class AgentComposerState extends State<AgentComposer> {
   late String _draftText;
   double _editorHeight = _minimumEditorHeight;
   bool _composerHasFocus = false;
-  AgentExecutionSettings? _loadedSettings;
   AgentSettingsScope? _scope;
   AgentExecutionSettings get _settings =>
       widget.executionSettings ?? _scope?.settings ?? agentExecutionSettings;
@@ -9441,21 +9443,6 @@ class AgentComposerState extends State<AgentComposer> {
   void didChangeDependencies() {
     super.didChangeDependencies();
     _scope = AgentSettingsScope.of(context);
-    _loadTargetModels();
-  }
-
-  void _loadTargetModels() {
-    if (_scope?.loadModels == null) {
-      _loadedSettings = null;
-      return;
-    }
-    if (identical(_loadedSettings, _settings)) return;
-    _loadedSettings = _settings;
-    final settings = _settings;
-    final load = _scope!.loadModels!;
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (mounted) unawaited(settings.loadModels(load));
-    });
   }
 
   @override
@@ -9467,7 +9454,6 @@ class AgentComposerState extends State<AgentComposer> {
   @override
   void didUpdateWidget(AgentComposer oldWidget) {
     super.didUpdateWidget(oldWidget);
-    _loadTargetModels();
     if (oldWidget.initialText != widget.initialText &&
         _draftText.trim().isEmpty) {
       _draftText = widget.initialText;
@@ -9518,33 +9504,6 @@ class AgentComposerState extends State<AgentComposer> {
         .toDouble();
     if ((_editorHeight - nextHeight).abs() < 1) return;
     setState(() => _editorHeight = nextHeight);
-  }
-
-  Future<void> _selectApproval(AgentApprovalPreset value) async {
-    if (value == AgentApprovalPreset.fullAccess) {
-      final confirmed = await showDialog<bool>(
-        context: context,
-        builder: (context) => AlertDialog(
-          icon: const Icon(Icons.warning_amber_rounded),
-          title: const Text('Enable Full Access?'),
-          content: const Text(
-            'Codex will run without approval prompts or sandbox restrictions and can access the internet and files on the computer running this project.',
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.of(context).pop(false),
-              child: const Text('Cancel'),
-            ),
-            FilledButton(
-              onPressed: () => Navigator.of(context).pop(true),
-              child: const Text('Enable Full Access'),
-            ),
-          ],
-        ),
-      );
-      if (confirmed != true) return;
-    }
-    _settings.setApproval(value);
   }
 
   @override
@@ -9632,102 +9591,10 @@ class AgentComposerState extends State<AgentComposer> {
                   ),
                 ),
                 const SizedBox(height: 8),
-                LayoutBuilder(
-                  builder: (context, constraints) {
-                    final controlWidth = constraints.maxWidth < 220
-                        ? constraints.maxWidth
-                        : 220.0;
-                    return Wrap(
-                      spacing: 16,
-                      runSpacing: 8,
-                      crossAxisAlignment: WrapCrossAlignment.center,
-                      children: [
-                        SizedBox(
-                          width: controlWidth,
-                          child: DropdownButtonHideUnderline(
-                            child: DropdownButton<AgentApprovalPreset>(
-                              value: _settings.approval,
-                              isDense: true,
-                              isExpanded: true,
-                              onChanged: (value) {
-                                if (value != null) {
-                                  unawaited(_selectApproval(value));
-                                }
-                              },
-                              items: const [
-                                DropdownMenuItem(
-                                  value: AgentApprovalPreset.ask,
-                                  child: Text('Ask for approval'),
-                                ),
-                                DropdownMenuItem(
-                                  value: AgentApprovalPreset.approveForMe,
-                                  child: Text('Approve for me'),
-                                ),
-                                DropdownMenuItem(
-                                  value: AgentApprovalPreset.fullAccess,
-                                  child: Text('Full Access'),
-                                ),
-                              ],
-                            ),
-                          ),
-                        ),
-                        SizedBox(
-                          width: controlWidth,
-                          child: Row(
-                            children: [
-                              Expanded(
-                                child: DropdownButtonHideUnderline(
-                                  child: DropdownButton<String?>(
-                                    value: _settings.model,
-                                    hint: const Text('Default model'),
-                                    isDense: true,
-                                    isExpanded: true,
-                                    onChanged: _settings.setModel,
-                                    items: [
-                                      const DropdownMenuItem<String?>(
-                                        value: null,
-                                        child: Text('Default model'),
-                                      ),
-                                      if (_settings.model != null &&
-                                          !_settings.models.any(
-                                            (m) => m.id == _settings.model,
-                                          ))
-                                        DropdownMenuItem<String?>(
-                                          value: _settings.model,
-                                          child: Text(_settings.model!),
-                                        ),
-                                      ..._settings.models.map(
-                                        (model) => DropdownMenuItem<String?>(
-                                          value: model.id,
-                                          child: Text(model.displayName),
-                                        ),
-                                      ),
-                                    ],
-                                  ),
-                                ),
-                              ),
-                              const SizedBox(width: 6),
-                              ContextWindowIndicator(
-                                model: _settings.selectedModel,
-                              ),
-                            ],
-                          ),
-                        ),
-                        if (_settings.loadingModels)
-                          const Text('Loading models…'),
-                        if (_settings.modelError != null)
-                          TextButton(
-                            onPressed: _scope?.loadModels == null
-                                ? null
-                                : () =>
-                                      _settings.loadModels(_scope!.loadModels!),
-                            child: Text(_settings.modelError!),
-                          ),
-                        if (widget.isWorking || widget.canStop)
-                          const Text('Applies next turn'),
-                      ],
-                    );
-                  },
+                AgentExecutionControls(
+                  settings: _settings,
+                  loadModels: _scope?.loadModels,
+                  appliesNextTurn: widget.isWorking || widget.canStop,
                 ),
               ],
             ),
@@ -9736,6 +9603,171 @@ class AgentComposerState extends State<AgentComposer> {
       ),
     );
   }
+}
+
+class AgentExecutionControls extends StatefulWidget {
+  const AgentExecutionControls({
+    required this.settings,
+    this.loadModels,
+    this.appliesNextTurn = false,
+    super.key,
+  });
+
+  final AgentExecutionSettings settings;
+  final Future<List<AgentModelOption>> Function()? loadModels;
+  final bool appliesNextTurn;
+
+  @override
+  State<AgentExecutionControls> createState() => _AgentExecutionControlsState();
+}
+
+class _AgentExecutionControlsState extends State<AgentExecutionControls> {
+  AgentExecutionSettings? _loadedSettings;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadModels();
+  }
+
+  @override
+  void didUpdateWidget(AgentExecutionControls oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    _loadModels();
+  }
+
+  void _loadModels() {
+    if (widget.loadModels == null) {
+      _loadedSettings = null;
+      return;
+    }
+    if (identical(_loadedSettings, widget.settings)) return;
+    final settings = _loadedSettings = widget.settings;
+    final load = widget.loadModels!;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) unawaited(settings.loadModels(load));
+    });
+  }
+
+  Future<void> _selectApproval(AgentApprovalPreset value) async {
+    if (value == AgentApprovalPreset.fullAccess) {
+      final confirmed = await showDialog<bool>(
+        context: context,
+        builder: (context) => AlertDialog(
+          icon: const Icon(Icons.warning_amber_rounded),
+          title: const Text('Enable Full Access?'),
+          content: const Text(
+            'Codex will run without approval prompts or sandbox restrictions and can access the internet and files on the computer running this project.',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(false),
+              child: const Text('Cancel'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.of(context).pop(true),
+              child: const Text('Enable Full Access'),
+            ),
+          ],
+        ),
+      );
+      if (confirmed != true) return;
+    }
+    widget.settings.setApproval(value);
+  }
+
+  @override
+  Widget build(BuildContext context) => ListenableBuilder(
+    listenable: widget.settings,
+    builder: (context, _) {
+      const controlWidth = 220.0;
+      return Wrap(
+        spacing: 16,
+        runSpacing: 8,
+        crossAxisAlignment: WrapCrossAlignment.center,
+        children: [
+          SizedBox(
+            width: controlWidth,
+            child: DropdownButtonHideUnderline(
+              child: DropdownButton<AgentApprovalPreset>(
+                value: widget.settings.approval,
+                isDense: true,
+                isExpanded: true,
+                onChanged: (value) {
+                  if (value != null) {
+                    unawaited(_selectApproval(value));
+                  }
+                },
+                items: const [
+                  DropdownMenuItem(
+                    value: AgentApprovalPreset.ask,
+                    child: Text('Ask for approval'),
+                  ),
+                  DropdownMenuItem(
+                    value: AgentApprovalPreset.approveForMe,
+                    child: Text('Approve for me'),
+                  ),
+                  DropdownMenuItem(
+                    value: AgentApprovalPreset.fullAccess,
+                    child: Text('Full Access'),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          SizedBox(
+            width: controlWidth,
+            child: Row(
+              children: [
+                Expanded(
+                  child: DropdownButtonHideUnderline(
+                    child: DropdownButton<String?>(
+                      value: widget.settings.model,
+                      hint: const Text('Default model'),
+                      isDense: true,
+                      isExpanded: true,
+                      onChanged: widget.settings.setModel,
+                      items: [
+                        const DropdownMenuItem<String?>(
+                          value: null,
+                          child: Text('Default model'),
+                        ),
+                        if (widget.settings.model != null &&
+                            !widget.settings.models.any(
+                              (m) => m.id == widget.settings.model,
+                            ))
+                          DropdownMenuItem<String?>(
+                            value: widget.settings.model,
+                            child: Text(widget.settings.model!),
+                          ),
+                        ...widget.settings.models.map(
+                          (model) => DropdownMenuItem<String?>(
+                            value: model.id,
+                            child: Text(model.displayName),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 6),
+                ContextWindowIndicator(model: widget.settings.selectedModel),
+              ],
+            ),
+          ),
+          if (widget.settings.loadingModels) const Text('Loading models…'),
+          if (widget.settings.modelError != null)
+            TextButton(
+              onPressed: widget.loadModels == null
+                  ? null
+                  : () => widget.settings.loadModels(widget.loadModels!),
+              child: Text(widget.settings.modelError!),
+            ),
+          if (widget.appliesNextTurn) const Text('Applies next turn'),
+        ],
+      );
+    },
+  );
 }
 
 class ContextWindowIndicator extends StatelessWidget {
@@ -12281,6 +12313,7 @@ class StartCodexSessionDialog extends StatefulWidget {
     required this.initialPrompt,
     this.onTask,
     this.settings,
+    this.loadModels,
     this.skillsController,
     this.projectId,
     super.key,
@@ -12288,6 +12321,7 @@ class StartCodexSessionDialog extends StatefulWidget {
 
   final String initialPrompt;
   final AgentExecutionSettings? settings;
+  final Future<List<AgentModelOption>> Function()? loadModels;
   final VoidCallback? onTask;
   final SkillsController? skillsController;
   final String? projectId;
@@ -12299,7 +12333,6 @@ class StartCodexSessionDialog extends StatefulWidget {
 
 class _StartCodexSessionDialogState extends State<StartCodexSessionDialog> {
   late final TextEditingController _prompt;
-  late bool appServer;
   AgentExecutionSettings get settings =>
       widget.settings ?? agentExecutionSettings;
   List<Map<String, dynamic>> selectedSkills = [];
@@ -12308,7 +12341,6 @@ class _StartCodexSessionDialogState extends State<StartCodexSessionDialog> {
   @override
   void initState() {
     super.initState();
-    appServer = settings.appServer;
     _prompt = TextEditingController(text: widget.initialPrompt);
     _promptFocusNode = FocusNode();
     WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -12331,7 +12363,6 @@ class _StartCodexSessionDialogState extends State<StartCodexSessionDialog> {
     if (prompt.isEmpty) {
       return;
     }
-    settings.appServer = appServer;
     settings.launchSkills = selectedSkills;
     Navigator.of(context).pop(prompt);
   }
@@ -12358,13 +12389,10 @@ class _StartCodexSessionDialogState extends State<StartCodexSessionDialog> {
                 alignLabelWithHint: true,
               ),
             ),
-            SwitchListTile(
-              title: const Text('Use App Server'),
-              subtitle: const Text(
-                'Interactive approvals and skills. Disable only to use legacy execution.',
-              ),
-              value: appServer,
-              onChanged: (v) => setState(() => appServer = v),
+            const SizedBox(height: 12),
+            AgentExecutionControls(
+              settings: settings,
+              loadModels: widget.loadModels,
             ),
             if (widget.skillsController != null && widget.projectId != null)
               SkillChips(
@@ -12379,14 +12407,9 @@ class _StartCodexSessionDialogState extends State<StartCodexSessionDialog> {
                   if (result != null && mounted) {
                     setState(() {
                       selectedSkills = result;
-                      if (result.isNotEmpty) appServer = true;
                     });
                   }
                 },
-              ),
-            if (!appServer && selectedSkills.isNotEmpty)
-              const Text(
-                'Selected skills cannot run through legacy execution.',
               ),
           ],
         ),

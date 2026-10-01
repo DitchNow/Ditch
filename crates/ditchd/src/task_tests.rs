@@ -341,7 +341,28 @@ mod task_tests {
     fn completed_linked_worker_submits_once_and_keeps_relational_task_link() {
         let (state, project) = fixture();
         let binary = project.root.join("fake-codex");
-        fs::write(&binary,"#!/bin/sh\ncase \"$1\" in --version) echo codex-cli-test; exit 0;; esac\ncat >/dev/null\nprintf 'run\\n' >> runs.txt\nprintf '%s\\n' '{\"type\":\"thread.started\",\"thread_id\":\"test-thread\"}' '{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"Implemented and tested\"}}' '{\"type\":\"turn.completed\"}'\n").unwrap();
+        fs::write(&binary, r#"#!/usr/bin/python3
+import json, sys
+if '--version' in sys.argv:
+    print('codex-cli-test'); sys.exit(0)
+assert sys.argv[1:] == ['app-server']
+def send(v): print(json.dumps(v), flush=True)
+for line in sys.stdin:
+    request=json.loads(line); method=request['method']; p=request.get('params',{})
+    if method=='initialized': continue
+    if method=='config/read': result={'config':{}}
+    elif method in ['thread/start','thread/resume']:
+        result={'thread':{'id':'test-thread'},'activePermissionProfile':{'id':p.get('config',{}).get('default_permissions')}}
+    elif method=='turn/start':
+        with open('runs.txt','a') as f: f.write('run\n')
+        send({'id':request['id'],'result':{'turn':{'id':'turn'}}})
+        send({'method':'turn/started','params':{'turn':{'id':'turn'}}})
+        send({'method':'item/completed','params':{'item':{'type':'agentMessage','text':'Implemented and tested'}}})
+        send({'method':'turn/completed','params':{'turn':{'id':'turn','status':'completed'}}})
+        break
+    else: result={}
+    send({'id':request['id'],'result':result})
+"#).unwrap();
         fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
         state.lock().unwrap().codex_binary = Some(binary.to_string_lossy().into_owned());
         let task = create(&state, &project);
