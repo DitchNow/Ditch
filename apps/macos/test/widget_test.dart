@@ -2342,7 +2342,7 @@ void main() {
     await tester.pumpWidget(_testApp());
 
     expect(find.text('Ditch'), findsWidgets);
-    expect(find.text('PROJECTS'), findsOneWidget);
+    expect(find.byKey(const Key('project-result-count')), findsOneWidget);
     expect(find.text('Agents'), findsOneWidget);
     expect(find.text('Attention'), findsNothing);
     expect(find.byKey(const Key('notification-bell')), findsOneWidget);
@@ -2360,7 +2360,7 @@ void main() {
     expect(find.byKey(const Key('first-project-add')), findsNothing);
     expect(find.widgetWithText(AlertDialog, 'Add Project'), findsNothing);
     expect(find.text('/Users/tester/Projects/example'), findsNothing);
-    expect(find.text('PROJECTS'), findsNothing);
+    expect(find.byKey(const Key('project-result-count')), findsNothing);
   });
 
   testWidgets('first project action remains gated until Codex is ready', (

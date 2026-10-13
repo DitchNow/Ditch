@@ -10,6 +10,10 @@ import 'package:flutter/services.dart';
 import 'package:xterm/xterm.dart';
 
 import 'application/command_center_controller.dart';
+import 'application/project_sidebar_controller.dart';
+import 'data/project_models.dart';
+import 'widgets/project_sidebar.dart';
+
 import 'application/task_board_controller.dart';
 import 'data/task_models.dart';
 import 'task_board.dart';
@@ -25,6 +29,8 @@ import 'widgets/inline_approval.dart';
 export 'data/runtime_transport.dart'
     show DitchRuntimeException, parseRuntimeResponseLine;
 export 'data/commercial_models.dart';
+export 'data/project_models.dart';
+export 'widgets/project_sidebar.dart';
 
 const ditchDeploymentEnvironment = String.fromEnvironment(
   'DITCH_DEPLOYMENT_ENVIRONMENT',
@@ -347,36 +353,6 @@ Future<void> setDitchThemeMode(ThemeMode mode) async {
   }
 }
 
-class DitchProject {
-  const DitchProject({
-    this.id,
-    required this.name,
-    required this.path,
-    this.gitPolicy = ProjectGitPolicy.requireRepository,
-    this.remoteMachineId,
-    this.sshHostAlias,
-  });
-
-  final String? id;
-  final String name;
-  final String path;
-  final ProjectGitPolicy gitPolicy;
-  final String? remoteMachineId;
-  final String? sshHostAlias;
-
-  bool get isRemote => sshHostAlias != null;
-}
-
-enum ProjectGitPolicy {
-  requireRepository,
-  initializeRepository,
-  allowOutsideGit,
-}
-
-String _titleCase(String value) => value.isEmpty
-    ? value
-    : '${value.substring(0, 1).toUpperCase()}${value.substring(1)}';
-
 bool isInsideGitWorkTree(String path) {
   var directory = Directory(path).absolute;
   while (true) {
@@ -389,15 +365,6 @@ bool isInsideGitWorkTree(String path) {
       return false;
     }
     directory = parent;
-  }
-}
-
-String canonicalProjectPath(String path) {
-  final directory = Directory(path).absolute;
-  try {
-    return directory.resolveSymbolicLinksSync();
-  } on FileSystemException {
-    return directory.path;
   }
 }
 
@@ -916,18 +883,6 @@ enum AgentStatus {
   completed,
   failed,
   stopped,
-}
-
-class ProjectAgentSummary {
-  const ProjectAgentSummary({
-    required this.runningCount,
-    required this.stoppedCount,
-    required this.hasUnreadResult,
-  });
-
-  final int runningCount;
-  final int stoppedCount;
-  final bool hasUnreadResult;
 }
 
 ProjectAgentSummary summarizeProjectAgents({
@@ -1885,6 +1840,17 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
   static const _defaultStartPrompt = '';
   static const _applicationChannel = MethodChannel('the_ditch/application');
 
+  late final _projectSidebar = ProjectSidebarController(
+    initialScope: widget.initialProjects.firstOrNull?.isRemote == true
+        ? ProjectScope.remote
+        : ProjectScope.local,
+  );
+
+  Future<void> _loadProjectSidebar() async {
+    await _projectSidebar.load();
+    if (mounted) _projectSidebar.reconcileProjects(_projects);
+  }
+
   final _idleChatViewport = ConversationViewportController();
   final _chatViewports = <String, ConversationViewportController>{};
   final _agentListController = ScrollController();
@@ -1925,7 +1891,10 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
       final project = _projects
           .where((p) => p.id == session.projectId)
           .firstOrNull;
-      if (project != null) _selectedProjectKey = _projectKey(project);
+      if (project != null) {
+        _selectedProjectKey = _projectKey(project);
+        _projectSidebar.revealProject(project);
+      }
       _expandedAgentLocalId = id;
       _focusedAgentLocalId = null;
     });
@@ -2054,11 +2023,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
     );
   }
 
-  String _projectKey(DitchProject project) =>
-      project.id ??
-      (project.isRemote
-          ? 'remote:${project.sshHostAlias}:${project.path}'
-          : canonicalProjectPath(project.path));
+  String _projectKey(DitchProject project) => projectKey(project);
 
   int get _selectedProjectIndex {
     if (_projects.isEmpty) return -1;
@@ -2095,7 +2060,8 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
     return agentId == null ? _idleComposerKey : _composerKeyForAgent(agentId);
   }
 
-  Future<void> _selectProject(int index) async {
+  Future<void> _selectProject(DitchProject project) async {
+    final key = _projectKey(project);
     final currentProjectId = _selectedProjectOrNull?.id;
     final currentFiles = currentProjectId == null
         ? null
@@ -2107,9 +2073,9 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
       currentFiles!.document!.dispose();
       currentFiles.document = null;
     }
-    if (!mounted) return;
+    if (!mounted || !_projects.any((p) => _projectKey(p) == key)) return;
     setState(() {
-      _selectedProjectKey = _projectKey(_projects[index]);
+      _selectedProjectKey = key;
       _expandedAgentLocalId = null;
       _focusedAgentLocalId = null;
       _terminalPresentation = TerminalPresentation.docked;
@@ -3059,7 +3025,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
       }
     }
     setState(() {
-      final selectedPath = _selectedProjectOrNull?.path;
+      final selectedKey = _selectedProjectKey;
       projects.sort((a, b) => a.name.compareTo(b.name));
       _projects
         ..clear()
@@ -3067,9 +3033,11 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
       if (_projects.isEmpty) {
         _selectedProjectKey = null;
       } else {
-        final restoredIndex = selectedPath == null
+        final restoredIndex = selectedKey == null
             ? -1
-            : _projects.indexWhere((project) => project.path == selectedPath);
+            : _projects.indexWhere(
+                (project) => _projectKey(project) == selectedKey,
+              );
         _selectedProjectKey = _projectKey(
           _projects[restoredIndex >= 0 ? restoredIndex : 0],
         );
@@ -3089,18 +3057,16 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
           attention.where((event) => event.isRead).map((event) => event.id),
         );
       final visibleSessions = _visibleSessions;
-      if (visibleSessions.isNotEmpty) {
-        _expandedAgentLocalId =
-            visibleSessions.any(
-              (session) => session.localId == _expandedAgentLocalId,
-            )
-            ? _expandedAgentLocalId
-            : visibleSessions.first.localId;
-      } else {
+      // A collapsed list is an intentional UI state, including after refresh.
+      if (_expandedAgentLocalId != null &&
+          !visibleSessions.any(
+            (session) => session.localId == _expandedAgentLocalId,
+          )) {
         _expandedAgentLocalId = null;
       }
       _runtimeSnapshotHydrated = true;
     });
+    _projectSidebar.reconcileProjects(_projects);
     if (removedViewports.isNotEmpty) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
         for (final viewport in removedViewports) {
@@ -3178,6 +3144,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
     _configureNativeNavigation();
     _scheduleStatusBarUpdate();
     unawaited(_loadPaneWidths());
+    unawaited(_loadProjectSidebar());
     if (widget.connectRuntimeOnStart) {
       unawaited(_connectRuntime());
     }
@@ -3187,6 +3154,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
   void dispose() {
     _applicationChannel.setMethodCallHandler(null);
     _tasks.dispose();
+    _projectSidebar.dispose();
     _presentation.dispose();
     _runtimeEvents?.cancel();
     _productUpdateTimer?.cancel();
@@ -3257,6 +3225,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
       _showSkills = false;
       _showBoard = false;
       _selectedProjectKey = _projectKey(_projects[projectIndex]);
+      _projectSidebar.revealProject(_projects[projectIndex]);
       _expandedAgentLocalId = session.localId;
       _focusedAgentLocalId = null;
       _pendingNotificationTarget = null;
@@ -3338,6 +3307,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
       setState(() {
         upsertProject(_projects, configuredProject);
         _selectedProjectKey = _projectKey(configuredProject);
+        _projectSidebar.revealProject(configuredProject);
         projectSession = _createAgentSession(expand: true);
       });
       _addChatMessage(
@@ -3375,6 +3345,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
     setState(() {
       upsertProject(_projects, created);
       _selectedProjectKey = _projectKey(created);
+      _projectSidebar.revealProject(created);
       _createAgentSession(expand: true);
     });
     unawaited(_ensureSelectedProjectTerminal());
@@ -3465,7 +3436,13 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
   }
 
   void _removeProjectFromUi(String projectId) {
-    if (!_projects.any((project) => project.id == projectId)) return;
+    final removedProject = _projects
+        .where((project) => project.id == projectId)
+        .firstOrNull;
+    if (removedProject == null) return;
+    if (_projectSidebar.groupFor(removedProject) != null) {
+      _projectSidebar.moveProject(removedProject, null);
+    }
     final removedSessionIds = _agentSessions
         .where((session) => session.projectId == projectId)
         .map((session) => session.localId)
@@ -4219,11 +4196,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
         return;
       }
       setState(() {
-        final existed = _agentSessionByLocalId(incoming.localId) != null;
         reconcileAgentSession(_agentSessions, incoming);
-        if (!existed) {
-          _expandedAgentLocalId ??= incoming.localId;
-        }
       });
       final updated = _agentSessionByLocalId(incoming.localId);
       if (updated != null &&
@@ -5468,12 +5441,13 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
                         width: projectSidebarWidth,
                         projects: _projects,
                         remoteHostStatus: _remoteHostStatus,
-                        selectedIndex:
+                        controller: _projectSidebar,
+                        selectedProjectKey:
                             (_showBoard ||
                                 _showSkills ||
                                 _editionWorkspace != null)
-                            ? -1
-                            : _selectedProjectIndex,
+                            ? null
+                            : _selectedProjectKey,
                         editionNavigation: [
                           if (widget.editionSurface is EditionWorkspaceProvider)
                             for (final item
@@ -5501,13 +5475,13 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
                           _showBoard = false;
                         }),
                         onAddProject: _addProject,
-                        onSelectProject: (index) {
+                        onSelectProject: (project) {
                           setState(() {
                             _editionWorkspace = null;
                             _showSkills = false;
                             _showBoard = false;
                           });
-                          unawaited(_selectProject(index));
+                          unawaited(_selectProject(project));
                         },
                         onRevealProject: (project) =>
                             unawaited(_revealProjectInFinder(project)),
@@ -5574,12 +5548,29 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
                                   presentation.connection ==
                                   RuntimeConnectionPhase.connected,
                               initialProjectId: _boardProjectId,
-                              onRunSelected: widget.editionSurface is EditionBoardProvider
-                                  ? (requestId, tasks) => (widget.editionSurface as EditionBoardProvider).runBoardTasks(
-                                      _runtimeClient, requestId, [for (final t in tasks) {'task_id': t.id, 'revision': t.revision}])
+                              onRunSelected:
+                                  widget.editionSurface is EditionBoardProvider
+                                  ? (requestId, tasks) =>
+                                        (widget.editionSurface
+                                                as EditionBoardProvider)
+                                            .runBoardTasks(
+                                              _runtimeClient,
+                                              requestId,
+                                              [
+                                                for (final t in tasks)
+                                                  {
+                                                    'task_id': t.id,
+                                                    'revision': t.revision,
+                                                  },
+                                              ],
+                                            )
                                   : null,
-                              onPause: widget.editionSurface is EditionBoardProvider
-                                  ? () => (widget.editionSurface as EditionBoardProvider).pauseBoardWork(_runtimeClient)
+                              onPause:
+                                  widget.editionSurface is EditionBoardProvider
+                                  ? () =>
+                                        (widget.editionSurface
+                                                as EditionBoardProvider)
+                                            .pauseBoardWork(_runtimeClient)
                                   : null,
                               executionProfile: () => _settingsForProject(
                                 _selectedProject.id,
@@ -7860,330 +7851,6 @@ class _NotificationCenterItem extends StatelessWidget {
     );
   }
 }
-
-class ProjectSidebar extends StatelessWidget {
-  final List<Widget> editionNavigation;
-  const ProjectSidebar({
-    required this.width,
-    required this.projects,
-    required this.remoteHostStatus,
-    required this.selectedIndex,
-    required this.onAddProject,
-    required this.onSelectProject,
-    required this.onRevealProject,
-    required this.onCopyProjectPath,
-    required this.onReconnectRemoteProject,
-    this.onSetupRemoteProject,
-    required this.onDeleteProject,
-    required this.summaryForProject,
-    this.onOpenBoard,
-    this.onOpenSkills,
-    this.editionNavigation = const [],
-    this.skillsSelected = false,
-    this.boardSelected = false,
-    super.key,
-  });
-
-  final VoidCallback? onOpenBoard;
-  final VoidCallback? onOpenSkills;
-  final bool skillsSelected;
-  final bool boardSelected;
-  final double width;
-  final List<DitchProject> projects;
-  final Map<String, String> remoteHostStatus;
-  final int selectedIndex;
-  final VoidCallback onAddProject;
-  final ValueChanged<int> onSelectProject;
-  final ValueChanged<DitchProject> onRevealProject;
-  final ValueChanged<DitchProject> onCopyProjectPath;
-  final ValueChanged<DitchProject> onReconnectRemoteProject;
-  final ValueChanged<DitchProject>? onSetupRemoteProject;
-  final ValueChanged<DitchProject> onDeleteProject;
-  final ProjectAgentSummary Function(DitchProject) summaryForProject;
-
-  @override
-  Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    return ColoredBox(
-      color: context.ditch.sidebar,
-      child: SizedBox(
-        width: width,
-        child: SafeArea(
-          top: false,
-          child: Padding(
-            padding: const EdgeInsets.all(12),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                ...editionNavigation,
-                if (showUnfinishedFeatureControls && onOpenBoard != null) ...[
-                  ListTile(
-                    dense: true,
-                    selected: boardSelected,
-                    leading: const Icon(Icons.view_kanban_outlined),
-                    title: const Text('Board'),
-                    onTap: onOpenBoard,
-                  ),
-                  if (onOpenSkills != null)
-                    ListTile(
-                      dense: true,
-                      selected: skillsSelected,
-                      leading: const Icon(Icons.extension_outlined),
-                      title: const Text('Skills'),
-                      onTap: onOpenSkills,
-                    ),
-                  const SizedBox(height: 12),
-                ],
-                Text(
-                  'PROJECTS',
-                  style: theme.textTheme.labelSmall?.copyWith(
-                    color: context.ditch.mutedText,
-                    fontWeight: FontWeight.w600,
-                    letterSpacing: 0.6,
-                  ),
-                ),
-                const SizedBox(height: 8),
-                Expanded(
-                  child: ListView.separated(
-                    itemCount: projects.length,
-                    separatorBuilder: (_, _) => const SizedBox(height: 8),
-                    itemBuilder: (context, index) {
-                      final project = projects[index];
-                      final summary = summaryForProject(project);
-                      return ProjectTile(
-                        name: project.name,
-                        path: project.path,
-                        isRemote: project.isRemote,
-                        sshHostAlias: project.sshHostAlias,
-                        remoteStatus: project.isRemote
-                            ? remoteHostStatus[project.sshHostAlias] ??
-                                  'connecting'
-                            : null,
-                        selected: index == selectedIndex,
-                        onTap: () => onSelectProject(index),
-                        onReveal: () => onRevealProject(project),
-                        onCopyPath: () => onCopyProjectPath(project),
-                        onSetup:
-                            project.isRemote && onSetupRemoteProject != null
-                            ? () => onSetupRemoteProject!(project)
-                            : null,
-                        onReconnect: project.isRemote
-                            ? () => onReconnectRemoteProject(project)
-                            : null,
-                        onDelete: () => onDeleteProject(project),
-                        runningCount: summary.runningCount,
-                        stoppedCount: summary.stoppedCount,
-                        hasUnreadResult: summary.hasUnreadResult,
-                      );
-                    },
-                  ),
-                ),
-                const SizedBox(height: 8),
-                TextButton.icon(
-                  onPressed: onAddProject,
-                  icon: const Icon(Icons.add, size: 16),
-                  label: const Text('Add Project'),
-                ),
-              ],
-            ),
-          ),
-        ),
-      ),
-    );
-  }
-}
-
-class ProjectTile extends StatelessWidget {
-  const ProjectTile({
-    required this.name,
-    required this.path,
-    required this.selected,
-    required this.onTap,
-    required this.onReveal,
-    required this.onCopyPath,
-    this.onReconnect,
-    this.onSetup,
-    required this.onDelete,
-    this.runningCount = 0,
-    this.stoppedCount = 0,
-    this.hasUnreadResult = false,
-    this.isRemote = false,
-    this.sshHostAlias,
-    this.remoteStatus,
-    super.key,
-  });
-
-  final String name;
-  final String path;
-  final bool selected;
-  final VoidCallback onTap;
-  final VoidCallback onReveal;
-  final VoidCallback onCopyPath;
-  final VoidCallback? onReconnect;
-  final VoidCallback? onSetup;
-  final VoidCallback onDelete;
-  final int runningCount;
-  final int stoppedCount;
-  final bool hasUnreadResult;
-  final bool isRemote;
-  final String? sshHostAlias;
-  final String? remoteStatus;
-
-  Future<void> _showContextMenu(
-    BuildContext context,
-    TapDownDetails details,
-  ) async {
-    final overlay = Overlay.of(context).context.findRenderObject() as RenderBox;
-    final action = await showMenu<_ProjectMenuAction>(
-      context: context,
-      position: RelativeRect.fromRect(
-        Rect.fromLTWH(
-          details.globalPosition.dx,
-          details.globalPosition.dy,
-          0,
-          0,
-        ),
-        Offset.zero & overlay.size,
-      ),
-      items: [
-        const PopupMenuItem(
-          value: _ProjectMenuAction.copyPath,
-          child: Text('Copy Project Path'),
-        ),
-        if (onSetup != null)
-          const PopupMenuItem(
-            value: _ProjectMenuAction.setup,
-            child: Text('Remote Runtime Setup…'),
-          ),
-        if (onReconnect != null)
-          const PopupMenuItem(
-            value: _ProjectMenuAction.reconnect,
-            child: Text('Reconnect'),
-          ),
-        const PopupMenuDivider(),
-        const PopupMenuItem(
-          value: _ProjectMenuAction.delete,
-          child: Text('Delete'),
-        ),
-      ],
-    );
-    switch (action) {
-      case _ProjectMenuAction.copyPath:
-        onCopyPath();
-      case _ProjectMenuAction.setup:
-        onSetup?.call();
-      case _ProjectMenuAction.reconnect:
-        onReconnect?.call();
-      case _ProjectMenuAction.delete:
-        onDelete();
-      case null:
-        break;
-    }
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final tokens = context.ditch;
-
-    return InkWell(
-      key: ValueKey('project-tile-$path'),
-      borderRadius: BorderRadius.circular(tokens.radiusSmall),
-      onTap: onTap,
-      onSecondaryTapDown: (details) => _showContextMenu(context, details),
-      child: DecoratedBox(
-        decoration: BoxDecoration(
-          color: selected ? tokens.selection : Colors.transparent,
-          borderRadius: BorderRadius.circular(tokens.radiusSmall),
-        ),
-        child: Padding(
-          padding: const EdgeInsets.all(10),
-          child: Row(
-            children: [
-              const Icon(Icons.folder_outlined, size: 18),
-              const SizedBox(width: 8),
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Row(
-                      children: [
-                        Expanded(
-                          child: Text(
-                            name,
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                          ),
-                        ),
-                        if (hasUnreadResult)
-                          Tooltip(
-                            message: 'New agent result',
-                            child: Container(
-                              key: ValueKey('project-unread-$path'),
-                              width: 8,
-                              height: 8,
-                              decoration: BoxDecoration(
-                                color: context.ditch.accent,
-                                shape: BoxShape.circle,
-                              ),
-                            ),
-                          ),
-                      ],
-                    ),
-                    Text(
-                      isRemote
-                          ? 'Remote · $sshHostAlias · ${_titleCase(remoteStatus ?? "connecting")}'
-                          : path,
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: Theme.of(context).textTheme.bodySmall,
-                    ),
-                    const SizedBox(height: 3),
-                    Text(
-                      '$runningCount running · $stoppedCount stopped',
-                      key: ValueKey('project-counts-$path'),
-                      style: Theme.of(context).textTheme.labelSmall?.copyWith(
-                        color: context.ditch.mutedText,
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-              const SizedBox(width: 4),
-              if (isRemote)
-                IconButton(
-                  key: ValueKey('reconnect-project-$path'),
-                  onPressed: onReconnect,
-                  tooltip: 'Reconnect',
-                  visualDensity: VisualDensity.compact,
-                  constraints: const BoxConstraints.tightFor(
-                    width: 28,
-                    height: 28,
-                  ),
-                  padding: EdgeInsets.zero,
-                  icon: const Icon(Icons.sync, size: 16),
-                )
-              else
-                IconButton(
-                  key: ValueKey('reveal-project-$path'),
-                  onPressed: onReveal,
-                  tooltip: 'Show in Finder',
-                  visualDensity: VisualDensity.compact,
-                  constraints: const BoxConstraints.tightFor(
-                    width: 28,
-                    height: 28,
-                  ),
-                  padding: EdgeInsets.zero,
-                  icon: const Icon(Icons.folder_open_outlined, size: 16),
-                ),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-}
-
-enum _ProjectMenuAction { copyPath, setup, reconnect, delete }
 
 class AgentsSurface extends StatelessWidget {
   const AgentsSurface({
