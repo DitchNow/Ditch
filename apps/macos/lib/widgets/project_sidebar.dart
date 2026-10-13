@@ -692,11 +692,17 @@ class _ProjectGroupRow extends StatelessWidget {
               color: context.ditch.muted,
             ),
             const SizedBox(width: 2),
-            Icon(
-              expanded ? Icons.folder_open_outlined : Icons.folder_outlined,
-              size: 15,
-              color: context.ditch.muted,
-            ),
+            if (activeProjectCount > 0)
+              ProjectActivityIndicator(
+                key: ValueKey('project-group-activity-${group.id}'),
+                count: activeProjectCount,
+              )
+            else
+              Icon(
+                expanded ? Icons.folder_open_outlined : Icons.folder_outlined,
+                size: 15,
+                color: context.ditch.muted,
+              ),
             const SizedBox(width: 6),
             Expanded(
               child: Text(
@@ -714,13 +720,6 @@ class _ProjectGroupRow extends StatelessWidget {
               '$count',
               style: TextStyle(fontSize: 11, color: context.ditch.muted),
             ),
-            if (activeProjectCount > 0) ...[
-              const SizedBox(width: 8),
-              ProjectActivityIndicator(
-                key: ValueKey('project-group-activity-${group.id}'),
-                count: activeProjectCount,
-              ),
-            ],
             if (onRename != null && onDelete != null)
               PopupMenuButton<String>(
                 tooltip: 'Group actions',
@@ -745,16 +744,45 @@ class _ProjectGroupRow extends StatelessWidget {
 }
 
 /// Counts projects, not agents. Only the small dot animates.
-class ProjectActivityIndicator extends StatefulWidget {
+class ProjectActivityIndicator extends StatelessWidget {
   const ProjectActivityIndicator({required this.count, super.key});
   final int count;
 
   @override
-  State<ProjectActivityIndicator> createState() =>
-      _ProjectActivityIndicatorState();
+  Widget build(BuildContext context) {
+    final label = count == 1
+        ? '1 project has running agents'
+        : '$count projects have running agents';
+    return Tooltip(
+      message: label,
+      child: Semantics(
+        label: label,
+        child: ExcludeSemantics(
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text(
+                '$count',
+                style: TextStyle(fontSize: 11, color: context.ditch.muted),
+              ),
+              const SizedBox(width: 4),
+              const _ProjectActivityDot(),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
 }
 
-class _ProjectActivityIndicatorState extends State<ProjectActivityIndicator>
+class _ProjectActivityDot extends StatefulWidget {
+  const _ProjectActivityDot({super.key});
+
+  @override
+  State<_ProjectActivityDot> createState() => _ProjectActivityDotState();
+}
+
+class _ProjectActivityDotState extends State<_ProjectActivityDot>
     with SingleTickerProviderStateMixin {
   late final _pulse = AnimationController(
     vsync: this,
@@ -784,40 +812,17 @@ class _ProjectActivityIndicatorState extends State<ProjectActivityIndicator>
   }
 
   @override
-  Widget build(BuildContext context) {
-    final label = widget.count == 1
-        ? '1 project has running agents'
-        : '${widget.count} projects have running agents';
-    return Tooltip(
-      message: label,
-      child: Semantics(
-        label: label,
-        child: ExcludeSemantics(
-          child: Row(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Text(
-                '${widget.count}',
-                style: TextStyle(fontSize: 11, color: context.ditch.muted),
-              ),
-              const SizedBox(width: 4),
-              FadeTransition(
-                opacity: _opacity,
-                child: Container(
-                  width: 6,
-                  height: 6,
-                  decoration: BoxDecoration(
-                    color: context.ditch.success,
-                    shape: BoxShape.circle,
-                  ),
-                ),
-              ),
-            ],
-          ),
-        ),
+  Widget build(BuildContext context) => FadeTransition(
+    opacity: _opacity,
+    child: Container(
+      width: 6,
+      height: 6,
+      decoration: BoxDecoration(
+        color: context.ditch.success,
+        shape: BoxShape.circle,
       ),
-    );
-  }
+    ),
+  );
 }
 
 class ProjectTile extends StatelessWidget {
@@ -949,9 +954,27 @@ class ProjectTile extends StatelessWidget {
               padding: EdgeInsets.all(compact ? 6 : 10),
               child: Row(
                 children: [
-                  if (!compact) ...[
-                    const Icon(Icons.folder_outlined, size: 18),
-                    const SizedBox(width: 8),
+                  if (!compact || runningCount > 0) ...[
+                    SizedBox(
+                      width: 18,
+                      height: 18,
+                      child: runningCount > 0
+                          ? Tooltip(
+                              message: 'Running agents',
+                              child: Semantics(
+                                label: 'Running agents',
+                                child: Center(
+                                  child: _ProjectActivityDot(
+                                    key: ValueKey(
+                                      'project-activity-${identity ?? path}',
+                                    ),
+                                  ),
+                                ),
+                              ),
+                            )
+                          : const Icon(Icons.folder_outlined, size: 18),
+                    ),
+                    SizedBox(width: compact ? 4 : 8),
                   ],
                   Expanded(
                     child: Column(

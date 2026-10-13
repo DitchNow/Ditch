@@ -711,6 +711,27 @@ void main() {
       );
       expect(tester.widget<ProjectActivityIndicator>(badge).count, 1);
       expect(tester.widget<ProjectActivityIndicator>(otherBadge).count, 1);
+      expect(
+        tester.getTopRight(badge).dx,
+        lessThan(tester.getTopLeft(find.text('Client Suite')).dx),
+      );
+      expect(
+        tester.getTopRight(otherBadge).dx,
+        lessThan(tester.getTopLeft(find.text('Other Projects')).dx),
+      );
+      final groupRow = find
+          .ancestor(
+            of: find.text('Client Suite'),
+            matching: find.byType(InkWell),
+          )
+          .first;
+      expect(
+        find.descendant(
+          of: groupRow,
+          matching: find.byIcon(Icons.folder_open_outlined),
+        ),
+        findsNothing,
+      );
       expect(find.text('Projects (3)'), findsOneWidget);
       controller.toggleGroup(group);
       await tester.pumpAndSettle();
@@ -756,6 +777,63 @@ void main() {
       expect(find.text('Projects (3)'), findsOneWidget);
       expect(badge, findsNothing);
       expect(otherBadge, findsOneWidget);
+      expect(
+        find.descendant(
+          of: groupRow,
+          matching: find.byIcon(Icons.folder_outlined),
+        ),
+        findsOneWidget,
+      );
+    },
+  );
+
+  testWidgets(
+    'project activity replaces the folder and restores it when idle',
+    (tester) async {
+      final controller = memoryController();
+      addTearDown(controller.dispose);
+      controller.setScope(ProjectScope.all);
+      final running = {'local': 3, 'remote': 1};
+      await tester.pumpWidget(
+        sidebar(controller, width: 520, runningCounts: running),
+      );
+      final tile = find.byKey(const ValueKey('project-tile-local'));
+      final dot = find.byKey(const ValueKey('project-activity-local'));
+      expect(dot, findsOneWidget);
+      expect(
+        find.byKey(const ValueKey('project-activity-remote')),
+        findsOneWidget,
+      );
+      expect(
+        find.byKey(const ValueKey('project-activity-other')),
+        findsNothing,
+      );
+      expect(tester.getSize(dot), const Size(6, 6));
+      expect(
+        find.descendant(of: tile, matching: find.byIcon(Icons.folder_outlined)),
+        findsNothing,
+      );
+      expect(
+        find.descendant(
+          of: tile,
+          matching: find.byType(ProjectActivityIndicator),
+        ),
+        findsNothing,
+      );
+      final namePosition = tester.getTopLeft(find.text('Website'));
+      expect(tester.getTopRight(dot).dx, lessThan(namePosition.dx));
+      running['local'] = 0;
+      await tester.pumpWidget(
+        sidebar(controller, width: 520, runningCounts: running),
+      );
+      await tester.pumpAndSettle();
+      expect(dot, findsNothing);
+      expect(
+        find.descendant(of: tile, matching: find.byIcon(Icons.folder_outlined)),
+        findsOneWidget,
+      );
+      expect(tester.getTopLeft(find.text('Website')), namePosition);
+      expect(tester.takeException(), isNull);
     },
   );
 
@@ -807,6 +885,10 @@ void main() {
           await tester.pumpAndSettle();
           expect(tester.takeException(), isNull);
           expect(find.byType(RemoteProjectTag), findsOneWidget);
+          expect(
+            find.byKey(const ValueKey('project-activity-remote')),
+            findsOneWidget,
+          );
           await tester.tap(find.byKey(const Key('open-project-search')));
           await tester.pumpAndSettle();
           expect(
