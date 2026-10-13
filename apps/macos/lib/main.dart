@@ -11,6 +11,8 @@ import 'package:xterm/xterm.dart';
 
 import 'application/command_center_controller.dart';
 import 'application/project_sidebar_controller.dart';
+import 'application/product_update_controller.dart';
+import 'widgets/update_available_dot.dart';
 import 'data/project_models.dart';
 import 'widgets/project_sidebar.dart';
 
@@ -1808,10 +1810,23 @@ DitchProject? parseRuntimeProject(Object? value) {
   );
 }
 
+ProductUpdateController productUpdateController(DitchRuntimeClient client) =>
+    ProductUpdateController(
+      loadContext: () async => (
+        runtime: await client.runtimeStatus(),
+        license: DitchCurrentLicense.fromEntitlement(
+          await client.commercialEntitlement(),
+        ),
+      ),
+      fetchRelease: (license, {required forInstallation}) =>
+          client.releaseForLicense(license, forInstallation: forInstallation),
+    );
+
 class CommandCenterScreen extends StatefulWidget {
   const CommandCenterScreen({
     this.connectRuntimeOnStart = true,
     this.runtimeClient,
+    this.updates,
     this.initialProjects = const [],
     this.editionSurface = const CommunityEditionSurface(),
     this.deploymentEnvironment = ditchDeploymentEnvironment,
@@ -1821,6 +1836,7 @@ class CommandCenterScreen extends StatefulWidget {
 
   final bool connectRuntimeOnStart;
   final DitchRuntimeClient? runtimeClient;
+  final ProductUpdateController? updates;
   final List<DitchProject> initialProjects;
   final EditionSurface editionSurface;
   final String deploymentEnvironment;
@@ -1830,7 +1846,8 @@ class CommandCenterScreen extends StatefulWidget {
   State<CommandCenterScreen> createState() => _CommandCenterScreenState();
 }
 
-class _CommandCenterScreenState extends State<CommandCenterScreen> {
+class _CommandCenterScreenState extends State<CommandCenterScreen>
+    with WidgetsBindingObserver {
   static const _defaultProjectSidebarWidth = 240.0;
   static const _defaultInspectorWidth = 320.0;
   static const _minimumProjectSidebarWidth = 160.0;
@@ -1975,9 +1992,10 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
   BuildContext? _activePermissionContext;
 
   StreamSubscription<Map<String, dynamic>>? _runtimeEvents;
-  Timer? _productUpdateTimer;
+  late final _productUpdates =
+      widget.updates ?? productUpdateController(_runtimeClient);
+  final _announcedProductReleases = <String>{};
   RuntimeStatusDto? _runtimeStatus;
-  bool _productUpdateChecking = false;
   String? _runtimeInstanceId;
   bool _runtimeReconnectScheduled = false;
   bool _runtimeConnecting = false;
@@ -2289,62 +2307,58 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
   }
 
   Future<void> _checkForProductUpdate() async {
-    if (_productUpdateChecking || _runtimeStatus == null) {
-      return;
-    }
-    _productUpdateChecking = true;
-    try {
-      final license = DitchCurrentLicense.fromEntitlement(
-        await _runtimeClient.commercialEntitlement(),
+    if (_runtimeStatus == null) return;
+    await _productUpdates.check();
+  }
+
+  void _productUpdateChanged() {
+    if (!mounted) return;
+    final manifest = _productUpdates.manifest;
+    final releaseId = _productUpdates.releaseId;
+    setState(() {
+      _attention.removeWhere(
+        (event) =>
+            event.action == AttentionAction.installProductUpdate &&
+            event.id != 'attention-product-update-$releaseId',
       );
-      final release = await _runtimeClient.releaseForLicense(license);
-      final manifest = (release['manifest'] as Map?)?.cast<String, dynamic>();
-      final sequence = (manifest?['release_sequence'] as num?)?.toInt();
-      if (manifest?['release_id'] is! String ||
-          sequence == null ||
-          sequence <= (_runtimeStatus?.releaseSequence ?? 0)) {
-        return;
-      }
-      final version = manifest?['version']?.toString() ?? 'new';
-      final build = manifest?['build']?.toString();
-      final notice = AttentionEvent(
-        id: 'attention-product-update-${manifest?['release_id']}',
-        kind: AttentionKind.completed,
-        icon: Icons.system_update_alt,
-        title: 'Ditch $version is available',
-        body:
-            'A verified ${manifest?['edition'] ?? 'Ditch'} update${build == null ? '' : ' (build $build)'} is ready. Click Install to update without changing projects, sessions, or SSH configuration.',
-        createdAt: DateTime.now(),
-        action: AttentionAction.installProductUpdate,
-      );
-      if (!mounted) return;
-      setState(() {
-        _attention.removeWhere(
-          (event) => event.action == AttentionAction.installProductUpdate,
+      if (manifest != null &&
+          releaseId != null &&
+          _announcedProductReleases.add(releaseId)) {
+        final version = manifest['version']?.toString() ?? 'new';
+        final build = manifest['build']?.toString();
+        _attention.insert(
+          0,
+          AttentionEvent(
+            id: 'attention-product-update-$releaseId',
+            kind: AttentionKind.completed,
+            icon: Icons.system_update_alt,
+            title: 'Ditch $version is available',
+            body:
+                'A verified ${manifest['edition'] ?? 'Ditch'} update${build == null ? '' : ' (build $build)'} is ready. Click Install to update without changing projects, sessions, or SSH configuration.',
+            createdAt: DateTime.now(),
+            action: AttentionAction.installProductUpdate,
+          ),
         );
-        _attention.insert(0, notice);
-      });
-      _scheduleStatusBarUpdate();
-    } on DitchRuntimeException catch (error) {
-      // No compatible newer release, an inactive entitlement, or a temporary
-      // Relay failure is not an agent-facing notification.
-      debugPrint('Product update check did not return an update: $error');
-    } on Object catch (error) {
-      debugPrint('Product update check failed: $error');
-    } finally {
-      _productUpdateChecking = false;
+      }
+    });
+    _scheduleStatusBarUpdate();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      unawaited(_checkForProductUpdate());
     }
   }
 
   Future<void> _installProductUpdate(AttentionEvent event) async {
     try {
-      final license = DitchCurrentLicense.fromEntitlement(
-        await _runtimeClient.commercialEntitlement(),
-      );
-      final release = await _runtimeClient.releaseForLicense(
-        license,
-        forInstallation: true,
-      );
+      final release = await _productUpdates.prepareInstallation();
+      if (release == null) {
+        throw const FormatException(
+          'No compatible update is currently available.',
+        );
+      }
       final releaseId = (release['manifest'] as Map?)?['release_id'];
       if (event.id != 'attention-product-update-$releaseId') {
         _markAttentionIdsRead({event.id});
@@ -2429,6 +2443,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
         onDone: _scheduleRuntimeReconnect,
       );
       final confirmed = await _runtimeClient.runtimeStatus();
+      final previousRuntime = _runtimeStatus;
       _runtimeStatus = confirmed;
       final confirmedInstanceId = confirmed.instanceId;
       if (_runtimeInstanceId != confirmedInstanceId) {
@@ -2437,13 +2452,16 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
       }
       _runtimeConnectionRetries = 0;
       _presentation.connected();
-      {
-        unawaited(_checkForProductUpdate());
-        _productUpdateTimer ??= Timer.periodic(
-          const Duration(hours: 6),
-          (_) => unawaited(_checkForProductUpdate()),
-        );
+      final updateRuntime = previousRuntime ?? _productUpdates.context?.runtime;
+      if (updateRuntime != null &&
+          (updateRuntime.instanceId != confirmed.instanceId ||
+              updateRuntime.deploymentEnvironment !=
+                  confirmed.deploymentEnvironment ||
+              updateRuntime.releaseSequence != confirmed.releaseSequence)) {
+        _productUpdates.invalidate();
       }
+      _productUpdates.startPolling();
+      unawaited(_checkForProductUpdate());
       unawaited(_ensureSelectedProjectTerminal());
       unawaited(_refreshNotificationReadiness());
       await _refreshCodexReadiness();
@@ -2743,6 +2761,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
   }
 
   Future<void> _openAppSettings() async {
+    unawaited(_checkForProductUpdate());
     final appVersion = await _installedAppVersionLabel();
     if (!mounted) return;
     final editionSections = widget.editionSurface.settingsSections(
@@ -2770,6 +2789,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
         subtitle: 'Check for updates for your current license',
         dialogBuilder: (client) => DitchUpdateDialog(
           client: client,
+          updates: _productUpdates,
           deploymentEnvironment: widget.deploymentEnvironment,
           relayOrigin: widget.relayOrigin,
         ),
@@ -2777,51 +2797,60 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
     ];
     final section = await showDialog<String>(
       context: context,
-      builder: (context) => SimpleDialog(
-        title: const Text('Settings'),
-        children: [
-          if (widget.deploymentEnvironment == 'staging')
-            Padding(
-              padding: const EdgeInsets.fromLTRB(24, 0, 24, 12),
-              child: StagingEnvironmentBanner(
-                key: const Key('settings-staging-environment'),
-                relayOrigin: widget.relayOrigin,
+      builder: (context) => ListenableBuilder(
+        listenable: _productUpdates,
+        builder: (context, _) => SimpleDialog(
+          title: const Text('Settings'),
+          children: [
+            if (widget.deploymentEnvironment == 'staging')
+              Padding(
+                padding: const EdgeInsets.fromLTRB(24, 0, 24, 12),
+                child: StagingEnvironmentBanner(
+                  key: const Key('settings-staging-environment'),
+                  relayOrigin: widget.relayOrigin,
+                ),
+              ),
+            SimpleDialogOption(
+              onPressed: () => Navigator.pop(context, 'codex'),
+              child: const ListTile(
+                leading: Icon(Icons.terminal),
+                title: Text('Codex'),
+                subtitle: Text('Installation and runtime setup'),
               ),
             ),
-          SimpleDialogOption(
-            onPressed: () => Navigator.pop(context, 'codex'),
-            child: const ListTile(
-              leading: Icon(Icons.terminal),
-              title: Text('Codex'),
-              subtitle: Text('Installation and runtime setup'),
-            ),
-          ),
-          ...settingsSections.map(
-            (entry) => SimpleDialogOption(
-              key: Key('settings-${entry.id}'),
-              onPressed: () => Navigator.pop(context, entry.id),
-              child: ListTile(
-                leading: Icon(entry.icon),
-                title: Text(entry.title),
-                subtitle: Text(entry.subtitle),
-              ),
-            ),
-          ),
-          if (appVersion != null) ...[
-            const Divider(height: 1),
-            Padding(
-              padding: const EdgeInsets.fromLTRB(24, 12, 24, 4),
-              child: Text(
-                appVersion,
-                key: const Key('settings-version'),
-                textAlign: TextAlign.center,
-                style: Theme.of(context).textTheme.labelSmall?.copyWith(
-                  color: context.ditch.mutedText,
+            ...settingsSections.map(
+              (entry) => SimpleDialogOption(
+                key: Key('settings-${entry.id}'),
+                onPressed: () => Navigator.pop(context, entry.id),
+                child: ListTile(
+                  leading: Icon(entry.icon),
+                  title: Text(entry.title),
+                  subtitle: Text(entry.subtitle),
+                  trailing:
+                      entry.id == 'upgrade-ditch' && _productUpdates.available
+                      ? const UpdateAvailableDot(
+                          key: Key('settings-update-dot'),
+                        )
+                      : null,
                 ),
               ),
             ),
+            if (appVersion != null) ...[
+              const Divider(height: 1),
+              Padding(
+                padding: const EdgeInsets.fromLTRB(24, 12, 24, 4),
+                child: Text(
+                  appVersion,
+                  key: const Key('settings-version'),
+                  textAlign: TextAlign.center,
+                  style: Theme.of(context).textTheme.labelSmall?.copyWith(
+                    color: context.ditch.mutedText,
+                  ),
+                ),
+              ),
+            ],
           ],
-        ],
+        ),
       ),
     );
     if (!mounted) return;
@@ -2840,6 +2869,10 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
         context: context,
         builder: (context) => selected!.dialogBuilder(_runtimeClient),
       );
+      if (mounted && section != 'upgrade-ditch') {
+        _productUpdates.invalidate();
+        unawaited(_checkForProductUpdate());
+      }
     }
   }
 
@@ -3137,6 +3170,8 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    _productUpdates.addListener(_productUpdateChanged);
     _projects = List<DitchProject>.of(widget.initialProjects);
     _selectedProjectKey = _projects.isEmpty
         ? null
@@ -3157,7 +3192,9 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
     _projectSidebar.dispose();
     _presentation.dispose();
     _runtimeEvents?.cancel();
-    _productUpdateTimer?.cancel();
+    WidgetsBinding.instance.removeObserver(this);
+    _productUpdates.removeListener(_productUpdateChanged);
+    if (widget.updates == null) _productUpdates.dispose();
     _idleChatViewport.dispose();
     for (final viewport in _chatViewports.values) {
       viewport.dispose();
@@ -5600,6 +5637,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
                       onDismissAllNotifications: _dismissAllNotifications,
                       onOpenCodexSettings: _openAppSettings,
                       codexAvailable: _codexBinary != null,
+                      updateAvailable: _productUpdates.available,
                       onToggleSidebar: _presentation.toggleSidebar,
                       onToggleInspector: _presentation.toggleInspector,
                     ),
@@ -6073,12 +6111,14 @@ class NotificationSetupBanner extends StatelessWidget {
 class DitchUpdateDialog extends StatefulWidget {
   const DitchUpdateDialog({
     required this.client,
+    this.updates,
     this.deploymentEnvironment = ditchDeploymentEnvironment,
     this.relayOrigin = ditchRelayOrigin,
     super.key,
   });
 
   final DitchRuntimeClient client;
+  final ProductUpdateController? updates;
   final String deploymentEnvironment;
   final String relayOrigin;
 
@@ -6088,6 +6128,8 @@ class DitchUpdateDialog extends StatefulWidget {
 
 class _DitchUpdateDialogState extends State<DitchUpdateDialog> {
   static const _applicationChannel = MethodChannel('the_ditch/application');
+  late final _updates =
+      widget.updates ?? productUpdateController(widget.client);
   RuntimeStatusDto? _runtime;
   DitchCurrentLicense? _license;
   Map<String, dynamic>? _release;
@@ -6101,7 +6143,49 @@ class _DitchUpdateDialogState extends State<DitchUpdateDialog> {
   @override
   void initState() {
     super.initState();
+    _updates.addListener(_syncUpdates);
     unawaited(_load());
+  }
+
+  @override
+  void dispose() {
+    _updates.removeListener(_syncUpdates);
+    if (widget.updates == null) _updates.dispose();
+    super.dispose();
+  }
+
+  String? get _availabilityMessage {
+    final manifest = _updates.manifest;
+    if (manifest != null) {
+      final version = manifest['version']?.toString() ?? 'new';
+      final build = manifest['build']?.toString();
+      return build == null
+          ? 'Ditch $version is available.'
+          : 'Ditch $version.$build is available.';
+    }
+    if (_updates.lastCheckedAt == null) return null;
+    if (_updates.noCompatibleRelease) {
+      return 'No compatible ${_usesCommercialUpdates ? 'Commercial' : 'Community'} update is currently available.';
+    }
+    return 'Ditch is up to date for ${_license?.displayName ?? 'your license'}.';
+  }
+
+  void _syncUpdates() {
+    if (!mounted) return;
+    setState(() {
+      _runtime = _updates.context?.runtime ?? _runtime;
+      _license = _updates.context?.license ?? _license;
+      _checking = _updates.checking;
+      _release = _updates.manifest == null
+          ? null
+          : {'manifest': _updates.manifest};
+      if (!_installing) {
+        _message = _availabilityMessage;
+        _error = _updates.error == null
+            ? null
+            : _friendlyError(_updates.error!);
+      }
+    });
   }
 
   Future<void> _load() async {
@@ -6113,6 +6197,10 @@ class _DitchUpdateDialogState extends State<DitchUpdateDialog> {
       final version = metadata?['version']?.trim();
       final build = metadata?['build']?.trim();
       if (!mounted) return;
+      _updates.reconcileContext((
+        runtime: runtime,
+        license: DitchCurrentLicense.fromEntitlement(entitlement),
+      ));
       setState(() {
         _runtime = runtime;
         _license = DitchCurrentLicense.fromEntitlement(entitlement);
@@ -6123,6 +6211,8 @@ class _DitchUpdateDialogState extends State<DitchUpdateDialog> {
             : 'v$version.$build';
         _loading = false;
       });
+      _syncUpdates();
+      if (widget.updates != null) unawaited(_updates.check());
     } on Object catch (error) {
       if (!mounted) return;
       setState(() {
@@ -6132,61 +6222,9 @@ class _DitchUpdateDialogState extends State<DitchUpdateDialog> {
     }
   }
 
-  Future<void> _checkForUpdates() async {
-    final license = _license;
-    final runtime = _runtime;
-    if (license == null || runtime == null) return;
-    setState(() {
-      _checking = true;
-      _release = null;
-      _message = null;
-      _error = null;
-    });
-    try {
-      final release = await _checkSelectedRelease();
-      final manifest = (release['manifest'] as Map?)?.cast<String, dynamic>();
-      final sequence = (manifest?['release_sequence'] as num?)?.toInt();
-      if (sequence == null) {
-        throw const FormatException(
-          'The Relay returned incomplete update metadata.',
-        );
-      }
-      if (!mounted) return;
-      setState(() {
-        if (sequence > runtime.releaseSequence) {
-          _release = release;
-          final version = manifest?['version']?.toString() ?? 'new';
-          final build = manifest?['build']?.toString();
-          _message = build == null
-              ? 'Ditch $version is available.'
-              : 'Ditch $version.$build is available.';
-        } else {
-          _message = 'Ditch is up to date for ${license.displayName}.';
-        }
-        _checking = false;
-      });
-    } on Object catch (error) {
-      if (!mounted) return;
-      setState(() {
-        _checking = false;
-        if (error is DitchRuntimeException &&
-            error.code == 'commercial_release_unavailable') {
-          _message = _friendlyError(error);
-        } else {
-          _error = _friendlyError(error);
-        }
-      });
-    }
-  }
+  Future<void> _checkForUpdates() => _updates.check(force: true);
 
   bool get _usesCommercialUpdates => _license?.hasCommercialAccess == true;
-
-  Future<Map<String, dynamic>> _checkSelectedRelease({
-    bool forInstallation = false,
-  }) => widget.client.releaseForLicense(
-    _license!,
-    forInstallation: forInstallation,
-  );
 
   Future<void> _installCommercialUpdate() async {
     final release = _release;
@@ -6198,29 +6236,20 @@ class _DitchUpdateDialogState extends State<DitchUpdateDialog> {
     try {
       // Discovery permissions expire. Obtain a freshly verified release and
       // session for every install attempt, including retries.
-      final freshRelease = await _checkSelectedRelease();
+      final freshRelease = await _updates.prepareInstallation();
       if (!mounted) return;
-      final arguments = authorizedCommercialUpdateArguments(freshRelease);
-      final manifest = (freshRelease['manifest'] as Map)
-          .cast<String, dynamic>();
-      final sequence = (manifest['release_sequence'] as num?)?.toInt();
-      if (sequence == null) {
-        throw const FormatException(
-          'The Relay returned incomplete update metadata.',
-        );
-      }
-      if (sequence <= _runtime!.releaseSequence) {
+      if (freshRelease == null) {
         setState(() {
-          _release = null;
           _installing = false;
-          _message = 'Ditch is up to date for ${_license!.displayName}.';
+          _message = _availabilityMessage;
         });
         return;
       }
+      final arguments = authorizedCommercialUpdateArguments(freshRelease);
       final selectedManifest = release['manifest'] as Map;
       if (arguments['release_id'] != selectedManifest['release_id']) {
         setState(() {
-          _release = freshRelease;
+          _release = {'manifest': _updates.manifest};
           _installing = false;
           _message =
               'Ditch ${arguments['version']}.${arguments['build']} is now available. Click Install Update to install this version.';
@@ -7329,6 +7358,7 @@ class DitchToolbar extends StatelessWidget {
     required this.onDismissAllNotifications,
     required this.onOpenCodexSettings,
     required this.codexAvailable,
+    this.updateAvailable = false,
     super.key,
   });
 
@@ -7346,6 +7376,7 @@ class DitchToolbar extends StatelessWidget {
   final VoidCallback onDismissAllNotifications;
   final VoidCallback onOpenCodexSettings;
   final bool codexAvailable;
+  final bool updateAvailable;
 
   @override
   Widget build(BuildContext context) {
@@ -7420,17 +7451,30 @@ class DitchToolbar extends StatelessWidget {
             ),
             IconButton(
               key: const Key('app-settings-button'),
-              tooltip: codexAvailable
-                  ? 'Codex installation'
+              tooltip: updateAvailable
+                  ? 'Settings — update available'
+                  : codexAvailable
+                  ? 'Settings'
                   : 'Codex not found — choose an installation',
               onPressed: onOpenCodexSettings,
-              icon: Icon(
-                codexAvailable
-                    ? Icons.settings_outlined
-                    : Icons.warning_amber_rounded,
-                color: codexAvailable
-                    ? null
-                    : Theme.of(context).colorScheme.error,
+              icon: Stack(
+                clipBehavior: Clip.none,
+                children: [
+                  Icon(
+                    codexAvailable
+                        ? Icons.settings_outlined
+                        : Icons.warning_amber_rounded,
+                    color: codexAvailable
+                        ? null
+                        : Theme.of(context).colorScheme.error,
+                  ),
+                  if (updateAvailable)
+                    const Positioned(
+                      top: -3,
+                      right: -3,
+                      child: UpdateAvailableDot(key: Key('toolbar-update-dot')),
+                    ),
+                ],
               ),
             ),
             NotificationCenterButton(

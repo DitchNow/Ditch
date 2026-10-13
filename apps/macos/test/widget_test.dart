@@ -86,6 +86,7 @@ class _CurrentLicenseClient extends DitchRuntimeClient {
     communityChecks++;
     return {
       'manifest': {
+        'release_id': '11111111-1111-4111-8111-111111111111',
         'edition': 'community',
         'release_sequence': 108,
         'version': '0.1.0',

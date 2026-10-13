@@ -43,6 +43,7 @@ class _UpdateClient extends DitchRuntimeClient {
   bool belowMinimum = false;
 
   int checks = 0;
+  int installationChecks = 0;
   Future<Map<String, dynamic>> Function()? onRefresh;
 
   @override
@@ -100,6 +101,18 @@ class _UpdateClient extends DitchRuntimeClient {
           ? '2020-01-01T00:00:00.123Z'
           : '2026-09-09T14:30:00.123Z',
     );
+  }
+
+  @override
+  Future<Map<String, dynamic>> currentCommercialRelease() {
+    installationChecks++;
+    return checkCommercialRelease();
+  }
+
+  @override
+  Future<Map<String, dynamic>> currentCommunityRelease() {
+    installationChecks++;
+    return checkCommunityRelease();
   }
 
   void _checkMinimum() {
@@ -212,6 +225,7 @@ void main() {
           final paid = status == 'active' || status == 'over_limit';
           expect(client.checks, paid ? 2 : 0);
           expect(client.communityChecks, paid ? 0 : 2);
+          expect(client.installationChecks, 1);
           expect(installs, hasLength(1));
           final arguments = installs.single.arguments as Map;
           expect(arguments['edition'], paid ? 'commercial' : 'community');
