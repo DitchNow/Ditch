@@ -22,33 +22,40 @@ InlineApproval approval({
 
 void main() {
   for (final choice in ApprovalChoice.values) {
-    testWidgets('${choice.label} resolves only after acknowledgement', (
-      tester,
-    ) async {
-      final response = Completer<void>();
-      final choices = <ApprovalChoice>[];
-      final request = approval(
-        send: (value) {
-          choices.add(value);
-          return response.future;
-        },
-      );
-      await tester.pumpWidget(
-        MaterialApp(
-          home: Scaffold(body: InlineApprovalCard(approval: request)),
-        ),
-      );
-      expect(find.byType(AlertDialog), findsNothing);
-      await tester.tap(find.text(choice.label));
-      await tester.pump();
-      await request.choose(choice);
-      expect(choices, [choice]);
-      expect(find.text(choice.result), findsNothing);
-      response.complete();
-      await tester.pump();
-      expect(find.text(choice.result), findsOneWidget);
-      expect(find.text('Approve once'), findsNothing);
-    });
+    testWidgets(
+      '${choice.label} waits for agent confirmation after acknowledgement',
+      (tester) async {
+        final response = Completer<void>();
+        final choices = <ApprovalChoice>[];
+        final request = approval(
+          send: (value) {
+            choices.add(value);
+            return response.future;
+          },
+        );
+        await tester.pumpWidget(
+          MaterialApp(
+            home: Scaffold(body: InlineApprovalCard(approval: request)),
+          ),
+        );
+        expect(find.byType(AlertDialog), findsNothing);
+        await tester.tap(find.text(choice.label));
+        await tester.pump();
+        await request.choose(choice);
+        expect(choices, [choice]);
+        expect(find.text(choice.result), findsNothing);
+        response.complete();
+        await tester.pump();
+        expect(request.resolution, isNull);
+        expect(request.awaitingConfirmation, isTrue);
+        await request.choose(choice);
+        expect(choices, [choice]);
+        request.resolve();
+        await tester.pump();
+        expect(find.text('Resolved'), findsOneWidget);
+        expect(find.text('Approve once'), findsNothing);
+      },
+    );
   }
   test(
     'offline approval cannot submit and becomes available after reconnect',
@@ -106,7 +113,9 @@ void main() {
     expect(find.text('Run tests?'), findsOneWidget);
     await tester.tap(find.text('Approve once'));
     await tester.pump();
-    expect(request.resolution, 'Approved once');
+    expect(request.resolution, isNull);
+    request.resolve();
+    expect(request.resolution, 'Resolved');
     await tester.pumpWidget(const SizedBox());
     viewport.dispose();
   });
@@ -125,6 +134,34 @@ void main() {
     expect(request.uncertain, isTrue);
     expect(request.resolution, isNull);
     request.resolve();
+    expect(request.actionable, isFalse);
+  });
+  test(
+    'snapshot recovers an unsent decision but does not resend a pending response',
+    () async {
+      var sends = 0;
+      final request = approval(
+        send: (_) async {
+          sends++;
+          throw TimeoutException('lost');
+        },
+      );
+      await request.choose(ApprovalChoice.once);
+      request.updateRequest({...request.request, 'response_pending': true});
+      expect(request.actionable, isFalse);
+      request.updateRequest({...request.request, 'response_pending': false});
+      expect(request.actionable, isTrue);
+      await request.choose(ApprovalChoice.once);
+      expect(sends, 2);
+    },
+  );
+  test('a recovered live request replaces a stale snapshot resolution', () {
+    final request = approval();
+    request.resolve();
+    expect(request.actionable, isFalse);
+    request.updateRequest({...request.request, 'response_pending': false});
+    expect(request.actionable, isTrue);
+    request.updateRequest({...request.request, 'response_pending': true});
     expect(request.actionable, isFalse);
   });
   test('resolution from another client disables the request', () async {
@@ -156,7 +193,9 @@ void main() {
       expect(find.text('No messages yet.'), findsNothing);
       await tester.tap(find.text('Cancel'));
       await tester.pump();
-      expect(first.resolution, 'Cancelled');
+      expect(first.resolution, isNull);
+      first.resolve();
+      expect(first.resolution, 'Resolved');
       expect(second.actionable, isTrue);
       await tester.pumpWidget(const SizedBox());
       viewport.dispose();

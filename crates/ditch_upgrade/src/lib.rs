@@ -102,7 +102,9 @@ pub enum UpgradeError {
     Expired,
     #[error("commercial release would downgrade this installation")]
     Downgrade,
-    #[error("commercial release is incompatible with this Community build")]
+    #[error(
+        "This update requires a newer installed version of Ditch. Manually install the latest official app to continue."
+    )]
     Incompatible,
     #[error("commercial release manifest signature is invalid")]
     ManifestSignature,
@@ -343,6 +345,8 @@ fn parse_minor_amount(value: &str) -> Result<u128, UpgradeError> {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct EntitlementSummary {
+    #[serde(default)]
+    pub enabled_capabilities: Vec<String>,
     pub active: bool,
     pub plan: Option<String>,
     pub status: String,
@@ -883,6 +887,8 @@ struct RelayEntitlement {
 
 #[derive(Deserialize)]
 struct RelayCapabilities {
+    #[serde(flatten)]
+    extra: std::collections::BTreeMap<String, serde_json::Value>,
     remote_control: RelayRemoteControl,
 }
 
@@ -900,6 +906,18 @@ struct RelaySlots {
 
 impl From<RelayEntitlement> for EntitlementSummary {
     fn from(value: RelayEntitlement) -> Self {
+        let mut enabled_capabilities: Vec<String> = value
+            .capabilities
+            .extra
+            .iter()
+            .filter(|(_, value)| {
+                value.get("enabled").and_then(serde_json::Value::as_bool) == Some(true)
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        if value.capabilities.remote_control.enabled {
+            enabled_capabilities.push("remote_control".into());
+        }
         let active = value.capabilities.remote_control.enabled
             && matches!(value.status.as_str(), "active" | "over_limit");
         let billing_management_available = value.billing_management_available.unwrap_or(false);
@@ -926,6 +944,7 @@ impl From<RelayEntitlement> for EntitlementSummary {
             }
         });
         Self {
+            enabled_capabilities,
             active,
             plan: (value.plan != "community").then_some(value.plan),
             status: value.status,
@@ -1149,7 +1168,6 @@ pub struct ReleaseVerifier {
     expected_channel: &'static str,
     expected_origin: Url,
     community_version: Version,
-    community_revision: Option<String>,
 }
 
 impl ReleaseVerifier {
@@ -1176,7 +1194,6 @@ impl ReleaseVerifier {
                 .map_err(|_| {
                 UpgradeError::InvalidResponse("installed Community version is invalid".to_owned())
             })?;
-        let community_revision = option_env!("DITCH_COMMUNITY_REVISION").map(str::to_owned);
         Ok(Self {
             expected_edition,
             manifest_public_key: VerifyingKey::from_sec1_bytes(manifest_public_key_sec1)
@@ -1185,7 +1202,6 @@ impl ReleaseVerifier {
             expected_channel,
             expected_origin,
             community_version,
-            community_revision,
         })
     }
 
@@ -1283,14 +1299,9 @@ impl ReleaseVerifier {
                 "Commercial release metadata has an invalid format".to_owned(),
             ));
         }
-        if self.expected_edition == Edition::Commercial
-            && self
-                .community_revision
-                .as_deref()
-                .is_some_and(|revision| revision != manifest.community_revision)
-        {
-            return Err(UpgradeError::Incompatible);
-        }
+        // Updates replace the complete app, including its Community core and
+        // Commercial code. The signed revision records the target's provenance;
+        // minimum version/build requirements above determine compatibility.
         let session = release.update_session.as_ref().ok_or_else(|| {
             UpgradeError::InvalidResponse(
                 "Commercial release is missing its authenticated update session".to_owned(),
@@ -1476,6 +1487,23 @@ mod tests {
     }
 
     #[test]
+    fn entitlement_preserves_only_explicitly_enabled_extension_capabilities() {
+        let mut body: serde_json::Value = serde_json::from_str(RELAY_ACTIVATION).unwrap();
+        body["entitlement"]["capabilities"]["extension_enabled"] =
+            serde_json::json!({"enabled":true});
+        body["entitlement"]["capabilities"]["extension_disabled"] =
+            serde_json::json!({"enabled":false});
+        body["entitlement"]["capabilities"]["extension_malformed"] =
+            serde_json::json!({"enabled":"true"});
+        let relay: RelayEntitlement = serde_json::from_value(body["entitlement"].clone()).unwrap();
+        let summary = EntitlementSummary::from(relay);
+        assert_eq!(
+            summary.enabled_capabilities,
+            vec!["extension_enabled", "remote_control"]
+        );
+    }
+
+    #[test]
     fn activation_http_response_converts_relay_entitlement() {
         let identity = InstallationIdentity::generate();
         for plan in ["complimentary", "commercial_lifetime", "commercial_monthly"] {
@@ -1598,6 +1626,7 @@ mod tests {
         ) -> Result<EntitlementSummary, UpgradeError> {
             let active = *self.redeemed.lock().unwrap();
             Ok(EntitlementSummary {
+                enabled_capabilities: vec![],
                 active,
                 plan: active.then(|| "commercial-monthly".to_owned()),
                 status: if active { "active" } else { "inactive" }.to_owned(),
@@ -1959,8 +1988,6 @@ mod tests {
             .unwrap();
             verifier.expected_origin = Url::parse(origin).unwrap();
             verifier.expected_channel = expected_release_channel(environment).unwrap();
-            // Community updates may advance to a new source revision.
-            verifier.community_revision = Some("f".repeat(40));
             let mut release = signed_release(&signing, b"artifact", 20);
             release.manifest.edition = Edition::Community;
             release.manifest.channel = Some(verifier.expected_channel.to_owned());
@@ -2000,6 +2027,59 @@ mod tests {
                     .verify_manifest(&release, Utc::now(), 10, 19)
                     .is_err()
             );
+        }
+    }
+
+    #[test]
+    fn complete_app_updates_accept_new_core_revisions_at_the_minimum_build() {
+        let signing = SigningKey::random(&mut OsRng);
+        // The same verifier handles Community-to-Commercial and
+        // Commercial-to-Commercial updates; the source edition is not a gate.
+        for edition in [Edition::Community, Edition::Commercial] {
+            let mut verifier = ReleaseVerifier::for_edition(
+                VerifyingKey::from(&signing)
+                    .to_encoded_point(false)
+                    .as_bytes(),
+                "DITCHNOW1",
+                edition,
+            )
+            .unwrap();
+            verifier.community_version = Version::parse("0.1.0").unwrap();
+            let mut release = signed_release(&signing, b"complete-app", 135);
+            release.manifest.edition = edition;
+            release.manifest.build = "135".to_owned();
+            release.manifest.minimum_community_build = 122;
+            let path = release_edition_path(edition);
+            let id = release.manifest.release_id.unwrap();
+            release.manifest.appcast_url =
+                format!("{CONFIGURED_UPGRADE_API_ORIGIN}/v1/{path}/releases/{id}/appcast");
+            release.manifest.artifact_url = format!(
+                "{CONFIGURED_UPGRADE_API_ORIGIN}/v1/{path}/releases/{id}/artifact/ditch.dmg"
+            );
+            // One installed verifier must accept either signed target revision.
+            for revision in ["a".repeat(40), "b".repeat(40)] {
+                release.manifest.community_revision = revision;
+                resign(&signing, &mut release);
+                for installed_build in [122, 134] {
+                    verifier
+                        .verify_manifest(&release, Utc::now(), installed_build, installed_build)
+                        .unwrap();
+                }
+                assert!(matches!(
+                    verifier.verify_manifest(&release, Utc::now(), 121, 121),
+                    Err(UpgradeError::Incompatible)
+                ));
+                assert!(matches!(
+                    verifier.verify_manifest(&release, Utc::now(), 136, 136),
+                    Err(UpgradeError::Downgrade)
+                ));
+            }
+            release.manifest.minimum_community_version = Some("0.2.0".to_owned());
+            resign(&signing, &mut release);
+            assert!(matches!(
+                verifier.verify_manifest(&release, Utc::now(), 134, 134),
+                Err(UpgradeError::Incompatible)
+            ));
         }
     }
 
@@ -2095,7 +2175,7 @@ mod tests {
     }
 
     #[test]
-    fn release_requires_compatible_version_revision_and_well_formed_artifact_metadata() {
+    fn release_requires_compatible_version_and_well_formed_artifact_metadata() {
         let signing = SigningKey::random(&mut OsRng);
         let verifier = ReleaseVerifier::new(
             VerifyingKey::from(&signing)

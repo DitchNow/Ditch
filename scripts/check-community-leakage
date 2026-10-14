@@ -49,6 +49,10 @@ for symbol in \
   RelaySocketClient \
   connect_relay_socket \
   remote_control_v1 \
+  DitchmasterChanged \
+  ditchmaster_v1 \
+  commercial_ditchmaster \
+  master_identity \
   QrImageView
 do
   if rg -n --hidden \
@@ -72,7 +76,7 @@ if [ "${DITCH_LEAKAGE_SOURCE_ONLY:-0}" != 1 ]; then
   cargo build --locked --release -p ditchd -p ditch_cli
   for binary in target/release/ditchd target/release/ditch_cli; do
     [ -f "$binary" ] || fail "expected Community binary is missing: $binary"
-    if strings "$binary" | rg "DITCH_REMOTE_RELAY_ORIGIN|RelaySocketClient|connect_relay_socket|CreateRemotePairing|RemoteControlStatus|remote_control_v1|$service_daemon" >/dev/null
+    if strings "$binary" | rg "DITCH_REMOTE_RELAY_ORIGIN|RelaySocketClient|connect_relay_socket|CreateRemotePairing|RemoteControlStatus|remote_control_v1|DitchmasterChanged|ditchmaster_v1|commercial_ditchmaster|master_identity|$service_daemon" >/dev/null
     then
       fail "proprietary symbol found in Community binary: $binary"
     fi
@@ -83,7 +87,7 @@ scan_app() {
   app=$1
   [ -d "$app" ] || return 0
   if find "$app" -type f -perm -111 -print0 | xargs -0 strings 2>/dev/null | \
-    rg "DITCH_REMOTE_RELAY_ORIGIN|RelaySocketClient|connect_relay_socket|CreateRemotePairing|RemoteControlStatus|remote_control_v1|$service_daemon" >/dev/null
+    rg "DITCH_REMOTE_RELAY_ORIGIN|RelaySocketClient|connect_relay_socket|CreateRemotePairing|RemoteControlStatus|remote_control_v1|DitchmasterChanged|ditchmaster_v1|commercial_ditchmaster|master_identity|$service_daemon" >/dev/null
   then
     fail "proprietary symbol found in Community app: $app"
   fi

@@ -40,8 +40,10 @@ class _UpdateClient extends DitchRuntimeClient {
   final String environment;
   int communityChecks = 0;
   bool communityUnavailable = false;
+  bool belowMinimum = false;
 
   int checks = 0;
+  int installationChecks = 0;
   Future<Map<String, dynamic>> Function()? onRefresh;
 
   @override
@@ -72,6 +74,7 @@ class _UpdateClient extends DitchRuntimeClient {
   @override
   Future<Map<String, dynamic>> checkCommunityRelease() async {
     communityChecks++;
+    _checkMinimum();
     if (communityUnavailable) {
       throw DitchRuntimeException(
         'commercial_release_unavailable',
@@ -88,6 +91,7 @@ class _UpdateClient extends DitchRuntimeClient {
   @override
   Future<Map<String, dynamic>> checkCommercialRelease() async {
     checks++;
+    _checkMinimum();
     if (checks > 1 && onRefresh != null) return onRefresh!();
     return _release(
       bearer: 'permission-$checks-with-at-least-32-characters',
@@ -97,6 +101,27 @@ class _UpdateClient extends DitchRuntimeClient {
           ? '2020-01-01T00:00:00.123Z'
           : '2026-09-09T14:30:00.123Z',
     );
+  }
+
+  @override
+  Future<Map<String, dynamic>> currentCommercialRelease() {
+    installationChecks++;
+    return checkCommercialRelease();
+  }
+
+  @override
+  Future<Map<String, dynamic>> currentCommunityRelease() {
+    installationChecks++;
+    return checkCommunityRelease();
+  }
+
+  void _checkMinimum() {
+    if (belowMinimum) {
+      throw const DitchRuntimeException(
+        'commercial_release_incompatible',
+        'incompatible build',
+      );
+    }
   }
 }
 
@@ -200,6 +225,7 @@ void main() {
           final paid = status == 'active' || status == 'over_limit';
           expect(client.checks, paid ? 2 : 0);
           expect(client.communityChecks, paid ? 0 : 2);
+          expect(client.installationChecks, 1);
           expect(installs, hasLength(1));
           final arguments = installs.single.arguments as Map;
           expect(arguments['edition'], paid ? 'commercial' : 'community');
@@ -254,6 +280,39 @@ void main() {
     );
     expect(find.textContaining('Follow the Sparkle window'), findsOneWidget);
   });
+
+  for (final status in ['active', 'inactive']) {
+    testWidgets('$status below-minimum update requires manual installation', (
+      tester,
+    ) async {
+      final client = _UpdateClient(status: status)..belowMinimum = true;
+      final installs = <MethodCall>[];
+      await _openUpdate(tester, client, installs, expectRelease: false);
+      expect(
+        find.text(
+          'This update requires a newer installed version of Ditch. Manually install the latest official app to continue.',
+        ),
+        findsOneWidget,
+      );
+      expect(find.byKey(const Key('install-ditch-update')), findsNothing);
+      expect(installs, isEmpty);
+    });
+
+    testWidgets('$status rechecks minimum requirements before installation', (
+      tester,
+    ) async {
+      final client = _UpdateClient(status: status);
+      final installs = <MethodCall>[];
+      await _openUpdate(tester, client, installs);
+      client.belowMinimum = true;
+      await _install(tester);
+      expect(
+        find.textContaining('Manually install the latest official app'),
+        findsOneWidget,
+      );
+      expect(installs, isEmpty);
+    });
+  }
 
   testWidgets(
     'expired native permission has a readable error and fresh retry',

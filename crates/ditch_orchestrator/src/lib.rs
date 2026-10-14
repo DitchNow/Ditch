@@ -44,6 +44,7 @@ where
         let now = chrono::Utc::now();
 
         Ok(AgentRun {
+            coordinator_group: None,
             id: ditch_core::AgentId::new(),
             provider: AgentProvider::Codex,
             state: AgentState::Starting,

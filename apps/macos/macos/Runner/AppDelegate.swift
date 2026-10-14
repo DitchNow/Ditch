@@ -605,6 +605,16 @@ class AppDelegate: FlutterAppDelegate, SPUUpdaterDelegate {
         UserDefaults.standard.set(mode, forKey: "themeMode")
         self.applyThemeMode(mode)
         result(true)
+      case "getProjectSidebarPreferences":
+        result(UserDefaults.standard.string(forKey: "projectSidebarPreferencesV1"))
+      case "setProjectSidebarPreferences":
+        guard let preferences = call.arguments as? String else {
+          result(FlutterError(code: "invalid_preferences",
+            message: "Sidebar preferences must be a JSON string.", details: nil))
+          return
+        }
+        UserDefaults.standard.set(preferences, forKey: "projectSidebarPreferencesV1")
+        result(nil)
       case "getPaneWidths":
         result([
           "projects": UserDefaults.standard.double(forKey: "projectSidebarWidth"),

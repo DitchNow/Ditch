@@ -1,3 +1,4 @@
+import 'github_inbox.dart';
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
@@ -9,6 +10,18 @@ import 'package:flutter/services.dart';
 import 'package:xterm/xterm.dart';
 
 import 'application/command_center_controller.dart';
+import 'application/project_sidebar_controller.dart';
+import 'application/product_update_controller.dart';
+import 'widgets/update_available_dot.dart';
+import 'data/project_models.dart';
+import 'widgets/project_sidebar.dart';
+
+import 'application/task_board_controller.dart';
+import 'data/task_models.dart';
+import 'task_board.dart';
+import 'skills_directory.dart';
+import 'release_ui_visibility.dart';
+import 'application/skills_controller.dart';
 import 'data/commercial_models.dart';
 import 'data/runtime_models.dart';
 import 'data/runtime_transport.dart';
@@ -18,6 +31,8 @@ import 'widgets/inline_approval.dart';
 export 'data/runtime_transport.dart'
     show DitchRuntimeException, parseRuntimeResponseLine;
 export 'data/commercial_models.dart';
+export 'data/project_models.dart';
+export 'widgets/project_sidebar.dart';
 
 const ditchDeploymentEnvironment = String.fromEnvironment(
   'DITCH_DEPLOYMENT_ENVIRONMENT',
@@ -195,6 +210,43 @@ class EditionSettingsSection {
   final Widget Function(DitchRuntimeClient client) dialogBuilder;
 }
 
+/// Edition-owned workspace content and navigation, using shared task/agent links.
+@immutable
+class EditionWorkspace {
+  const EditionWorkspace({
+    required this.id,
+    required this.navigationBuilder,
+    required this.builder,
+  });
+  final String id;
+  final Widget Function(
+    DitchRuntimeClient client,
+    bool selected,
+    VoidCallback open,
+  )
+  navigationBuilder;
+  final Widget Function(
+    DitchRuntimeClient client,
+    void Function(String projectId) openBoard,
+    void Function(String agentId) openAgent,
+  )
+  builder;
+}
+
+abstract interface class EditionWorkspaceProvider {
+  List<EditionWorkspace> workspaces();
+}
+
+abstract interface class EditionBoardProvider {
+  Future<void> runBoardTasks(DitchRuntimeClient client, String requestId, List<Map<String, dynamic>> tasks);
+  Future<void> pauseBoardWork(DitchRuntimeClient client);
+}
+
+EditionSettingsSection githubIntegrationSettingsSection() => EditionSettingsSection(
+  id: 'github', icon: Icons.code, title: 'GitHub', subtitle: 'Repository issues and task imports',
+  dialogBuilder: (client) => GitHubSettingsDialog(request: client.request),
+);
+
 abstract interface class EditionSurface {
   const EditionSurface();
 
@@ -206,6 +258,7 @@ class CommunityEditionSurface implements EditionSurface {
 
   @override
   List<EditionSettingsSection> settingsSections(DitchRuntimeClient client) => [
+    githubIntegrationSettingsSection(),
     EditionSettingsSection(
       id: 'remote-mobile',
       icon: Icons.phone_iphone,
@@ -302,36 +355,6 @@ Future<void> setDitchThemeMode(ThemeMode mode) async {
   }
 }
 
-class DitchProject {
-  const DitchProject({
-    this.id,
-    required this.name,
-    required this.path,
-    this.gitPolicy = ProjectGitPolicy.requireRepository,
-    this.remoteMachineId,
-    this.sshHostAlias,
-  });
-
-  final String? id;
-  final String name;
-  final String path;
-  final ProjectGitPolicy gitPolicy;
-  final String? remoteMachineId;
-  final String? sshHostAlias;
-
-  bool get isRemote => sshHostAlias != null;
-}
-
-enum ProjectGitPolicy {
-  requireRepository,
-  initializeRepository,
-  allowOutsideGit,
-}
-
-String _titleCase(String value) => value.isEmpty
-    ? value
-    : '${value.substring(0, 1).toUpperCase()}${value.substring(1)}';
-
 bool isInsideGitWorkTree(String path) {
   var directory = Directory(path).absolute;
   while (true) {
@@ -344,15 +367,6 @@ bool isInsideGitWorkTree(String path) {
       return false;
     }
     directory = parent;
-  }
-}
-
-String canonicalProjectPath(String path) {
-  final directory = Directory(path).absolute;
-  try {
-    return directory.resolveSymbolicLinksSync();
-  } on FileSystemException {
-    return directory.path;
   }
 }
 
@@ -556,13 +570,55 @@ class NotificationReadiness {
 }
 
 class AgentExecutionSettings extends ChangeNotifier {
+  AgentExecutionSettings({Map? profile}) {
+    syncProfile(profile);
+  }
+  bool edited = false;
+  bool loadingModels = false;
+  String? modelError;
+  List<Map<String, dynamic>> launchSkills = [];
   AgentApprovalPreset approval = AgentApprovalPreset.approveForMe;
+
+  void syncProfile(Map? profile) {
+    if (profile == null || edited) return;
+    model = profile['model']?.toString();
+    reasoningEffort = profile['reasoning_effort']?.toString();
+    launchSkills = ((profile['skills'] as List?) ?? [])
+        .map((s) => Map<String, dynamic>.from(s as Map))
+        .toList();
+    approval = switch (profile['approval']) {
+      'Ask' => AgentApprovalPreset.ask,
+      'FullAccess' => AgentApprovalPreset.fullAccess,
+      _ => AgentApprovalPreset.approveForMe,
+    };
+  }
+
+  Future<void> loadModels(
+    Future<List<AgentModelOption>> Function() load,
+  ) async {
+    if (loadingModels) return;
+    loadingModels = true;
+    modelError = null;
+    notifyListeners();
+    try {
+      setModels(await load());
+    } on Object {
+      modelError = 'Models unavailable. Retry';
+    } finally {
+      loadingModels = false;
+      notifyListeners();
+    }
+  }
+
   String? model;
+  String? reasoningEffort;
   List<AgentModelOption> models = const [];
 
   Map<String, dynamic> get protocolValue => {
+    'transport': 'AppServer',
+    'skills': launchSkills,
     'model': model,
-    'reasoning_effort': null,
+    'reasoning_effort': reasoningEffort,
     'approval': switch (approval) {
       AgentApprovalPreset.ask => 'Ask',
       AgentApprovalPreset.approveForMe => 'ApproveForMe',
@@ -571,11 +627,13 @@ class AgentExecutionSettings extends ChangeNotifier {
   };
 
   void setApproval(AgentApprovalPreset value) {
+    edited = true;
     approval = value;
     notifyListeners();
   }
 
   void setModel(String? value) {
+    edited = true;
     model = value;
     notifyListeners();
   }
@@ -585,19 +643,29 @@ class AgentExecutionSettings extends ChangeNotifier {
 
   void setModels(List<AgentModelOption> value) {
     models = value;
-    if (model == null) {
-      for (final item in value) {
-        if (item.isDefault) {
-          model = item.id;
-          break;
-        }
-      }
-    }
     notifyListeners();
   }
 }
 
+// Fallback for standalone widgets; application composers always receive a scope.
 final agentExecutionSettings = AgentExecutionSettings();
+
+class AgentSettingsScope extends InheritedWidget {
+  const AgentSettingsScope({
+    super.key,
+    required this.settings,
+    required this.loadModels,
+    required super.child,
+  });
+  final AgentExecutionSettings settings;
+  final Future<List<AgentModelOption>> Function()? loadModels;
+  static AgentSettingsScope? of(BuildContext context) =>
+      context.dependOnInheritedWidgetOfExactType<AgentSettingsScope>();
+  @override
+  bool updateShouldNotify(AgentSettingsScope oldWidget) =>
+      settings != oldWidget.settings ||
+      (loadModels == null) != (oldWidget.loadModels == null);
+}
 
 class ProjectTerminalSession {
   ProjectTerminalSession({
@@ -622,6 +690,8 @@ class AgentSession {
     required this.status,
     required this.messages,
     this.projectId,
+    this.coordinatorGroup,
+    AgentExecutionSettings? executionSettings,
     this.codexThreadId,
     this.codexTitle,
     this.userTitle,
@@ -637,13 +707,17 @@ class AgentSession {
     this.hasOlderMessages = false,
     this.nextBeforeSequence,
     this.historyError,
+    this.attachedSkills = const [],
     DateTime? createdAt,
     DateTime? updatedAt,
-  }) : createdAt = createdAt ?? DateTime.now(),
+  }) : executionSettings = executionSettings ?? AgentExecutionSettings(),
+       createdAt = createdAt ?? DateTime.now(),
        updatedAt = updatedAt ?? DateTime.now();
 
   final String localId;
+  AgentExecutionSettings executionSettings;
   final String? projectId;
+  String? coordinatorGroup;
   final AgentProvider provider;
   final DateTime createdAt;
   AgentStatus status;
@@ -666,6 +740,8 @@ class AgentSession {
   int? nextBeforeSequence;
   int latestMessageSequence = 0;
   String? historyError;
+  String streamingText = '';
+  List<Map<String, dynamic>> attachedSkills;
 
   String get displayName {
     final override = userTitle?.trim();
@@ -699,7 +775,12 @@ void reconcileAgentSession(List<AgentSession> sessions, AgentSession incoming) {
   }
 
   final existing = matches.first;
+  existing.executionSettings.syncProfile(
+    incoming.executionSettings.protocolValue,
+  );
+  existing.coordinatorGroup = incoming.coordinatorGroup;
   existing.status = incoming.status;
+  existing.attachedSkills = incoming.attachedSkills;
   existing.codexThreadId = incoming.codexThreadId;
   existing.codexTitle = incoming.codexTitle;
   existing.userTitle = incoming.userTitle;
@@ -804,18 +885,6 @@ enum AgentStatus {
   completed,
   failed,
   stopped,
-}
-
-class ProjectAgentSummary {
-  const ProjectAgentSummary({
-    required this.runningCount,
-    required this.stoppedCount,
-    required this.hasUnreadResult,
-  });
-
-  final int runningCount;
-  final int stoppedCount;
-  final bool hasUnreadResult;
 }
 
 ProjectAgentSummary summarizeProjectAgents({
@@ -1421,6 +1490,7 @@ class DitchRuntimeClient {
     required String projectName,
     required String projectRoot,
     required String prompt,
+    Map<String, dynamic>? executionProfile,
   }) {
     return request({
       'StartCodexSession': {
@@ -1429,7 +1499,8 @@ class DitchRuntimeClient {
         'project_root': projectRoot,
         'prompt': prompt,
         'mode': 'Exec',
-        'execution_profile': agentExecutionSettings.protocolValue,
+        'execution_profile':
+            executionProfile ?? AgentExecutionSettings().protocolValue,
       },
     });
   }
@@ -1439,6 +1510,7 @@ class DitchRuntimeClient {
     required String projectRoot,
     required String threadId,
     required String prompt,
+    Map<String, dynamic>? executionProfile,
   }) {
     return request({
       'ResumeCodexSession': {
@@ -1446,7 +1518,8 @@ class DitchRuntimeClient {
         'project_root': projectRoot,
         'thread_id': threadId,
         'prompt': prompt,
-        'execution_profile': agentExecutionSettings.protocolValue,
+        'execution_profile':
+            executionProfile ?? AgentExecutionSettings().protocolValue,
       },
     });
   }
@@ -1454,12 +1527,14 @@ class DitchRuntimeClient {
   Future<Map<String, dynamic>> promptAgent({
     required String agentId,
     required String prompt,
+    Map<String, dynamic>? executionProfile,
   }) {
     return request({
       'PromptAgent': {
         'agent_id': agentId,
         'prompt': prompt,
-        'execution_profile': agentExecutionSettings.protocolValue,
+        'execution_profile':
+            executionProfile ?? AgentExecutionSettings().protocolValue,
       },
     });
   }
@@ -1735,10 +1810,23 @@ DitchProject? parseRuntimeProject(Object? value) {
   );
 }
 
+ProductUpdateController productUpdateController(DitchRuntimeClient client) =>
+    ProductUpdateController(
+      loadContext: () async => (
+        runtime: await client.runtimeStatus(),
+        license: DitchCurrentLicense.fromEntitlement(
+          await client.commercialEntitlement(),
+        ),
+      ),
+      fetchRelease: (license, {required forInstallation}) =>
+          client.releaseForLicense(license, forInstallation: forInstallation),
+    );
+
 class CommandCenterScreen extends StatefulWidget {
   const CommandCenterScreen({
     this.connectRuntimeOnStart = true,
     this.runtimeClient,
+    this.updates,
     this.initialProjects = const [],
     this.editionSurface = const CommunityEditionSurface(),
     this.deploymentEnvironment = ditchDeploymentEnvironment,
@@ -1748,6 +1836,7 @@ class CommandCenterScreen extends StatefulWidget {
 
   final bool connectRuntimeOnStart;
   final DitchRuntimeClient? runtimeClient;
+  final ProductUpdateController? updates;
   final List<DitchProject> initialProjects;
   final EditionSurface editionSurface;
   final String deploymentEnvironment;
@@ -1757,7 +1846,8 @@ class CommandCenterScreen extends StatefulWidget {
   State<CommandCenterScreen> createState() => _CommandCenterScreenState();
 }
 
-class _CommandCenterScreenState extends State<CommandCenterScreen> {
+class _CommandCenterScreenState extends State<CommandCenterScreen>
+    with WidgetsBindingObserver {
   static const _defaultProjectSidebarWidth = 240.0;
   static const _defaultInspectorWidth = 320.0;
   static const _minimumProjectSidebarWidth = 160.0;
@@ -1767,6 +1857,17 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
   static const _defaultStartPrompt = '';
   static const _applicationChannel = MethodChannel('the_ditch/application');
 
+  late final _projectSidebar = ProjectSidebarController(
+    initialScope: widget.initialProjects.firstOrNull?.isRemote == true
+        ? ProjectScope.remote
+        : ProjectScope.local,
+  );
+
+  Future<void> _loadProjectSidebar() async {
+    await _projectSidebar.load();
+    if (mounted) _projectSidebar.reconcileProjects(_projects);
+  }
+
   final _idleChatViewport = ConversationViewportController();
   final _chatViewports = <String, ConversationViewportController>{};
   final _agentListController = ScrollController();
@@ -1774,6 +1875,99 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
   final _composerKeys = <String, GlobalKey<AgentComposerState>>{};
   int _composerFocusGeneration = 0;
   late final _runtimeClient = widget.runtimeClient ?? DitchRuntimeClient();
+  late final _tasks = TaskBoardController(request: _runtimeClient.request);
+  EditionWorkspace? _editionWorkspace;
+  bool _showBoard = false;
+  bool _showSkills = false;
+  String? _boardProjectId;
+  List<TaskProjectOption> get _taskProjects => [
+    for (final p in _projects)
+      if (p.id != null) TaskProjectOption(p.id!, p.name, remote: p.isRemote),
+  ];
+  void _openBoard([String? projectId]) {
+    setState(() {
+      _editionWorkspace = null;
+      _showSkills = false;
+      _showBoard = true;
+      _boardProjectId = projectId;
+      _focusedAgentLocalId = null;
+    });
+    unawaited(_tasks.refresh());
+  }
+
+  void _openTaskAgent(String id) {
+    final session = _agentSessionByLocalId(id);
+    if (session == null) {
+      unawaited(_tasks.refresh());
+      return;
+    }
+    setState(() {
+      _editionWorkspace = null;
+      _showSkills = false;
+      _showBoard = false;
+      final project = _projects
+          .where((p) => p.id == session.projectId)
+          .firstOrNull;
+      if (project != null) {
+        _selectedProjectKey = _projectKey(project);
+        _projectSidebar.revealProject(project);
+      }
+      _expandedAgentLocalId = id;
+      _focusedAgentLocalId = null;
+    });
+    unawaited(_loadAgentMessages(session));
+  }
+
+  Future<void> _chooseTaskForAgent() async {
+    _openBoard(_selectedProject.id);
+    final tasks = _tasks.tasks
+        .where(
+          (t) =>
+              t.projectId == _selectedProject.id &&
+              !t.archived &&
+              !t.running &&
+              t.column != TaskColumn.done &&
+              t.column != TaskColumn.inReview,
+        )
+        .toList();
+    final selected = await showDialog<String>(
+      context: context,
+      builder: (context) => SimpleDialog(
+        title: const Text('Choose a task'),
+        children: [
+          SimpleDialogOption(
+            onPressed: () => Navigator.pop(context, 'create'),
+            child: const Text('Create a new task…'),
+          ),
+          for (final task in tasks)
+            SimpleDialogOption(
+              onPressed: () => Navigator.pop(context, task.id),
+              child: Text(task.title),
+            ),
+        ],
+      ),
+    );
+    if (!mounted || selected == null) return;
+    final task = selected == 'create'
+        ? await showTaskEditor(
+            context,
+            _tasks,
+            _taskProjects,
+            projectId: _selectedProject.id,
+          )
+        : _tasks.task(selected);
+    if (mounted && task != null) {
+      await showTaskInspector(
+        context,
+        _tasks,
+        task,
+        _taskProjects,
+        () => _settingsForProject(_selectedProject.id).protocolValue,
+        _openTaskAgent,
+      );
+    }
+  }
+
   final _presentation = CommandCenterController();
   int _nextAgentSessionId = 1;
   int _nextAttentionId = 1;
@@ -1787,20 +1981,28 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
   final Set<String> _pendingMessageRefresh = {};
   final Set<String> _pendingPermissionIds = {};
   final Map<String, InlineApproval> _inlineApprovals = {};
+  final Map<String, AgentExecutionSettings> _projectExecutionSettings = {};
+  AgentExecutionSettings _settingsForProject(String? id) =>
+      _projectExecutionSettings.putIfAbsent(
+        id ?? _selectedProject.path,
+        AgentExecutionSettings.new,
+      );
   bool _showingPermission = false;
   String? _activePermissionId;
   BuildContext? _activePermissionContext;
 
   StreamSubscription<Map<String, dynamic>>? _runtimeEvents;
-  Timer? _productUpdateTimer;
+  late final _productUpdates =
+      widget.updates ?? productUpdateController(_runtimeClient);
+  final _announcedProductReleases = <String>{};
   RuntimeStatusDto? _runtimeStatus;
-  bool _productUpdateChecking = false;
   String? _runtimeInstanceId;
   bool _runtimeReconnectScheduled = false;
   bool _runtimeConnecting = false;
   int _runtimeConnectionRetries = 0;
   bool _runtimeHomeMismatchReported = false;
   bool _runtimeCodexHomeMatches = true;
+  bool _runtimeSupportsAppServerSessions = true;
   bool _runtimeSupportsPersistence = true;
   bool _runtimeSupportsAlwaysOnWebAccess = true;
   bool _runtimeCompatibilityReported = false;
@@ -1839,11 +2041,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
     );
   }
 
-  String _projectKey(DitchProject project) =>
-      project.id ??
-      (project.isRemote
-          ? 'remote:${project.sshHostAlias}:${project.path}'
-          : canonicalProjectPath(project.path));
+  String _projectKey(DitchProject project) => projectKey(project);
 
   int get _selectedProjectIndex {
     if (_projects.isEmpty) return -1;
@@ -1880,7 +2078,8 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
     return agentId == null ? _idleComposerKey : _composerKeyForAgent(agentId);
   }
 
-  Future<void> _selectProject(int index) async {
+  Future<void> _selectProject(DitchProject project) async {
+    final key = _projectKey(project);
     final currentProjectId = _selectedProjectOrNull?.id;
     final currentFiles = currentProjectId == null
         ? null
@@ -1892,9 +2091,9 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
       currentFiles!.document!.dispose();
       currentFiles.document = null;
     }
-    if (!mounted) return;
+    if (!mounted || !_projects.any((p) => _projectKey(p) == key)) return;
     setState(() {
-      _selectedProjectKey = _projectKey(_projects[index]);
+      _selectedProjectKey = key;
       _expandedAgentLocalId = null;
       _focusedAgentLocalId = null;
       _terminalPresentation = TerminalPresentation.docked;
@@ -2108,62 +2307,58 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
   }
 
   Future<void> _checkForProductUpdate() async {
-    if (_productUpdateChecking || _runtimeStatus == null) {
-      return;
-    }
-    _productUpdateChecking = true;
-    try {
-      final license = DitchCurrentLicense.fromEntitlement(
-        await _runtimeClient.commercialEntitlement(),
+    if (_runtimeStatus == null) return;
+    await _productUpdates.check();
+  }
+
+  void _productUpdateChanged() {
+    if (!mounted) return;
+    final manifest = _productUpdates.manifest;
+    final releaseId = _productUpdates.releaseId;
+    setState(() {
+      _attention.removeWhere(
+        (event) =>
+            event.action == AttentionAction.installProductUpdate &&
+            event.id != 'attention-product-update-$releaseId',
       );
-      final release = await _runtimeClient.releaseForLicense(license);
-      final manifest = (release['manifest'] as Map?)?.cast<String, dynamic>();
-      final sequence = (manifest?['release_sequence'] as num?)?.toInt();
-      if (manifest?['release_id'] is! String ||
-          sequence == null ||
-          sequence <= (_runtimeStatus?.releaseSequence ?? 0)) {
-        return;
-      }
-      final version = manifest?['version']?.toString() ?? 'new';
-      final build = manifest?['build']?.toString();
-      final notice = AttentionEvent(
-        id: 'attention-product-update-${manifest?['release_id']}',
-        kind: AttentionKind.completed,
-        icon: Icons.system_update_alt,
-        title: 'Ditch $version is available',
-        body:
-            'A verified ${manifest?['edition'] ?? 'Ditch'} update${build == null ? '' : ' (build $build)'} is ready. Click Install to update without changing projects, sessions, or SSH configuration.',
-        createdAt: DateTime.now(),
-        action: AttentionAction.installProductUpdate,
-      );
-      if (!mounted) return;
-      setState(() {
-        _attention.removeWhere(
-          (event) => event.action == AttentionAction.installProductUpdate,
+      if (manifest != null &&
+          releaseId != null &&
+          _announcedProductReleases.add(releaseId)) {
+        final version = manifest['version']?.toString() ?? 'new';
+        final build = manifest['build']?.toString();
+        _attention.insert(
+          0,
+          AttentionEvent(
+            id: 'attention-product-update-$releaseId',
+            kind: AttentionKind.completed,
+            icon: Icons.system_update_alt,
+            title: 'Ditch $version is available',
+            body:
+                'A verified ${manifest['edition'] ?? 'Ditch'} update${build == null ? '' : ' (build $build)'} is ready. Click Install to update without changing projects, sessions, or SSH configuration.',
+            createdAt: DateTime.now(),
+            action: AttentionAction.installProductUpdate,
+          ),
         );
-        _attention.insert(0, notice);
-      });
-      _scheduleStatusBarUpdate();
-    } on DitchRuntimeException catch (error) {
-      // No compatible newer release, an inactive entitlement, or a temporary
-      // Relay failure is not an agent-facing notification.
-      debugPrint('Product update check did not return an update: $error');
-    } on Object catch (error) {
-      debugPrint('Product update check failed: $error');
-    } finally {
-      _productUpdateChecking = false;
+      }
+    });
+    _scheduleStatusBarUpdate();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      unawaited(_checkForProductUpdate());
     }
   }
 
   Future<void> _installProductUpdate(AttentionEvent event) async {
     try {
-      final license = DitchCurrentLicense.fromEntitlement(
-        await _runtimeClient.commercialEntitlement(),
-      );
-      final release = await _runtimeClient.releaseForLicense(
-        license,
-        forInstallation: true,
-      );
+      final release = await _productUpdates.prepareInstallation();
+      if (release == null) {
+        throw const FormatException(
+          'No compatible update is currently available.',
+        );
+      }
       final releaseId = (release['manifest'] as Map?)?['release_id'];
       if (event.id != 'attention-product-update-$releaseId') {
         _markAttentionIdsRead({event.id});
@@ -2248,6 +2443,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
         onDone: _scheduleRuntimeReconnect,
       );
       final confirmed = await _runtimeClient.runtimeStatus();
+      final previousRuntime = _runtimeStatus;
       _runtimeStatus = confirmed;
       final confirmedInstanceId = confirmed.instanceId;
       if (_runtimeInstanceId != confirmedInstanceId) {
@@ -2256,13 +2452,16 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
       }
       _runtimeConnectionRetries = 0;
       _presentation.connected();
-      {
-        unawaited(_checkForProductUpdate());
-        _productUpdateTimer ??= Timer.periodic(
-          const Duration(hours: 6),
-          (_) => unawaited(_checkForProductUpdate()),
-        );
+      final updateRuntime = previousRuntime ?? _productUpdates.context?.runtime;
+      if (updateRuntime != null &&
+          (updateRuntime.instanceId != confirmed.instanceId ||
+              updateRuntime.deploymentEnvironment !=
+                  confirmed.deploymentEnvironment ||
+              updateRuntime.releaseSequence != confirmed.releaseSequence)) {
+        _productUpdates.invalidate();
       }
+      _productUpdates.startPolling();
+      unawaited(_checkForProductUpdate());
       unawaited(_ensureSelectedProjectTerminal());
       unawaited(_refreshNotificationReadiness());
       await _refreshCodexReadiness();
@@ -2310,14 +2509,6 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
         _codexBinary = report.path;
         _codexSetupChecking = false;
       });
-      if (report.ready) {
-        unawaited(
-          _runtimeClient
-              .listCodexModels()
-              .then(agentExecutionSettings.setModels)
-              .onError((_, _) {}),
-        );
-      }
     } on Object catch (error) {
       if (!mounted) return;
       setState(() {
@@ -2570,13 +2761,16 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
   }
 
   Future<void> _openAppSettings() async {
+    unawaited(_checkForProductUpdate());
     final appVersion = await _installedAppVersionLabel();
     if (!mounted) return;
     final editionSections = widget.editionSurface.settingsSections(
       _runtimeClient,
     );
     final settingsSections = [
-      ...editionSections,
+      ...editionSections.where(
+        (section) => showUnfinishedFeatureControls || section.id != 'github',
+      ),
       EditionSettingsSection(
         id: 'license-plans',
         icon: Icons.verified_outlined,
@@ -2595,6 +2789,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
         subtitle: 'Check for updates for your current license',
         dialogBuilder: (client) => DitchUpdateDialog(
           client: client,
+          updates: _productUpdates,
           deploymentEnvironment: widget.deploymentEnvironment,
           relayOrigin: widget.relayOrigin,
         ),
@@ -2602,51 +2797,60 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
     ];
     final section = await showDialog<String>(
       context: context,
-      builder: (context) => SimpleDialog(
-        title: const Text('Settings'),
-        children: [
-          if (widget.deploymentEnvironment == 'staging')
-            Padding(
-              padding: const EdgeInsets.fromLTRB(24, 0, 24, 12),
-              child: StagingEnvironmentBanner(
-                key: const Key('settings-staging-environment'),
-                relayOrigin: widget.relayOrigin,
+      builder: (context) => ListenableBuilder(
+        listenable: _productUpdates,
+        builder: (context, _) => SimpleDialog(
+          title: const Text('Settings'),
+          children: [
+            if (widget.deploymentEnvironment == 'staging')
+              Padding(
+                padding: const EdgeInsets.fromLTRB(24, 0, 24, 12),
+                child: StagingEnvironmentBanner(
+                  key: const Key('settings-staging-environment'),
+                  relayOrigin: widget.relayOrigin,
+                ),
+              ),
+            SimpleDialogOption(
+              onPressed: () => Navigator.pop(context, 'codex'),
+              child: const ListTile(
+                leading: Icon(Icons.terminal),
+                title: Text('Codex'),
+                subtitle: Text('Installation and runtime setup'),
               ),
             ),
-          SimpleDialogOption(
-            onPressed: () => Navigator.pop(context, 'codex'),
-            child: const ListTile(
-              leading: Icon(Icons.terminal),
-              title: Text('Codex'),
-              subtitle: Text('Installation and runtime setup'),
-            ),
-          ),
-          ...settingsSections.map(
-            (entry) => SimpleDialogOption(
-              key: Key('settings-${entry.id}'),
-              onPressed: () => Navigator.pop(context, entry.id),
-              child: ListTile(
-                leading: Icon(entry.icon),
-                title: Text(entry.title),
-                subtitle: Text(entry.subtitle),
-              ),
-            ),
-          ),
-          if (appVersion != null) ...[
-            const Divider(height: 1),
-            Padding(
-              padding: const EdgeInsets.fromLTRB(24, 12, 24, 4),
-              child: Text(
-                appVersion,
-                key: const Key('settings-version'),
-                textAlign: TextAlign.center,
-                style: Theme.of(context).textTheme.labelSmall?.copyWith(
-                  color: context.ditch.mutedText,
+            ...settingsSections.map(
+              (entry) => SimpleDialogOption(
+                key: Key('settings-${entry.id}'),
+                onPressed: () => Navigator.pop(context, entry.id),
+                child: ListTile(
+                  leading: Icon(entry.icon),
+                  title: Text(entry.title),
+                  subtitle: Text(entry.subtitle),
+                  trailing:
+                      entry.id == 'upgrade-ditch' && _productUpdates.available
+                      ? const UpdateAvailableDot(
+                          key: Key('settings-update-dot'),
+                        )
+                      : null,
                 ),
               ),
             ),
+            if (appVersion != null) ...[
+              const Divider(height: 1),
+              Padding(
+                padding: const EdgeInsets.fromLTRB(24, 12, 24, 4),
+                child: Text(
+                  appVersion,
+                  key: const Key('settings-version'),
+                  textAlign: TextAlign.center,
+                  style: Theme.of(context).textTheme.labelSmall?.copyWith(
+                    color: context.ditch.mutedText,
+                  ),
+                ),
+              ),
+            ],
           ],
-        ],
+        ),
       ),
     );
     if (!mounted) return;
@@ -2665,6 +2869,10 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
         context: context,
         builder: (context) => selected!.dialogBuilder(_runtimeClient),
       );
+      if (mounted && section != 'upgrade-ditch') {
+        _productUpdates.invalidate();
+        unawaited(_checkForProductUpdate());
+      }
     }
   }
 
@@ -2682,9 +2890,14 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
   }
 
   void _checkRuntimeCapabilities(RuntimeStatusDto status) {
+    _runtimeSupportsAppServerSessions = status.capabilities.contains(
+      'app_server_sessions_v2',
+    );
     _runtimeSupportsPersistence = status.supportsPersistentSessions;
     _runtimeSupportsAlwaysOnWebAccess = status.supportsAlwaysOnWebAccess;
-    if (_runtimeSupportsPersistence && _runtimeSupportsAlwaysOnWebAccess) {
+    if (_runtimeSupportsAppServerSessions &&
+        _runtimeSupportsPersistence &&
+        _runtimeSupportsAlwaysOnWebAccess) {
       _runtimeCompatibilityReported = false;
       return;
     }
@@ -2746,6 +2959,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
     if (snapshot is! Map<String, dynamic>) {
       return;
     }
+    _tasks.replaceSnapshot(snapshot);
     final agentsJson = snapshot['agents'];
     final messagesJson = snapshot['messages'];
     if (agentsJson is! List) {
@@ -2782,6 +2996,10 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
       if (session != null) {
         final existing = existingSessions[session.localId];
         if (existing != null) {
+          existing.executionSettings.syncProfile(
+            session.executionSettings.protocolValue,
+          );
+          session.executionSettings = existing.executionSettings;
           if (_projects.any(
                 (project) =>
                     project.id == session.projectId && project.isRemote,
@@ -2796,6 +3014,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
             ..clear()
             ..addAll(existing.messages);
           session.approvals.addAll(existing.approvals);
+          session.streamingText = existing.streamingText;
           session.messagesLoaded = existing.messagesLoaded;
           session.messagesLoading = existing.messagesLoading;
           session.hasOlderMessages = existing.hasOlderMessages;
@@ -2839,7 +3058,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
       }
     }
     setState(() {
-      final selectedPath = _selectedProjectOrNull?.path;
+      final selectedKey = _selectedProjectKey;
       projects.sort((a, b) => a.name.compareTo(b.name));
       _projects
         ..clear()
@@ -2847,9 +3066,11 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
       if (_projects.isEmpty) {
         _selectedProjectKey = null;
       } else {
-        final restoredIndex = selectedPath == null
+        final restoredIndex = selectedKey == null
             ? -1
-            : _projects.indexWhere((project) => project.path == selectedPath);
+            : _projects.indexWhere(
+                (project) => _projectKey(project) == selectedKey,
+              );
         _selectedProjectKey = _projectKey(
           _projects[restoredIndex >= 0 ? restoredIndex : 0],
         );
@@ -2869,18 +3090,16 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
           attention.where((event) => event.isRead).map((event) => event.id),
         );
       final visibleSessions = _visibleSessions;
-      if (visibleSessions.isNotEmpty) {
-        _expandedAgentLocalId =
-            visibleSessions.any(
-              (session) => session.localId == _expandedAgentLocalId,
-            )
-            ? _expandedAgentLocalId
-            : visibleSessions.first.localId;
-      } else {
+      // A collapsed list is an intentional UI state, including after refresh.
+      if (_expandedAgentLocalId != null &&
+          !visibleSessions.any(
+            (session) => session.localId == _expandedAgentLocalId,
+          )) {
         _expandedAgentLocalId = null;
       }
       _runtimeSnapshotHydrated = true;
     });
+    _projectSidebar.reconcileProjects(_projects);
     if (removedViewports.isNotEmpty) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
         for (final viewport in removedViewports) {
@@ -2914,7 +3133,13 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
           .map((request) => request['id']?.toString())
           .toSet();
       for (final approval in _inlineApprovals.values) {
-        if (!liveIds.contains(approval.id)) approval.resolve();
+        final project = _projects
+            .where((p) => p.id == approval.request['project_id'])
+            .firstOrNull;
+        final authoritative =
+            project?.isRemote != true ||
+            _remoteHostStatus[project?.sshHostAlias] == 'online';
+        if (authoritative && !liveIds.contains(approval.id)) approval.resolve();
       }
       _pendingPermissionIds.removeWhere((id) => !liveIds.contains(id));
       _permissionQueue.removeWhere(
@@ -2945,6 +3170,8 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    _productUpdates.addListener(_productUpdateChanged);
     _projects = List<DitchProject>.of(widget.initialProjects);
     _selectedProjectKey = _projects.isEmpty
         ? null
@@ -2952,6 +3179,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
     _configureNativeNavigation();
     _scheduleStatusBarUpdate();
     unawaited(_loadPaneWidths());
+    unawaited(_loadProjectSidebar());
     if (widget.connectRuntimeOnStart) {
       unawaited(_connectRuntime());
     }
@@ -2960,9 +3188,13 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
   @override
   void dispose() {
     _applicationChannel.setMethodCallHandler(null);
+    _tasks.dispose();
+    _projectSidebar.dispose();
     _presentation.dispose();
     _runtimeEvents?.cancel();
-    _productUpdateTimer?.cancel();
+    WidgetsBinding.instance.removeObserver(this);
+    _productUpdates.removeListener(_productUpdateChanged);
+    if (widget.updates == null) _productUpdates.dispose();
     _idleChatViewport.dispose();
     for (final viewport in _chatViewports.values) {
       viewport.dispose();
@@ -3027,7 +3259,10 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
     }
 
     setState(() {
+      _showSkills = false;
+      _showBoard = false;
       _selectedProjectKey = _projectKey(_projects[projectIndex]);
+      _projectSidebar.revealProject(_projects[projectIndex]);
       _expandedAgentLocalId = session.localId;
       _focusedAgentLocalId = null;
       _pendingNotificationTarget = null;
@@ -3109,6 +3344,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
       setState(() {
         upsertProject(_projects, configuredProject);
         _selectedProjectKey = _projectKey(configuredProject);
+        _projectSidebar.revealProject(configuredProject);
         projectSession = _createAgentSession(expand: true);
       });
       _addChatMessage(
@@ -3146,6 +3382,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
     setState(() {
       upsertProject(_projects, created);
       _selectedProjectKey = _projectKey(created);
+      _projectSidebar.revealProject(created);
       _createAgentSession(expand: true);
     });
     unawaited(_ensureSelectedProjectTerminal());
@@ -3236,7 +3473,13 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
   }
 
   void _removeProjectFromUi(String projectId) {
-    if (!_projects.any((project) => project.id == projectId)) return;
+    final removedProject = _projects
+        .where((project) => project.id == projectId)
+        .firstOrNull;
+    if (removedProject == null) return;
+    if (_projectSidebar.groupFor(removedProject) != null) {
+      _projectSidebar.moveProject(removedProject, null);
+    }
     final removedSessionIds = _agentSessions
         .where((session) => session.projectId == projectId)
         .map((session) => session.localId)
@@ -3344,14 +3587,28 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
 
     final prompt = await showDialog<String>(
       context: context,
-      builder: (context) =>
-          StartCodexSessionDialog(initialPrompt: _defaultStartPrompt),
+      builder: (context) => StartCodexSessionDialog(
+        initialPrompt: _defaultStartPrompt,
+        settings: _settingsForProject(_selectedProject.id),
+        loadModels:
+            _presentation.value.connection == RuntimeConnectionPhase.connected
+            ? () =>
+                  _runtimeClient.listCodexModels(projectId: _selectedProject.id)
+            : null,
+        skillsController: _tasks.skills,
+        projectId: _selectedProject.id,
+        onTask: () {
+          Navigator.pop(context);
+          unawaited(_chooseTaskForAgent());
+        },
+      ),
     );
     if (prompt == null || prompt.trim().isEmpty) {
       return;
     }
 
     await _startCodexRuntime(prompt.trim());
+    _settingsForProject(_selectedProject.id).launchSkills = [];
   }
 
   Future<void> _startCodexRuntime(String prompt) async {
@@ -3364,6 +3621,9 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
         projectName: _selectedProject.name,
         projectRoot: _selectedProject.path,
         prompt: prompt,
+        executionProfile: _settingsForProject(
+          _selectedProject.id,
+        ).protocolValue,
       );
       final run = response['AgentStarted'];
       final session = _agentSessionFromRuntime(run, const []);
@@ -3408,6 +3668,15 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
   }
 
   Future<bool> _prepareSelectedProjectForCodex() async {
+    if (!_runtimeSupportsAppServerSessions) {
+      _showProjectSetupResult(
+        title: 'Runtime update required',
+        message:
+            'Restart Ditch with the updated runtime before starting a new turn. Existing sessions can still be stopped or approved.',
+        isError: true,
+      );
+      return false;
+    }
     if (_selectedProject.isRemote) {
       try {
         final alias = _selectedProject.sshHostAlias;
@@ -3554,7 +3823,11 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
       return;
     }
 
-    if (session.originCodexHome != null &&
+    final remoteSession = _projects.any(
+      (p) => p.id == session.projectId && p.isRemote,
+    );
+    if (!remoteSession &&
+        session.originCodexHome != null &&
         _effectiveRuntimeCodexHome != null &&
         session.originCodexHome != _effectiveRuntimeCodexHome) {
       _addAttentionRequired(
@@ -3574,11 +3847,19 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
       session.updatedAt = DateTime.now();
     });
     _scheduleStatusBarUpdate();
+    final submittedProfile = session.executionSettings.protocolValue;
     try {
       await _runtimeClient.promptAgent(
         agentId: session.localId,
         prompt: cleanPrompt,
+        executionProfile: submittedProfile,
       );
+      if (mapEquals(
+        session.executionSettings.protocolValue,
+        submittedProfile,
+      )) {
+        session.executionSettings.edited = false;
+      }
       _resolveAttentionForSession(session);
     } on Object catch (error) {
       setState(() {
@@ -3868,6 +4149,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
       return;
     }
 
+    _tasks.applyEvent(eventBody);
     final snapshotReplaced = eventBody['SnapshotReplaced'];
     if (snapshotReplaced is Map<String, dynamic>) {
       _hydrateRuntimeSnapshot({'Snapshot': snapshotReplaced});
@@ -3951,11 +4233,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
         return;
       }
       setState(() {
-        final existed = _agentSessionByLocalId(incoming.localId) != null;
         reconcileAgentSession(_agentSessions, incoming);
-        if (!existed) {
-          _expandedAgentLocalId ??= incoming.localId;
-        }
       });
       final updated = _agentSessionByLocalId(incoming.localId);
       if (updated != null &&
@@ -3986,6 +4264,14 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
           );
         }
         _scheduleStatusBarUpdate();
+      }
+      return;
+    }
+
+    if (eventBody['AgentStreamingText'] case final Map stream) {
+      final session = _agentSessionByLocalId(stream['agent_id'] as String);
+      if (session != null) {
+        setState(() => session.streamingText = stream['text'] as String);
       }
       return;
     }
@@ -4112,16 +4398,13 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
           },
         ),
       );
+      approval.updateRequest(request);
       if (!session.approvals.contains(approval)) {
         setState(() => session.approvals.add(approval));
       }
       return;
     }
-    if (!_projects.any(
-      (project) => project.id == projectId && project.isRemote,
-    )) {
-      return;
-    }
+    if (request['response_pending'] == true) return;
     if (!_pendingPermissionIds.add(requestId)) return;
     _permissionQueue.add(request);
     unawaited(_showNextRemotePermission());
@@ -4217,7 +4500,20 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
             } on Object catch (error) {
               if (mounted) {
                 ScaffoldMessenger.of(context).showSnackBar(
-                  SnackBar(content: Text('Could not send answers: $error')),
+                  SnackBar(
+                    content: Text('Could not confirm answers: $error'),
+                    action: SnackBarAction(
+                      label: 'Check status',
+                      onPressed: () async {
+                        try {
+                          final snapshot = await _runtimeClient.snapshot();
+                          if (mounted) _hydrateRuntimeSnapshot(snapshot);
+                        } on Object {
+                          /* Keep the request available for reconnect. */
+                        }
+                      },
+                    ),
+                  ),
                 );
               }
             }
@@ -4250,8 +4546,16 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
     }
     final state = agentJson['state']?.toString();
     return AgentSession(
+      attachedSkills:
+          ((agentJson['execution_profile'] as Map?)?['skills'] as List? ?? [])
+              .map((s) => Map<String, dynamic>.from(s as Map))
+              .toList(),
       localId: agentId,
       projectId: agentJson['project_id']?.toString(),
+      coordinatorGroup: agentJson['coordinator_group']?.toString(),
+      executionSettings: AgentExecutionSettings(
+        profile: agentJson['execution_profile'] as Map?,
+      ),
       provider: AgentProvider.codex,
       status: _agentStatusFromRuntime(state),
       messages: List<AgentChatMessage>.from(messages),
@@ -4915,43 +5219,57 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
                 _minimumInspectorWidth,
                 _maximumInspectorWidth(constraints.maxWidth, showSidebar),
               );
-              final agentsSurface = AgentsSurface(
-                sessions: _visibleSessions,
-                expandedAgentLocalId: _expandedAgentLocalId,
-                focusedAgentLocalId: _focusedAgentLocalId,
-                chatViewport: _chatViewport,
-                agentListController: _agentListController,
-                composerKey: _idleComposerKey,
-                composerKeyForAgent: _composerKeyForAgent,
-                headerKeyForAgent: _agentHeaderKey,
-                initialPrompt: _defaultStartPrompt,
-                effectiveCodexHome: _effectiveRuntimeCodexHome,
-                onStartCodex: _startCodex,
-                onStartPrompt: _startCodexRuntime,
-                onSubmitPrompt: _submitComposer,
-                onLoadMessages: _loadAgentMessages,
-                onStopCodex: _stopCodex,
-                onDeleteAgent: _deleteAgent,
-                onRenameAgent: _renameAgent,
-                hasUnreadResult: (session) => unreadResultAttentionIdsForAgent(
-                  attention: _attention,
-                  agentId: session.localId,
-                  readAttentionIds: _readAttentionIds,
-                ).isNotEmpty,
-                onFocusAgent: (session) {
-                  if (session != null) _markAgentResultsRead(session);
-                  setState(() {
-                    _focusedAgentLocalId = session?.localId;
-                    if (session != null) {
-                      _expandedAgentLocalId = session.localId;
+              final modelProjectId = _selectedProject.id;
+              final agentsSurface = AgentSettingsScope(
+                settings: _settingsForProject(_selectedProject.id),
+                loadModels:
+                    presentation.connection == RuntimeConnectionPhase.connected
+                    ? () => _runtimeClient.listCodexModels(
+                        projectId: modelProjectId,
+                      )
+                    : null,
+                child: AgentsSurface(
+                  onOpenBoard: () => _openBoard(_selectedProject.id),
+                  sessions: _visibleSessions,
+                  expandedAgentLocalId: _expandedAgentLocalId,
+                  focusedAgentLocalId: _focusedAgentLocalId,
+                  chatViewport: _chatViewport,
+                  agentListController: _agentListController,
+                  composerKey: _idleComposerKey,
+                  composerKeyForAgent: _composerKeyForAgent,
+                  headerKeyForAgent: _agentHeaderKey,
+                  initialPrompt: _defaultStartPrompt,
+                  effectiveCodexHome: _selectedProject.isRemote
+                      ? null
+                      : _effectiveRuntimeCodexHome,
+                  onStartCodex: _startCodex,
+                  onStartPrompt: _startCodexRuntime,
+                  onSubmitPrompt: _submitComposer,
+                  onLoadMessages: _loadAgentMessages,
+                  onStopCodex: _stopCodex,
+                  onDeleteAgent: _deleteAgent,
+                  onRenameAgent: _renameAgent,
+                  hasUnreadResult: (session) =>
+                      unreadResultAttentionIdsForAgent(
+                        attention: _attention,
+                        agentId: session.localId,
+                        readAttentionIds: _readAttentionIds,
+                      ).isNotEmpty,
+                  onFocusAgent: (session) {
+                    if (session != null) _markAgentResultsRead(session);
+                    setState(() {
+                      _focusedAgentLocalId = session?.localId;
+                      if (session != null) {
+                        _expandedAgentLocalId = session.localId;
+                      }
+                    });
+                    final agentId = session?.localId ?? _expandedAgentLocalId;
+                    if (agentId != null) {
+                      _focusAgentComposerAfterLayout(agentId);
                     }
-                  });
-                  final agentId = session?.localId ?? _expandedAgentLocalId;
-                  if (agentId != null) {
-                    _focusAgentComposerAfterLayout(agentId);
-                  }
-                },
-                onToggleExpanded: _toggleExpandedAgent,
+                  },
+                  onToggleExpanded: _toggleExpandedAgent,
+                ),
               );
               final selectedTerminal = _selectedProject.id == null
                   ? null
@@ -5160,9 +5478,48 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
                         width: projectSidebarWidth,
                         projects: _projects,
                         remoteHostStatus: _remoteHostStatus,
-                        selectedIndex: _selectedProjectIndex,
+                        controller: _projectSidebar,
+                        selectedProjectKey:
+                            (_showBoard ||
+                                _showSkills ||
+                                _editionWorkspace != null)
+                            ? null
+                            : _selectedProjectKey,
+                        editionNavigation: [
+                          if (widget.editionSurface is EditionWorkspaceProvider)
+                            for (final item
+                                in (widget.editionSurface
+                                        as EditionWorkspaceProvider)
+                                    .workspaces())
+                              if (showUnfinishedFeatureControls ||
+                                  item.id != 'ditchmaster')
+                                item.navigationBuilder(
+                                  _runtimeClient,
+                                  _editionWorkspace?.id == item.id,
+                                  () => setState(() {
+                                    _editionWorkspace = item;
+                                    _showBoard = false;
+                                    _showSkills = false;
+                                  }),
+                                ),
+                        ],
+                        onOpenBoard: () => _openBoard(),
+                        boardSelected: _showBoard,
+                        skillsSelected: _showSkills,
+                        onOpenSkills: () => setState(() {
+                          _editionWorkspace = null;
+                          _showSkills = true;
+                          _showBoard = false;
+                        }),
                         onAddProject: _addProject,
-                        onSelectProject: _selectProject,
+                        onSelectProject: (project) {
+                          setState(() {
+                            _editionWorkspace = null;
+                            _showSkills = false;
+                            _showBoard = false;
+                          });
+                          unawaited(_selectProject(project));
+                        },
                         onRevealProject: (project) =>
                             unawaited(_revealProjectInFinder(project)),
                         onCopyProjectPath: (project) =>
@@ -5204,7 +5561,61 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
                         },
                       ),
                     ],
-                    Expanded(child: body),
+                    Expanded(
+                      child: _editionWorkspace != null
+                          ? _editionWorkspace!.builder(
+                              _runtimeClient,
+                              _openBoard,
+                              _openTaskAgent,
+                            )
+                          : _showSkills
+                          ? SkillsDirectory(
+                              controller: _tasks.skills,
+                              projects: _taskProjects,
+                              connected:
+                                  presentation.connection ==
+                                  RuntimeConnectionPhase.connected,
+                            )
+                          : _showBoard
+                          ? TaskBoard(
+                              key: ValueKey(_boardProjectId),
+                              controller: _tasks,
+                              projects: _taskProjects,
+                              connected:
+                                  presentation.connection ==
+                                  RuntimeConnectionPhase.connected,
+                              initialProjectId: _boardProjectId,
+                              onRunSelected:
+                                  widget.editionSurface is EditionBoardProvider
+                                  ? (requestId, tasks) =>
+                                        (widget.editionSurface
+                                                as EditionBoardProvider)
+                                            .runBoardTasks(
+                                              _runtimeClient,
+                                              requestId,
+                                              [
+                                                for (final t in tasks)
+                                                  {
+                                                    'task_id': t.id,
+                                                    'revision': t.revision,
+                                                  },
+                                              ],
+                                            )
+                                  : null,
+                              onPause:
+                                  widget.editionSurface is EditionBoardProvider
+                                  ? () =>
+                                        (widget.editionSurface
+                                                as EditionBoardProvider)
+                                            .pauseBoardWork(_runtimeClient)
+                                  : null,
+                              executionProfile: () => _settingsForProject(
+                                _selectedProject.id,
+                              ).protocolValue,
+                              onOpenAgent: _openTaskAgent,
+                            )
+                          : body,
+                    ),
                   ],
                 );
               }
@@ -5226,6 +5637,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen> {
                       onDismissAllNotifications: _dismissAllNotifications,
                       onOpenCodexSettings: _openAppSettings,
                       codexAvailable: _codexBinary != null,
+                      updateAvailable: _productUpdates.available,
                       onToggleSidebar: _presentation.toggleSidebar,
                       onToggleInspector: _presentation.toggleInspector,
                     ),
@@ -5699,12 +6111,14 @@ class NotificationSetupBanner extends StatelessWidget {
 class DitchUpdateDialog extends StatefulWidget {
   const DitchUpdateDialog({
     required this.client,
+    this.updates,
     this.deploymentEnvironment = ditchDeploymentEnvironment,
     this.relayOrigin = ditchRelayOrigin,
     super.key,
   });
 
   final DitchRuntimeClient client;
+  final ProductUpdateController? updates;
   final String deploymentEnvironment;
   final String relayOrigin;
 
@@ -5714,6 +6128,8 @@ class DitchUpdateDialog extends StatefulWidget {
 
 class _DitchUpdateDialogState extends State<DitchUpdateDialog> {
   static const _applicationChannel = MethodChannel('the_ditch/application');
+  late final _updates =
+      widget.updates ?? productUpdateController(widget.client);
   RuntimeStatusDto? _runtime;
   DitchCurrentLicense? _license;
   Map<String, dynamic>? _release;
@@ -5727,7 +6143,49 @@ class _DitchUpdateDialogState extends State<DitchUpdateDialog> {
   @override
   void initState() {
     super.initState();
+    _updates.addListener(_syncUpdates);
     unawaited(_load());
+  }
+
+  @override
+  void dispose() {
+    _updates.removeListener(_syncUpdates);
+    if (widget.updates == null) _updates.dispose();
+    super.dispose();
+  }
+
+  String? get _availabilityMessage {
+    final manifest = _updates.manifest;
+    if (manifest != null) {
+      final version = manifest['version']?.toString() ?? 'new';
+      final build = manifest['build']?.toString();
+      return build == null
+          ? 'Ditch $version is available.'
+          : 'Ditch $version.$build is available.';
+    }
+    if (_updates.lastCheckedAt == null) return null;
+    if (_updates.noCompatibleRelease) {
+      return 'No compatible ${_usesCommercialUpdates ? 'Commercial' : 'Community'} update is currently available.';
+    }
+    return 'Ditch is up to date for ${_license?.displayName ?? 'your license'}.';
+  }
+
+  void _syncUpdates() {
+    if (!mounted) return;
+    setState(() {
+      _runtime = _updates.context?.runtime ?? _runtime;
+      _license = _updates.context?.license ?? _license;
+      _checking = _updates.checking;
+      _release = _updates.manifest == null
+          ? null
+          : {'manifest': _updates.manifest};
+      if (!_installing) {
+        _message = _availabilityMessage;
+        _error = _updates.error == null
+            ? null
+            : _friendlyError(_updates.error!);
+      }
+    });
   }
 
   Future<void> _load() async {
@@ -5739,6 +6197,10 @@ class _DitchUpdateDialogState extends State<DitchUpdateDialog> {
       final version = metadata?['version']?.trim();
       final build = metadata?['build']?.trim();
       if (!mounted) return;
+      _updates.reconcileContext((
+        runtime: runtime,
+        license: DitchCurrentLicense.fromEntitlement(entitlement),
+      ));
       setState(() {
         _runtime = runtime;
         _license = DitchCurrentLicense.fromEntitlement(entitlement);
@@ -5749,6 +6211,8 @@ class _DitchUpdateDialogState extends State<DitchUpdateDialog> {
             : 'v$version.$build';
         _loading = false;
       });
+      _syncUpdates();
+      if (widget.updates != null) unawaited(_updates.check());
     } on Object catch (error) {
       if (!mounted) return;
       setState(() {
@@ -5758,61 +6222,9 @@ class _DitchUpdateDialogState extends State<DitchUpdateDialog> {
     }
   }
 
-  Future<void> _checkForUpdates() async {
-    final license = _license;
-    final runtime = _runtime;
-    if (license == null || runtime == null) return;
-    setState(() {
-      _checking = true;
-      _release = null;
-      _message = null;
-      _error = null;
-    });
-    try {
-      final release = await _checkSelectedRelease();
-      final manifest = (release['manifest'] as Map?)?.cast<String, dynamic>();
-      final sequence = (manifest?['release_sequence'] as num?)?.toInt();
-      if (sequence == null) {
-        throw const FormatException(
-          'The Relay returned incomplete update metadata.',
-        );
-      }
-      if (!mounted) return;
-      setState(() {
-        if (sequence > runtime.releaseSequence) {
-          _release = release;
-          final version = manifest?['version']?.toString() ?? 'new';
-          final build = manifest?['build']?.toString();
-          _message = build == null
-              ? 'Ditch $version is available.'
-              : 'Ditch $version.$build is available.';
-        } else {
-          _message = 'Ditch is up to date for ${license.displayName}.';
-        }
-        _checking = false;
-      });
-    } on Object catch (error) {
-      if (!mounted) return;
-      setState(() {
-        _checking = false;
-        if (error is DitchRuntimeException &&
-            error.code == 'commercial_release_unavailable') {
-          _message = _friendlyError(error);
-        } else {
-          _error = _friendlyError(error);
-        }
-      });
-    }
-  }
+  Future<void> _checkForUpdates() => _updates.check(force: true);
 
   bool get _usesCommercialUpdates => _license?.hasCommercialAccess == true;
-
-  Future<Map<String, dynamic>> _checkSelectedRelease({
-    bool forInstallation = false,
-  }) => widget.client.releaseForLicense(
-    _license!,
-    forInstallation: forInstallation,
-  );
 
   Future<void> _installCommercialUpdate() async {
     final release = _release;
@@ -5824,29 +6236,20 @@ class _DitchUpdateDialogState extends State<DitchUpdateDialog> {
     try {
       // Discovery permissions expire. Obtain a freshly verified release and
       // session for every install attempt, including retries.
-      final freshRelease = await _checkSelectedRelease();
+      final freshRelease = await _updates.prepareInstallation();
       if (!mounted) return;
-      final arguments = authorizedCommercialUpdateArguments(freshRelease);
-      final manifest = (freshRelease['manifest'] as Map)
-          .cast<String, dynamic>();
-      final sequence = (manifest['release_sequence'] as num?)?.toInt();
-      if (sequence == null) {
-        throw const FormatException(
-          'The Relay returned incomplete update metadata.',
-        );
-      }
-      if (sequence <= _runtime!.releaseSequence) {
+      if (freshRelease == null) {
         setState(() {
-          _release = null;
           _installing = false;
-          _message = 'Ditch is up to date for ${_license!.displayName}.';
+          _message = _availabilityMessage;
         });
         return;
       }
+      final arguments = authorizedCommercialUpdateArguments(freshRelease);
       final selectedManifest = release['manifest'] as Map;
       if (arguments['release_id'] != selectedManifest['release_id']) {
         setState(() {
-          _release = freshRelease;
+          _release = {'manifest': _updates.manifest};
           _installing = false;
           _message =
               'Ditch ${arguments['version']}.${arguments['build']} is now available. Click Install Update to install this version.';
@@ -5878,6 +6281,8 @@ class _DitchUpdateDialogState extends State<DitchUpdateDialog> {
           'This source build cannot use DitchNow hosted services. Install an official signed Community build to check prices, licenses, and hosted updates.',
         'commercial_release_unavailable' =>
           'No compatible ${_usesCommercialUpdates ? 'Commercial' : 'Community'} update is currently available.',
+        'commercial_release_incompatible' =>
+          'This update requires a newer installed version of Ditch. Manually install the latest official app to continue.',
         'commercial_entitlement_failed' =>
           'Ditch could not load the current license from the Relay.',
         _ => error.message,
@@ -6306,7 +6711,7 @@ class _CommercialUpgradeDialogState extends State<CommercialUpgradeDialog> {
         'commercial_release_authorization_expired' =>
           'The secure download authorization expired before installation started. Try again to request a fresh authorization.',
         'commercial_release_incompatible' =>
-          'The available Commercial build is not compatible with this Community build. Update Community first, then try again.',
+          'This update requires a newer installed version of Ditch. Manually install the latest official app to continue.',
         'commercial_release_downgrade_refused' =>
           'Ditch refused to install an older Commercial build over this installation.',
         'commercial_release_signature_invalid' ||
@@ -6953,6 +7358,7 @@ class DitchToolbar extends StatelessWidget {
     required this.onDismissAllNotifications,
     required this.onOpenCodexSettings,
     required this.codexAvailable,
+    this.updateAvailable = false,
     super.key,
   });
 
@@ -6970,6 +7376,7 @@ class DitchToolbar extends StatelessWidget {
   final VoidCallback onDismissAllNotifications;
   final VoidCallback onOpenCodexSettings;
   final bool codexAvailable;
+  final bool updateAvailable;
 
   @override
   Widget build(BuildContext context) {
@@ -7044,17 +7451,30 @@ class DitchToolbar extends StatelessWidget {
             ),
             IconButton(
               key: const Key('app-settings-button'),
-              tooltip: codexAvailable
-                  ? 'Codex installation'
+              tooltip: updateAvailable
+                  ? 'Settings — update available'
+                  : codexAvailable
+                  ? 'Settings'
                   : 'Codex not found — choose an installation',
               onPressed: onOpenCodexSettings,
-              icon: Icon(
-                codexAvailable
-                    ? Icons.settings_outlined
-                    : Icons.warning_amber_rounded,
-                color: codexAvailable
-                    ? null
-                    : Theme.of(context).colorScheme.error,
+              icon: Stack(
+                clipBehavior: Clip.none,
+                children: [
+                  Icon(
+                    codexAvailable
+                        ? Icons.settings_outlined
+                        : Icons.warning_amber_rounded,
+                    color: codexAvailable
+                        ? null
+                        : Theme.of(context).colorScheme.error,
+                  ),
+                  if (updateAvailable)
+                    const Positioned(
+                      top: -3,
+                      right: -3,
+                      child: UpdateAvailableDot(key: Key('toolbar-update-dot')),
+                    ),
+                ],
               ),
             ),
             NotificationCenterButton(
@@ -7476,301 +7896,6 @@ class _NotificationCenterItem extends StatelessWidget {
   }
 }
 
-class ProjectSidebar extends StatelessWidget {
-  const ProjectSidebar({
-    required this.width,
-    required this.projects,
-    required this.remoteHostStatus,
-    required this.selectedIndex,
-    required this.onAddProject,
-    required this.onSelectProject,
-    required this.onRevealProject,
-    required this.onCopyProjectPath,
-    required this.onReconnectRemoteProject,
-    this.onSetupRemoteProject,
-    required this.onDeleteProject,
-    required this.summaryForProject,
-    super.key,
-  });
-
-  final double width;
-  final List<DitchProject> projects;
-  final Map<String, String> remoteHostStatus;
-  final int selectedIndex;
-  final VoidCallback onAddProject;
-  final ValueChanged<int> onSelectProject;
-  final ValueChanged<DitchProject> onRevealProject;
-  final ValueChanged<DitchProject> onCopyProjectPath;
-  final ValueChanged<DitchProject> onReconnectRemoteProject;
-  final ValueChanged<DitchProject>? onSetupRemoteProject;
-  final ValueChanged<DitchProject> onDeleteProject;
-  final ProjectAgentSummary Function(DitchProject) summaryForProject;
-
-  @override
-  Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    return ColoredBox(
-      color: context.ditch.sidebar,
-      child: SizedBox(
-        width: width,
-        child: SafeArea(
-          top: false,
-          child: Padding(
-            padding: const EdgeInsets.all(12),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  'PROJECTS',
-                  style: theme.textTheme.labelSmall?.copyWith(
-                    color: context.ditch.mutedText,
-                    fontWeight: FontWeight.w600,
-                    letterSpacing: 0.6,
-                  ),
-                ),
-                const SizedBox(height: 8),
-                Expanded(
-                  child: ListView.separated(
-                    itemCount: projects.length,
-                    separatorBuilder: (_, _) => const SizedBox(height: 8),
-                    itemBuilder: (context, index) {
-                      final project = projects[index];
-                      final summary = summaryForProject(project);
-                      return ProjectTile(
-                        name: project.name,
-                        path: project.path,
-                        isRemote: project.isRemote,
-                        sshHostAlias: project.sshHostAlias,
-                        remoteStatus: project.isRemote
-                            ? remoteHostStatus[project.sshHostAlias] ??
-                                  'connecting'
-                            : null,
-                        selected: index == selectedIndex,
-                        onTap: () => onSelectProject(index),
-                        onReveal: () => onRevealProject(project),
-                        onCopyPath: () => onCopyProjectPath(project),
-                        onSetup:
-                            project.isRemote && onSetupRemoteProject != null
-                            ? () => onSetupRemoteProject!(project)
-                            : null,
-                        onReconnect: project.isRemote
-                            ? () => onReconnectRemoteProject(project)
-                            : null,
-                        onDelete: () => onDeleteProject(project),
-                        runningCount: summary.runningCount,
-                        stoppedCount: summary.stoppedCount,
-                        hasUnreadResult: summary.hasUnreadResult,
-                      );
-                    },
-                  ),
-                ),
-                const SizedBox(height: 8),
-                TextButton.icon(
-                  onPressed: onAddProject,
-                  icon: const Icon(Icons.add, size: 16),
-                  label: const Text('Add Project'),
-                ),
-              ],
-            ),
-          ),
-        ),
-      ),
-    );
-  }
-}
-
-class ProjectTile extends StatelessWidget {
-  const ProjectTile({
-    required this.name,
-    required this.path,
-    required this.selected,
-    required this.onTap,
-    required this.onReveal,
-    required this.onCopyPath,
-    this.onReconnect,
-    this.onSetup,
-    required this.onDelete,
-    this.runningCount = 0,
-    this.stoppedCount = 0,
-    this.hasUnreadResult = false,
-    this.isRemote = false,
-    this.sshHostAlias,
-    this.remoteStatus,
-    super.key,
-  });
-
-  final String name;
-  final String path;
-  final bool selected;
-  final VoidCallback onTap;
-  final VoidCallback onReveal;
-  final VoidCallback onCopyPath;
-  final VoidCallback? onReconnect;
-  final VoidCallback? onSetup;
-  final VoidCallback onDelete;
-  final int runningCount;
-  final int stoppedCount;
-  final bool hasUnreadResult;
-  final bool isRemote;
-  final String? sshHostAlias;
-  final String? remoteStatus;
-
-  Future<void> _showContextMenu(
-    BuildContext context,
-    TapDownDetails details,
-  ) async {
-    final overlay = Overlay.of(context).context.findRenderObject() as RenderBox;
-    final action = await showMenu<_ProjectMenuAction>(
-      context: context,
-      position: RelativeRect.fromRect(
-        Rect.fromLTWH(
-          details.globalPosition.dx,
-          details.globalPosition.dy,
-          0,
-          0,
-        ),
-        Offset.zero & overlay.size,
-      ),
-      items: [
-        const PopupMenuItem(
-          value: _ProjectMenuAction.copyPath,
-          child: Text('Copy Project Path'),
-        ),
-        if (onSetup != null)
-          const PopupMenuItem(
-            value: _ProjectMenuAction.setup,
-            child: Text('Remote Runtime Setup…'),
-          ),
-        if (onReconnect != null)
-          const PopupMenuItem(
-            value: _ProjectMenuAction.reconnect,
-            child: Text('Reconnect'),
-          ),
-        const PopupMenuDivider(),
-        const PopupMenuItem(
-          value: _ProjectMenuAction.delete,
-          child: Text('Delete'),
-        ),
-      ],
-    );
-    switch (action) {
-      case _ProjectMenuAction.copyPath:
-        onCopyPath();
-      case _ProjectMenuAction.setup:
-        onSetup?.call();
-      case _ProjectMenuAction.reconnect:
-        onReconnect?.call();
-      case _ProjectMenuAction.delete:
-        onDelete();
-      case null:
-        break;
-    }
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final tokens = context.ditch;
-
-    return InkWell(
-      key: ValueKey('project-tile-$path'),
-      borderRadius: BorderRadius.circular(tokens.radiusSmall),
-      onTap: onTap,
-      onSecondaryTapDown: (details) => _showContextMenu(context, details),
-      child: DecoratedBox(
-        decoration: BoxDecoration(
-          color: selected ? tokens.selection : Colors.transparent,
-          borderRadius: BorderRadius.circular(tokens.radiusSmall),
-        ),
-        child: Padding(
-          padding: const EdgeInsets.all(10),
-          child: Row(
-            children: [
-              const Icon(Icons.folder_outlined, size: 18),
-              const SizedBox(width: 8),
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Row(
-                      children: [
-                        Expanded(
-                          child: Text(
-                            name,
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                          ),
-                        ),
-                        if (hasUnreadResult)
-                          Tooltip(
-                            message: 'New agent result',
-                            child: Container(
-                              key: ValueKey('project-unread-$path'),
-                              width: 8,
-                              height: 8,
-                              decoration: BoxDecoration(
-                                color: context.ditch.accent,
-                                shape: BoxShape.circle,
-                              ),
-                            ),
-                          ),
-                      ],
-                    ),
-                    Text(
-                      isRemote
-                          ? 'Remote · $sshHostAlias · ${_titleCase(remoteStatus ?? "connecting")}'
-                          : path,
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: Theme.of(context).textTheme.bodySmall,
-                    ),
-                    const SizedBox(height: 3),
-                    Text(
-                      '$runningCount running · $stoppedCount stopped',
-                      key: ValueKey('project-counts-$path'),
-                      style: Theme.of(context).textTheme.labelSmall?.copyWith(
-                        color: context.ditch.mutedText,
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-              const SizedBox(width: 4),
-              if (isRemote)
-                IconButton(
-                  key: ValueKey('reconnect-project-$path'),
-                  onPressed: onReconnect,
-                  tooltip: 'Reconnect',
-                  visualDensity: VisualDensity.compact,
-                  constraints: const BoxConstraints.tightFor(
-                    width: 28,
-                    height: 28,
-                  ),
-                  padding: EdgeInsets.zero,
-                  icon: const Icon(Icons.sync, size: 16),
-                )
-              else
-                IconButton(
-                  key: ValueKey('reveal-project-$path'),
-                  onPressed: onReveal,
-                  tooltip: 'Show in Finder',
-                  visualDensity: VisualDensity.compact,
-                  constraints: const BoxConstraints.tightFor(
-                    width: 28,
-                    height: 28,
-                  ),
-                  padding: EdgeInsets.zero,
-                  icon: const Icon(Icons.folder_open_outlined, size: 16),
-                ),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-}
-
-enum _ProjectMenuAction { copyPath, setup, reconnect, delete }
-
 class AgentsSurface extends StatelessWidget {
   const AgentsSurface({
     required this.sessions,
@@ -7793,9 +7918,11 @@ class AgentsSurface extends StatelessWidget {
     this.hasUnreadResult = _neverUnreadAgentResult,
     required this.onFocusAgent,
     required this.onToggleExpanded,
+    this.onOpenBoard,
     super.key,
   });
 
+  final VoidCallback? onOpenBoard;
   final List<AgentSession> sessions;
   final String? expandedAgentLocalId;
   final String? focusedAgentLocalId;
@@ -7836,6 +7963,12 @@ class AgentsSurface extends StatelessWidget {
                       style: Theme.of(context).textTheme.headlineSmall,
                     ),
                   ),
+                  if (showUnfinishedFeatureControls && onOpenBoard != null)
+                    IconButton(
+                      onPressed: onOpenBoard,
+                      tooltip: 'Project Board — $projectWriteDisclosure',
+                      icon: const Icon(Icons.view_kanban_outlined, size: 20),
+                    ),
                   FilledButton.icon(
                     key: const Key('agents-new-agent-button'),
                     onPressed: onStartCodex,
@@ -8265,7 +8398,19 @@ class ExpandableAgentPanel extends StatelessWidget {
                     ],
                   ),
                   const SizedBox(height: 2),
-                  AgentStatusChip(status: session.status),
+                  Wrap(
+                    spacing: 8,
+                    crossAxisAlignment: WrapCrossAlignment.center,
+                    children: [
+                      AgentStatusChip(status: session.status),
+                      Text(
+                        session.coordinatorGroup == null
+                            ? 'User agent'
+                            : 'Ditchmaster agent',
+                        style: Theme.of(context).textTheme.bodySmall,
+                      ),
+                    ],
+                  ),
                   if (session.lastVisibleAction != null) ...[
                     const SizedBox(height: 2),
                     Text(
@@ -8323,8 +8468,18 @@ class ExpandableAgentPanel extends StatelessWidget {
         );
         Widget buildChatPanel() => AgentChatPanel(
           conversationId: session.localId,
-          messages: session.messages,
+          executionSettings: session.executionSettings,
           approvals: session.approvals,
+          messages: [
+            ...session.messages,
+            if (session.streamingText.isNotEmpty)
+              AgentChatMessage(
+                identity: 'stream-${session.localId}',
+                role: ChatMessageRole.assistant,
+                text: session.streamingText,
+                createdAt: session.updatedAt,
+              ),
+          ],
           viewport: chatViewport!,
           enlarged: enlarged,
           composerKey: composerKey!,
@@ -8386,6 +8541,16 @@ class ExpandableAgentPanel extends StatelessWidget {
                             ),
                     ),
                   ),
+                  if (showUnfinishedFeatureControls &&
+                      expanded &&
+                      session.attachedSkills.isNotEmpty)
+                    Align(
+                      alignment: Alignment.centerLeft,
+                      child: Tooltip(
+                        message: 'Recorded when this thread was launched',
+                        child: SkillChips(skills: session.attachedSkills),
+                      ),
+                    ),
                   if (expanded)
                     Expanded(
                       child: Padding(
@@ -8488,6 +8653,7 @@ class AgentChatPanel extends StatelessWidget {
     required this.onStopCodex,
     this.onEnlarge,
     this.autofocusAfterInitialPositioning = false,
+    this.executionSettings,
     super.key,
   });
 
@@ -8498,6 +8664,7 @@ class AgentChatPanel extends StatelessWidget {
   final bool enlarged;
   final GlobalKey<AgentComposerState> composerKey;
   final String initialPrompt;
+  final AgentExecutionSettings? executionSettings;
   final bool hasSession;
   final bool isWorking;
   final bool canStop;
@@ -8549,6 +8716,7 @@ class AgentChatPanel extends StatelessWidget {
         ),
       AgentComposer(
         key: composerKey,
+        executionSettings: executionSettings,
         initialText: initialPrompt,
         hasSession: hasSession,
         isWorking: isWorking,
@@ -8959,10 +9127,12 @@ class AgentComposer extends StatefulWidget {
     required this.onStop,
     this.onEnlarge,
     this.onEscape,
+    this.executionSettings,
     super.key,
   });
 
   final String initialText;
+  final AgentExecutionSettings? executionSettings;
   final bool hasSession;
   final bool isWorking;
   final bool canStop;
@@ -8983,6 +9153,15 @@ class AgentComposerState extends State<AgentComposer> {
   late String _draftText;
   double _editorHeight = _minimumEditorHeight;
   bool _composerHasFocus = false;
+  AgentSettingsScope? _scope;
+  AgentExecutionSettings get _settings =>
+      widget.executionSettings ?? _scope?.settings ?? agentExecutionSettings;
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    _scope = AgentSettingsScope.of(context);
+  }
 
   @override
   void initState() {
@@ -9045,33 +9224,6 @@ class AgentComposerState extends State<AgentComposer> {
     setState(() => _editorHeight = nextHeight);
   }
 
-  Future<void> _selectApproval(AgentApprovalPreset value) async {
-    if (value == AgentApprovalPreset.fullAccess) {
-      final confirmed = await showDialog<bool>(
-        context: context,
-        builder: (context) => AlertDialog(
-          icon: const Icon(Icons.warning_amber_rounded),
-          title: const Text('Enable Full Access?'),
-          content: const Text(
-            'Codex will run without approval prompts or sandbox restrictions and can access the internet and files on this Mac.',
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.of(context).pop(false),
-              child: const Text('Cancel'),
-            ),
-            FilledButton(
-              onPressed: () => Navigator.of(context).pop(true),
-              child: const Text('Enable Full Access'),
-            ),
-          ],
-        ),
-      );
-      if (confirmed != true) return;
-    }
-    agentExecutionSettings.setApproval(value);
-  }
-
   @override
   Widget build(BuildContext context) {
     final hasText = _draftText.trim().isNotEmpty;
@@ -9099,7 +9251,7 @@ class AgentComposerState extends State<AgentComposer> {
           ),
           padding: const EdgeInsets.all(10),
           child: ListenableBuilder(
-            listenable: agentExecutionSettings,
+            listenable: _settings,
             builder: (context, _) => Column(
               mainAxisSize: MainAxisSize.min,
               children: [
@@ -9157,81 +9309,10 @@ class AgentComposerState extends State<AgentComposer> {
                   ),
                 ),
                 const SizedBox(height: 8),
-                LayoutBuilder(
-                  builder: (context, constraints) {
-                    final controlWidth = constraints.maxWidth < 220
-                        ? constraints.maxWidth
-                        : 220.0;
-                    return Wrap(
-                      spacing: 16,
-                      runSpacing: 8,
-                      crossAxisAlignment: WrapCrossAlignment.center,
-                      children: [
-                        SizedBox(
-                          width: controlWidth,
-                          child: DropdownButtonHideUnderline(
-                            child: DropdownButton<AgentApprovalPreset>(
-                              value: agentExecutionSettings.approval,
-                              isDense: true,
-                              isExpanded: true,
-                              onChanged: (value) {
-                                if (value != null) {
-                                  unawaited(_selectApproval(value));
-                                }
-                              },
-                              items: const [
-                                DropdownMenuItem(
-                                  value: AgentApprovalPreset.ask,
-                                  enabled: false,
-                                  child: Text('Ask for approval — unavailable'),
-                                ),
-                                DropdownMenuItem(
-                                  value: AgentApprovalPreset.approveForMe,
-                                  child: Text('Approve for me'),
-                                ),
-                                DropdownMenuItem(
-                                  value: AgentApprovalPreset.fullAccess,
-                                  child: Text('Full Access'),
-                                ),
-                              ],
-                            ),
-                          ),
-                        ),
-                        SizedBox(
-                          width: controlWidth,
-                          child: Row(
-                            children: [
-                              Expanded(
-                                child: DropdownButtonHideUnderline(
-                                  child: DropdownButton<String?>(
-                                    value: agentExecutionSettings.model,
-                                    hint: const Text('Default model'),
-                                    isDense: true,
-                                    isExpanded: true,
-                                    onChanged: agentExecutionSettings.setModel,
-                                    items: agentExecutionSettings.models
-                                        .map(
-                                          (model) => DropdownMenuItem<String?>(
-                                            value: model.id,
-                                            child: Text(model.displayName),
-                                          ),
-                                        )
-                                        .toList(),
-                                  ),
-                                ),
-                              ),
-                              const SizedBox(width: 6),
-                              ContextWindowIndicator(
-                                model: agentExecutionSettings.selectedModel,
-                              ),
-                            ],
-                          ),
-                        ),
-                        if (widget.isWorking || widget.canStop)
-                          const Text('Applies next turn'),
-                      ],
-                    );
-                  },
+                AgentExecutionControls(
+                  settings: _settings,
+                  loadModels: _scope?.loadModels,
+                  appliesNextTurn: widget.isWorking || widget.canStop,
                 ),
               ],
             ),
@@ -9240,6 +9321,171 @@ class AgentComposerState extends State<AgentComposer> {
       ),
     );
   }
+}
+
+class AgentExecutionControls extends StatefulWidget {
+  const AgentExecutionControls({
+    required this.settings,
+    this.loadModels,
+    this.appliesNextTurn = false,
+    super.key,
+  });
+
+  final AgentExecutionSettings settings;
+  final Future<List<AgentModelOption>> Function()? loadModels;
+  final bool appliesNextTurn;
+
+  @override
+  State<AgentExecutionControls> createState() => _AgentExecutionControlsState();
+}
+
+class _AgentExecutionControlsState extends State<AgentExecutionControls> {
+  AgentExecutionSettings? _loadedSettings;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadModels();
+  }
+
+  @override
+  void didUpdateWidget(AgentExecutionControls oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    _loadModels();
+  }
+
+  void _loadModels() {
+    if (widget.loadModels == null) {
+      _loadedSettings = null;
+      return;
+    }
+    if (identical(_loadedSettings, widget.settings)) return;
+    final settings = _loadedSettings = widget.settings;
+    final load = widget.loadModels!;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) unawaited(settings.loadModels(load));
+    });
+  }
+
+  Future<void> _selectApproval(AgentApprovalPreset value) async {
+    if (value == AgentApprovalPreset.fullAccess) {
+      final confirmed = await showDialog<bool>(
+        context: context,
+        builder: (context) => AlertDialog(
+          icon: const Icon(Icons.warning_amber_rounded),
+          title: const Text('Enable Full Access?'),
+          content: const Text(
+            'Codex will run without approval prompts or sandbox restrictions and can access the internet and files on the computer running this project.',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(false),
+              child: const Text('Cancel'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.of(context).pop(true),
+              child: const Text('Enable Full Access'),
+            ),
+          ],
+        ),
+      );
+      if (confirmed != true) return;
+    }
+    widget.settings.setApproval(value);
+  }
+
+  @override
+  Widget build(BuildContext context) => ListenableBuilder(
+    listenable: widget.settings,
+    builder: (context, _) {
+      const controlWidth = 220.0;
+      return Wrap(
+        spacing: 16,
+        runSpacing: 8,
+        crossAxisAlignment: WrapCrossAlignment.center,
+        children: [
+          SizedBox(
+            width: controlWidth,
+            child: DropdownButtonHideUnderline(
+              child: DropdownButton<AgentApprovalPreset>(
+                value: widget.settings.approval,
+                isDense: true,
+                isExpanded: true,
+                onChanged: (value) {
+                  if (value != null) {
+                    unawaited(_selectApproval(value));
+                  }
+                },
+                items: const [
+                  DropdownMenuItem(
+                    value: AgentApprovalPreset.ask,
+                    child: Text('Ask for approval'),
+                  ),
+                  DropdownMenuItem(
+                    value: AgentApprovalPreset.approveForMe,
+                    child: Text('Approve for me'),
+                  ),
+                  DropdownMenuItem(
+                    value: AgentApprovalPreset.fullAccess,
+                    child: Text('Full Access'),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          SizedBox(
+            width: controlWidth,
+            child: Row(
+              children: [
+                Expanded(
+                  child: DropdownButtonHideUnderline(
+                    child: DropdownButton<String?>(
+                      value: widget.settings.model,
+                      hint: const Text('Default model'),
+                      isDense: true,
+                      isExpanded: true,
+                      onChanged: widget.settings.setModel,
+                      items: [
+                        const DropdownMenuItem<String?>(
+                          value: null,
+                          child: Text('Default model'),
+                        ),
+                        if (widget.settings.model != null &&
+                            !widget.settings.models.any(
+                              (m) => m.id == widget.settings.model,
+                            ))
+                          DropdownMenuItem<String?>(
+                            value: widget.settings.model,
+                            child: Text(widget.settings.model!),
+                          ),
+                        ...widget.settings.models.map(
+                          (model) => DropdownMenuItem<String?>(
+                            value: model.id,
+                            child: Text(model.displayName),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 6),
+                ContextWindowIndicator(model: widget.settings.selectedModel),
+              ],
+            ),
+          ),
+          if (widget.settings.loadingModels) const Text('Loading models…'),
+          if (widget.settings.modelError != null)
+            TextButton(
+              onPressed: widget.loadModels == null
+                  ? null
+                  : () => widget.settings.loadModels(widget.loadModels!),
+              child: Text(widget.settings.modelError!),
+            ),
+          if (widget.appliesNextTurn) const Text('Applies next turn'),
+        ],
+      );
+    },
+  );
 }
 
 class ContextWindowIndicator extends StatelessWidget {
@@ -10454,16 +10700,9 @@ class ProjectTerminalBody extends StatelessWidget {
             autofocus: false,
             theme: ditchTerminalTheme(context),
             padding: const EdgeInsets.all(8),
-            onKeyEvent: onEscape == null
-                ? null
-                : (_, event) {
-                    if (event is KeyDownEvent &&
-                        event.logicalKey == LogicalKeyboardKey.escape) {
-                      onEscape!();
-                      return KeyEventResult.handled;
-                    }
-                    return KeyEventResult.ignored;
-                  },
+
+            // Terminal applications own Escape (for example Vim's Insert mode).
+            // The outer shortcut still restores when focus is outside this view.
           );
   }
 }
@@ -10627,6 +10866,8 @@ class AddProjectKindDialog extends StatelessWidget {
       child: Column(
         mainAxisSize: MainAxisSize.min,
         children: [
+          const Text(projectWriteDisclosure),
+          const SizedBox(height: 12),
           ListTile(
             leading: const Icon(Icons.laptop_mac_outlined),
             title: const Text('Local Project'),
@@ -10711,6 +10952,7 @@ class _AddRemoteProjectDialogState extends State<AddRemoteProjectDialog> {
   final _password = TextEditingController();
   final _path = TextEditingController();
   final _name = TextEditingController();
+  String? _inferredName;
   List<Map<String, dynamic>> _hosts = const [];
   List<Map<String, dynamic>> _entries = const [];
   Map<String, dynamic>? _setup;
@@ -10961,11 +11203,13 @@ class _AddRemoteProjectDialogState extends State<AddRemoteProjectDialog> {
                   .map((item) => Map<String, dynamic>.from(item))
                   .toList()
             : const [];
-        if (_name.text.isEmpty) {
-          _name.text =
-              _path.text.split('/').where((v) => v.isNotEmpty).lastOrNull ??
-              alias;
+        final inferred =
+            _path.text.split('/').where((v) => v.isNotEmpty).lastOrNull ??
+            alias;
+        if (_name.text.trim().isEmpty || _name.text == _inferredName) {
+          _name.text = inferred;
         }
+        _inferredName = inferred;
         _busy = false;
       });
     } on Object catch (error) {
@@ -11686,6 +11930,7 @@ class _AddProjectDialogState extends State<AddProjectDialog> {
         _path.text.trim().isNotEmpty &&
         _gitPolicy != null;
     return AlertDialog(
+      scrollable: true,
       title: const Text('Add Project'),
       content: SizedBox(
         width: 520,
@@ -11752,9 +11997,7 @@ class _AddProjectDialogState extends State<AddProjectDialog> {
             const SizedBox(height: 16),
             const Align(
               alignment: Alignment.centerLeft,
-              child: Text(
-                'Ditch will create and verify:\n.ditch/agents  •  .ditch/hooks  •  .ditch/mcp',
-              ),
+              child: Text(projectWriteDisclosure),
             ),
           ],
         ),
@@ -11784,9 +12027,22 @@ class _AddProjectDialogState extends State<AddProjectDialog> {
 }
 
 class StartCodexSessionDialog extends StatefulWidget {
-  const StartCodexSessionDialog({required this.initialPrompt, super.key});
+  const StartCodexSessionDialog({
+    required this.initialPrompt,
+    this.onTask,
+    this.settings,
+    this.loadModels,
+    this.skillsController,
+    this.projectId,
+    super.key,
+  });
 
   final String initialPrompt;
+  final AgentExecutionSettings? settings;
+  final Future<List<AgentModelOption>> Function()? loadModels;
+  final VoidCallback? onTask;
+  final SkillsController? skillsController;
+  final String? projectId;
 
   @override
   State<StartCodexSessionDialog> createState() =>
@@ -11795,6 +12051,9 @@ class StartCodexSessionDialog extends StatefulWidget {
 
 class _StartCodexSessionDialogState extends State<StartCodexSessionDialog> {
   late final TextEditingController _prompt;
+  AgentExecutionSettings get settings =>
+      widget.settings ?? agentExecutionSettings;
+  List<Map<String, dynamic>> selectedSkills = [];
   late final FocusNode _promptFocusNode;
 
   @override
@@ -11822,6 +12081,7 @@ class _StartCodexSessionDialogState extends State<StartCodexSessionDialog> {
     if (prompt.isEmpty) {
       return;
     }
+    settings.launchSkills = selectedSkills;
     Navigator.of(context).pop(prompt);
   }
 
@@ -11829,22 +12089,57 @@ class _StartCodexSessionDialogState extends State<StartCodexSessionDialog> {
   Widget build(BuildContext context) {
     return AlertDialog(
       title: const Text('Start Codex Session'),
+      scrollable: true,
       content: SizedBox(
         width: 640,
-        child: TextField(
-          controller: _prompt,
-          focusNode: _promptFocusNode,
-          autofocus: true,
-          minLines: 4,
-          maxLines: 8,
-          textInputAction: TextInputAction.newline,
-          decoration: const InputDecoration(
-            labelText: 'Initial prompt',
-            alignLabelWithHint: true,
-          ),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            TextField(
+              controller: _prompt,
+              focusNode: _promptFocusNode,
+              autofocus: true,
+              minLines: 4,
+              maxLines: 8,
+              textInputAction: TextInputAction.newline,
+              decoration: const InputDecoration(
+                labelText: 'Initial prompt',
+                alignLabelWithHint: true,
+              ),
+            ),
+            const SizedBox(height: 12),
+            AgentExecutionControls(
+              settings: settings,
+              loadModels: widget.loadModels,
+            ),
+            if (showUnfinishedFeatureControls &&
+                widget.skillsController != null &&
+                widget.projectId != null)
+              SkillChips(
+                skills: selectedSkills,
+                onEdit: () async {
+                  final result = await showSkillPicker(
+                    context,
+                    widget.skillsController!,
+                    widget.projectId!,
+                    selectedSkills,
+                  );
+                  if (result != null && mounted) {
+                    setState(() {
+                      selectedSkills = result;
+                    });
+                  }
+                },
+              ),
+          ],
         ),
       ),
       actions: [
+        if (showUnfinishedFeatureControls && widget.onTask != null)
+          TextButton(
+            onPressed: widget.onTask,
+            child: const Text("Create / select task…"),
+          ),
         TextButton(
           onPressed: () => Navigator.of(context).pop(),
           child: const Text('Cancel'),

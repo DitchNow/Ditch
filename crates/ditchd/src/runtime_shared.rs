@@ -241,6 +241,17 @@ struct RuntimeState {
     store: DitchStore,
     projects: HashMap<String, Project>,
     agents: HashMap<AgentId, AgentRecord>,
+    tasks: HashMap<TaskId, Task>,
+    app_server_streams: HashMap<AgentId, String>,
+    acceptance_controls:HashMap<TaskId,AcceptanceControl>,
+    acceptance_waiters:HashMap<AgentId,mpsc::Sender<()>>,
+    acceptance_owners:std::collections::HashSet<AgentId>,
+    validator_owners:std::collections::HashSet<AgentId>,
+    skill_discovery: HashMap<ProjectId, Vec<ditch_core::SkillEntry>>,
+    writer_leases: HashMap<AgentId, WorkspaceLease>,
+    remote_write_uncertain: HashMap<AgentId,String>,
+    orphan_writer_groups: HashMap<AgentId,i32>,
+    remote_task_generation: HashMap<String,u64>,
     children: HashMap<AgentId, ActiveAgentChild>,
     remote_launching: HashSet<AgentId>,
     terminals: HashMap<uuid::Uuid, ProjectTerminalRecord>,
@@ -289,10 +300,10 @@ struct SetupTerminalRecord {
     exited: Arc<AtomicBool>,
 }
 
+#[derive(Clone)]
 struct AgentRecord {
     run: AgentRun,
     project_root: PathBuf,
-    allow_non_git: bool,
     messages: Vec<AgentChatMessage>,
     terminal_failure: Option<String>,
 }
@@ -312,7 +323,21 @@ impl RuntimeState {
         let mut store = DitchStore::open(&paths).map_err(io::Error::other)?;
         edition::initialize_store(&mut store)?;
         store.reconcile_active_agents().map_err(io::Error::other)?;
+        store.reconcile_tasks().map_err(io::Error::other)?;
         let durable = store.load().map_err(io::Error::other)?;
+        let mut writer_leases=HashMap::new();
+        let mut orphan_writer_groups=HashMap::new();
+        let mut remote_write_uncertain=HashMap::new();
+        for (id,lease,pid) in store.writer_reservations().map_err(io::Error::other)? {
+            if lease.target != "local" {
+                if let Some(alias)=durable.projects.iter().find_map(|p| match &p.execution_target { ProjectExecutionTarget::Remote {remote_machine_id,ssh_host_alias} if remote_machine_id.to_string()==lease.target => Some(ssh_host_alias.clone()), _=>None }) {
+                    remote_write_uncertain.insert(id,alias); writer_leases.insert(id,lease);
+                } else { store.release_writer(id).map_err(io::Error::other)?; }
+            } else if let Some(pid)=pid.filter(|pid|process_group_exists(*pid)) {
+                orphan_writer_groups.insert(id,pid);writer_leases.insert(id,lease);
+            } else { store.release_writer(id).map_err(io::Error::other)?; }
+        }
+
         let projects = durable
             .projects
             .into_iter()
@@ -334,7 +359,6 @@ impl RuntimeState {
                     AgentRecord {
                         run,
                         project_root: project.root.clone(),
-                        allow_non_git: project.git_policy == ProjectGitPolicy::AllowOutsideGit,
                         messages: agent.messages,
                         terminal_failure: agent.terminal_failure,
                     },
@@ -363,11 +387,21 @@ impl RuntimeState {
         #[cfg(not(target_os = "macos"))]
         let installation_identity = FileIdentityStore::new(&legacy_identity_path).load_or_create();
         let installation_identity = Arc::new(installation_identity.map_err(io::Error::other)?);
+        let validator_owners=store.validator_owners().map_err(io::Error::other)?;
         Ok(Self {
             paths,
             store,
             projects,
             agents,
+            app_server_streams: HashMap::new(),
+            validator_owners,
+            acceptance_controls:HashMap::new(), acceptance_waiters:HashMap::new(), acceptance_owners:std::collections::HashSet::new(),
+            skill_discovery: HashMap::new(),
+            tasks: durable.tasks.into_iter().map(|t|(t.id,t)).collect(),
+            writer_leases,
+            remote_write_uncertain,
+            orphan_writer_groups,
+            remote_task_generation: HashMap::new(),
             children: HashMap::new(),
             remote_launching: HashSet::new(),
             terminals: HashMap::new(),
@@ -405,13 +439,22 @@ impl RuntimeState {
     fn runtime_status(&self) -> RuntimeStatus {
         let mut capabilities = vec![
             format!("edition_{RUNTIME_EDITION}"),
+            "tasks_v1".to_owned(),
+            "acceptance_v1".to_owned(),
+            "identified_tasks_v1".to_owned(),
+            "board_workflow_v1".to_owned(),
+            "coordinator_concurrency_v1".to_owned(),
+            "bounded_context_v1".to_owned(),
             "persistent_sessions_v1".to_owned(),
+            "app_server_sessions_v2".to_owned(),
             "attention_stream_v1".to_owned(),
             "transcript_pagination_v1".to_owned(),
             "project_files_v1".to_owned(),
             "persistent_attention_read_v1".to_owned(),
             "always_on_web_access_v1".to_owned(),
             "ssh_remote_runtime_v1".to_owned(),
+            "skills_v1".to_owned(),
+            "app_server_only_v1".to_owned(),
             "remote_directory_picker_v1".to_owned(),
             format!(
                 "remote_runtime_protocol_v{}",
@@ -448,7 +491,7 @@ impl RuntimeState {
                             | AgentState::Blocked
                     )
                 })
-                .count(),
+                .count().max(self.writer_leases.len()),
             attention_count: self.attention.len(),
             unread_attention_count: self
                 .attention
@@ -485,7 +528,7 @@ impl RuntimeState {
                 })
                 .collect(),
             projects: self.projects.values().cloned().collect(),
-            tasks: Vec::new(),
+            tasks: self.tasks.values().cloned().collect(),
             agents: self
                 .agents
                 .values()
@@ -498,6 +541,10 @@ impl RuntimeState {
     }
 
     fn broadcast(&mut self, event: ServerEvent) {
+        if let ServerEvent::AgentChanged(run) = &event {
+            if !run.can_stop && !self.children.contains_key(&run.id) && !matches!(run.state,AgentState::Starting | AgentState::Working | AgentState::Stopping | AgentState::AwaitingApproval) { self.release_writer(run.id); }
+            self.sync_agent_task(run.id);
+        }
         let is_attention_event = matches!(
             event,
             ServerEvent::AttentionRaised(_)
@@ -639,6 +686,7 @@ fn start_remote_reconciler(state: Arc<Mutex<RuntimeState>>) {
                             connections.disconnect(&alias);
                             break;
                         }
+                        let task_generation = *state.lock().unwrap().remote_task_generation.get(&alias).unwrap_or(&0);
                         let result = (|| {
                             let ServerResponse::RuntimeStatus(status) = connections
                                 .request(&alias, ClientRequest::RuntimeStatus)
@@ -674,6 +722,7 @@ fn start_remote_reconciler(state: Arc<Mutex<RuntimeState>>) {
                                 &projects,
                                 status.instance_id,
                                 snapshot,
+                                task_generation,
                             );
                             update_remote_presence(&state, &alias, "online", None);
                             ensure_remote_event_subscription(&state, &alias);
@@ -744,12 +793,14 @@ fn ensure_remote_event_subscription(state: &Arc<Mutex<RuntimeState>>, alias: &st
                     })
                     .cloned()
                     .collect::<Vec<_>>();
+                let task_generation = *guard.remote_task_generation.get(&alias_for_event).unwrap_or(&0);
                 reconcile_remote_snapshot_locked(
                     &mut guard,
                     &alias_for_event,
                     &projects,
                     epoch,
                     snapshot,
+                    task_generation,
                 );
             } else {
                 forward_remote_event_locked(&mut guard, &alias_for_event, event);
@@ -782,6 +833,26 @@ fn forward_remote_event(state: &Arc<Mutex<RuntimeState>>, alias: &str, event: Se
 
 fn forward_remote_event_locked(state: &mut RuntimeState, alias: &str, event: ServerEvent) {
     match event {
+        ServerEvent::AgentStreamingText {agent_id,text} => {
+            if state.remote_agent_hosts.get(&agent_id).is_some_and(|host|host==alias) { state.broadcast(ServerEvent::AgentStreamingText{agent_id,text}); }
+        }
+        ServerEvent::SkillsChanged {project_id} => {
+            if project_id.is_some_and(|id|state.projects.values().any(|p|p.id==id&&ssh_remote::remote_alias(p)==Some(alias))) {state.broadcast(ServerEvent::SkillsChanged{project_id});}
+        }
+        ServerEvent::TaskChanged(task) => {
+            *state.remote_task_generation.entry(alias.into()).or_default() += 1;
+            if state.projects.values().any(|p|p.id == task.project_id && ssh_remote::remote_alias(p) == Some(alias))
+                && state.tasks.get(&task.id).is_none_or(|old|old.revision <= task.revision) {
+                    state.update_remote_task(task.clone()); state.broadcast(ServerEvent::TaskChanged(task));
+            }
+        }
+        ServerEvent::TaskDeleted {task_id,project_id} => {
+            *state.remote_task_generation.entry(alias.into()).or_default() += 1;
+            if state.projects.values().any(|p|p.id == project_id && ssh_remote::remote_alias(p) == Some(alias)) {
+                state.tasks.remove(&task_id); state.broadcast(ServerEvent::TaskDeleted {task_id,project_id});
+            }
+        }
+
         ServerEvent::AgentChanged(run) => {
             let owns_project = state.projects.values().any(|project| {
                 project.id == run.project_id
@@ -904,8 +975,9 @@ fn reconcile_remote_snapshot(
     projects: &[Project],
     epoch: uuid::Uuid,
     snapshot: Snapshot,
+    task_generation: u64,
 ) {
-    reconcile_remote_snapshot_locked(&mut state.lock().unwrap(), alias, projects, epoch, snapshot);
+    reconcile_remote_snapshot_locked(&mut state.lock().unwrap(), alias, projects, epoch, snapshot, task_generation);
 }
 
 fn reconcile_remote_snapshot_locked(
@@ -914,6 +986,7 @@ fn reconcile_remote_snapshot_locked(
     projects: &[Project],
     epoch: Uuid,
     snapshot: Snapshot,
+    task_generation: u64,
 ) {
     let project_ids = projects
         .iter()
@@ -942,6 +1015,14 @@ fn reconcile_remote_snapshot_locked(
         );
     }
 
+    if *state.remote_task_generation.get(alias).unwrap_or(&0) == task_generation {
+        let remote_ids:HashSet<_>=snapshot.tasks.iter().map(|t|t.id).collect();
+        state.tasks.retain(|id,t|t.remote_pending || !project_ids.contains(&t.project_id) || remote_ids.contains(id));
+        for task in snapshot.tasks.into_iter().filter(|t|project_ids.contains(&t.project_id)) { state.update_remote_task(task); }
+    }
+    let uncertain:Vec<_>=state.remote_write_uncertain.iter().filter_map(|(id,host)|(host == alias).then_some(*id)).collect();
+    for id in uncertain { state.remote_write_uncertain.remove(&id); state.release_writer(id); }
+    for run in &snapshot.agents { if !run.can_stop { state.release_writer(run.id); } }
     let authoritative_ids = snapshot
         .agents
         .iter()
@@ -984,7 +1065,6 @@ fn reconcile_remote_snapshot_locked(
             AgentRecord {
                 run,
                 project_root: project.root.clone(),
-                allow_non_git: project.git_policy == ProjectGitPolicy::AllowOutsideGit,
                 messages,
                 terminal_failure: None,
             },
@@ -1100,13 +1180,26 @@ fn handle_client(mut stream: UnixStream, state: Arc<Mutex<RuntimeState>>) -> io:
     let request = {
         let mut reader = BufReader::new(stream.try_clone()?);
         let mut line = String::new();
-        reader.read_line(&mut line)?;
+        (&mut reader).take(8 * 1024 * 1024 + 1).read_line(&mut line)?;
+        if line.len()>8*1024*1024 {return Err(io::Error::new(io::ErrorKind::InvalidData,"Runtime request exceeds 8 MiB"));}
         serde_json::from_str::<Envelope<ClientRequest>>(&line)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?
     };
 
     let request_id = request.id;
     let request = request.body;
+    if matches!(request, ClientRequest::GitHub(_)) && !github::native_peer(&stream) {
+        let response = Envelope::new(protocol_error("client_not_authorized", "GitHub integration requires the Ditch native client"));
+        serde_json::to_writer(&mut stream, &response)?;
+        stream.write_all(b"\n")?;
+        return Ok(());
+    }
+    if let Err(message)=edition::authorize_client(&stream,&request,&state) {
+        let response=Envelope::new(protocol_error("client_not_authorized",message));
+        stream.write_all(serde_json::to_string(&response).map_err(io::Error::other)?.as_bytes())?;
+        stream.write_all(b"\n")?;
+        return Ok(());
+    }
     if let ClientRequest::SubscribeEvents { .. } = request {
         return subscribe(stream, state);
     }
@@ -1751,6 +1844,9 @@ fn handle_request(request: ClientRequest, state: Arc<Mutex<RuntimeState>>) -> Se
             state.broadcast(ServerEvent::ProjectChanged(project.clone()));
             ServerResponse::ProjectCreated(project)
         }
+        ClientRequest::SkillRequest(request) => handle_skill_request(state,request),
+        ClientRequest::TaskRequest(request) => handle_task_request(state,request),
+        ClientRequest::GitHub(request) => github::handle(state, request),
         ClientRequest::DeleteProject { project_id } => delete_project_for_target(state, project_id),
         ClientRequest::StartCodexSession {
             project_id,
@@ -1797,12 +1893,16 @@ fn handle_request(request: ClientRequest, state: Arc<Mutex<RuntimeState>>) -> Se
                     execution_profile,
                 )
             } else {
-                start_codex_session(
+                let project = project_id
+                    .and_then(|id| project_by_id(&state, id))
+                    .unwrap_or_else(|| project_for_launch(&state, project_name, project_root));
+                start_app_server_session(
                     state,
-                    project_name,
-                    project_root,
+                    project.id,
+                    project.name,
+                    project.root.to_string_lossy().into_owned(),
+                    None,
                     prompt,
-                    mode,
                     execution_profile,
                 )
             }
@@ -1845,11 +1945,15 @@ fn handle_request(request: ClientRequest, state: Arc<Mutex<RuntimeState>>) -> Se
                     execution_profile,
                 )
             } else {
-                resume_codex_session(
+                let project = project_id
+                    .and_then(|id| project_by_id(&state, id))
+                    .unwrap_or_else(|| project_for_launch(&state, project_name, project_root));
+                start_app_server_session(
                     state,
-                    project_name,
-                    project_root,
-                    thread_id,
+                    project.id,
+                    project.name,
+                    project.root.to_string_lossy().into_owned(),
+                    Some(thread_id),
                     prompt,
                     execution_profile,
                 )
@@ -1913,7 +2017,7 @@ fn handle_request(request: ClientRequest, state: Arc<Mutex<RuntimeState>>) -> Se
                     },
                 )
             } else {
-                list_agent_models(state, provider)
+                list_agent_models(state, provider, project_id)
             }
         }
         ClientRequest::OpenProjectTerminal {
@@ -1943,6 +2047,7 @@ fn handle_request(request: ClientRequest, state: Arc<Mutex<RuntimeState>>) -> Se
                 relative_path,
             },
         ),
+        ClientRequest::ReadProjectContext {project_id,relative_path,max_bytes} => project_file_request_for_target(state,project_id,ClientRequest::ReadProjectContext{project_id,relative_path,max_bytes}),
         ClientRequest::ReadProjectFile {
             project_id,
             relative_path,
@@ -2339,6 +2444,14 @@ fn project_file_request_for_target(
     };
     if project.is_remote() {
         return match request {
+            ClientRequest::ReadProjectContext { .. } => {
+                let alias=ssh_remote::remote_alias(&project).unwrap();
+                let connections=state.lock().unwrap().remote_connections.clone();
+                match connections.request(alias,ClientRequest::RuntimeStatus) {
+                    Ok(ServerResponse::RuntimeStatus(status)) if status.capabilities.iter().any(|c|c=="bounded_context_v1") => forward_project_command(&state,&project,request),
+                    _=>protocol_error("unsupported_context", "Install a runtime supporting bounded project context reads on this SSH host"),
+                }
+            }
             ClientRequest::ListProjectDirectory { .. } | ClientRequest::ReadProjectFile { .. } => {
                 forward_project_command(&state, &project, request)
             }
@@ -2353,6 +2466,7 @@ fn project_file_request_for_target(
         ClientRequest::ListProjectDirectory { relative_path, .. } => {
             list_project_directory(state, project_id, &relative_path)
         }
+        ClientRequest::ReadProjectContext {relative_path,max_bytes,..} => read_project_context(state,project_id,&relative_path,max_bytes),
         ClientRequest::ReadProjectFile { relative_path, .. } => {
             read_project_file(state, project_id, &relative_path)
         }
@@ -2805,6 +2919,7 @@ fn delete_project_for_target(
         state
             .projects
             .retain(|_, candidate| candidate.id != project_id);
+        state.tasks.retain(|_,t|t.project_id != project_id);
         state.broadcast(ServerEvent::ProjectDeleted { project_id });
         return ServerResponse::Accepted;
     }
@@ -2889,7 +3004,6 @@ fn cache_remote_agent(
         AgentRecord {
             run: run.clone(),
             project_root: project.root.clone(),
-            allow_non_git: project.git_policy == ProjectGitPolicy::AllowOutsideGit,
             messages: Vec::new(),
             terminal_failure: None,
         },
@@ -2910,11 +3024,6 @@ fn forward_remote_start(
     let Some(alias) = ssh_remote::remote_alias(&project).map(str::to_owned) else {
         return protocol_error("wrong_execution_target", "project is not remote");
     };
-    let connections = state
-        .lock()
-        .expect("runtime state lock should not be poisoned")
-        .remote_connections
-        .clone();
     ensure_remote_event_subscription(&state, &alias);
     let request = ClientRequest::StartRemoteCodexAppServerSession {
         project_id: project.id,
@@ -2923,8 +3032,8 @@ fn forward_remote_start(
         prompt,
         execution_profile,
     };
-    match connections.request(&alias, request) {
-        Ok(ServerResponse::AgentStarted(run)) => {
+    match remote_writer_request(&state, &project, request) {
+        ServerResponse::AgentStarted(run) => {
             if !cache_remote_agent(&state, &alias, &project, &run) {
                 return protocol_error(
                     "agent_target_conflict",
@@ -2933,8 +3042,7 @@ fn forward_remote_start(
             }
             ServerResponse::AgentStarted(run)
         }
-        Ok(response) => response,
-        Err(error) => protocol_error("remote_unavailable", error.to_string()),
+        response => response,
     }
 }
 
@@ -2950,11 +3058,6 @@ fn forward_remote_resume(
     let Some(alias) = ssh_remote::remote_alias(&project).map(str::to_owned) else {
         return protocol_error("wrong_execution_target", "project is not remote");
     };
-    let connections = state
-        .lock()
-        .expect("runtime state lock should not be poisoned")
-        .remote_connections
-        .clone();
     ensure_remote_event_subscription(&state, &alias);
     let request = ClientRequest::ResumeRemoteCodexAppServerSession {
         project_id: project.id,
@@ -2964,8 +3067,8 @@ fn forward_remote_resume(
         prompt,
         execution_profile,
     };
-    match connections.request(&alias, request) {
-        Ok(ServerResponse::AgentStarted(run)) => {
+    match remote_writer_request(&state, &project, request) {
+        ServerResponse::AgentStarted(run) => {
             if !cache_remote_agent(&state, &alias, &project, &run) {
                 return protocol_error(
                     "agent_target_conflict",
@@ -2974,8 +3077,7 @@ fn forward_remote_resume(
             }
             ServerResponse::AgentStarted(run)
         }
-        Ok(response) => response,
-        Err(error) => protocol_error("remote_unavailable", error.to_string()),
+        response => response,
     }
 }
 
@@ -3002,24 +3104,13 @@ fn forward_or_prompt_agent(
     execution_profile: AgentExecutionProfile,
 ) -> ServerResponse {
     let remote = remote_agent_connection(&state, agent_id);
-    let Some((alias, connections)) = remote else {
-        if state.lock().unwrap().remote_runtime {
-            return prompt_remote_app_server_agent(state, agent_id, prompt, execution_profile);
-        }
+    let Some((alias, _connections)) = remote else {
         return prompt_agent(state, agent_id, prompt, execution_profile);
     };
     ensure_remote_event_subscription(&state, &alias);
-    match connections.request(
-        &alias,
-        ClientRequest::PromptRemoteCodexAppServerAgent {
-            agent_id,
-            prompt,
-            execution_profile,
-        },
-    ) {
-        Ok(response) => response,
-        Err(error) => protocol_error("remote_unavailable", error.to_string()),
-    }
+    let project = { let locked=state.lock().expect("runtime lock poisoned"); locked.agents.get(&agent_id).and_then(|r|locked.projects.values().find(|p|p.id == r.run.project_id)).cloned() };
+    let Some(project)=project else { return protocol_error("project_not_found","Project unavailable"); };
+    remote_writer_request(&state,&project,ClientRequest::PromptRemoteCodexAppServerAgent { agent_id,prompt,execution_profile })
 }
 
 fn forward_or_stop_agent(
@@ -3197,6 +3288,9 @@ fn shutdown_runtime(state: Arc<Mutex<RuntimeState>>) -> ServerResponse {
         let mut state = state
             .lock()
             .expect("runtime state lock should not be poisoned");
+        edition::shutdown(&mut state);
+        for control in state.acceptance_controls.values(){control.cancel.store(true,Ordering::Release);let _=control.wake.send(());}
+
         let children = std::mem::take(&mut state.children);
         for child in children.values() {
             signal_process_group(child.process_group_id, libc::SIGKILL);
@@ -3237,18 +3331,34 @@ fn shutdown_runtime(state: Arc<Mutex<RuntimeState>>) -> ServerResponse {
     ServerResponse::Accepted
 }
 
-fn list_agent_models(state: Arc<Mutex<RuntimeState>>, provider: AgentProvider) -> ServerResponse {
+fn list_agent_models(
+    state: Arc<Mutex<RuntimeState>>,
+    provider: AgentProvider,
+    project_id: Option<ProjectId>,
+) -> ServerResponse {
     if provider != AgentProvider::Codex {
         return ServerResponse::AgentModels(Vec::new());
     }
-    let binary = active_codex_binary(&state);
-    let Some(binary) = binary else {
+    let cwd = match project_id {
+        Some(id) => match project_by_id(&state, id) {
+            Some(project) => project.root,
+            None => {
+                return protocol_error("project_not_found", "The selected project no longer exists");
+            }
+        },
+        None => match std::env::current_dir() {
+            Ok(cwd) => cwd,
+            Err(error) => return protocol_error("codex_models_failed", error.to_string()),
+        },
+    };
+    let Some(binary) = active_codex_binary(&state) else {
         return protocol_error(
             "codex_not_found",
             "No working Codex CLI installation was found for this user",
         );
     };
-    match discover_codex_models(&binary) {
+    let home = state.lock().unwrap().codex_home.clone();
+    match discover_codex_models(&binary, &cwd, home.as_deref()) {
         Ok(models) => ServerResponse::AgentModels(models),
         Err(error) => protocol_error("codex_models_failed", error.to_string()),
     }
@@ -3450,53 +3560,22 @@ fn close_project_terminal(
     ServerResponse::Accepted
 }
 
-fn discover_codex_models(binary: &str) -> io::Result<Vec<AgentModel>> {
-    let mut command = Command::new(binary);
-    command.args(["app-server", "--stdio"]);
-    if let Some(path) = effective_path_for_binary(Path::new(binary)) {
-        command.env("PATH", path);
-    }
-    let mut child = command
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()?;
-    let mut stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| io::Error::other("missing app-server stdin"))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| io::Error::other("missing app-server stdout"))?;
-    writeln!(
-        stdin,
-        "{}",
-        serde_json::json!({"id":1,"method":"initialize","params":{"clientInfo":{"name":"the_ditch","title":"The Ditch","version":env!("CARGO_PKG_VERSION")}}})
-    )?;
-    writeln!(
-        stdin,
-        "{}",
-        serde_json::json!({"method":"initialized","params":{}})
-    )?;
-    writeln!(
-        stdin,
-        "{}",
-        serde_json::json!({"id":2,"method":"model/list","params":{"limit":100,"includeHidden":false}})
-    )?;
-    stdin.flush()?;
+fn discover_codex_models(
+    binary: &str,
+    cwd: &Path,
+    home: Option<&Path>,
+) -> io::Result<Vec<AgentModel>> {
+    let mut client = app_server_client::Client::open(binary, cwd, home, None)?;
     let mut models = Vec::new();
-    for line in BufReader::new(stdout).lines() {
-        let value: Value = serde_json::from_str(&line?)?;
-        if value.get("id").and_then(Value::as_i64) != Some(2) {
-            continue;
-        }
-        if let Some(error) = value.get("error") {
-            let _ = child.kill();
-            return Err(io::Error::other(error.to_string()));
-        }
-        for item in value
-            .pointer("/result/data")
+    let mut cursor: Option<String> = None;
+    let mut seen_cursors = HashSet::new();
+    loop {
+        let result = client.call(
+            "model/list",
+            serde_json::json!({"limit":100,"includeHidden":false,"cursor":cursor}),
+        )?;
+        for item in result
+            .get("data")
             .and_then(Value::as_array)
             .into_iter()
             .flatten()
@@ -3539,167 +3618,33 @@ fn discover_codex_models(binary: &str) -> io::Result<Vec<AgentModel>> {
                     }),
             });
         }
-        break;
+        cursor = result
+            .get("nextCursor")
+            .and_then(Value::as_str)
+            .filter(|cursor| !cursor.is_empty())
+            .map(str::to_owned);
+        let Some(next) = cursor.as_ref() else {
+            break;
+        };
+        if !seen_cursors.insert(next.clone()) {
+            return Err(io::Error::other(
+                "Codex model discovery repeated a pagination cursor",
+            ));
+        }
     }
-    let _ = child.kill();
-    let _ = child.wait();
     Ok(models)
 }
 
+include!("task_runtime.rs");
+include!("acceptance_runtime.rs");
+include!("skill_runtime.rs");
 include!("remote_app_server_runtime.rs");
-
-fn start_codex_session(
-    state: Arc<Mutex<RuntimeState>>,
-    project_name: String,
-    project_root: String,
-    prompt: String,
-    mode: CodexLaunchMode,
-    execution_profile: ditch_core::AgentExecutionProfile,
-) -> ServerResponse {
-    let project = project_for_launch(&state, project_name, project_root);
-    if let Err(error) = ensure_project_metadata(&project) {
-        return protocol_error("project_metadata_failed", error.to_string());
-    }
-
-    let now = Utc::now();
-    let mut run = AgentRun {
-        id: AgentId::new(),
-        provider: AgentProvider::Codex,
-        state: AgentState::Starting,
-        can_stop: false,
-        launch_mode: mode.clone(),
-        execution_profile: execution_profile.clone(),
-        project_id: project.id,
-        task_id: None,
-        pane_id: None,
-        native_session_id: None,
-        codex_title: None,
-        user_title: None,
-        origin_codex_home: std::env::var("CODEX_HOME").ok(),
-        current_prompt: Some(prompt.clone()),
-        last_visible_action: Some("Starting Codex".to_owned()),
-        state_confidence: 0.8,
-        state_evidence: "Ditch Runtime accepted the session and is launching Codex.".to_owned(),
-        started_at: now,
-        updated_at: now,
-        finished_at: None,
-        exit_code: None,
-        resume_block_reason: None,
-    };
-
-    if let Err(error) = verify_project_git_policy(&project) {
-        return error;
-    }
-    let allow_non_git = project.git_policy == ProjectGitPolicy::AllowOutsideGit;
-    let user_message = AgentChatMessage {
-        agent_id: run.id,
-        role: AgentChatRole::User,
-        text: prompt.clone(),
-        created_at: Utc::now(),
-    };
-    let binary = active_codex_binary(&state);
-    let Some(binary) = binary else {
-        return persist_launch_failure(
-            &state,
-            project,
-            run,
-            user_message,
-            allow_non_git,
-            "No working Codex CLI installation was found. Choose an existing installation in Ditch settings.".to_owned(),
-        );
-    };
-    let child = match spawn_codex_child(
-        &binary,
-        &project.root,
-        &prompt,
-        &mode,
-        None,
-        allow_non_git,
-        &execution_profile,
-    ) {
-        Ok(child) => Arc::new(Mutex::new(child)),
-        Err(error) => {
-            return persist_launch_failure(
-                &state,
-                project,
-                run,
-                user_message,
-                allow_non_git,
-                error.to_string(),
-            );
-        }
-    };
-    let process_group_id = child
-        .lock()
-        .expect("child lock should not be poisoned")
-        .id() as i32;
-
-    let run_id = uuid::Uuid::new_v4();
-    run.state = AgentState::Working;
-    run.can_stop = true;
-    run.updated_at = Utc::now();
-    run.state_evidence = "Codex process is running under Ditch Runtime.".to_owned();
-
-    {
-        let mut state = state
-            .lock()
-            .expect("runtime state lock should not be poisoned");
-        if let Err(error) = state.store.upsert_project(&project) {
-            let _ = child
-                .lock()
-                .expect("child lock should not be poisoned")
-                .kill();
-            return protocol_error("project_store_failed", error.to_string());
-        }
-        let home = state
-            .codex_home
-            .as_ref()
-            .map(|value| value.to_string_lossy().into_owned());
-        if let Err(error) = state
-            .store
-            .persist_new_agent(&run, &user_message, home.as_deref())
-        {
-            let _ = child
-                .lock()
-                .expect("child lock should not be poisoned")
-                .kill();
-            return protocol_error("agent_store_failed", error.to_string());
-        }
-        state.projects.insert(project.root_key(), project.clone());
-        state.agents.insert(
-            run.id,
-            AgentRecord {
-                run: run.clone(),
-                project_root: project.root.clone(),
-                allow_non_git,
-                messages: vec![user_message.clone()],
-                terminal_failure: None,
-            },
-        );
-        state.children.insert(
-            run.id,
-            ActiveAgentChild {
-                run_id,
-                process_group_id,
-                child: Arc::clone(&child),
-                app_server: false,
-            },
-        );
-        state.broadcast(ServerEvent::ProjectChanged(project));
-        state.broadcast(ServerEvent::AgentChanged(run.clone()));
-        state.broadcast(ServerEvent::AgentMessageAppended(user_message));
-    }
-
-    attach_codex_io(Arc::clone(&state), run.id, run_id, child);
-    ServerResponse::AgentStarted(run)
-}
 
 fn persist_launch_failure(
     state: &Arc<Mutex<RuntimeState>>,
     project: Project,
     mut run: AgentRun,
     user_message: AgentChatMessage,
-    allow_non_git: bool,
     error: String,
 ) -> ServerResponse {
     run.state = AgentState::Failed;
@@ -3749,13 +3694,14 @@ fn persist_launch_failure(
         return protocol_error("agent_store_failed", store_error.to_string());
     }
     state.projects.insert(project.root_key(), project.clone());
+    let mut messages = state.agents.get(&run.id).map(|r| r.messages.clone()).unwrap_or_default();
+    messages.extend([user_message.clone(), system_message.clone()]);
     state.agents.insert(
         run.id,
         AgentRecord {
             run: run.clone(),
             project_root: project.root.clone(),
-            allow_non_git,
-            messages: vec![user_message.clone(), system_message.clone()],
+            messages,
             terminal_failure: Some(error.clone()),
         },
     );
@@ -3806,155 +3752,6 @@ fn verify_project_git_policy(project: &Project) -> Result<(), ServerResponse> {
     }
 }
 
-fn resume_codex_session(
-    state: Arc<Mutex<RuntimeState>>,
-    project_name: String,
-    project_root: String,
-    thread_id: String,
-    prompt: String,
-    execution_profile: ditch_core::AgentExecutionProfile,
-) -> ServerResponse {
-    let project = project_for_launch(&state, project_name, project_root);
-    if let Err(message) = validate_thread_project(&state, &thread_id, &project.root) {
-        return protocol_error("codex_thread_project_mismatch", message);
-    }
-    if let Err(error) = ensure_project_metadata(&project) {
-        return protocol_error("project_metadata_failed", error.to_string());
-    }
-
-    let now = Utc::now();
-    let mut run = AgentRun {
-        id: AgentId::new(),
-        provider: AgentProvider::Codex,
-        state: AgentState::Starting,
-        can_stop: false,
-        launch_mode: CodexLaunchMode::Exec,
-        execution_profile: execution_profile.clone(),
-        project_id: project.id,
-        task_id: None,
-        pane_id: None,
-        native_session_id: Some(thread_id.clone()),
-        codex_title: None,
-        user_title: None,
-        origin_codex_home: std::env::var("CODEX_HOME").ok(),
-        current_prompt: Some(prompt.clone()),
-        last_visible_action: Some("Resuming Codex".to_owned()),
-        state_confidence: 0.8,
-        state_evidence: "Ditch Runtime accepted the session and is resuming Codex.".to_owned(),
-        started_at: now,
-        updated_at: now,
-        finished_at: None,
-        exit_code: None,
-        resume_block_reason: None,
-    };
-
-    if let Err(error) = verify_project_git_policy(&project) {
-        return error;
-    }
-    let allow_non_git = project.git_policy == ProjectGitPolicy::AllowOutsideGit;
-    let user_message = AgentChatMessage {
-        agent_id: run.id,
-        role: AgentChatRole::User,
-        text: prompt.clone(),
-        created_at: Utc::now(),
-    };
-    let binary = active_codex_binary(&state);
-    let Some(binary) = binary else {
-        return persist_launch_failure(
-            &state,
-            project,
-            run,
-            user_message,
-            allow_non_git,
-            "No working Codex CLI installation was found. Choose an existing installation in Ditch settings.".to_owned(),
-        );
-    };
-    let child = match spawn_codex_child(
-        &binary,
-        &project.root,
-        &prompt,
-        &CodexLaunchMode::Exec,
-        Some(&thread_id),
-        allow_non_git,
-        &execution_profile,
-    ) {
-        Ok(child) => Arc::new(Mutex::new(child)),
-        Err(error) => {
-            return persist_launch_failure(
-                &state,
-                project,
-                run,
-                user_message,
-                allow_non_git,
-                error.to_string(),
-            );
-        }
-    };
-    let process_group_id = child
-        .lock()
-        .expect("child lock should not be poisoned")
-        .id() as i32;
-
-    let run_id = uuid::Uuid::new_v4();
-    run.state = AgentState::Working;
-    run.can_stop = true;
-    run.updated_at = Utc::now();
-    run.state_evidence = "Codex resume process is running under Ditch Runtime.".to_owned();
-
-    {
-        let mut state = state
-            .lock()
-            .expect("runtime state lock should not be poisoned");
-        if let Err(error) = state.store.upsert_project(&project) {
-            let _ = child
-                .lock()
-                .expect("child lock should not be poisoned")
-                .kill();
-            return protocol_error("project_store_failed", error.to_string());
-        }
-        let home = state
-            .codex_home
-            .as_ref()
-            .map(|value| value.to_string_lossy().into_owned());
-        if let Err(error) = state
-            .store
-            .persist_new_agent(&run, &user_message, home.as_deref())
-        {
-            let _ = child
-                .lock()
-                .expect("child lock should not be poisoned")
-                .kill();
-            return protocol_error("agent_store_failed", error.to_string());
-        }
-        state.projects.insert(project.root_key(), project.clone());
-        state.agents.insert(
-            run.id,
-            AgentRecord {
-                run: run.clone(),
-                project_root: project.root.clone(),
-                allow_non_git,
-                messages: vec![user_message.clone()],
-                terminal_failure: None,
-            },
-        );
-        state.children.insert(
-            run.id,
-            ActiveAgentChild {
-                run_id,
-                process_group_id,
-                child: Arc::clone(&child),
-                app_server: false,
-            },
-        );
-        state.broadcast(ServerEvent::ProjectChanged(project));
-        state.broadcast(ServerEvent::AgentChanged(run.clone()));
-        state.broadcast(ServerEvent::AgentMessageAppended(user_message));
-    }
-
-    attach_codex_io(Arc::clone(&state), run.id, run_id, child);
-    ServerResponse::AgentStarted(run)
-}
-
 fn validate_thread_project(
     state: &Arc<Mutex<RuntimeState>>,
     thread_id: &str,
@@ -3984,125 +3781,11 @@ fn prompt_agent(
     state: Arc<Mutex<RuntimeState>>,
     agent_id: AgentId,
     prompt: String,
-    execution_profile: ditch_core::AgentExecutionProfile,
+    execution_profile: AgentExecutionProfile,
 ) -> ServerResponse {
-    let (project_root, thread_id, allow_non_git) = {
-        let state = state
-            .lock()
-            .expect("runtime state lock should not be poisoned");
-        let Some(record) = state.agents.get(&agent_id) else {
-            return protocol_error("agent_not_found", "agent session was not found");
-        };
-        if state.children.contains_key(&agent_id)
-            || matches!(
-                record.run.state,
-                AgentState::Starting | AgentState::Working | AgentState::Stopping
-            )
-        {
-            return protocol_error("agent_busy", "agent session is already working");
-        }
-        if record.run.native_session_id.is_none()
-            && matches!(
-                record.run.state,
-                AgentState::Failed | AgentState::Interrupted | AgentState::Stale
-            )
-        {
-            return protocol_error(
-                "agent_not_resumable",
-                "This session cannot accept another prompt because Codex never created a thread. Start a new agent instead.",
-            );
-        }
-        let current_home = state
-            .codex_home
-            .as_ref()
-            .map(|value| value.to_string_lossy());
-        if record.run.origin_codex_home.as_deref() != current_home.as_deref() {
-            return protocol_error(
-                "codex_home_mismatch",
-                "This session belongs to a different CODEX_HOME. Start a new agent with the current Codex account.",
-            );
-        }
-        (
-            record.project_root.clone(),
-            record.run.native_session_id.clone(),
-            record.allow_non_git,
-        )
-    };
-
-    let binary = active_codex_binary(&state);
-    let Some(binary) = binary else {
-        let message = "No working Codex CLI installation was found. Choose an existing installation in Ditch settings.".to_owned();
-        record_terminal_failure(&state, agent_id, message.clone(), None);
-        finish_agent(&state, agent_id, None, Some(1));
-        return protocol_error("codex_not_found", message);
-    };
-
-    let child = match spawn_codex_child(
-        &binary,
-        &project_root,
-        &prompt,
-        &CodexLaunchMode::Exec,
-        thread_id.as_deref(),
-        allow_non_git,
-        &execution_profile,
-    ) {
-        Ok(child) => Arc::new(Mutex::new(child)),
-        Err(error) => {
-            let message = error.to_string();
-            record_terminal_failure(&state, agent_id, message.clone(), None);
-            finish_agent(&state, agent_id, None, Some(1));
-            return protocol_error("codex_start_failed", message);
-        }
-    };
-
-    let user_message = AgentChatMessage {
-        agent_id,
-        role: AgentChatRole::User,
-        text: prompt.clone(),
-        created_at: Utc::now(),
-    };
-    let run_id = uuid::Uuid::new_v4();
-    let process_group_id = child
-        .lock()
-        .expect("child lock should not be poisoned")
-        .id() as i32;
-
-    {
-        let mut state = state
-            .lock()
-            .expect("runtime state lock should not be poisoned");
-        let Some(record) = state.agents.get_mut(&agent_id) else {
-            return protocol_error("agent_not_found", "agent session was not found");
-        };
-        record.run.state = AgentState::Working;
-        record.run.can_stop = true;
-        record.run.execution_profile = execution_profile;
-        record.run.current_prompt = Some(prompt);
-        record.run.last_visible_action = Some("Prompt sent to Codex".to_owned());
-        record.run.updated_at = Utc::now();
-        record.run.finished_at = None;
-        record.run.exit_code = None;
-        record.run.resume_block_reason = None;
-        record.terminal_failure = None;
-        record.messages.push(user_message.clone());
-        let run = record.run.clone();
-        state.persist_message(&user_message);
-        state.persist_agent(agent_id);
-        state.children.insert(
-            agent_id,
-            ActiveAgentChild {
-                run_id,
-                process_group_id,
-                child: Arc::clone(&child),
-                app_server: false,
-            },
-        );
-        state.broadcast(ServerEvent::AgentChanged(run));
-        state.broadcast(ServerEvent::AgentMessageAppended(user_message));
-    }
-
-    attach_codex_io(Arc::clone(&state), agent_id, run_id, child);
-    ServerResponse::Accepted
+    // Historical Legacy profiles remain readable. Every subsequent turn resumes
+    // the saved native thread through App Server with the newly selected profile.
+    prompt_app_server_agent(state, agent_id, prompt, execution_profile)
 }
 
 fn stop_agent(state: Arc<Mutex<RuntimeState>>, agent_id: AgentId) -> ServerResponse {
@@ -4110,16 +3793,8 @@ fn stop_agent(state: Arc<Mutex<RuntimeState>>, agent_id: AgentId) -> ServerRespo
         let mut state = state
             .lock()
             .expect("runtime state lock should not be poisoned");
+        if let Some(control)=state.acceptance_controls.values().find(|c|c.owner==agent_id) {control.cancel.store(true,Ordering::Release);let _=control.wake.send(());}
         let active = state.children.get(&agent_id).cloned();
-        if active.as_ref().is_some_and(|child| child.app_server) {
-            state.app_server_turns.remove(&agent_id);
-            state
-                .app_server_permission_agents
-                .retain(|_, owner| *owner != agent_id);
-            state
-                .pending_permissions
-                .retain(|_, request| request.agent_id != Some(agent_id));
-        }
         let Some(record) = state.agents.get_mut(&agent_id) else {
             return protocol_error("agent_not_found", "agent session was not found");
         };
@@ -4153,6 +3828,25 @@ fn stop_agent(state: Arc<Mutex<RuntimeState>>, agent_id: AgentId) -> ServerRespo
         return ServerResponse::Accepted;
     };
 
+    if active.app_server {
+        let control = state
+            .lock()
+            .unwrap()
+            .app_server_turns
+            .get(&agent_id)
+            .cloned();
+        if let Some(control) = control
+            && control.interrupt().is_ok()
+                && wait_for_run_finalization(
+                    &state,
+                    agent_id,
+                    active.run_id,
+                    Duration::from_secs(3),
+                )
+            {
+                return ServerResponse::Accepted;
+            }
+    }
     signal_process(active.process_group_id, libc::SIGINT);
     let mut group_stopped = wait_for_process_group_exit(&active, STOP_INTERRUPT_GRACE);
     if !group_stopped {
@@ -4185,6 +3879,7 @@ fn stop_agent(state: Arc<Mutex<RuntimeState>>, agent_id: AgentId) -> ServerRespo
 }
 
 fn force_kill_agent(state: Arc<Mutex<RuntimeState>>, agent_id: AgentId) -> ServerResponse {
+    {let locked=state.lock().unwrap();if let Some(control)=locked.acceptance_controls.values().find(|c|c.owner==agent_id){control.cancel.store(true,Ordering::Release);let _=control.wake.send(());}}
     let active = {
         let state = state
             .lock()
@@ -4295,6 +3990,8 @@ fn finalize_stopped_run(state: &Arc<Mutex<RuntimeState>>, agent_id: AgentId, run
         return;
     }
     state.children.remove(&agent_id);
+    state.app_server_turns.remove(&agent_id);
+    clear_agent_permissions(&mut state, agent_id);
     let Some(record) = state.agents.get_mut(&agent_id) else {
         return;
     };
@@ -4368,7 +4065,7 @@ fn delete_project(
                         | AgentState::Blocked
                 ))
     });
-    if has_active_agent {
+    if has_active_agent || state.tasks.values().any(|task|task.project_id==project_id && state.task_live(task)) {
         return protocol_error(
             "project_active",
             "Stop this project's active agents before deleting it.",
@@ -4426,6 +4123,9 @@ fn rename_agent(
     ServerResponse::Accepted
 }
 
+// Historical CLI output fixtures exercise persisted-session and Stop behavior.
+// Production turns use the App Server event adapter.
+#[cfg(test)]
 fn attach_codex_io(
     state: Arc<Mutex<RuntimeState>>,
     agent_id: AgentId,
@@ -4523,6 +4223,7 @@ fn attach_codex_io(
     });
 }
 
+#[cfg(test)]
 fn handle_codex_stdout_line(
     state: &Arc<Mutex<RuntimeState>>,
     agent_id: AgentId,
@@ -4683,6 +4384,7 @@ fn handle_codex_stdout_line(
     }
 }
 
+#[cfg(test)]
 fn codex_session_title(value: &Value) -> Option<String> {
     [
         value.get("title"),
@@ -4721,6 +4423,7 @@ fn codex_title_from_state(thread_id: &str) -> Option<String> {
         .filter(|title| !title.is_empty())
 }
 
+#[cfg(test)]
 fn looks_like_diagnostic(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
     lower.starts_with("error")
@@ -4729,17 +4432,20 @@ fn looks_like_diagnostic(text: &str) -> bool {
         || lower.contains("usage limit")
 }
 
+#[cfg(test)]
 fn is_terminal_codex_stderr(text: &str) -> bool {
     text.starts_with("Error:")
         || text.starts_with("Failed to create session:")
         || text.starts_with("failed to initialize thread persistence:")
 }
 
+#[cfg(test)]
 fn is_transient_reconnect(message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
     lower.contains("reconnecting...") && lower.contains("stream disconnected before completion")
 }
 
+#[cfg(test)]
 fn extract_diagnostic_message(value: &Value) -> Option<String> {
     let error = value
         .get("error")
@@ -4786,6 +4492,7 @@ fn extract_diagnostic_message(value: &Value) -> Option<String> {
     }
 }
 
+#[cfg(test)]
 fn extract_explicit_error(value: &Value) -> Option<String> {
     if value.get("error").is_some()
         || value.pointer("/item/error").is_some()
@@ -4913,7 +4620,10 @@ fn update_agent_action(
     let Some(record) = state.agents.get_mut(&agent_id) else {
         return;
     };
-    if record.run.state == AgentState::Stopping {
+    if matches!(
+        record.run.state,
+        AgentState::Stopping | AgentState::AwaitingApproval
+    ) {
         return;
     }
     record.run.last_visible_action = Some(action.to_owned());
@@ -5015,6 +4725,7 @@ fn finish_agent(
     {
         return;
     }
+    let acceptance_owned=state.acceptance_owners.contains(&agent_id);
     let app_server = state
         .children
         .get(&agent_id)
@@ -5130,7 +4841,8 @@ fn finish_agent(
     };
     state.persist_agent(agent_id);
     state.broadcast(ServerEvent::AgentChanged(run));
-    if let Some(attention) = attention {
+    if let Some(wake)=state.acceptance_waiters.get(&agent_id) {let _=wake.send(());}
+    if let Some(attention) = attention.filter(|_|!acceptance_owned) {
         if let Err(error) = state.store.upsert_attention(&attention) {
             eprintln!("{RUNTIME_IDENTITY} failed to persist attention: {error}");
         }
@@ -5162,121 +4874,6 @@ fn notification_summary(value: &str) -> String {
     let mut summary = compact.chars().take(MAX_CHARS - 1).collect::<String>();
     summary.push('…');
     summary
-}
-
-fn spawn_codex_child(
-    binary: &str,
-    cwd: &Path,
-    prompt: &str,
-    mode: &CodexLaunchMode,
-    resume_thread: Option<&str>,
-    allow_non_git: bool,
-    execution_profile: &AgentExecutionProfile,
-) -> io::Result<Child> {
-    let mut command = Command::new(binary);
-    // A dedicated process group lets Stop terminate Codex and every helper it
-    // launches. Killing only the direct CLI process can orphan the app-server
-    // process that owns the thread-store writer lock.
-    command.process_group(0);
-    command.args(codex_child_args(
-        cwd,
-        mode,
-        resume_thread,
-        allow_non_git,
-        execution_profile,
-    ));
-    command.current_dir(cwd);
-    command.env("TERM", "xterm-256color");
-    if let Some(path) = effective_path_for_binary(Path::new(binary)) {
-        command.env("PATH", path);
-    }
-    if let Some(codex_home) = std::env::var_os("CODEX_HOME") {
-        command.env("CODEX_HOME", codex_home);
-    }
-    command.stdin(Stdio::piped());
-    command.stdout(Stdio::piped());
-    command.stderr(Stdio::piped());
-
-    let mut child = command.spawn()?;
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(prompt.as_bytes())?;
-        stdin.write_all(b"\n")?;
-        stdin.flush()?;
-    }
-    Ok(child)
-}
-
-fn codex_child_args(
-    cwd: &Path,
-    mode: &CodexLaunchMode,
-    resume_thread: Option<&str>,
-    allow_non_git: bool,
-    execution_profile: &AgentExecutionProfile,
-) -> Vec<String> {
-    let mut args = Vec::new();
-    match execution_profile.approval {
-        AgentApprovalPreset::Ask => args.extend([
-            "--sandbox".to_owned(),
-            "workspace-write".to_owned(),
-            "--ask-for-approval".to_owned(),
-            "on-request".to_owned(),
-        ]),
-        AgentApprovalPreset::ApproveForMe => args.extend([
-            "--sandbox".to_owned(),
-            "workspace-write".to_owned(),
-            "--ask-for-approval".to_owned(),
-            "never".to_owned(),
-        ]),
-        AgentApprovalPreset::FullAccess => {
-            args.push("--dangerously-bypass-approvals-and-sandbox".to_owned())
-        }
-    }
-    if execution_profile.approval != AgentApprovalPreset::FullAccess {
-        args.extend([
-            "--config".to_owned(),
-            "sandbox_workspace_write.network_access=true".to_owned(),
-        ]);
-    }
-    args.extend([
-        "--config".to_owned(),
-        "web_search=\"live\"".to_owned(),
-        "--config".to_owned(),
-        "tools.web_search=true".to_owned(),
-    ]);
-    if let Some(model) = execution_profile.model.as_deref() {
-        args.extend(["--model".to_owned(), model.to_owned()]);
-    }
-    if let Some(effort) = execution_profile.reasoning_effort.as_deref() {
-        args.extend([
-            "--config".to_owned(),
-            format!("model_reasoning_effort=\"{effort}\""),
-        ]);
-    }
-    if resume_thread.is_none() {
-        args.extend(["--cd".to_owned(), cwd.to_string_lossy().into_owned()]);
-    }
-    args.push("exec".to_owned());
-    if allow_non_git {
-        args.push("--skip-git-repo-check".to_owned());
-    }
-    if let Some(thread_id) = resume_thread {
-        args.extend([
-            "resume".to_owned(),
-            "--json".to_owned(),
-            thread_id.to_owned(),
-            "-".to_owned(),
-        ]);
-    } else {
-        match mode {
-            CodexLaunchMode::Exec | CodexLaunchMode::InteractiveTui => args.extend([
-                "--json".to_owned(),
-                "--color".to_owned(),
-                "never".to_owned(),
-                "-".to_owned(),
-            ]),
-        }
-    }
-    args
 }
 
 fn canonical_project_root(root: &Path) -> PathBuf {
@@ -5403,6 +5000,19 @@ fn list_project_directory(
     })
 }
 
+fn read_project_context(state:Arc<Mutex<RuntimeState>>,project_id:ProjectId,relative:&str,max_bytes:u32)->ServerResponse {
+    let project=match project_for_file_request(&state,project_id){Ok(p)=>p,Err(e)=>return e};
+    let result=(||->Result<ProjectFile,String>{
+        if !(1..=32768).contains(&max_bytes){return Err("Context reads are limited to 32 KiB".into());}
+        for part in Path::new(relative).components(){let name=part.as_os_str().to_string_lossy().to_ascii_lowercase();
+            if name.starts_with('.') || ["secret","credential","token","password"].iter().any(|s|name.contains(s)) || name.ends_with(".pem") || name.ends_with(".key") || name.ends_with(".env") || name.ends_with(".p12") || name.ends_with(".pfx") || name=="auth.json" || name.starts_with("id_rsa") || name.starts_with("id_ed25519"){return Err("Hidden and secret-pattern paths are excluded from context reads".into());}}
+        let bytes=acceptance_evidence::read_scoped_file(&project.root,relative,max_bytes)?;
+        if bytes.len()>max_bytes as usize || bytes.contains(&0){return Err("Context exceeds byte limit or contains binary data".into());}
+        let content=String::from_utf8(bytes.clone()).map_err(|e|e.to_string())?;
+        Ok(ProjectFile{project_id,relative_path:relative.into(),content:acceptance_evidence::redact(&content),revision:file_revision(&bytes),size:bytes.len() as u64})
+    })();match result{Ok(file)=>ServerResponse::ProjectFile(file),Err(e)=>protocol_error("context_rejected",e)}
+}
+
 fn read_project_file(
     state: Arc<Mutex<RuntimeState>>,
     project_id: ProjectId,
@@ -5417,7 +5027,11 @@ fn read_project_file(
         Ok(_) => return protocol_error("not_a_file", "path is not a file"),
         Err(response) => return response,
     };
-    let bytes = match fs::read(&path) {
+    let bytes = match fs::File::open(&path).and_then(|file| {
+        let mut bytes=Vec::new();
+        std::io::Read::take(file, MAX_EDITABLE_FILE_BYTES + 1).read_to_end(&mut bytes)?;
+        Ok(bytes)
+    }) {
         Ok(bytes) => bytes,
         Err(error) => return protocol_error("file_read_failed", error.to_string()),
     };
@@ -5528,18 +5142,6 @@ fn check_codex_readiness(binary: Option<&str>) -> CodexReadiness {
         Duration::from_secs(5),
         path.clone(),
     );
-    let exec_help = command_text(
-        executable,
-        &["exec", "--help"],
-        Duration::from_secs(5),
-        path.clone(),
-    );
-    let resume_help = command_text(
-        executable,
-        &["exec", "resume", "--help"],
-        Duration::from_secs(5),
-        path.clone(),
-    );
     let update_supported = root_help
         .as_deref()
         .is_some_and(|help| help.contains("update"));
@@ -5550,100 +5152,15 @@ fn check_codex_readiness(binary: Option<&str>) -> CodexReadiness {
     if version.is_none() {
         issues.push("The selected executable did not report a Codex version.".to_owned());
     }
-    let required_global_flags = [
-        "--ask-for-approval",
-        "--sandbox",
-        "--cd",
-        "--model",
-        "--config",
-        "--dangerously-bypass-approvals-and-sandbox",
-    ];
-    match root_help.as_deref() {
-        Some(help) => {
-            let missing = required_global_flags
-                .iter()
-                .filter(|flag| !help.contains(**flag))
-                .copied()
-                .collect::<Vec<_>>();
-            if !missing.is_empty() {
-                issues.push(format!(
-                    "This Codex CLI is missing required global options: {}.",
-                    missing.join(", ")
-                ));
-            }
-        }
-        None => issues.push("The selected Codex CLI does not provide command help.".to_owned()),
-    }
-    let required_exec_flags = ["--json", "--color", "--skip-git-repo-check"];
-    match exec_help.as_deref() {
-        Some(help) => {
-            let missing = required_exec_flags
-                .iter()
-                .filter(|flag| !help.contains(**flag))
-                .copied()
-                .collect::<Vec<_>>();
-            if !missing.is_empty() {
-                issues.push(format!(
-                    "This Codex CLI is missing required exec options: {}.",
-                    missing.join(", ")
-                ));
-            }
-        }
-        None => issues.push("The selected Codex CLI does not provide `codex exec`.".to_owned()),
-    }
-    if resume_help.is_none() {
-        issues.push("The selected Codex CLI does not support resumable exec sessions.".to_owned());
-    }
-    let launch_probes: [(&str, &[&str]); 3] = [
-        (
-            "automatic workspace launch",
-            &[
-                "--sandbox",
-                "workspace-write",
-                "--ask-for-approval",
-                "never",
-                "--config",
-                "sandbox_workspace_write.network_access=true",
-                "--config",
-                "web_search=\"live\"",
-                "--config",
-                "tools.web_search=true",
-                "exec",
-                "--help",
-            ],
-        ),
-        (
-            "approval-based resumed launch",
-            &[
-                "--sandbox",
-                "workspace-write",
-                "--ask-for-approval",
-                "on-request",
-                "exec",
-                "resume",
-                "--help",
-            ],
-        ),
-        (
-            "full-access launch",
-            &[
-                "--dangerously-bypass-approvals-and-sandbox",
-                "exec",
-                "--help",
-            ],
-        ),
-    ];
-    for (label, args) in launch_probes {
-        if let Err(detail) = codex_argument_probe(executable, args, path.clone()) {
-            issues.push(format!("Codex rejected Ditch's {label}: {detail}"));
-        }
+    if let Err(detail) = codex_argument_probe(executable, &["app-server", "--help"], path.clone()) {
+        issues.push(format!("Codex App Server is unavailable: {detail}"));
     }
     if !root_help
         .as_deref()
         .is_some_and(|help| help.contains("app-server"))
     {
         issues.push(
-            "The selected Codex CLI cannot provide the model catalog required by Ditch.".to_owned(),
+            "The selected Codex CLI lacks app-server support required for Ditch sessions and model selection.".to_owned(),
         );
     }
 
@@ -5668,8 +5185,6 @@ fn check_codex_readiness(binary: Option<&str>) -> CodexReadiness {
         .unwrap_or_else(|| "Codex diagnostics could not be completed.".to_owned())
     });
     let compatible = version.is_some()
-        && exec_help.is_some()
-        && resume_help.is_some()
         && !issues.iter().any(|issue| !issue.contains("not signed in"));
 
     CodexReadiness {
@@ -6170,11 +5685,8 @@ mod tests {
             r#"#!/bin/sh
 case "$1 $2 $3" in
   "--version  ") echo "codex-cli 1.2.3" ;;
-  "--help  ") echo "exec app-server doctor update login --ask-for-approval --sandbox --cd --model --config --dangerously-bypass-approvals-and-sandbox" ;;
-  "exec --help ") echo "--json --color --skip-git-repo-check" ;;
-  "exec resume --help") echo "resume" ;;
-  "--sandbox workspace-write --ask-for-approval") echo "accepted" ;;
-  "--dangerously-bypass-approvals-and-sandbox exec --help") echo "accepted" ;;
+  "--help  ") echo "app-server doctor update login" ;;
+  "app-server --help ") echo "App Server" ;;
   "login status ") echo "Logged in" ;;
   "doctor --json ") echo '{}' ;;
   *) exit 2 ;;
@@ -6206,7 +5718,7 @@ esac
             r#"#!/bin/sh
 case "$1 $2 $3" in
   "--version  ") echo "codex-cli 0.1.0" ;;
-  "--help  ") echo "exec app-server login" ;;
+  "--help  ") echo "exec login" ;;
   "exec --help ") echo "--json --color --skip-git-repo-check" ;;
   "exec resume --help") echo "resume" ;;
   "login status ") echo "Logged in" ;;
@@ -6226,7 +5738,7 @@ esac
             readiness
                 .issues
                 .iter()
-                .any(|issue| issue.contains("missing required global options"))
+                .any(|issue| issue.contains("lacks app-server support"))
         );
         assert!(
             readiness
@@ -6238,6 +5750,7 @@ esac
     }
 
     include!("remote_recovery_tests.rs");
+    include!("model_discovery_tests.rs");
 
     pub(super) fn test_runtime() -> RuntimeState {
         let root = std::env::temp_dir().join(format!("ditchd-test-{}", uuid::Uuid::new_v4()));
@@ -6434,182 +5947,6 @@ esac
     }
 
     #[test]
-    fn new_codex_session_disables_color_output() {
-        let args = codex_child_args(
-            Path::new("/tmp/project"),
-            &CodexLaunchMode::Exec,
-            None,
-            false,
-            &AgentExecutionProfile::default(),
-        );
-
-        assert_eq!(
-            args,
-            vec![
-                "--sandbox",
-                "workspace-write",
-                "--ask-for-approval",
-                "never",
-                "--config",
-                "sandbox_workspace_write.network_access=true",
-                "--config",
-                "web_search=\"live\"",
-                "--config",
-                "tools.web_search=true",
-                "--cd",
-                "/tmp/project",
-                "exec",
-                "--json",
-                "--color",
-                "never",
-                "-"
-            ]
-        );
-    }
-
-    #[test]
-    fn resumed_codex_session_does_not_pass_color_flag() {
-        let args = codex_child_args(
-            Path::new("/tmp/project"),
-            &CodexLaunchMode::Exec,
-            Some("thread-123"),
-            false,
-            &AgentExecutionProfile::default(),
-        );
-
-        assert_eq!(
-            args,
-            vec![
-                "--sandbox",
-                "workspace-write",
-                "--ask-for-approval",
-                "never",
-                "--config",
-                "sandbox_workspace_write.network_access=true",
-                "--config",
-                "web_search=\"live\"",
-                "--config",
-                "tools.web_search=true",
-                "exec",
-                "resume",
-                "--json",
-                "thread-123",
-                "-"
-            ]
-        );
-        assert!(!args.iter().any(|arg| arg == "--color"));
-    }
-
-    #[test]
-    fn explicit_non_git_policy_adds_skip_check_to_new_and_resumed_sessions() {
-        let fresh = codex_child_args(
-            Path::new("/tmp/project"),
-            &CodexLaunchMode::Exec,
-            None,
-            true,
-            &AgentExecutionProfile::default(),
-        );
-        let resumed = codex_child_args(
-            Path::new("/tmp/project"),
-            &CodexLaunchMode::Exec,
-            Some("thread-123"),
-            true,
-            &AgentExecutionProfile::default(),
-        );
-
-        assert_eq!(
-            fresh[fresh.iter().position(|arg| arg == "exec").unwrap() + 1],
-            "--skip-git-repo-check"
-        );
-        assert_eq!(
-            resumed[resumed.iter().position(|arg| arg == "exec").unwrap() + 1],
-            "--skip-git-repo-check"
-        );
-    }
-
-    #[test]
-    fn codex_execution_profile_maps_approval_and_model_flags() {
-        let ask = AgentExecutionProfile {
-            model: Some("gpt-test".to_owned()),
-            reasoning_effort: Some("high".to_owned()),
-            approval: AgentApprovalPreset::Ask,
-        };
-        let ask_args = codex_child_args(
-            Path::new("/tmp/project"),
-            &CodexLaunchMode::Exec,
-            None,
-            false,
-            &ask,
-        );
-        assert!(
-            ask_args
-                .windows(2)
-                .any(|args| args == ["--model", "gpt-test"])
-        );
-        assert!(
-            ask_args
-                .windows(2)
-                .any(|args| args == ["--sandbox", "workspace-write"])
-        );
-        assert!(
-            ask_args
-                .windows(2)
-                .any(|args| args == ["--ask-for-approval", "on-request"])
-        );
-        assert!(
-            ask_args.windows(2).any(|args| {
-                args == ["--config", "sandbox_workspace_write.network_access=true"]
-            })
-        );
-        for setting in ["web_search=\"live\"", "tools.web_search=true"] {
-            assert!(
-                ask_args
-                    .windows(2)
-                    .any(|args| args == ["--config", setting])
-            );
-        }
-        let ask_exec = ask_args.iter().position(|arg| arg == "exec").unwrap();
-        for global in ["--ask-for-approval", "--sandbox", "--model", "--config"] {
-            assert!(ask_args.iter().position(|arg| arg == global).unwrap() < ask_exec);
-        }
-
-        let full_access = AgentExecutionProfile {
-            approval: AgentApprovalPreset::FullAccess,
-            ..Default::default()
-        };
-        let full_access_args = codex_child_args(
-            Path::new("/tmp/project"),
-            &CodexLaunchMode::Exec,
-            Some("thread-123"),
-            false,
-            &full_access,
-        );
-        assert!(
-            full_access_args
-                .iter()
-                .any(|arg| arg == "--dangerously-bypass-approvals-and-sandbox")
-        );
-        for setting in ["web_search=\"live\"", "tools.web_search=true"] {
-            assert!(
-                full_access_args
-                    .windows(2)
-                    .any(|args| args == ["--config", setting])
-            );
-        }
-        assert!(
-            full_access_args
-                .iter()
-                .position(|arg| arg == "--dangerously-bypass-approvals-and-sandbox")
-                .unwrap()
-                < full_access_args
-                    .iter()
-                    .position(|arg| arg == "exec")
-                    .unwrap()
-        );
-        assert!(!full_access_args.iter().any(|arg| arg == "--approve-for-me"));
-    }
-
-    #[test]
     fn workspace_permission_denials_are_recognized() {
         assert!(is_workspace_permission_denial(
             "patch rejected: writing is blocked by read-only sandbox; rejected by user approval settings"
@@ -6647,6 +5984,7 @@ esac
             agent_id,
             AgentRecord {
                 run: AgentRun {
+                    coordinator_group: None,
                     id: agent_id,
                     provider: AgentProvider::Codex,
                     state: AgentState::Stopping,
@@ -6671,7 +6009,6 @@ esac
                     resume_block_reason: None,
                 },
                 project_root: project.root,
-                allow_non_git: false,
                 messages: Vec::new(),
                 terminal_failure: None,
             },
@@ -6729,6 +6066,7 @@ esac
             agent_id,
             AgentRecord {
                 run: AgentRun {
+                    coordinator_group: None,
                     id: agent_id,
                     provider: AgentProvider::Codex,
                     state: AgentState::Working,
@@ -6753,7 +6091,6 @@ esac
                     resume_block_reason: None,
                 },
                 project_root: project.root,
-                allow_non_git: false,
                 messages: Vec::new(),
                 terminal_failure: None,
             },
@@ -6833,6 +6170,7 @@ esac
             agent_id,
             AgentRecord {
                 run: AgentRun {
+                    coordinator_group: None,
                     id: agent_id,
                     provider: AgentProvider::Codex,
                     state: AgentState::Working,
@@ -6857,7 +6195,6 @@ esac
                     resume_block_reason: None,
                 },
                 project_root: project.root,
-                allow_non_git: false,
                 messages: vec![AgentChatMessage {
                     agent_id,
                     role: AgentChatRole::System,
@@ -6915,6 +6252,7 @@ esac
             agent_id,
             AgentRecord {
                 run: AgentRun {
+                    coordinator_group: None,
                     id: agent_id,
                     provider: AgentProvider::Codex,
                     state: AgentState::Working,
@@ -6939,7 +6277,6 @@ esac
                     resume_block_reason: None,
                 },
                 project_root: project.root,
-                allow_non_git: false,
                 messages: Vec::new(),
                 terminal_failure: None,
             },
@@ -6976,6 +6313,7 @@ esac
             agent_id,
             AgentRecord {
                 run: AgentRun {
+                    coordinator_group: None,
                     id: agent_id,
                     provider: AgentProvider::Codex,
                     state: AgentState::Working,
@@ -7000,7 +6338,6 @@ esac
                     resume_block_reason: None,
                 },
                 project_root: project.root,
-                allow_non_git: false,
                 messages: Vec::new(),
                 terminal_failure: None,
             },
@@ -7052,6 +6389,7 @@ esac
             agent_id,
             AgentRecord {
                 run: AgentRun {
+                    coordinator_group: None,
                     id: agent_id,
                     provider: AgentProvider::Codex,
                     state: AgentState::Working,
@@ -7076,7 +6414,6 @@ esac
                     resume_block_reason: None,
                 },
                 project_root: project.root,
-                allow_non_git: false,
                 messages: Vec::new(),
                 terminal_failure: None,
             },
@@ -7115,6 +6452,7 @@ esac
             agent_id,
             AgentRecord {
                 run: AgentRun {
+                    coordinator_group: None,
                     id: agent_id,
                     provider: AgentProvider::Codex,
                     state: AgentState::Failed,
@@ -7139,7 +6477,6 @@ esac
                     resume_block_reason: None,
                 },
                 project_root: project.root,
-                allow_non_git: false,
                 messages: Vec::new(),
                 terminal_failure: None,
             },
@@ -7230,3 +6567,12 @@ esac
         ));
     }
 }
+
+#[cfg(test)]
+include!("task_tests.rs");
+
+#[cfg(test)]
+include!("skill_tests.rs");
+
+#[cfg(test)]
+include!("acceptance_tests.rs");

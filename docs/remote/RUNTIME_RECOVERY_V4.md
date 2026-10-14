@@ -2,7 +2,8 @@
 
 The remote daemon owns processes and durable state. SSH RPC/event bridges are
 clients: disconnecting a bridge never stops an agent or starts another turn.
-Local projects retain the existing local execution path.
+Local and remote projects now share the app-server session adapter. See
+[session controls and update requirements](../runtime-sessions.md).
 
 - Startup waits for initialize, thread/start or thread/resume, and turn/start
   responses in order. Client IDs are namespaced strings; server request IDs use
@@ -33,7 +34,9 @@ Local projects retain the existing local execution path.
 
 Use Reconnect for a transport retry and Remote Runtime Setup for installing or
 repairing the daemon. Protocol 3 daemons cannot accept new protocol 4 mutations;
-upgrade the remote artifact first. Ordinary reconnection does not install or
+upgrade the remote artifact first. New turns additionally require the
+`app_server_sessions_v2` capability; protocol 4 recovery controls remain usable
+while preparing that upgrade. Ordinary reconnection does not install or
 restart services. The SSH bridge starts a detached user daemon when none is
 reachable; a lifetime lock prevents competing daemon owners. Neither a service
 manager nor Linux lingering is required. Host policies that kill user processes

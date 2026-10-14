@@ -7,6 +7,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/gestures.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:xterm/xterm.dart';
 import 'package:the_ditch/main.dart';
 import 'package:the_ditch/application/command_center_controller.dart';
 import 'package:the_ditch/data/runtime_models.dart';
@@ -37,6 +38,42 @@ class _PendingRemoteSetupClient extends DitchRuntimeClient {
   }) => pending.future;
 }
 
+class _RemoteFolderClient extends DitchRuntimeClient {
+  _RemoteFolderClient()
+    : super(socketPath: '/tmp/ditch-folder-regression.sock');
+  @override
+  Future<List<Map<String, dynamic>>> discoverSshHosts() async => [
+    {'alias': 'fixture'},
+  ];
+  @override
+  Future<Map<String, dynamic>> checkRemoteSetup({
+    required String alias,
+    String? password,
+    bool rememberPassword = false,
+    bool trustUnknownHost = false,
+  }) async => {
+    'ready': true,
+    'home_directory': '/home/user',
+    'checks': [
+      {'key': 'codex_sandbox', 'state': 'ready'},
+    ],
+  };
+  @override
+  Future<Map<String, dynamic>> listRemoteDirectory(
+    String alias,
+    String absolutePath,
+  ) async => {
+    'absolute_path': absolutePath,
+    'entries': [
+      {
+        'name': 'next',
+        'absolute_path': '$absolutePath/next',
+        'is_directory': true,
+      },
+    ],
+  };
+}
+
 class _CurrentLicenseClient extends DitchRuntimeClient {
   _CurrentLicenseClient({required this.entitlement})
     : super(socketPath: '/tmp/ditch-current-license.sock');
@@ -49,6 +86,7 @@ class _CurrentLicenseClient extends DitchRuntimeClient {
     communityChecks++;
     return {
       'manifest': {
+        'release_id': '11111111-1111-4111-8111-111111111111',
         'edition': 'community',
         'release_sequence': 108,
         'version': '0.1.0',
@@ -1231,6 +1269,43 @@ void main() {
     },
   );
 
+  testWidgets(
+    'remote folder name follows navigation and preserves a custom name',
+    (tester) async {
+      tester.view.physicalSize = const Size(1200, 1000);
+      tester.view.devicePixelRatio = 1;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: AddRemoteProjectDialog(
+              client: _RemoteFolderClient(),
+              initialAlias: 'fixture',
+            ),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Connect'));
+      await tester.pumpAndSettle();
+      final nameField = find.byWidgetPredicate(
+        (w) => w is TextField && w.decoration?.labelText == 'Project name',
+      );
+      expect(tester.widget<TextField>(nameField).controller!.text, 'user');
+      await tester.tap(find.text('next'));
+      await tester.pumpAndSettle();
+      expect(tester.widget<TextField>(nameField).controller!.text, 'next');
+      await tester.enterText(nameField, 'Custom project');
+      await tester.tap(find.byTooltip('Go up'));
+      await tester.pumpAndSettle();
+      expect(
+        tester.widget<TextField>(nameField).controller!.text,
+        'Custom project',
+      );
+    },
+  );
+
   testWidgets('remote setup progress is pinned above the scrolling content', (
     tester,
   ) async {
@@ -2268,7 +2343,7 @@ void main() {
     await tester.pumpWidget(_testApp());
 
     expect(find.text('Ditch'), findsWidgets);
-    expect(find.text('PROJECTS'), findsOneWidget);
+    expect(find.byKey(const Key('project-result-count')), findsOneWidget);
     expect(find.text('Agents'), findsOneWidget);
     expect(find.text('Attention'), findsNothing);
     expect(find.byKey(const Key('notification-bell')), findsOneWidget);
@@ -2286,7 +2361,7 @@ void main() {
     expect(find.byKey(const Key('first-project-add')), findsNothing);
     expect(find.widgetWithText(AlertDialog, 'Add Project'), findsNothing);
     expect(find.text('/Users/tester/Projects/example'), findsNothing);
-    expect(find.text('PROJECTS'), findsNothing);
+    expect(find.byKey(const Key('project-result-count')), findsNothing);
   });
 
   testWidgets('first project action remains gated until Codex is ready', (
@@ -3058,6 +3133,65 @@ void main() {
     );
   });
 
+  testWidgets(
+    'New Agent remains available beside active user and Ditchmaster agents',
+    (tester) async {
+      final viewport = ConversationViewportController();
+      final listController = ScrollController();
+      addTearDown(viewport.dispose);
+      addTearDown(listController.dispose);
+      final sessions = [
+        AgentSession(
+          localId: 'manual-concurrent',
+          projectId: 'one',
+          provider: AgentProvider.codex,
+          status: AgentStatus.working,
+          canStop: true,
+          messages: [],
+        ),
+        AgentSession(
+          localId: 'managed-concurrent',
+          projectId: 'one',
+          coordinatorGroup: 'master-group',
+          provider: AgentProvider.codex,
+          status: AgentStatus.working,
+          canStop: true,
+          messages: [],
+        ),
+      ];
+      var starts = 0;
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: AgentsSurface(
+              sessions: sessions,
+              expandedAgentLocalId: null,
+              focusedAgentLocalId: null,
+              chatViewport: viewport,
+              agentListController: listController,
+              composerKey: GlobalKey<AgentComposerState>(),
+              headerKeyForAgent: _testAgentHeaderKey,
+              initialPrompt: '',
+              onStartCodex: () => starts++,
+              onSubmitPrompt: (_, _) {},
+              onStopCodex: (_) {},
+              onDeleteAgent: (_) {},
+              onRenameAgent: (_, _) {},
+              onFocusAgent: (_) {},
+              onToggleExpanded: (_) {},
+            ),
+          ),
+        ),
+      );
+      await tester.tap(find.byKey(const Key('agents-new-agent-button')));
+      await tester.tap(find.byKey(const Key('agents-new-agent-button')));
+      expect(starts, 2);
+      expect(find.text('User agent'), findsOneWidget);
+      expect(find.text('Ditchmaster agent'), findsOneWidget);
+      await tester.pumpWidget(const SizedBox());
+    },
+  );
+
   testWidgets('new agent action lives in the Agents header', (tester) async {
     await tester.pumpWidget(_testApp());
 
@@ -3213,6 +3347,42 @@ void main() {
       isNull,
     );
     document.dispose();
+  });
+
+  testWidgets('focused terminal receives Escape without restoring its pane', (
+    tester,
+  ) async {
+    final session = ProjectTerminalSession(
+      id: 'escape',
+      projectId: 'p',
+      shell: '/bin/sh',
+    );
+    final output = <String>[];
+    session.terminal.onOutput = output.add;
+    var restored = false;
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: CallbackShortcuts(
+            bindings: {
+              const SingleActivator(LogicalKeyboardKey.escape): () =>
+                  restored = true,
+            },
+            child: ProjectTerminalBody(
+              terminal: session,
+              onEscape: () => restored = true,
+            ),
+          ),
+        ),
+      ),
+    );
+    await tester.tap(find.byType(TerminalView));
+    await tester.pump();
+    await tester.sendKeyEvent(LogicalKeyboardKey.escape);
+    expect(restored, isFalse);
+    expect(output.join(), contains('\x1b'));
+    await tester.pumpWidget(const SizedBox.shrink());
+    await tester.pump(const Duration(seconds: 1));
   });
 
   testWidgets('maximized terminal restores with close or Escape', (

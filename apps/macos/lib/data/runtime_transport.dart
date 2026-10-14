@@ -34,11 +34,20 @@ class RuntimeTransport {
           .bind(socket)
           .transform(const LineSplitter())
           .first
-          .timeout(const Duration(seconds: 100));
+          .timeout(responseTimeout(body));
       return parseRuntimeResponseLine(line);
     } finally {
       socket.destroy();
     }
+  }
+
+  // GitHub reads have a runtime deadline of ten minutes, plus bounded cleanup.
+  // Keep the socket alive for batches instead of reporting failure before commit.
+  static Duration responseTimeout(Object body) {
+    if (body is Map && body['GitHub'] is Map) {
+      return const Duration(minutes: 12);
+    }
+    return const Duration(seconds: 100);
   }
 
   Future<Stream<Map<String, dynamic>>> subscribeEvents({
