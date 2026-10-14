@@ -6,6 +6,7 @@ import 'acceptance_review.dart';
 import 'package:flutter/material.dart';
 import 'application/task_board_controller.dart';
 import 'data/task_models.dart';
+import 'data/session_title.dart';
 import 'design_system/ditch_theme.dart';
 
 const projectWriteDisclosure =
@@ -1376,9 +1377,11 @@ class _TaskInspectorState extends State<_TaskInspector> {
                     },
                     icon: const Icon(Icons.chat_bubble_outline),
                     label: Text(
-                      agent?['user_title'] as String? ??
-                          agent?['codex_title'] as String? ??
-                          'Open linked agent chat',
+                      sessionDisplayName(
+                        agent?['user_title'] as String?,
+                        agent?['codex_title'] as String?,
+                        namingFailed: agent?['naming_failed'] == true,
+                      ),
                     ),
                   ),
                 if (!running &&
@@ -1456,9 +1459,11 @@ class _TaskInspectorState extends State<_TaskInspector> {
                         DropdownMenuItem(
                           value: a['id'] as String,
                           child: Text(
-                            a['user_title'] as String? ??
-                                a['codex_title'] as String? ??
-                                a['id'] as String,
+                            sessionDisplayName(
+                              a['user_title'] as String?,
+                              a['codex_title'] as String?,
+                              namingFailed: a['naming_failed'] == true,
+                            ),
                           ),
                         ),
                     ],

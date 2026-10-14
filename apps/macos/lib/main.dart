@@ -14,6 +14,7 @@ import 'application/project_sidebar_controller.dart';
 import 'application/product_update_controller.dart';
 import 'widgets/update_available_dot.dart';
 import 'data/project_models.dart';
+import 'data/session_title.dart';
 import 'widgets/project_sidebar.dart';
 
 import 'application/task_board_controller.dart';
@@ -694,6 +695,7 @@ class AgentSession {
     AgentExecutionSettings? executionSettings,
     this.codexThreadId,
     this.codexTitle,
+    this.namingFailed = false,
     this.userTitle,
     this.originCodexHome,
     this.currentPrompt,
@@ -723,6 +725,7 @@ class AgentSession {
   AgentStatus status;
   String? codexThreadId;
   String? codexTitle;
+  bool namingFailed;
   String? userTitle;
   final String? originCodexHome;
   String? currentPrompt;
@@ -743,13 +746,8 @@ class AgentSession {
   String streamingText = '';
   List<Map<String, dynamic>> attachedSkills;
 
-  String get displayName {
-    final override = userTitle?.trim();
-    if (override != null && override.isNotEmpty) return override;
-    final native = codexTitle?.trim();
-    if (native != null && native.isNotEmpty) return native;
-    return 'Codex';
-  }
+  String get displayName =>
+      sessionDisplayName(userTitle, codexTitle, namingFailed: namingFailed);
 
   bool get hasCodexThread => codexThreadId != null;
 
@@ -783,6 +781,7 @@ void reconcileAgentSession(List<AgentSession> sessions, AgentSession incoming) {
   existing.attachedSkills = incoming.attachedSkills;
   existing.codexThreadId = incoming.codexThreadId;
   existing.codexTitle = incoming.codexTitle;
+  existing.namingFailed = incoming.namingFailed;
   existing.userTitle = incoming.userTitle;
   existing.currentPrompt = incoming.currentPrompt;
   existing.lastVisibleAction = incoming.lastVisibleAction;
@@ -3941,7 +3940,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen>
   }
 
   Future<void> _renameAgent(AgentSession session, String? title) async {
-    final cleanTitle = title?.trim();
+    final cleanTitle = normalizeSessionTitle(title);
     final previous = session.userTitle;
     setState(() {
       session.userTitle = cleanTitle == null || cleanTitle.isEmpty
@@ -4563,6 +4562,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen>
       hasOlderMessages: messages.isNotEmpty,
       codexThreadId: agentJson['native_session_id']?.toString(),
       codexTitle: agentJson['codex_title']?.toString(),
+      namingFailed: agentJson['naming_failed'] == true,
       userTitle: agentJson['user_title']?.toString(),
       originCodexHome: agentJson['origin_codex_home']?.toString(),
       currentPrompt: agentJson['current_prompt']?.toString(),
@@ -8244,9 +8244,9 @@ class _EditableAgentTitleState extends State<EditableAgentTitle> {
   }
 
   void _save() {
-    final value = _controller.text.trim();
+    final value = normalizeSessionTitle(_controller.text);
     setState(() => _editing = false);
-    widget.onRename(value.isEmpty ? null : value);
+    widget.onRename(value);
   }
 
   void _cancel() {
@@ -8272,10 +8272,20 @@ class _EditableAgentTitleState extends State<EditableAgentTitle> {
     return Tooltip(
       message: widget.hasOverride
           ? 'Click to rename. Clear to restore the Codex title.'
+          : widget.title == sessionTitleFailed
+          ? 'Automatic naming failed. Click to rename, or save an empty name to retry.'
           : 'Click to rename',
       child: GestureDetector(
         behavior: HitTestBehavior.opaque,
-        onTap: () => setState(() => _editing = true),
+        onTap: () => setState(() {
+          _controller.text =
+              !widget.hasOverride &&
+                  (widget.title == sessionTitlePending ||
+                      widget.title == sessionTitleFailed)
+              ? ''
+              : widget.title;
+          _editing = true;
+        }),
         child: Text(widget.title),
       ),
     );

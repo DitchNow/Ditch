@@ -56,6 +56,7 @@ where
             pane_id: Some(pane.id),
             native_session_id: None,
             codex_title: None,
+            naming_failed: false,
             user_title: None,
             origin_codex_home: None,
             current_prompt: Some(request.prompt),

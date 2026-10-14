@@ -1,4 +1,148 @@
 // Included in the shared runtime tests: these run in both editions.
+#[test]
+fn session_title_live_updates_preserve_manual_rename_and_ignore_stale_or_duplicate_events() {
+    let mut runtime = test_runtime();
+    let id = recovery_agent(&mut runtime);
+    runtime.agents.get_mut(&id).unwrap().run.user_title = Some("My name".into());
+    let mut child = Command::new("/bin/sh")
+        .args(["-c", "exit 0"])
+        .spawn()
+        .unwrap();
+    child.wait().unwrap();
+    let run_id = Uuid::new_v4();
+    runtime.children.insert(
+        id,
+        ActiveAgentChild {
+            run_id,
+            process_group_id: child.id() as i32,
+            child: Arc::new(Mutex::new(child)),
+            app_server: true,
+        },
+    );
+    let (tx, rx) = mpsc::sync_channel(2048);
+    runtime.subscribers.push(tx);
+    let state = Arc::new(Mutex::new(runtime));
+    assert!(!handle_remote_app_server_event(
+        &state,
+        id,
+        Uuid::new_v4(),
+        codex_app_server::Event::Title("Stale name".into()),
+    ));
+    assert!(state.lock().unwrap().agents[&id].run.codex_title.is_none());
+    assert!(!handle_remote_app_server_event(
+        &state,
+        id,
+        run_id,
+        codex_app_server::Event::Title(" Fix\n login ".into()),
+    ));
+    {
+        let locked = state.lock().unwrap();
+        assert_eq!(
+            locked.agents[&id].run.codex_title.as_deref(),
+            Some("Fix login")
+        );
+        assert_eq!(agent_display_name(&locked.agents[&id].run), "My name");
+    }
+    assert!(rx.try_recv().is_ok());
+    assert!(!handle_remote_app_server_event(
+        &state,
+        id,
+        run_id,
+        codex_app_server::Event::Title("Fix login".into()),
+    ));
+    assert!(!handle_remote_app_server_event(&state, id, run_id, codex_app_server::Event::Title("  ".into())));
+    assert!(rx.try_recv().is_err());
+}
+
+#[test]
+fn session_title_restart_replaces_legacy_prompt_and_preserves_manual_title() {
+    let mut runtime = test_runtime();
+    let id = recovery_agent(&mut runtime);
+    let home = runtime.paths.data_dir.join("codex-name-fixture");
+    fs::create_dir_all(&home).unwrap();
+    let db = rusqlite::Connection::open(home.join("state_5.sqlite")).unwrap();
+    db.execute_batch(
+        "CREATE TABLE threads (id TEXT PRIMARY KEY, name TEXT, title TEXT);
+        INSERT INTO threads VALUES ('saved-thread', NULL, 'The full initial prompt');",
+    )
+    .unwrap();
+    let record = runtime.agents.get_mut(&id).unwrap();
+    record.run.origin_codex_home = Some(home.to_string_lossy().into_owned());
+    record.run.codex_title = Some("The full initial prompt".into());
+    record.run.user_title = Some("My title".into());
+    // Persist with the fixture home, as the production runtime does.
+    runtime.codex_home = Some(home.clone());
+    runtime.persist_agent(id);
+    let paths = runtime.paths.clone();
+    drop(runtime);
+    let runtime = RuntimeState::new(paths.clone(), false).unwrap();
+    assert!(runtime.agents[&id].run.codex_title.is_none());
+    assert_eq!(agent_display_name(&runtime.agents[&id].run), "My title");
+    drop(runtime);
+    db.execute("UPDATE threads SET name = 'Fix login'", [])
+        .unwrap();
+    let runtime = RuntimeState::new(paths, false).unwrap();
+    assert_eq!(
+        runtime.agents[&id].run.codex_title.as_deref(),
+        Some("Fix login")
+    );
+}
+
+#[test]
+fn session_title_arrives_after_turn_without_rewriting_manual_name_or_rebroadcasting() {
+    let mut runtime = test_runtime();
+    let id = recovery_agent(&mut runtime);
+    let home = runtime.paths.data_dir.join("codex-name-fixture");
+    fs::create_dir_all(&home).unwrap();
+    let db = rusqlite::Connection::open(home.join("state_5.sqlite")).unwrap();
+    db.execute_batch(
+        "CREATE TABLE threads (id TEXT PRIMARY KEY, name TEXT, title TEXT);
+        INSERT INTO threads VALUES ('saved-thread', NULL, 'The full initial prompt');",
+    )
+    .unwrap();
+    let record = runtime.agents.get_mut(&id).unwrap();
+    record.run.origin_codex_home = Some(home.to_string_lossy().into_owned());
+    record.run.user_title = Some("My own name".into());
+    record.run.state = AgentState::Completed;
+    record.run.can_stop = false;
+    let (tx, rx) = mpsc::sync_channel(2048);
+    runtime.subscribers.push(tx);
+    let state = Arc::new(Mutex::new(runtime));
+    refresh_session_names(&state);
+    assert!(state.lock().unwrap().agents[&id].run.codex_title.is_none());
+    assert!(rx.try_recv().is_err());
+    db.execute("UPDATE threads SET name = ?1", ["🙂".repeat(200)])
+        .unwrap();
+    refresh_session_names(&state);
+    {
+        let locked = state.lock().unwrap();
+        let run = &locked.agents[&id].run;
+        assert_eq!(
+            run.codex_title.as_ref().unwrap().encode_utf16().count(),
+            240
+        );
+        assert_eq!(agent_display_name(run), "My own name");
+        let saved = locked.store.load().unwrap();
+        assert_eq!(
+            saved
+                .agents
+                .iter()
+                .find(|a| a.run.id == id)
+                .unwrap()
+                .run
+                .codex_title,
+            Some("🙂".repeat(120))
+        );
+    }
+    let envelope: Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+    assert_eq!(
+        envelope.pointer("/body/event/AgentChanged/id"),
+        Some(&serde_json::json!(id))
+    );
+    refresh_session_names(&state);
+    assert!(rx.try_recv().is_err());
+}
+
 pub(super) fn recovery_agent(runtime: &mut RuntimeState) -> AgentId {
     let project = Project::new("Recovery fixture", runtime.paths.data_dir.join("project"));
     runtime.store.upsert_project(&project).unwrap();
@@ -17,6 +161,7 @@ pub(super) fn recovery_agent(runtime: &mut RuntimeState) -> AgentId {
         pane_id: None,
         native_session_id: Some("saved-thread".into()),
         codex_title: None,
+        naming_failed: false,
         user_title: None,
         origin_codex_home: None,
         current_prompt: Some("original prompt".into()),

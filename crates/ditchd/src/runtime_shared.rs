@@ -354,6 +354,12 @@ impl RuntimeState {
                 // Child processes are not durable. Never expose a persisted
                 // stop affordance after a runtime restart.
                 run.can_stop = false;
+                if matches!(project.execution_target, ProjectExecutionTarget::Local) {
+                    // Older builds cached the first prompt as the automatic title.
+                    run.codex_title = run.native_session_id.as_deref().and_then(|id| {
+                        codex_title_from_state_at(id, run.origin_codex_home.as_deref())
+                    });
+                }
                 Some((
                     run.id,
                     AgentRecord {
@@ -628,6 +634,7 @@ fn serve(paths: AppPaths, remote_runtime: bool) -> io::Result<()> {
     write_runtime_metadata(&state)?;
     edition::start(Arc::clone(&state));
     start_remote_reconciler(Arc::clone(&state));
+    start_session_name_watcher(&state);
 
     for stream in listener.incoming() {
         let stream = stream?;
@@ -4106,9 +4113,7 @@ fn rename_agent(
     agent_id: AgentId,
     title: Option<String>,
 ) -> ServerResponse {
-    let title = title
-        .map(|value| value.trim().to_owned())
-        .filter(|value| !value.is_empty());
+    let title = title.as_deref().and_then(ditch_core::normalize_session_title);
     let mut state = state
         .lock()
         .expect("runtime state lock should not be poisoned");
@@ -4116,8 +4121,15 @@ fn rename_agent(
         return protocol_error("agent_not_found", "agent session was not found");
     };
     record.run.user_title = title;
+    let retry_naming = record.run.user_title.is_none() && record.run.naming_failed;
+    if retry_naming {
+        record.run.naming_failed = false;
+    }
     record.run.updated_at = Utc::now();
     let run = record.run.clone();
+    if retry_naming {
+        let _ = state.store.set_setting(&name_receipt_key(agent_id), "{}");
+    }
     state.persist_agent(agent_id);
     state.broadcast(ServerEvent::AgentChanged(run));
     ServerResponse::Accepted
@@ -4387,11 +4399,8 @@ fn handle_codex_stdout_line(
 #[cfg(test)]
 fn codex_session_title(value: &Value) -> Option<String> {
     [
-        value.get("title"),
         value.get("name"),
-        value.pointer("/thread/title"),
         value.pointer("/thread/name"),
-        value.pointer("/session/title"),
         value.pointer("/session/name"),
     ]
     .into_iter()
@@ -4402,26 +4411,7 @@ fn codex_session_title(value: &Value) -> Option<String> {
     .map(str::to_owned)
 }
 
-fn codex_title_from_state(thread_id: &str) -> Option<String> {
-    let codex_home = std::env::var_os("CODEX_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))?;
-    let connection = rusqlite::Connection::open_with_flags(
-        codex_home.join("state_5.sqlite"),
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )
-    .ok()?;
-    connection
-        .query_row(
-            "SELECT COALESCE(NULLIF(name, ''), NULLIF(title, '')) FROM threads WHERE id = ?1",
-            [thread_id],
-            |row| row.get::<_, Option<String>>(0),
-        )
-        .ok()
-        .flatten()
-        .map(|title| title.trim().to_owned())
-        .filter(|title| !title.is_empty())
-}
+include!("session_names.rs");
 
 #[cfg(test)]
 fn looks_like_diagnostic(text: &str) -> bool {
@@ -4852,17 +4842,7 @@ fn finish_agent(
 }
 
 fn agent_display_name(run: &AgentRun) -> String {
-    run.user_title
-        .as_deref()
-        .filter(|title| !title.trim().is_empty())
-        .or_else(|| {
-            run.codex_title
-                .as_deref()
-                .filter(|title| !title.trim().is_empty())
-        })
-        .unwrap_or("Codex")
-        .trim()
-        .to_owned()
+    run.display_name()
 }
 
 fn notification_summary(value: &str) -> String {
@@ -5750,6 +5730,7 @@ esac
     }
 
     include!("remote_recovery_tests.rs");
+    include!("session_name_tests.rs");
     include!("model_discovery_tests.rs");
 
     pub(super) fn test_runtime() -> RuntimeState {
@@ -5996,6 +5977,7 @@ esac
                     pane_id: None,
                     native_session_id: None,
                     codex_title: None,
+                    naming_failed: false,
                     user_title: None,
                     origin_codex_home: None,
                     current_prompt: Some("start".to_owned()),
@@ -6078,6 +6060,7 @@ esac
                     pane_id: None,
                     native_session_id: Some("thread-stop".to_owned()),
                     codex_title: Some("Stop test".to_owned()),
+                    naming_failed: false,
                     user_title: None,
                     origin_codex_home: None,
                     current_prompt: Some("keep working".to_owned()),
@@ -6182,6 +6165,7 @@ esac
                     pane_id: None,
                     native_session_id: None,
                     codex_title: None,
+                    naming_failed: false,
                     user_title: None,
                     origin_codex_home: None,
                     current_prompt: Some("test".to_owned()),
@@ -6264,6 +6248,7 @@ esac
                     pane_id: None,
                     native_session_id: Some("thread-completed".to_owned()),
                     codex_title: Some("Notification test".to_owned()),
+                    naming_failed: false,
                     user_title: None,
                     origin_codex_home: None,
                     current_prompt: Some("finish soon".to_owned()),
@@ -6325,6 +6310,7 @@ esac
                     pane_id: None,
                     native_session_id: Some("thread-safe".to_owned()),
                     codex_title: Some("Safety test".to_owned()),
+                    naming_failed: false,
                     user_title: None,
                     origin_codex_home: None,
                     current_prompt: Some("explain the detector".to_owned()),
@@ -6401,6 +6387,7 @@ esac
                     pane_id: None,
                     native_session_id: Some("thread-quota".to_owned()),
                     codex_title: None,
+                    naming_failed: false,
                     user_title: None,
                     origin_codex_home: None,
                     current_prompt: Some("test".to_owned()),
@@ -6464,6 +6451,7 @@ esac
                     pane_id: None,
                     native_session_id: Some("thread-123".to_owned()),
                     codex_title: None,
+                    naming_failed: false,
                     user_title: None,
                     origin_codex_home: None,
                     current_prompt: None,

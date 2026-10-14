@@ -103,6 +103,7 @@ fn start_remote_app_server_session_linked(
         pane_id: None,
         native_session_id: resume_thread.clone(),
         codex_title: None,
+        naming_failed: false,
         user_title: None,
         origin_codex_home: state
             .lock()
@@ -127,6 +128,7 @@ fn start_remote_app_server_session_linked(
     if let Some(previous) = &previous {
         run.started_at = previous.run.started_at;
         run.codex_title = previous.run.codex_title.clone();
+        run.naming_failed = previous.run.naming_failed;
         run.user_title = previous.run.user_title.clone();
     }
     run.coordinator_group = state.lock().unwrap().agent_coordinator_group(run.id);
@@ -605,12 +607,19 @@ fn handle_remote_app_server_event(
             }
         }
         codex_app_server::Event::Title(title) => {
+            let Some(title) = ditch_core::normalize_session_title(&title) else {
+                return false;
+            };
             let mut locked = state.lock().unwrap();
             if !is_current_run(&locked, agent_id, run_id) {
-                return true;
+                return false;
             }
             if let Some(record) = locked.agents.get_mut(&agent_id) {
+                if record.run.codex_title.as_deref() == Some(&title) {
+                    return false;
+                }
                 record.run.codex_title = Some(title);
+                record.run.naming_failed = false;
                 let run = record.run.clone();
                 locked.persist_agent(agent_id);
                 locked.broadcast(ServerEvent::AgentChanged(run));
@@ -638,7 +647,7 @@ fn handle_remote_app_server_event(
             let Some(record) = state.agents.get_mut(&agent_id) else {
                 return true;
             };
-            if let Some(title) = codex_title_from_state(&thread_id) {
+            if let Some(title) = codex_title_from_state_at(&thread_id, record.run.origin_codex_home.as_deref()) {
                 record.run.codex_title = Some(title);
             }
             record.run.native_session_id = Some(thread_id);
@@ -749,7 +758,7 @@ fn handle_remote_app_server_event(
                 .run
                 .native_session_id
                 .as_deref()
-                .and_then(codex_title_from_state)
+                .and_then(|id| codex_title_from_state_at(id, record.run.origin_codex_home.as_deref()))
             {
                 record.run.codex_title = Some(title);
             }
