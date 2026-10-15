@@ -401,7 +401,7 @@ fn app_server_drains_final_output_before_processing_child_exit() {
 #[test]
 fn remote_daemon_has_one_owner_and_reconnect_reuses_live_socket() {
     let mut runtime = test_runtime();
-    runtime.paths.socket_path = PathBuf::from(format!("/tmp/ditch-{}.sock", Uuid::new_v4()));
+    runtime.paths.socket_path = std::env::temp_dir().join(format!("ds-{}.sock", &Uuid::new_v4().simple().to_string()[..8]));
     let owner = remote_daemon_lock(&runtime.paths).unwrap();
     assert_eq!(
         remote_daemon_lock(&runtime.paths).unwrap_err().kind(),

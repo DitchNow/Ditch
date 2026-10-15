@@ -43,6 +43,60 @@ manager nor Linux lingering is required. Host policies that kill user processes
 and host reboot can interrupt live turns; this protocol preserves recoverable
 session identity, not live processes. Service/autostart configuration is optional.
 
+## Manager-aware installation and repair
+
+The app uploads an exact-build, checksum-verified executable. That executable's
+`upgrade-remote` helper performs the handoff on the target host. It selects
+systemd or launchd only when the service's reported PID owns the running daemon;
+an inactive service or installed service manager does not establish ownership.
+Otherwise an existing daemon retains direct-process management. Fresh installs
+prefer a usable user service manager and use direct startup when none is usable.
+Custom service definitions are not overwritten. Enabling Linux lingering is not
+automatic; host policy still determines survival across logout and reboot.
+
+Manager selection is saved in `~/.ditch/run/runtime-manager.json`. Reconnect
+reuses a live daemon; if it is missing, it starts the recorded service or a direct
+daemon. Reconnect does not upgrade an existing process or submit another turn.
+
+Repair holds a host-side flock and journals progress in
+`~/.ditch/run/runtime-upgrade.json`. The replacement is staged before activation.
+Runtimes advertising `remote_maintenance_v1` atomically check active agents,
+writer reservations, validation, terminals, and pending mutations, then close
+admission to new work. The idle check and writer admission share the runtime
+mutex. Background session naming also participates. A live upgrade lock keeps
+admission closed even if the normal maintenance lease expires. An abandoned
+maintenance lease expires after the helper releases its lock.
+
+The current executable link switches while admission is closed, so newly opened
+SSH bridges use the replacement's upgrade-lock-aware bootstrap. The helper stops
+the verified process through its actual manager, waits for exit and release of
+the daemon lock, starts the replacement, and checks its running build, edition,
+protocol capability and new instance identity. There is no force-kill fallback.
+The new runtime starts in maintenance until its health check completes.
+
+Older daemons cannot atomically block new work. Repair therefore requires an
+explicit UI confirmation that agents and terminal work have finished and other
+Ditch clients are disconnected. Active-session and instance checks run again
+immediately before shutdown. This is a one-time maintenance window, not an
+atomic guarantee supplied by the old daemon. New runtimes use guarded maintenance
+and do not require that compatibility confirmation.
+
+Failed activation restores the previous executable and restarts it when safe.
+Interrupted operations are reconciled on the next repair; a verified replacement
+with a lost response is retained without another restart. An unexpected daemon
+instance is never killed to force rollback. Errors distinguish activation from
+recovery failures. Project files, saved sessions, identity and the runtime
+database are not removed by repair. A failed desktop reconnection after verified
+activation retains the new installation and offers a retry.
+
+Regression coverage uses disposable daemon processes and Unix sockets for old
+and new direct-runtime upgrades, busy deferral, failed-start recovery, interrupted
+activation, locking and repeat repair. Runtime tests cover maintenance ownership
+and writer admission; Flutter tests cover legacy confirmation and busy errors.
+Release validation must additionally exercise packaged previous-release binaries
+over real Linux SSH (with and without systemd) and macOS launchd. Fixture results
+do not establish that native service or packaged release validation has passed.
+
 In Commercial, Mobile and Relay connect only to the Mac runtime. The Mac routes
 remote commands, approval details and transcript reads over SSH and publishes
 remote agents in its own projection. Remote daemons never enroll in Mobile Relay.

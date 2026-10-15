@@ -330,7 +330,7 @@ for line in sys.stdin:
         let mut bad = good.clone();
         bad.content_base64 = base64::engine::general_purpose::STANDARD.encode("no frontmatter");
         assert!(skill_files::validate_files(&[bad]).is_err());
-        let root = PathBuf::from("/tmp").join(format!("dsv-{}", Uuid::new_v4()));
+        let root = std::env::temp_dir().join(format!("dsv-{}", Uuid::new_v4()));
         skill_files::write_tree(&root, &[good]).unwrap();
         std::os::unix::fs::symlink("/tmp", root.join("escape")).unwrap();
         assert!(skill_files::read_tree(&root).is_err());

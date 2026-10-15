@@ -1366,9 +1366,15 @@ class DitchRuntimeClient {
     return Map<String, dynamic>.from(response['RemoteSetup'] as Map);
   }
 
-  Future<Map<String, dynamic>> installRemoteRuntime(String alias) async {
+  Future<Map<String, dynamic>> installRemoteRuntime(
+    String alias, {
+    bool legacyMaintenanceConfirmed = false,
+  }) async {
     final response = await request({
-      'InstallRemoteRuntime': {'alias': alias},
+      'InstallRemoteRuntime': {
+        'alias': alias,
+        'legacy_maintenance_confirmed': legacyMaintenanceConfirmed,
+      },
     });
     return Map<String, dynamic>.from(response['RemoteSetup'] as Map);
   }
@@ -11104,7 +11110,7 @@ class _AddRemoteProjectDialogState extends State<AddRemoteProjectDialog> {
     }
   }
 
-  Future<void> _installRuntime() async {
+  Future<void> _installRuntime({bool legacyMaintenanceConfirmed = false}) async {
     final alias = _alias;
     if (alias == null) return;
     setState(() {
@@ -11112,10 +11118,45 @@ class _AddRemoteProjectDialogState extends State<AddRemoteProjectDialog> {
       _error = null;
     });
     try {
-      final setup = await widget.client.installRemoteRuntime(alias);
+      final setup = await widget.client.installRemoteRuntime(
+        alias,
+        legacyMaintenanceConfirmed: legacyMaintenanceConfirmed,
+      );
       if (!mounted) return;
       await _acceptSetup(setup);
     } on Object catch (error) {
+      if (mounted &&
+          !legacyMaintenanceConfirmed &&
+          '$error'.contains('legacy_maintenance_required:')) {
+        setState(() {
+          _busy = false;
+        });
+        final confirmed = await showDialog<bool>(
+          context: context,
+          builder: (context) => AlertDialog(
+            title: const Text('Upgrade an older remote runtime'),
+            content: const Text(
+              'This older runtime cannot prevent other clients from starting work during an upgrade. '
+              'Finish all remote agents and terminal work, and disconnect other Ditch clients from this host. '
+              'Repair will recheck active agents before stopping the runtime. Saved projects and sessions are retained.',
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(context, false),
+                child: const Text('Cancel'),
+              ),
+              FilledButton(
+                onPressed: () => Navigator.pop(context, true),
+                child: const Text('Work finished — repair'),
+              ),
+            ],
+          ),
+        );
+        if (confirmed == true && mounted) {
+          await _installRuntime(legacyMaintenanceConfirmed: true);
+        }
+        return;
+      }
       if (mounted) {
         setState(() {
           _busy = false;

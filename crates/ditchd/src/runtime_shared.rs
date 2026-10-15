@@ -43,6 +43,7 @@ use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 const RUNTIME_IDENTITY: &str = "The Ditch Runtime";
+include!("remote_maintenance.rs");
 const RUNTIME_EDITION: &str = edition::RUNTIME_EDITION;
 const CODEX_BINARY_SETTING: &str = "codex_binary";
 const STOP_INTERRUPT_GRACE: Duration = Duration::from_millis(1500);
@@ -76,6 +77,9 @@ fn main() {
                 })
             );
             Ok(())
+        }
+        [command, target, checksum, legacy] if command == "upgrade-remote" => {
+            remote_lifecycle::upgrade(target, checksum, legacy == "confirmed")
         }
         [] => run_runtime(),
         _ => Err(io::Error::new(
@@ -128,11 +132,15 @@ fn remote_daemon_lock(paths: &AppPaths) -> io::Result<fs::File> {
 }
 
 fn ensure_remote_daemon(paths: &AppPaths) -> io::Result<()> {
+    let _upgrade = remote_lifecycle::bootstrap_lock(paths)?;
     // A reachable runtime is never restarted or upgraded by reconnect.
     if UnixStream::connect(&paths.socket_path).is_ok() {
         return Ok(());
     }
     ensure_app_dirs(paths).map_err(io::Error::other)?;
+    if remote_lifecycle::start_service_if_configured(paths)? {
+        return remote_lifecycle::wait_for_socket(paths);
+    }
     let log = fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -283,6 +291,8 @@ struct RuntimeState {
     app_server_turns: HashMap<AgentId, codex_app_server::ActiveTurn>,
     app_server_permission_agents: HashMap<uuid::Uuid, AgentId>,
     remote_runtime: bool,
+    remote_maintenance: Option<(Uuid, Instant)>,
+    remote_mutations: usize,
 }
 
 struct ProjectTerminalRecord {
@@ -394,6 +404,7 @@ impl RuntimeState {
         let installation_identity = FileIdentityStore::new(&legacy_identity_path).load_or_create();
         let installation_identity = Arc::new(installation_identity.map_err(io::Error::other)?);
         let validator_owners=store.validator_owners().map_err(io::Error::other)?;
+        let remote_maintenance = if remote_runtime { remote_lifecycle::initial_maintenance(&paths) } else { None };
         Ok(Self {
             paths,
             store,
@@ -439,6 +450,8 @@ impl RuntimeState {
             app_server_turns: HashMap::new(),
             app_server_permission_agents: HashMap::new(),
             remote_runtime,
+            remote_maintenance,
+            remote_mutations: 0,
         })
     }
 
@@ -467,6 +480,9 @@ impl RuntimeState {
                 ditch_protocol::REMOTE_RUNTIME_PROTOCOL_VERSION
             ),
         ];
+        if self.remote_runtime {
+            capabilities.push("remote_maintenance_v1".to_owned());
+        }
         edition::extend_runtime_capabilities(&self.edition, &mut capabilities);
         RuntimeStatus {
             identity: RUNTIME_IDENTITY.to_owned(),
@@ -1230,6 +1246,10 @@ fn handle_operation(
     request: ClientRequest,
     state: Arc<Mutex<RuntimeState>>,
 ) -> ServerResponse {
+    let _admission = match RemoteMutationGuard::acquire(&state, &request) {
+        Ok(guard) => guard,
+        Err(message) => return protocol_error("remote_maintenance", message),
+    };
     // Reserve before dispatch. A crash between launch and completion stays unknown,
     // so reusing an ID never executes a second copy of a possibly accepted command.
     let tracked = matches!(
@@ -1605,6 +1625,9 @@ fn handle_request(request: ClientRequest, state: Arc<Mutex<RuntimeState>>) -> Se
             }
         }
         ClientRequest::Shutdown => shutdown_runtime(state),
+        ClientRequest::RemoteRuntimeMaintenance { instance_id, token, action } => {
+            remote_maintenance_request(state, instance_id, token, &action)
+        }
         ClientRequest::ListProjects => {
             let state = state
                 .lock()
@@ -1655,13 +1678,13 @@ fn handle_request(request: ClientRequest, state: Arc<Mutex<RuntimeState>>) -> Se
                 Err(error) => protocol_error("remote_setup_failed", error.to_string()),
             }
         }
-        ClientRequest::InstallRemoteRuntime { alias } => {
+        ClientRequest::InstallRemoteRuntime { alias, legacy_maintenance_confirmed } => {
             let connections = state
                 .lock()
                 .expect("runtime state lock should not be poisoned")
                 .remote_connections
                 .clone();
-            match ssh_remote::install_remote_runtime(&connections, &alias) {
+            match ssh_remote::install_remote_runtime(&connections, &alias, legacy_maintenance_confirmed) {
                 Ok(status) => ServerResponse::RemoteSetup(status),
                 Err(error) => protocol_error("remote_runtime_install_failed", error.to_string()),
             }

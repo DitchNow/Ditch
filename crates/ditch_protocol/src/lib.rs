@@ -38,6 +38,11 @@ pub enum ClientRequest {
     RuntimeStatus,
     Snapshot,
     Shutdown,
+    RemoteRuntimeMaintenance {
+        instance_id: Uuid,
+        token: Uuid,
+        action: String,
+    },
     SubscribeEvents {
         since_sequence: u64,
     },
@@ -91,6 +96,8 @@ pub enum ClientRequest {
     },
     InstallRemoteRuntime {
         alias: String,
+        #[serde(default)]
+        legacy_maintenance_confirmed: bool,
     },
     InstallRemoteCodex {
         alias: String,

@@ -99,6 +99,7 @@ fn start_session_name_watcher(state: &Arc<Mutex<RuntimeState>>) {
         loop {
             thread::sleep(std::time::Duration::from_secs(3));
             let Some(state) = weak.upgrade() else { break };
+            let Ok(_admission) = RemoteMutationGuard::background_work(&state) else { continue };
             refresh_session_names(&state);
             process_session_name_job(&state);
         }
