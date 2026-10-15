@@ -963,7 +963,7 @@ impl UpgradeBackend for HttpUpgradeBackend {
         &self,
         installation: &InstallationIdentity,
     ) -> Result<CommercialOfferCatalog, UpgradeError> {
-        self.ensure_owner(installation)?;
+        self.register(installation)?;
         let catalog: CommercialOfferCatalog =
             self.signed_json(installation, "GET", "/v1/commercial/offers", b"")?;
         catalog.validate()
