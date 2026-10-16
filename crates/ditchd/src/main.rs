@@ -13,5 +13,6 @@ mod github;
 mod skill_files;
 mod ssh_remote;
 mod remote_lifecycle;
+mod remote_process;
 
 include!("runtime_shared.rs");

@@ -202,21 +202,81 @@ fn maintenance(
 }
 
 fn modern(status: &RuntimeStatus) -> bool {
+    // The first maintenance implementation counted every registered terminal
+    // as busy, even after its process exited. Migrate those builds through the
+    // same fenced handoff as 140; their maintenance endpoint cannot finish it.
     status.capabilities.iter().any(|s| s == MAINTENANCE)
+        && status
+            .capabilities
+            .iter()
+            .any(|s| s == "remote_terminal_maintenance_v1")
 }
-fn check_idle(status: &RuntimeStatus, confirmed: bool) -> io::Result<()> {
+fn check_idle(status: &RuntimeStatus, _confirmed: bool) -> io::Result<()> {
     if status.active_session_count != 0 {
         return Err(fail(format!(
-            "Repair deferred: {} remote agent(s) or execution reservations are active. Nothing was stopped.",
+            "runtime_busy: Waiting for {} active remote agent(s) or execution reservations.",
             status.active_session_count
         )));
     }
-    if !modern(status) && !confirmed {
-        return Err(fail(
-            "legacy_maintenance_required: This older runtime needs a maintenance window. Finish remote work and disconnect other Ditch clients before confirming repair.",
-        ));
-    }
     Ok(())
+}
+
+// Old releases persist reservations before spawning agent work. Holding the
+// writer transaction prevents another client from passing that reservation
+// while the old runtime is paused and its children are inspected. No rows are
+// changed. This is deliberately not the old Shutdown RPC, which kills agents.
+struct LegacyHandoff {
+    _database: rusqlite::Connection,
+    daemon: super::remote_process::Frozen,
+}
+fn legacy_database_fence(paths: &AppPaths) -> io::Result<rusqlite::Connection> {
+    use rusqlite::{Connection, OpenFlags};
+    let db = Connection::open_with_flags(&paths.database_path, OpenFlags::SQLITE_OPEN_READ_WRITE)
+        .map_err(|e| fail(format!("Cannot inspect legacy runtime reservations: {e}")))?;
+    db.busy_timeout(Duration::from_millis(250))
+        .map_err(io::Error::other)?;
+    db.execute_batch("BEGIN IMMEDIATE")
+        .map_err(|_| fail("runtime_busy: Waiting for remote operations."))?;
+    let reservations: i64 = db
+        .query_row("SELECT count(*) FROM writer_reservations", [], |r| r.get(0))
+        .map_err(|e| fail(format!("Cannot inspect legacy runtime reservations: {e}")))?;
+    let active: i64 = db.query_row(
+        "SELECT count(*) FROM agents WHERE json_extract(run_json,'$.state') IN ('Starting','Working','Stopping','AwaitingApproval','Blocked')",
+        [], |r| r.get(0)).map_err(io::Error::other)?;
+    if reservations > 0 || active > 0 {
+        return Err(fail("runtime_busy: Waiting for remote agents."));
+    }
+    Ok(db)
+}
+fn prepare_legacy(paths: &AppPaths, running: &RuntimeStatus) -> io::Result<LegacyHandoff> {
+    let database = legacy_database_fence(paths)?;
+    let all = super::remote_process::processes()?;
+    let process = all
+        .iter()
+        .find(|p| p.pid == running.pid)
+        .ok_or_else(|| fail("Remote runtime exited before handoff"))?;
+    let daemon = super::remote_process::Frozen::new(process)?;
+    let all = super::remote_process::processes()?;
+    let terminals = super::remote_process::legacy_project_terminals(&all, running.pid)?;
+    super::remote_process::close_terminal_sessions(&terminals)?;
+    let until = Instant::now() + Duration::from_secs(2);
+    loop {
+        let all = super::remote_process::processes()?;
+        if !super::remote_process::descendants(&all, running.pid)
+            .iter()
+            .any(|p| p.state != 'Z')
+        {
+            break;
+        }
+        if Instant::now() >= until {
+            return Err(fail("runtime_busy: Waiting for remote processes to exit."));
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    Ok(LegacyHandoff {
+        _database: database,
+        daemon,
+    })
 }
 
 fn systemd_pid() -> io::Result<u32> {
@@ -464,17 +524,39 @@ fn stop(
     if current.instance_id != running.instance_id || current.pid != running.pid {
         return Err(fail("Daemon changed before restart; nothing was stopped."));
     }
+    let process_identity = super::remote_process::processes()?
+        .into_iter()
+        .find(|p| p.pid == current.pid)
+        .ok_or_else(|| fail("Daemon exited before restart"))?
+        .identity;
     prepare(paths, &current, token, confirmed)?;
+    let legacy = if modern(&current) {
+        None
+    } else {
+        Some(prepare_legacy(paths, &current)?)
+    };
     match manager {
         Manager::Systemd => {
             if systemd_pid()? != current.pid {
                 return Err(fail("systemd ownership changed; nothing was stopped."));
             }
-            command("systemctl", &["--user", "stop", SERVICE])?;
+            if let Some(legacy) = &legacy {
+                command("systemctl", &["--user", "stop", "--no-block", SERVICE])?;
+                // Queue termination before resuming the paused legacy daemon;
+                // do not reopen an admission window while systemd schedules it.
+                legacy.daemon.signal_if_alive(libc::SIGTERM)?;
+                legacy.daemon.signal_if_alive(libc::SIGCONT)?;
+            } else {
+                command("systemctl", &["--user", "stop", SERVICE])?;
+            }
         }
         Manager::Launchd => {
             if launchd_pid()? != current.pid {
                 return Err(fail("launchd ownership changed; nothing was stopped."));
+            }
+            if let Some(legacy) = &legacy {
+                legacy.daemon.signal_if_alive(libc::SIGTERM)?;
+                legacy.daemon.signal_if_alive(libc::SIGCONT)?;
             }
             command("launchctl", &["bootout", &launchd_label()])?;
         }
@@ -482,19 +564,17 @@ fn stop(
             if modern(&current) {
                 maintenance(paths, &current, token, "exit")?;
             } else {
-                // Old releases cannot close admission atomically. This branch is
-                // available only after the UI's explicit maintenance confirmation.
-                if !matches!(
-                    rpc(paths, ClientRequest::Shutdown)?,
-                    ServerResponse::Accepted
-                ) {
-                    return Err(fail("Old runtime did not acknowledge shutdown."));
-                }
+                let legacy = legacy.as_ref().unwrap();
+                legacy.daemon.signal_if_alive(libc::SIGTERM)?;
+                legacy.daemon.signal_if_alive(libc::SIGCONT)?;
             }
         }
     }
     let deadline = Instant::now() + Duration::from_secs(15);
-    while unsafe { libc::kill(current.pid as i32, 0) } == 0 {
+    while super::remote_process::processes()?
+        .iter()
+        .any(|p| p.pid == current.pid && p.identity == process_identity && p.state != 'Z')
+    {
         if Instant::now() >= deadline {
             return Err(fail(
                 "Old runtime did not exit. No force-kill was attempted.",
@@ -502,11 +582,19 @@ fn stop(
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    let _released = super::remote_daemon_lock(paths).map_err(|e| {
-        fail(format!(
-            "Old process exited but runtime ownership is still held: {e}"
-        ))
-    })?;
+    // Process exit and kernel descriptor teardown need not become observable
+    // in the same instant. Ownership, not a transient zombie entry, is final.
+    loop {
+        match super::remote_daemon_lock(paths) {
+            Ok(_released) => break,
+            Err(error) if Instant::now() >= deadline => {
+                return Err(fail(format!(
+                    "Old process exited but runtime ownership is still held: {error}"
+                )));
+            }
+            Err(_) => std::thread::sleep(Duration::from_millis(50)),
+        }
+    }
     Ok(())
 }
 
@@ -679,6 +767,21 @@ pub(super) fn upgrade(target: &str, checksum: &str, confirmed: bool) -> io::Resu
         }
     }
     let running = status(&paths)?;
+    if let Some(running) = &running {
+        if running.build_identifier == build_id() && running.edition == super::RUNTIME_EDITION {
+            println!("Requested runtime is already running.");
+            return Ok(());
+        }
+        let local_number = option_env!("DITCH_BUILD_NUMBER").and_then(|s| s.parse::<u64>().ok());
+        let remote_number = running.build_number.parse::<u64>().ok();
+        if running.edition == super::RUNTIME_EDITION
+            && remote_number.is_some_and(|remote| remote > local_number.unwrap_or(0) && remote > 0)
+        {
+            return Err(fail(
+                "client_update_required: The remote runtime is newer. Update this Mac's Ditch app; the remote was not downgraded.",
+            ));
+        }
+    }
     if running.is_none() {
         // An unreachable socket is not proof the daemon has exited.
         // Respect the same lifetime lock used by old and new remote runtimes.

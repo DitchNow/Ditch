@@ -96,9 +96,8 @@ pub enum ClientRequest {
     },
     InstallRemoteRuntime {
         alias: String,
-        #[serde(default)]
-        legacy_maintenance_confirmed: bool,
     },
+    RemoteRuntimeUpdateStatus { alias: String },
     InstallRemoteCodex {
         alias: String,
     },
@@ -664,6 +663,7 @@ pub enum ServerEvent {
     AttentionSnapshotReplaced(Vec<RuntimeAttention>),
     RuntimeStatusChanged(RuntimeStatus),
     RemoteHostStatusChanged(RemoteHostPresence),
+    RemoteRuntimeRestarted { alias: String },
     ProjectChanged(Project),
     ProjectDeleted {
         project_id: ProjectId,

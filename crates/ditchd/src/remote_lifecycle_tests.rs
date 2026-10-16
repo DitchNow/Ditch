@@ -29,7 +29,7 @@ while True:
             response = {'RuntimeStatus': {'identity':'fixture', 'edition':'__EDITION__',
                 'pid':os.getpid(), 'socket_path':str(sock), 'active_session_count':active,
                 'build_identifier':build, 'instance_id':identity,
-                'capabilities':['remote_runtime_protocol_v4'] + (['remote_maintenance_v1'] if modern else [])}}
+                'capabilities':['remote_runtime_protocol_v4'] + (['remote_maintenance_v1','remote_terminal_maintenance_v1'] if modern else [])}}
         elif isinstance(body, dict) and 'RemoteRuntimeMaintenance' in body:
             operation = body['RemoteRuntimeMaintenance']
             if active or operation['instance_id'] != identity:
@@ -67,6 +67,8 @@ impl Fixture {
             scrollback_dir: data.join("state/scrollback"),
             data_dir: data,
         };
+        let db = rusqlite::Connection::open(&paths.database_path).unwrap();
+        db.execute_batch("CREATE TABLE writer_reservations(agent_id TEXT PRIMARY KEY); CREATE TABLE agents(run_json TEXT);").unwrap();
         Self { paths, root }
     }
     fn release(&self, name: &str, modern: bool) -> PathBuf {
@@ -111,25 +113,19 @@ impl Fixture {
 impl Drop for Fixture {
     fn drop(&mut self) {
         let _ = fs::remove_file(self.paths.data_dir.join("busy"));
-        if let Ok(Some(running)) = status(&self.paths) {
-            let _ = stop(&self.paths, &running, Manager::Direct, Uuid::new_v4(), true);
-        }
+        let _ = rpc(&self.paths, ClientRequest::Shutdown);
+        std::thread::sleep(Duration::from_millis(100));
         let _ = fs::remove_dir_all(&self.root);
     }
 }
 
 #[test]
-fn legacy_direct_upgrade_requires_confirmation_then_replaces_actual_process() {
+fn legacy_direct_upgrade_needs_no_confirmation_and_replaces_actual_process() {
     let f = Fixture::new();
     let old_path = f.release("old", false);
     let new_path = f.release("new", true);
     let old = f.running(&old_path, "old");
-    assert!(
-        prepare(&f.paths, &old, Uuid::new_v4(), false)
-            .unwrap_err()
-            .to_string()
-            .contains("legacy_maintenance_required")
-    );
+    prepare(&f.paths, &old, Uuid::new_v4(), false).unwrap();
     assert_eq!(status(&f.paths).unwrap().unwrap().pid, old.pid);
     let journal = f.journal(&old, old_path, new_path.clone());
     let _lock = lock(&f.paths, true).unwrap();
@@ -158,6 +154,30 @@ fn busy_legacy_runtime_is_not_stopped_even_after_confirmation() {
     let error = stop(&f.paths, &old, Manager::Direct, Uuid::new_v4(), true).unwrap_err();
     assert!(error.to_string().contains("active"));
     assert_eq!(status(&f.paths).unwrap().unwrap().pid, old.pid);
+}
+
+#[test]
+fn first_maintenance_release_uses_fenced_migration_instead_of_its_terminal_busy_check() {
+    let f = Fixture::new();
+    let old_path = f.release("first-maintenance", false);
+    let binary = f.paths.data_dir.join("bin").join(&old_path).join("ditchd");
+    let script = fs::read_to_string(&binary).unwrap().replace(
+        "['remote_runtime_protocol_v4']",
+        "['remote_runtime_protocol_v4','remote_maintenance_v1']",
+    );
+    fs::write(&binary, script).unwrap();
+    let old = f.running(&old_path, "first-maintenance");
+    assert!(old.capabilities.iter().any(|c| c == MAINTENANCE));
+    assert!(!modern(&old));
+    let new_path = f.release("new", true);
+    handoff(
+        &f.paths,
+        f.journal(&old, old_path, new_path),
+        Some(&old),
+        false,
+    )
+    .unwrap();
+    assert_ne!(status(&f.paths).unwrap().unwrap().pid, old.pid);
 }
 
 #[test]
@@ -231,18 +251,48 @@ fn service_ownership_requires_the_actual_daemon_pid() {
 }
 
 #[test]
-fn old_install_request_does_not_implicitly_confirm_legacy_maintenance() {
+fn install_request_has_no_maintenance_confirmation() {
     let request: ClientRequest = serde_json::from_value(serde_json::json!({
         "InstallRemoteRuntime": {"alias": "fixture"}
     }))
     .unwrap();
     assert!(matches!(
         request,
-        ClientRequest::InstallRemoteRuntime {
-            legacy_maintenance_confirmed: false,
-            ..
-        }
+        ClientRequest::InstallRemoteRuntime { .. }
     ));
+}
+
+#[test]
+fn legacy_fence_blocks_new_writer_reservations_without_modifying_data() {
+    let f = Fixture::new();
+    let other = rusqlite::Connection::open(&f.paths.database_path).unwrap();
+    other.busy_timeout(Duration::ZERO).unwrap();
+    let fence = legacy_database_fence(&f.paths).unwrap();
+    assert!(
+        other
+            .execute(
+                "INSERT INTO writer_reservations VALUES ('racing-agent')",
+                []
+            )
+            .is_err()
+    );
+    drop(fence);
+    other
+        .execute(
+            "INSERT INTO writer_reservations VALUES ('active-agent')",
+            [],
+        )
+        .unwrap();
+    assert!(
+        legacy_database_fence(&f.paths)
+            .unwrap_err()
+            .to_string()
+            .contains("runtime_busy")
+    );
+    let count: i64 = other
+        .query_row("SELECT count(*) FROM writer_reservations", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(count, 1);
 }
 
 #[test]

@@ -82,7 +82,10 @@ pub struct RemoteConnectionManager {
     event_cancellations: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
     event_cursors: Arc<Mutex<HashMap<String, (Uuid, u64)>>>,
     maintenance_hosts: Arc<Mutex<HashSet<String>>>,
+    updates: Arc<Mutex<HashMap<String, RequestedUpdate>>>,
 }
+
+include!("remote_updates.rs");
 
 struct RemoteMaintenanceGuard {
     hosts: Arc<Mutex<HashSet<String>>>,
@@ -221,7 +224,11 @@ impl RemoteConnectionManager {
         );
         // Pause this Mac's schedulers too, including the legacy maintenance
         // window. Status/rejoin and explicit stop controls remain available.
-        if !read_only && !matches!(request, ClientRequest::StopAgent { .. } | ClientRequest::ForceKillAgent { .. })
+        if matches!(request, ClientRequest::StartRemoteCodexAppServerSession { .. }
+            | ClientRequest::ResumeRemoteCodexAppServerSession { .. }
+            | ClientRequest::PromptRemoteCodexAppServerAgent { .. }
+            | ClientRequest::StartCodexSession { .. } | ClientRequest::ResumeCodexSession { .. }
+            | ClientRequest::PromptAgent { .. } | ClientRequest::OpenProjectTerminal { .. })
             && !self.maintenance_hosts.lock().unwrap().is_empty()
         {
             let identity = maintenance_identity(&resolve_host(alias)?);
@@ -676,6 +683,11 @@ pub fn check_setup(
     let exact = server_version.as_deref() == Some(env!("CARGO_PKG_VERSION"))
         && server_protocol == Some(ditch_protocol::REMOTE_RUNTIME_PROTOCOL_VERSION)
         && server_build == Some(local_build);
+    let compatible = server_protocol == Some(ditch_protocol::REMOTE_RUNTIME_PROTOCOL_VERSION);
+    let server_number = runtime_json.as_ref().and_then(|v| v.get("build_number"))
+        .and_then(|v| v.as_str()).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+    let local_number = option_env!("DITCH_BUILD_NUMBER").and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+    let newer = server_number > local_number && server_number > 0;
     let mut checks = vec![
         check(
             "ssh",
@@ -698,8 +710,10 @@ pub fn check_setup(
         check(
             "runtime",
             "Ditch Runtime",
-            if exact {
+            if exact || (compatible && newer) {
                 RemoteCheckState::Ready
+            } else if newer {
+                RemoteCheckState::Failed
             } else if runtime_value == "missing" {
                 RemoteCheckState::Missing
             } else {
@@ -707,6 +721,10 @@ pub fn check_setup(
             },
             if exact {
                 "Exact version installed"
+            } else if newer && compatible {
+                "Compatible newer runtime installed"
+            } else if newer {
+                "Update this Mac's Ditch app to connect to the newer remote runtime"
             } else if runtime_value == "missing" {
                 "Not installed"
             } else {
@@ -833,7 +851,7 @@ pub fn check_setup(
     let mut machine_id = None;
     let mut daemon_epoch = None;
     let mut daemon_ready = false;
-    if exact {
+    if compatible {
         connections.disconnect(alias);
         if let Ok(ServerResponse::RuntimeStatus(status)) =
             connections.request(alias, ClientRequest::RuntimeStatus)
@@ -846,8 +864,7 @@ pub fn check_setup(
                     .capabilities
                     .iter()
                     .any(|c| c == "app_server_sessions_v2")
-                && status.build_identifier
-                    == option_env!("DITCH_BUILD_IDENTIFIER").unwrap_or(env!("CARGO_PKG_VERSION"));
+                && status.edition == super::RUNTIME_EDITION;
             daemon_epoch = Some(status.instance_id);
         }
         if let Ok(ServerResponse::HostIdentity(status)) =
@@ -858,7 +875,7 @@ pub fn check_setup(
     }
     let ready = desktop_project_setup_ready(
         supported,
-        exact,
+        compatible,
         git != "missing",
         codex != "missing",
         codex_auth == "ready",
@@ -962,14 +979,21 @@ git --version
     check_setup(connections, alias, None, false, false)
 }
 
-pub fn install_remote_runtime(
+struct StagedRuntime {
+    target: String,
+    checksum: String,
+    upload: String,
+}
+
+fn install_remote_runtime(
     connections: &RemoteConnectionManager,
     alias: &str,
-    legacy_maintenance_confirmed: bool,
+    staged: &mut Option<StagedRuntime>,
 ) -> Result<RemoteSetupStatus, SshError> {
     observe("remote_runtime_install_started", alias, None);
     let resolved = resolve_host(alias)?;
     let _maintenance = connections.begin_maintenance(&resolved)?;
+    if staged.is_none() {
     let (preflight, _) = run_fixed_admin_authenticated(
         alias,
         PREFLIGHT_SCRIPT,
@@ -995,16 +1019,19 @@ pub fn install_remote_runtime(
         Uuid::new_v4()
     );
     upload_artifact(connections, &resolved, &artifact, &remote_upload)?;
+    *staged = Some(StagedRuntime { target: target.into(), checksum, upload: remote_upload });
+    }
+    let staged = staged.as_ref().unwrap();
 
     let mut command = base_ssh_command(alias)?;
     command.args([
         "sh",
         "-s",
         "--",
-        target,
-        &checksum,
-        &remote_upload,
-        if legacy_maintenance_confirmed { "confirmed" } else { "unconfirmed" },
+        &staged.target,
+        &staged.checksum,
+        &staged.upload,
+        "automatic",
     ]);
     command
         .stdin(Stdio::piped())
@@ -1035,7 +1062,7 @@ pub fn install_remote_runtime(
         Ok(status)
     } else {
         Err(SshError::Failed(format!(
-            "Runtime activation completed, but desktop reconnection failed: {}. The verified installation was retained; retry Check Again.",
+            "Runtime activation completed, but desktop reconnection failed: {}. The verified installation was retained.",
             status.last_error.as_deref().unwrap_or("runtime handshake did not match this app")
         )))
     }
@@ -1362,7 +1389,6 @@ fi
 chmod 700 "$upload"
 # The replacement itself manages activation on the host. Its persistent journal
 # allows a subsequent repair to recover an interrupted SSH invocation.
-trap 'rm -f "$upload"' EXIT
 "$upload" upgrade-remote "$target" "$expected" "$legacy"
 "#;
 

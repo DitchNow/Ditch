@@ -71,6 +71,8 @@ fn main() {
                     "protocol_version": ditch_protocol::PROTOCOL_VERSION,
                     "remote_runtime_protocol_version": ditch_protocol::REMOTE_RUNTIME_PROTOCOL_VERSION,
                     "build_identifier": option_env!("DITCH_BUILD_IDENTIFIER").unwrap_or(env!("CARGO_PKG_VERSION")),
+                    "build_number": option_env!("DITCH_BUILD_NUMBER").unwrap_or("0"),
+                    "release_sequence": option_env!("DITCH_RELEASE_SEQUENCE").and_then(|s| s.parse::<u64>().ok()).unwrap_or(0),
                     "edition": RUNTIME_EDITION,
                     "os": std::env::consts::OS,
                     "architecture": std::env::consts::ARCH,
@@ -80,6 +82,12 @@ fn main() {
         }
         [command, target, checksum, legacy] if command == "upgrade-remote" => {
             remote_lifecycle::upgrade(target, checksum, legacy == "confirmed")
+        }
+        [command, pid, identity, owner] if command == "remote-handoff-watchdog" => {
+            match (pid.parse(), owner.parse()) {
+                (Ok(pid), Ok(owner)) => remote_process::watchdog(pid, identity, owner),
+                _ => Err(io::Error::other("Invalid handoff process identity")),
+            }
         }
         [] => run_runtime(),
         _ => Err(io::Error::new(
@@ -482,6 +490,7 @@ impl RuntimeState {
         ];
         if self.remote_runtime {
             capabilities.push("remote_maintenance_v1".to_owned());
+            capabilities.push("remote_terminal_maintenance_v1".to_owned());
         }
         edition::extend_runtime_capabilities(&self.edition, &mut capabilities);
         RuntimeStatus {
@@ -710,6 +719,9 @@ fn start_remote_reconciler(state: Arc<Mutex<RuntimeState>>) {
                             break;
                         }
                         let task_generation = *state.lock().unwrap().remote_task_generation.get(&alias).unwrap_or(&0);
+                        // Recover an explicitly requested update after the Mac
+                        // runtime restarts. This never creates a new request.
+                        let _ = connections.runtime_update_status(&alias);
                         let result = (|| {
                             let ServerResponse::RuntimeStatus(status) = connections
                                 .request(&alias, ClientRequest::RuntimeStatus)
@@ -738,6 +750,8 @@ fn start_remote_reconciler(state: Arc<Mutex<RuntimeState>>) {
                             if restarted {
                                 connections.disconnect(&alias);
                                 state.lock().unwrap().remote_event_cursors.remove(&alias);
+                                state.lock().unwrap().remote_terminal_hosts.retain(|_, host| host != &alias);
+                                state.lock().unwrap().broadcast(ServerEvent::RemoteRuntimeRestarted { alias: alias.clone() });
                             }
                             reconcile_remote_snapshot(
                                 &state,
@@ -1667,6 +1681,9 @@ fn handle_request(request: ClientRequest, state: Arc<Mutex<RuntimeState>>) -> Se
                 .expect("runtime state lock should not be poisoned")
                 .remote_connections
                 .clone();
+            if let Ok(Some(update)) = connections.runtime_update_status(&alias) {
+                if update.connection_state == "updating" { return ServerResponse::RemoteSetup(update); }
+            }
             match ssh_remote::check_setup(
                 &connections,
                 &alias,
@@ -1678,15 +1695,23 @@ fn handle_request(request: ClientRequest, state: Arc<Mutex<RuntimeState>>) -> Se
                 Err(error) => protocol_error("remote_setup_failed", error.to_string()),
             }
         }
-        ClientRequest::InstallRemoteRuntime { alias, legacy_maintenance_confirmed } => {
+        ClientRequest::InstallRemoteRuntime { alias, .. } => {
             let connections = state
                 .lock()
                 .expect("runtime state lock should not be poisoned")
                 .remote_connections
                 .clone();
-            match ssh_remote::install_remote_runtime(&connections, &alias, legacy_maintenance_confirmed) {
+            match connections.start_runtime_update(&alias) {
                 Ok(status) => ServerResponse::RemoteSetup(status),
                 Err(error) => protocol_error("remote_runtime_install_failed", error.to_string()),
+            }
+        }
+        ClientRequest::RemoteRuntimeUpdateStatus { alias } => {
+            let connections = state.lock().unwrap().remote_connections.clone();
+            match connections.runtime_update_status(&alias) {
+                Ok(Some(status)) => ServerResponse::RemoteSetup(status),
+                Ok(None) => protocol_error("remote_update_not_found", "No runtime update has been requested."),
+                Err(error) => protocol_error("remote_update_failed", error.to_string()),
             }
         }
         ClientRequest::InstallRemoteCodex { alias } => {
@@ -3410,9 +3435,10 @@ fn open_project_terminal(
     rows: u16,
 ) -> ServerResponse {
     let (project_root, existing) = {
-        let state = state
+        let mut state = state
             .lock()
             .expect("runtime state lock should not be poisoned");
+        state.reap_project_terminals();
         let project = state
             .projects
             .values()

@@ -1366,15 +1366,16 @@ class DitchRuntimeClient {
     return Map<String, dynamic>.from(response['RemoteSetup'] as Map);
   }
 
-  Future<Map<String, dynamic>> installRemoteRuntime(
-    String alias, {
-    bool legacyMaintenanceConfirmed = false,
-  }) async {
+  Future<Map<String, dynamic>> installRemoteRuntime(String alias) async {
     final response = await request({
-      'InstallRemoteRuntime': {
-        'alias': alias,
-        'legacy_maintenance_confirmed': legacyMaintenanceConfirmed,
-      },
+      'InstallRemoteRuntime': {'alias': alias},
+    });
+    return Map<String, dynamic>.from(response['RemoteSetup'] as Map);
+  }
+
+  Future<Map<String, dynamic>> remoteRuntimeUpdateStatus(String alias) async {
+    final response = await request({
+      'RemoteRuntimeUpdateStatus': {'alias': alias},
     });
     return Map<String, dynamic>.from(response['RemoteSetup'] as Map);
   }
@@ -2265,9 +2266,12 @@ class _CommandCenterScreenState extends State<CommandCenterScreen>
         .clamp(_minimumInspectorWidth, 620.0);
   }
 
-  Future<void> _ensureSelectedProjectTerminal() async {
+  final Set<String> _remoteTerminalAutoOpenSuppressed = {};
+
+  Future<void> _ensureSelectedProjectTerminal({bool userRequested = false}) async {
     final project = _selectedProjectOrNull;
     if (project == null) return;
+    if (!userRequested && _remoteTerminalAutoOpenSuppressed.contains(project.sshHostAlias)) return;
     final projectId = project.id;
     if (projectId == null || _projectTerminals.containsKey(projectId)) return;
     try {
@@ -4176,6 +4180,19 @@ class _CommandCenterScreenState extends State<CommandCenterScreen>
     }
 
     final terminalExited = eventBody['ProjectTerminalExited'];
+    final remoteRestart = eventBody['RemoteRuntimeRestarted'];
+    if (remoteRestart is Map) {
+      final alias = remoteRestart['alias']?.toString();
+      if (alias != null) {
+        setState(() {
+          _remoteTerminalAutoOpenSuppressed.add(alias);
+          for (final project in _projects.where((project) => project.sshHostAlias == alias)) {
+            _projectTerminals.remove(project.id);
+          }
+        });
+      }
+      return;
+    }
     if (terminalExited is Map) {
       final id = terminalExited['terminal_id']?.toString();
       if (id != null) {
@@ -4184,7 +4201,13 @@ class _CommandCenterScreenState extends State<CommandCenterScreen>
             .map((entry) => entry.key)
             .toList();
         if (keys.isNotEmpty) {
-          setState(() => keys.forEach(_projectTerminals.remove));
+          setState(() {
+            for (final project in _projects.where((project) => keys.contains(project.id))) {
+              final alias = project.sshHostAlias;
+              if (alias != null) _remoteTerminalAutoOpenSuppressed.add(alias);
+            }
+            keys.forEach(_projectTerminals.remove);
+          });
         }
       }
       return;
@@ -5280,6 +5303,10 @@ class _CommandCenterScreenState extends State<CommandCenterScreen>
               final selectedTerminal = _selectedProject.id == null
                   ? null
                   : _projectTerminals[_selectedProject.id];
+              final VoidCallback? openClosedTerminal = selectedTerminal == null &&
+                      _remoteTerminalAutoOpenSuppressed.contains(_selectedProject.sshHostAlias)
+                  ? () => unawaited(_ensureSelectedProjectTerminal(userRequested: true))
+                  : null;
               final selectedFiles = _selectedProject.id == null
                   ? null
                   : _projectFiles.putIfAbsent(
@@ -5297,6 +5324,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen>
                   files: selectedFiles,
                   showFiles: showFiles,
                   onEnsureTerminal: _ensureSelectedProjectTerminal,
+                  onStartTerminal: openClosedTerminal,
                   onEnsureFiles: () {
                     final projectId = _selectedProject.id;
                     if (projectId != null) {
@@ -5383,6 +5411,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen>
                 }
                 return ProjectTerminalSurface(
                   terminal: selectedTerminal,
+                  onStartTerminal: openClosedTerminal,
                   presentation: _terminalPresentation,
                   onTitleTap: () =>
                       _setTerminalPresentation(TerminalPresentation.docked),
@@ -10106,6 +10135,7 @@ class ProjectToolsPanel extends StatefulWidget {
     required this.files,
     required this.showFiles,
     required this.onEnsureTerminal,
+    this.onStartTerminal,
     required this.onEnsureFiles,
     required this.presentation,
     required this.presentedTool,
@@ -10132,6 +10162,7 @@ class ProjectToolsPanel extends StatefulWidget {
   final ProjectFilesState? files;
   final bool showFiles;
   final Future<void> Function() onEnsureTerminal;
+  final VoidCallback? onStartTerminal;
   final Future<void> Function() onEnsureFiles;
   final TerminalPresentation presentation;
   final WorkspaceToolKind presentedTool;
@@ -10159,7 +10190,7 @@ class _ProjectToolsPanelState extends State<ProjectToolsPanel> {
   @override
   void initState() {
     super.initState();
-    if (widget.terminal == null) {
+    if (widget.terminal == null && widget.onStartTerminal == null) {
       WidgetsBinding.instance.addPostFrameCallback(
         (_) => widget.onEnsureTerminal(),
       );
@@ -10170,7 +10201,7 @@ class _ProjectToolsPanelState extends State<ProjectToolsPanel> {
   @override
   void didUpdateWidget(ProjectToolsPanel oldWidget) {
     super.didUpdateWidget(oldWidget);
-    if (widget.terminal == null &&
+    if (widget.terminal == null && widget.onStartTerminal == null &&
         oldWidget.terminal?.projectId != widget.terminal?.projectId) {
       WidgetsBinding.instance.addPostFrameCallback(
         (_) => widget.onEnsureTerminal(),
@@ -10204,6 +10235,7 @@ class _ProjectToolsPanelState extends State<ProjectToolsPanel> {
               )
             : ProjectTerminalSurface(
                 terminal: terminal,
+                onStartTerminal: widget.onStartTerminal,
                 presentation: widget.presentation,
                 onTitleTap: () =>
                     widget.onPresentationChanged(TerminalPresentation.docked),
@@ -10223,7 +10255,7 @@ class _ProjectToolsPanelState extends State<ProjectToolsPanel> {
             onPresentationChanged: widget.onPresentationChanged,
           ),
           if (widget.dockedTerminalExpanded)
-            Expanded(child: ProjectTerminalBody(terminal: terminal)),
+            Expanded(child: ProjectTerminalBody(terminal: terminal, onStartTerminal: widget.onStartTerminal)),
           if (widget.showFiles) ...[
             ProjectFilesHeader(
               expanded: widget.dockedFilesExpanded,
@@ -10663,6 +10695,7 @@ class ProjectTerminalSurface extends StatelessWidget {
     required this.onTitleTap,
     required this.onPresentationChanged,
     this.onClose,
+    this.onStartTerminal,
     super.key,
   });
 
@@ -10671,6 +10704,7 @@ class ProjectTerminalSurface extends StatelessWidget {
   final VoidCallback onTitleTap;
   final ValueChanged<TerminalPresentation> onPresentationChanged;
   final VoidCallback? onClose;
+  final VoidCallback? onStartTerminal;
 
   @override
   Widget build(BuildContext context) {
@@ -10690,6 +10724,7 @@ class ProjectTerminalSurface extends StatelessWidget {
           Expanded(
             child: ProjectTerminalBody(
               terminal: terminal,
+              onStartTerminal: onStartTerminal,
               onEscape: presentation == TerminalPresentation.maximized
                   ? onClose
                   : null,
@@ -10702,15 +10737,22 @@ class ProjectTerminalSurface extends StatelessWidget {
 }
 
 class ProjectTerminalBody extends StatelessWidget {
-  const ProjectTerminalBody({required this.terminal, this.onEscape, super.key});
+  const ProjectTerminalBody({required this.terminal, this.onEscape, this.onStartTerminal, super.key});
 
   final ProjectTerminalSession? terminal;
   final VoidCallback? onEscape;
+  final VoidCallback? onStartTerminal;
 
   @override
   Widget build(BuildContext context) {
     return terminal == null
-        ? const Center(child: Text('Starting project shell…'))
+        ? Center(child: onStartTerminal == null
+            ? const Text('Starting project shell…')
+            : TextButton.icon(
+                onPressed: onStartTerminal,
+                icon: const Icon(Icons.terminal, size: 16),
+                label: const Text('Open terminal'),
+              ))
         : TerminalView(
             terminal!.terminal,
             autofocus: false,
@@ -10986,7 +11028,8 @@ class _AddRemoteProjectDialogState extends State<AddRemoteProjectDialog> {
     _alias = widget.initialAlias;
     _setup = widget.initialSetup;
     if (widget.initialSetup != null) {
-      _busy = false;
+      _busy = widget.initialSetup!['connection_state'] == 'updating';
+      if (_busy) unawaited(_followRuntimeUpdate(widget.initialSetup!));
     } else if (widget.repairOnly && widget.initialAlias != null) {
       unawaited(_check());
     } else {
@@ -11036,7 +11079,7 @@ class _AddRemoteProjectDialogState extends State<AddRemoteProjectDialog> {
         trustUnknownHost: trust,
       );
       if (!mounted) return;
-      await _acceptSetup(setup);
+      await _followRuntimeUpdate(setup);
       if (!mounted) return;
       if (setup['connection_state'] == 'host_key_confirmation_required') {
         final fingerprint =
@@ -11110,7 +11153,7 @@ class _AddRemoteProjectDialogState extends State<AddRemoteProjectDialog> {
     }
   }
 
-  Future<void> _installRuntime({bool legacyMaintenanceConfirmed = false}) async {
+  Future<void> _installRuntime() async {
     final alias = _alias;
     if (alias == null) return;
     setState(() {
@@ -11118,52 +11161,37 @@ class _AddRemoteProjectDialogState extends State<AddRemoteProjectDialog> {
       _error = null;
     });
     try {
-      final setup = await widget.client.installRemoteRuntime(
-        alias,
-        legacyMaintenanceConfirmed: legacyMaintenanceConfirmed,
-      );
-      if (!mounted) return;
-      await _acceptSetup(setup);
+      await _followRuntimeUpdate(await widget.client.installRemoteRuntime(alias));
     } on Object catch (error) {
-      if (mounted &&
-          !legacyMaintenanceConfirmed &&
-          '$error'.contains('legacy_maintenance_required:')) {
-        setState(() {
-          _busy = false;
-        });
-        final confirmed = await showDialog<bool>(
-          context: context,
-          builder: (context) => AlertDialog(
-            title: const Text('Upgrade an older remote runtime'),
-            content: const Text(
-              'This older runtime cannot prevent other clients from starting work during an upgrade. '
-              'Finish all remote agents and terminal work, and disconnect other Ditch clients from this host. '
-              'Repair will recheck active agents before stopping the runtime. Saved projects and sessions are retained.',
-            ),
-            actions: [
-              TextButton(
-                onPressed: () => Navigator.pop(context, false),
-                child: const Text('Cancel'),
-              ),
-              FilledButton(
-                onPressed: () => Navigator.pop(context, true),
-                child: const Text('Work finished — repair'),
-              ),
-            ],
-          ),
-        );
-        if (confirmed == true && mounted) {
-          await _installRuntime(legacyMaintenanceConfirmed: true);
-        }
+      if (!mounted) return;
+      setState(() { _busy = false; _error = '$error'; });
+    }
+  }
+
+  Future<void> _followRuntimeUpdate(Map<String, dynamic> setup) async {
+    var pollFailures = 0;
+    while (mounted && setup['connection_state'] == 'updating') {
+      setState(() { _setup = setup; _busy = true; _error = null; });
+      await Future<void>.delayed(const Duration(seconds: 1));
+      if (!mounted) return;
+      try {
+        setup = await widget.client.remoteRuntimeUpdateStatus(_alias!);
+        pollFailures = 0;
+      } on Object catch (error) {
+        // Losing a progress response does not cancel the runtime's operation
+        // or require another Install / Repair click.
+        if (++pollFailures < 5) continue;
+        if (!mounted) return;
+        setState(() { _busy = false; _error = '$error'; });
         return;
       }
-      if (mounted) {
-        setState(() {
-          _busy = false;
-          _error = '$error';
-        });
-      }
     }
+    if (!mounted) return;
+    if (setup['connection_state'] == 'update_failed') {
+      setState(() { _setup = setup; _busy = false; _error = setup['last_error']?.toString(); });
+      return;
+    }
+    await _acceptSetup(setup);
   }
 
   Future<void> _installCodex() async {
@@ -11354,7 +11382,8 @@ class _AddRemoteProjectDialogState extends State<AddRemoteProjectDialog> {
     final runtimeNeedsInstall =
         checks is List &&
         checks.whereType<Map>().any(
-          (item) => item['key'] == 'runtime' && item['state'] != 'ready',
+          (item) => item['key'] == 'runtime' &&
+              ['missing', 'install_available', 'checking'].contains(item['state']),
         );
     final codexNeedsInstall =
         checks is List &&
@@ -11414,7 +11443,7 @@ class _AddRemoteProjectDialogState extends State<AddRemoteProjectDialog> {
       content: SizedBox(
         width: 600,
         height: 520,
-        child: _busy && _hosts.isEmpty
+        child: _busy && _hosts.isEmpty && _setup?['connection_state'] != 'updating'
             ? const Center(child: CircularProgressIndicator())
             : ListView(
                 children: [
