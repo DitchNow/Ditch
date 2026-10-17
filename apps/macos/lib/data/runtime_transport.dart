@@ -47,6 +47,7 @@ class RuntimeTransport {
     if (body is Map && body.containsKey('InstallRemoteRuntime')) {
       return const Duration(minutes: 5);
     }
+
     if (body is Map && body['GitHub'] is Map) {
       return const Duration(minutes: 12);
     }
