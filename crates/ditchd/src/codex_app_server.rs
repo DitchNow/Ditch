@@ -581,6 +581,11 @@ fn handle_line(
             let _ = events.send(Event::EffectiveModel(model.to_owned()));
         }
         let _ = events.send(Event::ThreadReady(thread_id.to_owned()));
+        if let Some(name) = value.pointer("/result/thread/name").and_then(Value::as_str)
+            .and_then(ditch_core::normalize_session_title)
+        {
+            let _ = events.send(Event::Title(name));
+        }
         let Some(writer) = writer.upgrade() else {
             return;
         };
@@ -1079,6 +1084,26 @@ mod tests {
 
     fn ids() -> (ProjectId, AgentId) {
         (ProjectId::new(), AgentId::new())
+    }
+
+    #[test]
+    fn session_title_uses_thread_name_on_start_or_resume_never_preview() {
+        for name in [None, Some(""), Some(" Fix\n login ")] {
+            let (project_id, agent_id) = ids();
+            let pending = Arc::new(Mutex::new(HashMap::new()));
+            let (tx, rx) = mpsc::channel();
+            let response = json!({"id": THREAD_ID, "result": {"thread": {
+                "id": "thread", "name": name, "title": "secret prompt", "preview": "secret prompt"
+            }}}).to_string();
+            handle_line(&response, &Weak::new(), &pending, &tx, project_id, agent_id,
+                Path::new("/tmp"), "secret prompt", None, None, "on-request",
+                &json!({"type": "workspaceWrite"}), &[]);
+            assert!(matches!(rx.try_recv().unwrap(), Event::ThreadReady(id) if id == "thread"));
+            if name == Some(" Fix\n login ") {
+                assert!(matches!(rx.try_recv().unwrap(), Event::Title(title) if title == "Fix login"));
+            }
+            assert!(rx.try_recv().is_err());
+        }
     }
 
     #[test]

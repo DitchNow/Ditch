@@ -978,6 +978,7 @@ mod tests {
             pane_id: None,
             native_session_id: Some("thread-1".into()),
             codex_title: Some("Codex title".into()),
+            naming_failed: false,
             user_title: None,
             origin_codex_home: Some("/tmp/codex-home".into()),
             current_prompt: Some("hello".into()),

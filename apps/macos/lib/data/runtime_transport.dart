@@ -44,6 +44,10 @@ class RuntimeTransport {
   // GitHub reads have a runtime deadline of ten minutes, plus bounded cleanup.
   // Keep the socket alive for batches instead of reporting failure before commit.
   static Duration responseTimeout(Object body) {
+    if (body is Map && body.containsKey('InstallRemoteRuntime')) {
+      return const Duration(minutes: 5);
+    }
+
     if (body is Map && body['GitHub'] is Map) {
       return const Duration(minutes: 12);
     }

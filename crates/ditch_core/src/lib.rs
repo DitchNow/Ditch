@@ -9,6 +9,8 @@ mod skills;
 pub use skills::*;
 mod tasks;
 pub use tasks::*;
+mod session_title;
+pub use session_title::*;
 pub mod github;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
@@ -294,6 +296,8 @@ pub struct AgentRun {
     pub native_session_id: Option<String>,
     #[serde(default)]
     pub codex_title: Option<String>,
+    #[serde(default)]
+    pub naming_failed: bool,
     #[serde(default)]
     pub user_title: Option<String>,
     #[serde(default)]

@@ -7,9 +7,12 @@
 mod acceptance_evidence;
 mod app_server_client;
 mod codex_app_server;
+mod session_namer;
 mod edition;
 mod github;
 mod skill_files;
 mod ssh_remote;
+mod remote_lifecycle;
+mod remote_process;
 
 include!("runtime_shared.rs");

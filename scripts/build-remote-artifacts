@@ -54,6 +54,8 @@ build_linux_with_docker() {
     -e HOME=/tmp \
     -e CARGO_HOME=/cargo \
     -e DITCH_BUILD_IDENTIFIER="$DITCH_BUILD_IDENTIFIER" \
+    -e DITCH_BUILD_NUMBER="${DITCH_BUILD_NUMBER:-0}" \
+    -e DITCH_RELEASE_SEQUENCE="${DITCH_RELEASE_SEQUENCE:-0}" \
     -e CARGO_TARGET_DIR="/workspace/target/$target" \
     -v "$workspace:/workspace" \
     -v "$docker_cache:/cargo" \

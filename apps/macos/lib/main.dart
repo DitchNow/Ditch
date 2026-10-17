@@ -14,6 +14,7 @@ import 'application/project_sidebar_controller.dart';
 import 'application/product_update_controller.dart';
 import 'widgets/update_available_dot.dart';
 import 'data/project_models.dart';
+import 'data/session_title.dart';
 import 'widgets/project_sidebar.dart';
 
 import 'application/task_board_controller.dart';
@@ -694,6 +695,7 @@ class AgentSession {
     AgentExecutionSettings? executionSettings,
     this.codexThreadId,
     this.codexTitle,
+    this.namingFailed = false,
     this.userTitle,
     this.originCodexHome,
     this.currentPrompt,
@@ -723,6 +725,7 @@ class AgentSession {
   AgentStatus status;
   String? codexThreadId;
   String? codexTitle;
+  bool namingFailed;
   String? userTitle;
   final String? originCodexHome;
   String? currentPrompt;
@@ -743,13 +746,8 @@ class AgentSession {
   String streamingText = '';
   List<Map<String, dynamic>> attachedSkills;
 
-  String get displayName {
-    final override = userTitle?.trim();
-    if (override != null && override.isNotEmpty) return override;
-    final native = codexTitle?.trim();
-    if (native != null && native.isNotEmpty) return native;
-    return 'Codex';
-  }
+  String get displayName =>
+      sessionDisplayName(userTitle, codexTitle, namingFailed: namingFailed);
 
   bool get hasCodexThread => codexThreadId != null;
 
@@ -783,6 +781,7 @@ void reconcileAgentSession(List<AgentSession> sessions, AgentSession incoming) {
   existing.attachedSkills = incoming.attachedSkills;
   existing.codexThreadId = incoming.codexThreadId;
   existing.codexTitle = incoming.codexTitle;
+  existing.namingFailed = incoming.namingFailed;
   existing.userTitle = incoming.userTitle;
   existing.currentPrompt = incoming.currentPrompt;
   existing.lastVisibleAction = incoming.lastVisibleAction;
@@ -1370,6 +1369,13 @@ class DitchRuntimeClient {
   Future<Map<String, dynamic>> installRemoteRuntime(String alias) async {
     final response = await request({
       'InstallRemoteRuntime': {'alias': alias},
+    });
+    return Map<String, dynamic>.from(response['RemoteSetup'] as Map);
+  }
+
+  Future<Map<String, dynamic>> remoteRuntimeUpdateStatus(String alias) async {
+    final response = await request({
+      'RemoteRuntimeUpdateStatus': {'alias': alias},
     });
     return Map<String, dynamic>.from(response['RemoteSetup'] as Map);
   }
@@ -2260,9 +2266,12 @@ class _CommandCenterScreenState extends State<CommandCenterScreen>
         .clamp(_minimumInspectorWidth, 620.0);
   }
 
-  Future<void> _ensureSelectedProjectTerminal() async {
+  final Set<String> _remoteTerminalAutoOpenSuppressed = {};
+
+  Future<void> _ensureSelectedProjectTerminal({bool userRequested = false}) async {
     final project = _selectedProjectOrNull;
     if (project == null) return;
+    if (!userRequested && _remoteTerminalAutoOpenSuppressed.contains(project.sshHostAlias)) return;
     final projectId = project.id;
     if (projectId == null || _projectTerminals.containsKey(projectId)) return;
     try {
@@ -3941,7 +3950,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen>
   }
 
   Future<void> _renameAgent(AgentSession session, String? title) async {
-    final cleanTitle = title?.trim();
+    final cleanTitle = normalizeSessionTitle(title);
     final previous = session.userTitle;
     setState(() {
       session.userTitle = cleanTitle == null || cleanTitle.isEmpty
@@ -4171,6 +4180,19 @@ class _CommandCenterScreenState extends State<CommandCenterScreen>
     }
 
     final terminalExited = eventBody['ProjectTerminalExited'];
+    final remoteRestart = eventBody['RemoteRuntimeRestarted'];
+    if (remoteRestart is Map) {
+      final alias = remoteRestart['alias']?.toString();
+      if (alias != null) {
+        setState(() {
+          _remoteTerminalAutoOpenSuppressed.add(alias);
+          for (final project in _projects.where((project) => project.sshHostAlias == alias)) {
+            _projectTerminals.remove(project.id);
+          }
+        });
+      }
+      return;
+    }
     if (terminalExited is Map) {
       final id = terminalExited['terminal_id']?.toString();
       if (id != null) {
@@ -4179,7 +4201,13 @@ class _CommandCenterScreenState extends State<CommandCenterScreen>
             .map((entry) => entry.key)
             .toList();
         if (keys.isNotEmpty) {
-          setState(() => keys.forEach(_projectTerminals.remove));
+          setState(() {
+            for (final project in _projects.where((project) => keys.contains(project.id))) {
+              final alias = project.sshHostAlias;
+              if (alias != null) _remoteTerminalAutoOpenSuppressed.add(alias);
+            }
+            keys.forEach(_projectTerminals.remove);
+          });
         }
       }
       return;
@@ -4563,6 +4591,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen>
       hasOlderMessages: messages.isNotEmpty,
       codexThreadId: agentJson['native_session_id']?.toString(),
       codexTitle: agentJson['codex_title']?.toString(),
+      namingFailed: agentJson['naming_failed'] == true,
       userTitle: agentJson['user_title']?.toString(),
       originCodexHome: agentJson['origin_codex_home']?.toString(),
       currentPrompt: agentJson['current_prompt']?.toString(),
@@ -5274,6 +5303,10 @@ class _CommandCenterScreenState extends State<CommandCenterScreen>
               final selectedTerminal = _selectedProject.id == null
                   ? null
                   : _projectTerminals[_selectedProject.id];
+              final VoidCallback? openClosedTerminal = selectedTerminal == null &&
+                      _remoteTerminalAutoOpenSuppressed.contains(_selectedProject.sshHostAlias)
+                  ? () => unawaited(_ensureSelectedProjectTerminal(userRequested: true))
+                  : null;
               final selectedFiles = _selectedProject.id == null
                   ? null
                   : _projectFiles.putIfAbsent(
@@ -5291,6 +5324,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen>
                   files: selectedFiles,
                   showFiles: showFiles,
                   onEnsureTerminal: _ensureSelectedProjectTerminal,
+                  onStartTerminal: openClosedTerminal,
                   onEnsureFiles: () {
                     final projectId = _selectedProject.id;
                     if (projectId != null) {
@@ -5377,6 +5411,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen>
                 }
                 return ProjectTerminalSurface(
                   terminal: selectedTerminal,
+                  onStartTerminal: openClosedTerminal,
                   presentation: _terminalPresentation,
                   onTitleTap: () =>
                       _setTerminalPresentation(TerminalPresentation.docked),
@@ -8244,9 +8279,9 @@ class _EditableAgentTitleState extends State<EditableAgentTitle> {
   }
 
   void _save() {
-    final value = _controller.text.trim();
+    final value = normalizeSessionTitle(_controller.text);
     setState(() => _editing = false);
-    widget.onRename(value.isEmpty ? null : value);
+    widget.onRename(value);
   }
 
   void _cancel() {
@@ -8272,10 +8307,20 @@ class _EditableAgentTitleState extends State<EditableAgentTitle> {
     return Tooltip(
       message: widget.hasOverride
           ? 'Click to rename. Clear to restore the Codex title.'
+          : widget.title == sessionTitleFailed
+          ? 'Automatic naming failed. Click to rename, or save an empty name to retry.'
           : 'Click to rename',
       child: GestureDetector(
         behavior: HitTestBehavior.opaque,
-        onTap: () => setState(() => _editing = true),
+        onTap: () => setState(() {
+          _controller.text =
+              !widget.hasOverride &&
+                  (widget.title == sessionTitlePending ||
+                      widget.title == sessionTitleFailed)
+              ? ''
+              : widget.title;
+          _editing = true;
+        }),
         child: Text(widget.title),
       ),
     );
@@ -10090,6 +10135,7 @@ class ProjectToolsPanel extends StatefulWidget {
     required this.files,
     required this.showFiles,
     required this.onEnsureTerminal,
+    this.onStartTerminal,
     required this.onEnsureFiles,
     required this.presentation,
     required this.presentedTool,
@@ -10116,6 +10162,7 @@ class ProjectToolsPanel extends StatefulWidget {
   final ProjectFilesState? files;
   final bool showFiles;
   final Future<void> Function() onEnsureTerminal;
+  final VoidCallback? onStartTerminal;
   final Future<void> Function() onEnsureFiles;
   final TerminalPresentation presentation;
   final WorkspaceToolKind presentedTool;
@@ -10143,7 +10190,7 @@ class _ProjectToolsPanelState extends State<ProjectToolsPanel> {
   @override
   void initState() {
     super.initState();
-    if (widget.terminal == null) {
+    if (widget.terminal == null && widget.onStartTerminal == null) {
       WidgetsBinding.instance.addPostFrameCallback(
         (_) => widget.onEnsureTerminal(),
       );
@@ -10154,7 +10201,7 @@ class _ProjectToolsPanelState extends State<ProjectToolsPanel> {
   @override
   void didUpdateWidget(ProjectToolsPanel oldWidget) {
     super.didUpdateWidget(oldWidget);
-    if (widget.terminal == null &&
+    if (widget.terminal == null && widget.onStartTerminal == null &&
         oldWidget.terminal?.projectId != widget.terminal?.projectId) {
       WidgetsBinding.instance.addPostFrameCallback(
         (_) => widget.onEnsureTerminal(),
@@ -10188,6 +10235,7 @@ class _ProjectToolsPanelState extends State<ProjectToolsPanel> {
               )
             : ProjectTerminalSurface(
                 terminal: terminal,
+                onStartTerminal: widget.onStartTerminal,
                 presentation: widget.presentation,
                 onTitleTap: () =>
                     widget.onPresentationChanged(TerminalPresentation.docked),
@@ -10207,7 +10255,7 @@ class _ProjectToolsPanelState extends State<ProjectToolsPanel> {
             onPresentationChanged: widget.onPresentationChanged,
           ),
           if (widget.dockedTerminalExpanded)
-            Expanded(child: ProjectTerminalBody(terminal: terminal)),
+            Expanded(child: ProjectTerminalBody(terminal: terminal, onStartTerminal: widget.onStartTerminal)),
           if (widget.showFiles) ...[
             ProjectFilesHeader(
               expanded: widget.dockedFilesExpanded,
@@ -10647,6 +10695,7 @@ class ProjectTerminalSurface extends StatelessWidget {
     required this.onTitleTap,
     required this.onPresentationChanged,
     this.onClose,
+    this.onStartTerminal,
     super.key,
   });
 
@@ -10655,6 +10704,7 @@ class ProjectTerminalSurface extends StatelessWidget {
   final VoidCallback onTitleTap;
   final ValueChanged<TerminalPresentation> onPresentationChanged;
   final VoidCallback? onClose;
+  final VoidCallback? onStartTerminal;
 
   @override
   Widget build(BuildContext context) {
@@ -10674,6 +10724,7 @@ class ProjectTerminalSurface extends StatelessWidget {
           Expanded(
             child: ProjectTerminalBody(
               terminal: terminal,
+              onStartTerminal: onStartTerminal,
               onEscape: presentation == TerminalPresentation.maximized
                   ? onClose
                   : null,
@@ -10686,15 +10737,22 @@ class ProjectTerminalSurface extends StatelessWidget {
 }
 
 class ProjectTerminalBody extends StatelessWidget {
-  const ProjectTerminalBody({required this.terminal, this.onEscape, super.key});
+  const ProjectTerminalBody({required this.terminal, this.onEscape, this.onStartTerminal, super.key});
 
   final ProjectTerminalSession? terminal;
   final VoidCallback? onEscape;
+  final VoidCallback? onStartTerminal;
 
   @override
   Widget build(BuildContext context) {
     return terminal == null
-        ? const Center(child: Text('Starting project shell…'))
+        ? Center(child: onStartTerminal == null
+            ? const Text('Starting project shell…')
+            : TextButton.icon(
+                onPressed: onStartTerminal,
+                icon: const Icon(Icons.terminal, size: 16),
+                label: const Text('Open terminal'),
+              ))
         : TerminalView(
             terminal!.terminal,
             autofocus: false,
@@ -10970,7 +11028,8 @@ class _AddRemoteProjectDialogState extends State<AddRemoteProjectDialog> {
     _alias = widget.initialAlias;
     _setup = widget.initialSetup;
     if (widget.initialSetup != null) {
-      _busy = false;
+      _busy = widget.initialSetup!['connection_state'] == 'updating';
+      if (_busy) unawaited(_followRuntimeUpdate(widget.initialSetup!));
     } else if (widget.repairOnly && widget.initialAlias != null) {
       unawaited(_check());
     } else {
@@ -11020,7 +11079,7 @@ class _AddRemoteProjectDialogState extends State<AddRemoteProjectDialog> {
         trustUnknownHost: trust,
       );
       if (!mounted) return;
-      await _acceptSetup(setup);
+      await _followRuntimeUpdate(setup);
       if (!mounted) return;
       if (setup['connection_state'] == 'host_key_confirmation_required') {
         final fingerprint =
@@ -11102,17 +11161,37 @@ class _AddRemoteProjectDialogState extends State<AddRemoteProjectDialog> {
       _error = null;
     });
     try {
-      final setup = await widget.client.installRemoteRuntime(alias);
-      if (!mounted) return;
-      await _acceptSetup(setup);
+      await _followRuntimeUpdate(await widget.client.installRemoteRuntime(alias));
     } on Object catch (error) {
-      if (mounted) {
-        setState(() {
-          _busy = false;
-          _error = '$error';
-        });
+      if (!mounted) return;
+      setState(() { _busy = false; _error = '$error'; });
+    }
+  }
+
+  Future<void> _followRuntimeUpdate(Map<String, dynamic> setup) async {
+    var pollFailures = 0;
+    while (mounted && setup['connection_state'] == 'updating') {
+      setState(() { _setup = setup; _busy = true; _error = null; });
+      await Future<void>.delayed(const Duration(seconds: 1));
+      if (!mounted) return;
+      try {
+        setup = await widget.client.remoteRuntimeUpdateStatus(_alias!);
+        pollFailures = 0;
+      } on Object catch (error) {
+        // Losing a progress response does not cancel the runtime's operation
+        // or require another Install / Repair click.
+        if (++pollFailures < 5) continue;
+        if (!mounted) return;
+        setState(() { _busy = false; _error = '$error'; });
+        return;
       }
     }
+    if (!mounted) return;
+    if (setup['connection_state'] == 'update_failed') {
+      setState(() { _setup = setup; _busy = false; _error = setup['last_error']?.toString(); });
+      return;
+    }
+    await _acceptSetup(setup);
   }
 
   Future<void> _installCodex() async {
@@ -11303,7 +11382,8 @@ class _AddRemoteProjectDialogState extends State<AddRemoteProjectDialog> {
     final runtimeNeedsInstall =
         checks is List &&
         checks.whereType<Map>().any(
-          (item) => item['key'] == 'runtime' && item['state'] != 'ready',
+          (item) => item['key'] == 'runtime' &&
+              ['missing', 'install_available', 'checking'].contains(item['state']),
         );
     final codexNeedsInstall =
         checks is List &&
@@ -11363,7 +11443,7 @@ class _AddRemoteProjectDialogState extends State<AddRemoteProjectDialog> {
       content: SizedBox(
         width: 600,
         height: 520,
-        child: _busy && _hosts.isEmpty
+        child: _busy && _hosts.isEmpty && _setup?['connection_state'] != 'updating'
             ? const Center(child: CircularProgressIndicator())
             : ListView(
                 children: [

@@ -43,6 +43,7 @@ use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 const RUNTIME_IDENTITY: &str = "The Ditch Runtime";
+include!("remote_maintenance.rs");
 const RUNTIME_EDITION: &str = edition::RUNTIME_EDITION;
 const CODEX_BINARY_SETTING: &str = "codex_binary";
 const STOP_INTERRUPT_GRACE: Duration = Duration::from_millis(1500);
@@ -70,12 +71,23 @@ fn main() {
                     "protocol_version": ditch_protocol::PROTOCOL_VERSION,
                     "remote_runtime_protocol_version": ditch_protocol::REMOTE_RUNTIME_PROTOCOL_VERSION,
                     "build_identifier": option_env!("DITCH_BUILD_IDENTIFIER").unwrap_or(env!("CARGO_PKG_VERSION")),
+                    "build_number": option_env!("DITCH_BUILD_NUMBER").unwrap_or("0"),
+                    "release_sequence": option_env!("DITCH_RELEASE_SEQUENCE").and_then(|s| s.parse::<u64>().ok()).unwrap_or(0),
                     "edition": RUNTIME_EDITION,
                     "os": std::env::consts::OS,
                     "architecture": std::env::consts::ARCH,
                 })
             );
             Ok(())
+        }
+        [command, target, checksum, legacy] if command == "upgrade-remote" => {
+            remote_lifecycle::upgrade(target, checksum, legacy == "confirmed")
+        }
+        [command, pid, identity, owner] if command == "remote-handoff-watchdog" => {
+            match (pid.parse(), owner.parse()) {
+                (Ok(pid), Ok(owner)) => remote_process::watchdog(pid, identity, owner),
+                _ => Err(io::Error::other("Invalid handoff process identity")),
+            }
         }
         [] => run_runtime(),
         _ => Err(io::Error::new(
@@ -128,11 +140,15 @@ fn remote_daemon_lock(paths: &AppPaths) -> io::Result<fs::File> {
 }
 
 fn ensure_remote_daemon(paths: &AppPaths) -> io::Result<()> {
+    let _upgrade = remote_lifecycle::bootstrap_lock(paths)?;
     // A reachable runtime is never restarted or upgraded by reconnect.
     if UnixStream::connect(&paths.socket_path).is_ok() {
         return Ok(());
     }
     ensure_app_dirs(paths).map_err(io::Error::other)?;
+    if remote_lifecycle::start_service_if_configured(paths)? {
+        return remote_lifecycle::wait_for_socket(paths);
+    }
     let log = fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -283,6 +299,8 @@ struct RuntimeState {
     app_server_turns: HashMap<AgentId, codex_app_server::ActiveTurn>,
     app_server_permission_agents: HashMap<uuid::Uuid, AgentId>,
     remote_runtime: bool,
+    remote_maintenance: Option<(Uuid, Instant)>,
+    remote_mutations: usize,
 }
 
 struct ProjectTerminalRecord {
@@ -354,6 +372,12 @@ impl RuntimeState {
                 // Child processes are not durable. Never expose a persisted
                 // stop affordance after a runtime restart.
                 run.can_stop = false;
+                if matches!(project.execution_target, ProjectExecutionTarget::Local) {
+                    // Older builds cached the first prompt as the automatic title.
+                    run.codex_title = run.native_session_id.as_deref().and_then(|id| {
+                        codex_title_from_state_at(id, run.origin_codex_home.as_deref())
+                    });
+                }
                 Some((
                     run.id,
                     AgentRecord {
@@ -388,6 +412,7 @@ impl RuntimeState {
         let installation_identity = FileIdentityStore::new(&legacy_identity_path).load_or_create();
         let installation_identity = Arc::new(installation_identity.map_err(io::Error::other)?);
         let validator_owners=store.validator_owners().map_err(io::Error::other)?;
+        let remote_maintenance = if remote_runtime { remote_lifecycle::initial_maintenance(&paths) } else { None };
         Ok(Self {
             paths,
             store,
@@ -433,6 +458,8 @@ impl RuntimeState {
             app_server_turns: HashMap::new(),
             app_server_permission_agents: HashMap::new(),
             remote_runtime,
+            remote_maintenance,
+            remote_mutations: 0,
         })
     }
 
@@ -461,6 +488,10 @@ impl RuntimeState {
                 ditch_protocol::REMOTE_RUNTIME_PROTOCOL_VERSION
             ),
         ];
+        if self.remote_runtime {
+            capabilities.push("remote_maintenance_v1".to_owned());
+            capabilities.push("remote_terminal_maintenance_v1".to_owned());
+        }
         edition::extend_runtime_capabilities(&self.edition, &mut capabilities);
         RuntimeStatus {
             identity: RUNTIME_IDENTITY.to_owned(),
@@ -628,6 +659,7 @@ fn serve(paths: AppPaths, remote_runtime: bool) -> io::Result<()> {
     write_runtime_metadata(&state)?;
     edition::start(Arc::clone(&state));
     start_remote_reconciler(Arc::clone(&state));
+    start_session_name_watcher(&state);
 
     for stream in listener.incoming() {
         let stream = stream?;
@@ -687,6 +719,9 @@ fn start_remote_reconciler(state: Arc<Mutex<RuntimeState>>) {
                             break;
                         }
                         let task_generation = *state.lock().unwrap().remote_task_generation.get(&alias).unwrap_or(&0);
+                        // Recover an explicitly requested update after the Mac
+                        // runtime restarts. This never creates a new request.
+                        let _ = connections.runtime_update_status(&alias);
                         let result = (|| {
                             let ServerResponse::RuntimeStatus(status) = connections
                                 .request(&alias, ClientRequest::RuntimeStatus)
@@ -715,6 +750,8 @@ fn start_remote_reconciler(state: Arc<Mutex<RuntimeState>>) {
                             if restarted {
                                 connections.disconnect(&alias);
                                 state.lock().unwrap().remote_event_cursors.remove(&alias);
+                                state.lock().unwrap().remote_terminal_hosts.retain(|_, host| host != &alias);
+                                state.lock().unwrap().broadcast(ServerEvent::RemoteRuntimeRestarted { alias: alias.clone() });
                             }
                             reconcile_remote_snapshot(
                                 &state,
@@ -1223,6 +1260,10 @@ fn handle_operation(
     request: ClientRequest,
     state: Arc<Mutex<RuntimeState>>,
 ) -> ServerResponse {
+    let _admission = match RemoteMutationGuard::acquire(&state, &request) {
+        Ok(guard) => guard,
+        Err(message) => return protocol_error("remote_maintenance", message),
+    };
     // Reserve before dispatch. A crash between launch and completion stays unknown,
     // so reusing an ID never executes a second copy of a possibly accepted command.
     let tracked = matches!(
@@ -1598,6 +1639,9 @@ fn handle_request(request: ClientRequest, state: Arc<Mutex<RuntimeState>>) -> Se
             }
         }
         ClientRequest::Shutdown => shutdown_runtime(state),
+        ClientRequest::RemoteRuntimeMaintenance { instance_id, token, action } => {
+            remote_maintenance_request(state, instance_id, token, &action)
+        }
         ClientRequest::ListProjects => {
             let state = state
                 .lock()
@@ -1637,6 +1681,9 @@ fn handle_request(request: ClientRequest, state: Arc<Mutex<RuntimeState>>) -> Se
                 .expect("runtime state lock should not be poisoned")
                 .remote_connections
                 .clone();
+            if let Ok(Some(update)) = connections.runtime_update_status(&alias) {
+                if update.connection_state == "updating" { return ServerResponse::RemoteSetup(update); }
+            }
             match ssh_remote::check_setup(
                 &connections,
                 &alias,
@@ -1648,15 +1695,23 @@ fn handle_request(request: ClientRequest, state: Arc<Mutex<RuntimeState>>) -> Se
                 Err(error) => protocol_error("remote_setup_failed", error.to_string()),
             }
         }
-        ClientRequest::InstallRemoteRuntime { alias } => {
+        ClientRequest::InstallRemoteRuntime { alias, .. } => {
             let connections = state
                 .lock()
                 .expect("runtime state lock should not be poisoned")
                 .remote_connections
                 .clone();
-            match ssh_remote::install_remote_runtime(&connections, &alias) {
+            match connections.start_runtime_update(&alias) {
                 Ok(status) => ServerResponse::RemoteSetup(status),
                 Err(error) => protocol_error("remote_runtime_install_failed", error.to_string()),
+            }
+        }
+        ClientRequest::RemoteRuntimeUpdateStatus { alias } => {
+            let connections = state.lock().unwrap().remote_connections.clone();
+            match connections.runtime_update_status(&alias) {
+                Ok(Some(status)) => ServerResponse::RemoteSetup(status),
+                Ok(None) => protocol_error("remote_update_not_found", "No runtime update has been requested."),
+                Err(error) => protocol_error("remote_update_failed", error.to_string()),
             }
         }
         ClientRequest::InstallRemoteCodex { alias } => {
@@ -3380,9 +3435,10 @@ fn open_project_terminal(
     rows: u16,
 ) -> ServerResponse {
     let (project_root, existing) = {
-        let state = state
+        let mut state = state
             .lock()
             .expect("runtime state lock should not be poisoned");
+        state.reap_project_terminals();
         let project = state
             .projects
             .values()
@@ -4106,9 +4162,7 @@ fn rename_agent(
     agent_id: AgentId,
     title: Option<String>,
 ) -> ServerResponse {
-    let title = title
-        .map(|value| value.trim().to_owned())
-        .filter(|value| !value.is_empty());
+    let title = title.as_deref().and_then(ditch_core::normalize_session_title);
     let mut state = state
         .lock()
         .expect("runtime state lock should not be poisoned");
@@ -4116,8 +4170,15 @@ fn rename_agent(
         return protocol_error("agent_not_found", "agent session was not found");
     };
     record.run.user_title = title;
+    let retry_naming = record.run.user_title.is_none() && record.run.naming_failed;
+    if retry_naming {
+        record.run.naming_failed = false;
+    }
     record.run.updated_at = Utc::now();
     let run = record.run.clone();
+    if retry_naming {
+        let _ = state.store.set_setting(&name_receipt_key(agent_id), "{}");
+    }
     state.persist_agent(agent_id);
     state.broadcast(ServerEvent::AgentChanged(run));
     ServerResponse::Accepted
@@ -4387,11 +4448,8 @@ fn handle_codex_stdout_line(
 #[cfg(test)]
 fn codex_session_title(value: &Value) -> Option<String> {
     [
-        value.get("title"),
         value.get("name"),
-        value.pointer("/thread/title"),
         value.pointer("/thread/name"),
-        value.pointer("/session/title"),
         value.pointer("/session/name"),
     ]
     .into_iter()
@@ -4402,26 +4460,7 @@ fn codex_session_title(value: &Value) -> Option<String> {
     .map(str::to_owned)
 }
 
-fn codex_title_from_state(thread_id: &str) -> Option<String> {
-    let codex_home = std::env::var_os("CODEX_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))?;
-    let connection = rusqlite::Connection::open_with_flags(
-        codex_home.join("state_5.sqlite"),
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )
-    .ok()?;
-    connection
-        .query_row(
-            "SELECT COALESCE(NULLIF(name, ''), NULLIF(title, '')) FROM threads WHERE id = ?1",
-            [thread_id],
-            |row| row.get::<_, Option<String>>(0),
-        )
-        .ok()
-        .flatten()
-        .map(|title| title.trim().to_owned())
-        .filter(|title| !title.is_empty())
-}
+include!("session_names.rs");
 
 #[cfg(test)]
 fn looks_like_diagnostic(text: &str) -> bool {
@@ -4852,17 +4891,7 @@ fn finish_agent(
 }
 
 fn agent_display_name(run: &AgentRun) -> String {
-    run.user_title
-        .as_deref()
-        .filter(|title| !title.trim().is_empty())
-        .or_else(|| {
-            run.codex_title
-                .as_deref()
-                .filter(|title| !title.trim().is_empty())
-        })
-        .unwrap_or("Codex")
-        .trim()
-        .to_owned()
+    run.display_name()
 }
 
 fn notification_summary(value: &str) -> String {
@@ -5750,6 +5779,7 @@ esac
     }
 
     include!("remote_recovery_tests.rs");
+    include!("session_name_tests.rs");
     include!("model_discovery_tests.rs");
 
     pub(super) fn test_runtime() -> RuntimeState {
@@ -5996,6 +6026,7 @@ esac
                     pane_id: None,
                     native_session_id: None,
                     codex_title: None,
+                    naming_failed: false,
                     user_title: None,
                     origin_codex_home: None,
                     current_prompt: Some("start".to_owned()),
@@ -6078,6 +6109,7 @@ esac
                     pane_id: None,
                     native_session_id: Some("thread-stop".to_owned()),
                     codex_title: Some("Stop test".to_owned()),
+                    naming_failed: false,
                     user_title: None,
                     origin_codex_home: None,
                     current_prompt: Some("keep working".to_owned()),
@@ -6182,6 +6214,7 @@ esac
                     pane_id: None,
                     native_session_id: None,
                     codex_title: None,
+                    naming_failed: false,
                     user_title: None,
                     origin_codex_home: None,
                     current_prompt: Some("test".to_owned()),
@@ -6264,6 +6297,7 @@ esac
                     pane_id: None,
                     native_session_id: Some("thread-completed".to_owned()),
                     codex_title: Some("Notification test".to_owned()),
+                    naming_failed: false,
                     user_title: None,
                     origin_codex_home: None,
                     current_prompt: Some("finish soon".to_owned()),
@@ -6325,6 +6359,7 @@ esac
                     pane_id: None,
                     native_session_id: Some("thread-safe".to_owned()),
                     codex_title: Some("Safety test".to_owned()),
+                    naming_failed: false,
                     user_title: None,
                     origin_codex_home: None,
                     current_prompt: Some("explain the detector".to_owned()),
@@ -6401,6 +6436,7 @@ esac
                     pane_id: None,
                     native_session_id: Some("thread-quota".to_owned()),
                     codex_title: None,
+                    naming_failed: false,
                     user_title: None,
                     origin_codex_home: None,
                     current_prompt: Some("test".to_owned()),
@@ -6464,6 +6500,7 @@ esac
                     pane_id: None,
                     native_session_id: Some("thread-123".to_owned()),
                     codex_title: None,
+                    naming_failed: false,
                     user_title: None,
                     origin_codex_home: None,
                     current_prompt: None,

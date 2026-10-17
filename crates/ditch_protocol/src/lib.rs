@@ -38,6 +38,11 @@ pub enum ClientRequest {
     RuntimeStatus,
     Snapshot,
     Shutdown,
+    RemoteRuntimeMaintenance {
+        instance_id: Uuid,
+        token: Uuid,
+        action: String,
+    },
     SubscribeEvents {
         since_sequence: u64,
     },
@@ -92,6 +97,7 @@ pub enum ClientRequest {
     InstallRemoteRuntime {
         alias: String,
     },
+    RemoteRuntimeUpdateStatus { alias: String },
     InstallRemoteCodex {
         alias: String,
     },
@@ -657,6 +663,7 @@ pub enum ServerEvent {
     AttentionSnapshotReplaced(Vec<RuntimeAttention>),
     RuntimeStatusChanged(RuntimeStatus),
     RemoteHostStatusChanged(RemoteHostPresence),
+    RemoteRuntimeRestarted { alias: String },
     ProjectChanged(Project),
     ProjectDeleted {
         project_id: ProjectId,

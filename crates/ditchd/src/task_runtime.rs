@@ -57,6 +57,9 @@ impl WriterGuard {
             PathBuf::from(root.to_string_lossy().to_lowercase())
         };
         let mut locked = state.lock().expect("runtime state lock poisoned");
+        if locked.remote_maintenance_active() {
+            return Err("Remote runtime is being upgraded; retry when repair finishes.".into());
+        }
         locked.reap_orphan_writers();
         if locked.acceptance_owners.contains(&agent_id)
             && locked.writer_leases.contains_key(&agent_id)

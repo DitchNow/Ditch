@@ -10,7 +10,7 @@ use ditch_ssh::{
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
@@ -81,6 +81,25 @@ pub struct RemoteConnectionManager {
     session_passwords: Arc<Mutex<HashMap<String, Vec<u8>>>>,
     event_cancellations: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
     event_cursors: Arc<Mutex<HashMap<String, (Uuid, u64)>>>,
+    maintenance_hosts: Arc<Mutex<HashSet<String>>>,
+    updates: Arc<Mutex<HashMap<String, RequestedUpdate>>>,
+}
+
+include!("remote_updates.rs");
+
+struct RemoteMaintenanceGuard {
+    hosts: Arc<Mutex<HashSet<String>>>,
+    identity: String,
+}
+
+fn maintenance_identity(host: &ResolvedSshHost) -> String {
+    // SSH aliases for the same configured host/account share admission.
+    serde_json::to_string(&(&host.hostname, &host.user, host.port)).unwrap()
+}
+impl Drop for RemoteMaintenanceGuard {
+    fn drop(&mut self) {
+        self.hosts.lock().unwrap().remove(&self.identity);
+    }
 }
 
 struct Bridge {
@@ -108,6 +127,13 @@ impl Drop for Bridge {
 }
 
 impl RemoteConnectionManager {
+    fn begin_maintenance(&self, host: &ResolvedSshHost) -> Result<RemoteMaintenanceGuard, SshError> {
+        let identity = maintenance_identity(host);
+        if !self.maintenance_hosts.lock().unwrap().insert(identity.clone()) {
+            return Err(SshError::Failed("Another repair is already running for this remote account.".into()));
+        }
+        Ok(RemoteMaintenanceGuard { hosts: Arc::clone(&self.maintenance_hosts), identity })
+    }
     pub fn remember_session_password(&self, alias: &str, password: Vec<u8>) {
         if let Some(mut old) = self
             .session_passwords
@@ -196,6 +222,20 @@ impl RemoteConnectionManager {
                 | ClientRequest::GetPermissionRequest { .. }
                 | ClientRequest::ListFilesystemDirectory { .. }
         );
+        // Pause this Mac's schedulers too, including the legacy maintenance
+        // window. Status/rejoin and explicit stop controls remain available.
+        if matches!(request, ClientRequest::StartRemoteCodexAppServerSession { .. }
+            | ClientRequest::ResumeRemoteCodexAppServerSession { .. }
+            | ClientRequest::PromptRemoteCodexAppServerAgent { .. }
+            | ClientRequest::StartCodexSession { .. } | ClientRequest::ResumeCodexSession { .. }
+            | ClientRequest::PromptAgent { .. } | ClientRequest::OpenProjectTerminal { .. })
+            && !self.maintenance_hosts.lock().unwrap().is_empty()
+        {
+            let identity = maintenance_identity(&resolve_host(alias)?);
+            if self.maintenance_hosts.lock().unwrap().contains(&identity) {
+                return Err(SshError::Failed("Remote runtime repair is in progress; new work is temporarily paused.".into()));
+            }
+        }
         // Recovery controls must remain usable for already-running older sessions.
         // Only new turns need the policy/model/confirmation contract.
         let needs_session_controls = matches!(
@@ -643,6 +683,11 @@ pub fn check_setup(
     let exact = server_version.as_deref() == Some(env!("CARGO_PKG_VERSION"))
         && server_protocol == Some(ditch_protocol::REMOTE_RUNTIME_PROTOCOL_VERSION)
         && server_build == Some(local_build);
+    let compatible = server_protocol == Some(ditch_protocol::REMOTE_RUNTIME_PROTOCOL_VERSION);
+    let server_number = runtime_json.as_ref().and_then(|v| v.get("build_number"))
+        .and_then(|v| v.as_str()).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+    let local_number = option_env!("DITCH_BUILD_NUMBER").and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+    let newer = server_number > local_number && server_number > 0;
     let mut checks = vec![
         check(
             "ssh",
@@ -665,8 +710,10 @@ pub fn check_setup(
         check(
             "runtime",
             "Ditch Runtime",
-            if exact {
+            if exact || (compatible && newer) {
                 RemoteCheckState::Ready
+            } else if newer {
+                RemoteCheckState::Failed
             } else if runtime_value == "missing" {
                 RemoteCheckState::Missing
             } else {
@@ -674,6 +721,10 @@ pub fn check_setup(
             },
             if exact {
                 "Exact version installed"
+            } else if newer && compatible {
+                "Compatible newer runtime installed"
+            } else if newer {
+                "Update this Mac's Ditch app to connect to the newer remote runtime"
             } else if runtime_value == "missing" {
                 "Not installed"
             } else {
@@ -800,7 +851,7 @@ pub fn check_setup(
     let mut machine_id = None;
     let mut daemon_epoch = None;
     let mut daemon_ready = false;
-    if exact {
+    if compatible {
         connections.disconnect(alias);
         if let Ok(ServerResponse::RuntimeStatus(status)) =
             connections.request(alias, ClientRequest::RuntimeStatus)
@@ -813,8 +864,7 @@ pub fn check_setup(
                     .capabilities
                     .iter()
                     .any(|c| c == "app_server_sessions_v2")
-                && status.build_identifier
-                    == option_env!("DITCH_BUILD_IDENTIFIER").unwrap_or(env!("CARGO_PKG_VERSION"));
+                && status.edition == super::RUNTIME_EDITION;
             daemon_epoch = Some(status.instance_id);
         }
         if let Ok(ServerResponse::HostIdentity(status)) =
@@ -825,7 +875,7 @@ pub fn check_setup(
     }
     let ready = desktop_project_setup_ready(
         supported,
-        exact,
+        compatible,
         git != "missing",
         codex != "missing",
         codex_auth == "ready",
@@ -929,12 +979,21 @@ git --version
     check_setup(connections, alias, None, false, false)
 }
 
-pub fn install_remote_runtime(
+struct StagedRuntime {
+    target: String,
+    checksum: String,
+    upload: String,
+}
+
+fn install_remote_runtime(
     connections: &RemoteConnectionManager,
     alias: &str,
+    staged: &mut Option<StagedRuntime>,
 ) -> Result<RemoteSetupStatus, SshError> {
     observe("remote_runtime_install_started", alias, None);
     let resolved = resolve_host(alias)?;
+    let _maintenance = connections.begin_maintenance(&resolved)?;
+    if staged.is_none() {
     let (preflight, _) = run_fixed_admin_authenticated(
         alias,
         PREFLIGHT_SCRIPT,
@@ -951,27 +1010,6 @@ pub fn install_remote_runtime(
         values.get("os").map(String::as_str).unwrap_or(""),
         values.get("arch").map(String::as_str).unwrap_or(""),
     )?;
-    if values
-        .get("runtime")
-        .is_some_and(|value| value != "missing")
-    {
-        match connections.request(alias, ClientRequest::RuntimeStatus) {
-            Ok(ServerResponse::RuntimeStatus(status)) if status.active_session_count == 0 => {}
-            Ok(ServerResponse::RuntimeStatus(status)) => {
-                return Err(SshError::Failed(format!(
-                    "Remote runtime update deferred because {} agent(s) are still running. Their work will not be interrupted.",
-                    status.active_session_count
-                )));
-            }
-            _ => {
-                return Err(SshError::Failed(
-                    "Remote runtime update deferred because Ditch could not prove that the existing runtime is idle."
-                        .into(),
-                ));
-            }
-        }
-    }
-
     let artifact = locate_artifact(target)?;
     let checksum = format!("{:x}", Sha256::digest(fs::read(&artifact)?));
     verify_artifact_metadata(&artifact, target, &checksum)?;
@@ -981,16 +1019,19 @@ pub fn install_remote_runtime(
         Uuid::new_v4()
     );
     upload_artifact(connections, &resolved, &artifact, &remote_upload)?;
+    *staged = Some(StagedRuntime { target: target.into(), checksum, upload: remote_upload });
+    }
+    let staged = staged.as_ref().unwrap();
 
     let mut command = base_ssh_command(alias)?;
     command.args([
         "sh",
         "-s",
         "--",
-        env!("CARGO_PKG_VERSION"),
-        target,
-        &checksum,
-        &remote_upload,
+        &staged.target,
+        &staged.checksum,
+        &staged.upload,
+        "automatic",
     ]);
     command
         .stdin(Stdio::piped())
@@ -1004,11 +1045,10 @@ pub fn install_remote_runtime(
     if let Some(mut stdin) = child.stdin.take() {
         stdin.write_all(INSTALL_SCRIPT.as_bytes())?;
     }
-    let output = ditch_ssh::wait_output(child, Duration::from_secs(90));
+    let output = ditch_ssh::wait_output(child, Duration::from_secs(150));
     drop(guard);
     let output = output?;
     if !output.status.success() {
-        let _ = rollback_remote_runtime(connections, alias);
         return Err(SshError::Failed(
             String::from_utf8_lossy(&output.stderr)
                 .chars()
@@ -1017,53 +1057,14 @@ pub fn install_remote_runtime(
         ));
     }
     connections.disconnect(alias);
-    let deadline = std::time::Instant::now() + Duration::from_secs(15);
-    loop {
-        if let Ok(status) = check_setup(connections, alias, None, false, false)
-            && status.connection_state == "connected"
-        {
-            return Ok(status);
-        }
-        if std::time::Instant::now() >= deadline {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(200));
-    }
-    let _ = rollback_remote_runtime(connections, alias);
-    Err(SshError::Failed(
-        "runtime installed but its health handshake did not become ready".into(),
-    ))
-}
-
-fn rollback_remote_runtime(
-    connections: &RemoteConnectionManager,
-    alias: &str,
-) -> Result<(), SshError> {
-    const SCRIPT: &str = r#"set -eu
-root="$HOME/.ditch"
-previous=$(cat "$root/run/previous-runtime" 2>/dev/null || true)
-[ -n "$previous" ] || exit 0
-rm -f "$root/bin/current.next"
-ln -s "$previous" "$root/bin/current.next"
-case "$(uname -s)" in
-  Linux)
-    mv -Tf "$root/bin/current.next" "$root/bin/current"
-    if command -v systemctl >/dev/null 2>&1 && systemctl --user is-active --quiet the-ditch.service; then systemctl --user restart the-ditch.service; fi
-    ;;
-  Darwin)
-    mv -fh "$root/bin/current.next" "$root/bin/current"
-    uid=$(id -u)
-    if launchctl print "user/$uid/dev.theditch.runtime.remote" >/dev/null 2>&1; then launchctl kickstart -k "user/$uid/dev.theditch.runtime.remote"; fi
-    ;;
-esac
-"#;
-    let resolved = resolve_host(alias)?;
-    let (output, _) =
-        run_fixed_admin_authenticated(alias, SCRIPT, connections.password_for(&resolved), false)?;
-    if output.status.success() {
-        Ok(())
+    let status = check_setup(connections, alias, None, false, false)?;
+    if status.connection_state == "connected" {
+        Ok(status)
     } else {
-        Err(SshError::Failed("runtime rollback failed".into()))
+        Err(SshError::Failed(format!(
+            "Runtime activation completed, but desktop reconnection failed: {}. The verified installation was retained.",
+            status.last_error.as_deref().unwrap_or("runtime handshake did not match this app")
+        )))
     }
 }
 
@@ -1087,7 +1088,6 @@ fn locate_artifact(target: &str) -> Result<PathBuf, SshError> {
     if let Ok(current) = std::env::current_exe()
         && let Some(directory) = current.parent()
     {
-        candidates.push(directory.join(format!("ditchd-remote-{target}")));
         candidates.push(
             directory
                 .parent()
@@ -1095,6 +1095,7 @@ fn locate_artifact(target: &str) -> Result<PathBuf, SshError> {
                 .join("Resources/RemoteRuntimes")
                 .join(format!("ditchd-{target}")),
         );
+        candidates.push(directory.join(format!("ditchd-remote-{target}")));
     }
     let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -1371,15 +1372,11 @@ pub fn create_remote_project(
 }
 
 const INSTALL_SCRIPT: &str = r#"set -eu
-version=$1
-target=$2
-expected=$3
-upload=$4
 umask 077
-root="$HOME/.ditch"
-release="versions/$version/$target/$expected"
-mkdir -p "$root/bin/$release" "$root/state" "$root/run" "$root/logs" "$root/identity"
-chmod 700 "$root" "$root/bin" "$root/bin/versions" "$root/state" "$root/run" "$root/logs" "$root/identity"
+target=$1
+expected=$2
+upload=$3
+legacy=$4
 if command -v sha256sum >/dev/null 2>&1; then
   actual=$(sha256sum "$upload" | awk '{print $1}')
 elif command -v shasum >/dev/null 2>&1; then
@@ -1388,36 +1385,11 @@ else
   echo 'No SHA-256 utility is available' >&2
   exit 41
 fi
-[ "$actual" = "$expected" ] || { echo 'Runtime artifact checksum mismatch' >&2; rm -f "$upload"; exit 42; }
-destination="$root/bin/$release/ditchd"
-temporary="$destination.tmp"
-mv "$upload" "$temporary"
-chmod 700 "$temporary"
-mv "$temporary" "$destination"
-[ ! -L "$root/bin/current" ] || readlink "$root/bin/current" > "$root/run/previous-runtime"
-rm -f "$root/bin/current.next"
-ln -s "$release" "$root/bin/current.next"
-case "$(uname -s)" in
-  Linux) mv -Tf "$root/bin/current.next" "$root/bin/current" ;;
-  Darwin) mv -fh "$root/bin/current.next" "$root/bin/current" ;;
-esac
-# Remove the nested symlink produced by the pre-checksum updater. This path is
-# never a release and is scoped to the exact version/target being installed.
-legacy_nested_next="$root/bin/versions/$version/$target/current.next"
-[ ! -L "$legacy_nested_next" ] || rm -f "$legacy_nested_next"
-# A healthy daemon is reused. The bridge bootstraps a detached user process on
-# demand; systemd/launchd and lingering are not prerequisites. Explicit upgrades
-# of an already-running older daemon require a separate, visible restart.
-"$root/bin/current/ditchd" version-json
-# This is explicit setup/upgrade, never reconnect. Reuse an existing supervisor
-# if one was installed by an older Ditch; do not install another service.
-if [ "$(uname -s)" = Linux ] && command -v systemctl >/dev/null 2>&1 && systemctl --user is-active --quiet the-ditch.service; then
-  systemctl --user restart the-ditch.service
-fi
-if [ "$(uname -s)" = Darwin ] && launchctl print "user/$(id -u)/dev.theditch.runtime.remote" >/dev/null 2>&1; then
-  launchctl kickstart -k "user/$(id -u)/dev.theditch.runtime.remote"
-fi
-
+[ "$actual" = "$expected" ] || { echo 'Runtime artifact checksum mismatch' >&2; exit 42; }
+chmod 700 "$upload"
+# The replacement itself manages activation on the host. Its persistent journal
+# allows a subsequent repair to recover an interrupted SSH invocation.
+"$upload" upgrade-remote "$target" "$expected" "$legacy"
 "#;
 
 pub fn observe(event: &str, alias: &str, detail: Option<&str>) {
@@ -1435,6 +1407,22 @@ pub fn observe(event: &str, alias: &str, detail: Option<&str>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repair_admission_is_shared_across_aliases_and_released_on_error() {
+        let connections = RemoteConnectionManager::default();
+        let mut host = ResolvedSshHost {
+            alias: "first".into(), hostname: "fixture.invalid".into(), user: "fixture".into(),
+            port: 22, identity_files: vec![], preferred_authentications: vec![],
+        };
+        let guard = connections.begin_maintenance(&host).unwrap();
+        host.alias = "second".into();
+        assert!(connections.clone().begin_maintenance(&host).is_err());
+        assert!(connections.maintenance_hosts.lock().unwrap().contains(&maintenance_identity(&host)));
+        drop(guard);
+        assert!(connections.begin_maintenance(&host).is_ok());
+        assert!(connections.maintenance_hosts.lock().unwrap().is_empty());
+    }
 
     #[test]
     fn silent_stream_deadlines_and_cancellation_are_bounded() {
