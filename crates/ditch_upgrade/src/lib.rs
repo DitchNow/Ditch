@@ -549,6 +549,31 @@ pub struct HttpUpgradeBackend {
 }
 
 impl HttpUpgradeBackend {
+    /// Fixed staging-only GitHub endpoint; uses the existing Keychain machine identity.
+    /// No GitHub token or app secret is accepted by the desktop client.
+    pub fn github_staging_request(
+        &self,
+        identity: &InstallationIdentity,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value, UpgradeError> {
+        if DEPLOYMENT_ENVIRONMENT != "staging"
+            || self.origin.as_str().trim_end_matches('/') != "https://ditch-remote-relay-staging.matin-1a7.workers.dev"
+        {
+            return Err(UpgradeError::InvalidResponse("GitHub App is staging-only".into()));
+        }
+        let bearer = self.official_build_bearer(identity)?
+            .ok_or_else(|| UpgradeError::InvalidResponse("GitHub requires a signed staging Ditch build".into()))?;
+        let bytes = serde_json::to_vec(body).map_err(|e| UpgradeError::InvalidResponse(e.to_string()))?;
+        let response = self.machine_signed_response(identity, "POST", "/v1/github/commands", &bytes, Some(&bearer))?;
+        let mut bytes = Vec::new();
+        response.into_reader().take(4 * 1024 * 1024 + 1).read_to_end(&mut bytes)
+            .map_err(|_| UpgradeError::InvalidResponse("Cannot read GitHub response".into()))?;
+        if bytes.len() > 4 * 1024 * 1024 {
+            return Err(UpgradeError::InvalidResponse("GitHub response exceeded its limit".into()));
+        }
+        serde_json::from_slice(&bytes).map_err(|_| UpgradeError::InvalidResponse("Invalid GitHub response".into()))
+    }
+
     pub fn official() -> Result<Self, UpgradeError> {
         Self::for_deployment(DEPLOYMENT_ENVIRONMENT, CONFIGURED_UPGRADE_API_ORIGIN)
     }
@@ -781,6 +806,9 @@ impl HttpUpgradeBackend {
             .set("X-Ditch-Timestamp", &timestamp.to_string())
             .set("X-Ditch-Nonce", &nonce)
             .set("X-Ditch-Signature", &identity.sign(canonical.as_bytes()));
+        if path_and_query == "/v1/github/commands" {
+            request = request.timeout(std::time::Duration::from_secs(60));
+        }
         if let Some(bearer) = official_build_bearer {
             request = request.set("X-Ditch-Official-Build", bearer);
         }

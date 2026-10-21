@@ -12,6 +12,22 @@ pub enum GitHubRequest {
     CancelRead,
     OpenBrowser,
     Disconnect,
+    ManageRepositories,
+    RemoteSuggestions {
+        project_id: ProjectId,
+    },
+    SyncChanges {
+        cursor: u64,
+        #[serde(default)]
+        after_task: Option<String>,
+    },
+    CreateIssue {
+        project_id: ProjectId,
+        repository_id: u64,
+        request_id: String,
+        title: String,
+        body: String,
+    },
     Repositories {
         page: u32,
     },

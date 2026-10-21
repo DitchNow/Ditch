@@ -457,7 +457,8 @@ class _ProjectSidebarState extends State<ProjectSidebar> {
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 ...widget.editionNavigation,
-                if (showUnfinishedFeatureControls &&
+                if ((showUnfinishedFeatureControls ||
+                        showGitHubBoardControls) &&
                     widget.onOpenBoard != null) ...[
                   ListTile(
                     dense: true,
@@ -466,7 +467,8 @@ class _ProjectSidebarState extends State<ProjectSidebar> {
                     title: const Text('Board'),
                     onTap: widget.onOpenBoard,
                   ),
-                  if (widget.onOpenSkills != null)
+                  if (showUnfinishedFeatureControls &&
+                      widget.onOpenSkills != null)
                     ListTile(
                       dense: true,
                       selected: widget.skillsSelected,

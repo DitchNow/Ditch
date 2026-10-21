@@ -5,6 +5,8 @@ use ditch_core::{TaskActor, TaskDraft, TaskPriority};
 use rusqlite::{OptionalExtension, params};
 use serde_json::json;
 use sha2::{Digest, Sha256};
+#[path = "github_app.rs"]
+mod app;
 #[path = "github_auth.rs"]
 mod auth;
 
@@ -18,6 +20,19 @@ static RATE_LIMIT: Mutex<Option<Instant>> = Mutex::new(None);
 trait GitHubService {
     fn get(&self, path: &str) -> Result<Value, String>;
     fn progress(&self, _detail: &str) {}
+    fn link(&self, _project: ProjectId, _repository: u64) -> Result<(), String> {
+        Ok(())
+    }
+    fn create(
+        &self,
+        _project: ProjectId,
+        _repository: u64,
+        _request: &str,
+        _title: &str,
+        _body: &str,
+    ) -> Result<Value, String> {
+        Err("Issue creation requires the staging GitHub App".into())
+    }
     fn check_commit(&self, _state: &RuntimeState) -> Result<(), String> {
         Ok(())
     }
@@ -572,6 +587,9 @@ pub fn handle(state: Arc<Mutex<RuntimeState>>, request: GitHubRequest) -> Server
     }
 }
 fn handle_inner(state: Arc<Mutex<RuntimeState>>, request: GitHubRequest) -> Result<Value, String> {
+    if app::enabled() {
+        return app::handle(state, request);
+    }
     let root = {
         let s = state.lock().unwrap();
         if s.remote_runtime {
@@ -608,6 +626,40 @@ fn handle_service(
     _root: &Path,
 ) -> Result<Value, String> {
     match request {
+        GitHubRequest::ManageRepositories
+        | GitHubRequest::RemoteSuggestions { .. }
+        | GitHubRequest::SyncChanges { .. } => {
+            Err("This operation requires the staging GitHub App".into())
+        }
+        GitHubRequest::CreateIssue {
+            project_id,
+            repository_id,
+            request_id,
+            title,
+            body,
+        } => {
+            check_registered(&state, project_id)?;
+            Uuid::parse_str(&request_id).map_err(|_| "Invalid creation request ID")?;
+            if title.trim().is_empty() || title.chars().count() > 256 || body.len() > 65536 {
+                return Err(
+                    "Enter a title of 1–256 characters and a body of at most 64 KiB".into(),
+                );
+            }
+            let repo = verified_repository(&state, service, project_id, repository_id)?;
+            let raw =
+                service.create(project_id, repository_id, &request_id, title.trim(), &body)?;
+            let issue: GitHubIssue =
+                serde_json::from_value(raw).map_err(|_| "Invalid created issue")?;
+            if !issue.html_url.eq_ignore_ascii_case(&format!(
+                "https://github.com/{}/issues/{}",
+                repo.full_name, issue.number
+            )) {
+                return Err("Created issue identity could not be verified".into());
+            }
+            let mut s = state.lock().unwrap();
+            service.check_commit(&s)?;
+            import_issues(&mut s, project_id, &repo, vec![issue], Some(request_id))
+        }
         GitHubRequest::Status
         | GitHubRequest::Connect
         | GitHubRequest::OpenBrowser
@@ -646,6 +698,7 @@ fn handle_service(
             if !repo.has_issues {
                 return Err("Issues are disabled for this repository".into());
             }
+            service.link(project_id, repo.id)?;
             let s = state.lock().unwrap();
             service.check_commit(&s)?;
             s.store.with_extension_connection(NS, |c| {
@@ -1052,6 +1105,60 @@ mod tests {
 
     #[derive(Clone)]
     struct Fake(HashMap<String, Value>);
+    #[test]
+    fn explicit_issue_creation_imports_once_without_starting_or_accepting_work() {
+        struct Creator(Fake, std::cell::Cell<usize>);
+        impl GitHubService for Creator {
+            fn get(&self, path: &str) -> Result<Value, String> {
+                self.0.get(path)
+            }
+            fn create(
+                &self,
+                _: ProjectId,
+                _: u64,
+                _: &str,
+                _: &str,
+                _: &str,
+            ) -> Result<Value, String> {
+                self.1.set(self.1.get() + 1);
+                self.0.get("repos/owner/repo/issues/7")
+            }
+        }
+        let (state, project, fake) = fixture();
+        let service = Creator(fake, std::cell::Cell::new(0));
+        let request_id = Uuid::new_v4().to_string();
+        let request = |title: &str| GitHubRequest::CreateIssue {
+            project_id: project.id,
+            repository_id: 42,
+            request_id: request_id.clone(),
+            title: title.into(),
+            body: "Explicitly submitted content".into(),
+        };
+        assert!(
+            handle_service(state.clone(), request(" "), &service, Path::new("unused")).is_err()
+        );
+        assert_eq!(service.1.get(), 0);
+        let first = handle_service(
+            state.clone(),
+            request("New issue"),
+            &service,
+            Path::new("unused"),
+        )
+        .unwrap();
+        let second = handle_service(
+            state.clone(),
+            request("New issue"),
+            &service,
+            Path::new("unused"),
+        )
+        .unwrap();
+        assert_eq!(first, second);
+        let s = state.lock().unwrap();
+        assert_eq!(s.tasks.len(), 1);
+        let task = s.tasks.values().next().unwrap();
+        assert_eq!(task.column(), ditch_core::TaskColumn::Backlog);
+        assert_eq!(task.github_source.as_ref().unwrap().issue_id, 70);
+    }
     impl GitHubService for Fake {
         fn get(&self, path: &str) -> Result<Value, String> {
             self.0

@@ -2778,7 +2778,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen>
     );
     final settingsSections = [
       ...editionSections.where(
-        (section) => showUnfinishedFeatureControls || section.id != 'github',
+        (section) => showUnfinishedFeatureControls || showGitHubBoardControls || section.id != 'github',
       ),
       EditionSettingsSection(
         id: 'license-plans',
@@ -7998,7 +7998,7 @@ class AgentsSurface extends StatelessWidget {
                       style: Theme.of(context).textTheme.headlineSmall,
                     ),
                   ),
-                  if (showUnfinishedFeatureControls && onOpenBoard != null)
+                  if ((showUnfinishedFeatureControls || showGitHubBoardControls) && onOpenBoard != null)
                     IconButton(
                       onPressed: onOpenBoard,
                       tooltip: 'Project Board — $projectWriteDisclosure',

@@ -22,6 +22,32 @@ The practical concurrency tests do not replace ThreadSanitizer or formal verific
 
 ## GitHub integration boundary (2026-09-29)
 
+### Staging GitHub App boundary (2026-10-21)
+
+For the exact staging Relay environment, the native runtime uses `github_app.rs`
+instead of the legacy CLI implementation below. The native-peer requirement remains.
+The Mac holds its own Keychain machine identity, never a GitHub App private key,
+client secret or GitHub user token. Signed, official-build-authenticated Relay
+requests use a closed command schema. Relay encrypts user tokens with associated
+machine/connection identity and enforces current user access, selected-repository
+installations, and explicit project/repository links before reads or creation.
+
+CreateIssue is a deliberate native user action with destination/content preview.
+It may publish title/body to GitHub, then imports the returned source into Backlog.
+An uncertain POST is not automatically repeated; durable receipts fence retries.
+GitHub bodies remain untrusted task data. Webhooks cannot launch agents, mutate
+local task scope, advance the board or accept work. Imported metadata refreshes
+check the connection generation before local commits. Git remote detection reads
+local configuration with fixed Git arguments and never invokes helpers or writes
+remotes. Repository linkage does not grant Git push access.
+
+Cloudflare sees private GitHub issue content while proxying API responses and
+receiving webhooks. This is an explicit privacy boundary, distinct from encrypted
+mobile traffic. Only encrypted credentials, identifiers, hashes and change markers
+are stored on Relay. Logs must omit credentials and issue/comment bodies.
+
+The remaining CLI description documents the unchanged production implementation.
+
 GitHub operations retain the native-peer check before runtime dispatch; the shared helper is also used by Commercial Ditchmaster. Worker tools and the typed mobile command surface do not expose GitHub connection/import operations. No caller-provided actor flag authorizes them.
 
 The integration executes only the pinned managed CLI and internally constructed GET requests. It removes inherited tokens and browser/editor/pager overrides. Authentication uses noninteractive pipes with stdin closed and prompts disabled; only the expected device code and fixed github.com device URL reach the native panel. Authentication output is not published as events or agent scrollback.
