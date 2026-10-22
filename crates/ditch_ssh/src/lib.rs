@@ -20,7 +20,7 @@ use thiserror::Error;
 
 pub const SSH_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 pub const ADMIN_TIMEOUT: Duration = Duration::from_secs(45);
-pub const SSH_PASSWORD_KEYCHAIN_SERVICE: &str = "dev.theditch.ssh-password.v1";
+pub const SSH_PASSWORD_KEYCHAIN_SERVICE: &str = ditch_product::deployment::SSH_KEYCHAIN_SERVICE;
 const ASKPASS_SOCKET_NAME: &str = "s";
 // macOS has the smallest supported sockaddr_un.sun_path (104 bytes, including
 // its terminating NUL). Leave a little headroom for platform encoding details.
@@ -534,7 +534,7 @@ pub fn askpass_main() -> Result<(), SshError> {
 
 pub fn bridge_command(alias: &str) -> Result<Command, SshError> {
     let mut command = base_ssh_command(alias)?;
-    command.arg("~/.ditch/bin/current/ditchd");
+    command.arg(format!("~/{}/bin/current/ditchd", ditch_product::deployment::REMOTE_DIRECTORY));
     command.arg("bridge");
     command.arg("--stdio");
     command

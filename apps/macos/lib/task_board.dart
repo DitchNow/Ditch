@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'package:flutter/services.dart';
 import 'github_inbox.dart';
 import 'release_ui_visibility.dart';
 import 'skills_directory.dart';
@@ -121,6 +122,11 @@ class _TaskBoardState extends State<TaskBoard> {
   void initState() {
     super.initState();
     unawaited(loadSubprojects());
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted && projectId != null) {
+        unawaited(widget.controller.loadBoardExecution(projectId!));
+      }
+    });
   }
 
   Future<void> loadSubprojects() async {
@@ -221,6 +227,37 @@ class _TaskBoardState extends State<TaskBoard> {
     if (before == task.id || !widget.connected || widget.controller.busy) {
       return;
     }
+    if (column == task.column) {
+      if (projectId == null ||
+          subprojects.isNotEmpty ||
+          column != TaskColumn.inProgress ||
+          !task.waitingInQueue) {
+        return;
+      }
+      await widget.controller.mutate(task.projectId, {
+        'ReorderQueue': {
+          'task_id': task.id,
+          'expected_revision': task.revision,
+          'before_id': before,
+        },
+      });
+      return;
+    }
+    if (column == TaskColumn.inProgress &&
+        task.column == TaskColumn.todo &&
+        task.coordinatorGroup == null) {
+      await widget.controller.mutate(task.projectId, {
+        'Enqueue': {
+          'task_id': task.id,
+          'expected_revision': task.revision,
+          'execution_profile': {
+            ...widget.executionProfile(),
+            'transport': 'AppServer',
+          },
+        },
+      });
+      return;
+    }
     if (column != task.column &&
         (column == TaskColumn.inProgress ||
             column == TaskColumn.done ||
@@ -269,25 +306,28 @@ class _TaskBoardState extends State<TaskBoard> {
           .toList();
       return Row(
         children: [
-          if (showGithub)
-            SizedBox(
-              width: 350,
-              child: GitHubInbox(
-                key: ValueKey('$projectId:${subprojects.toList()..sort()}'),
-                request: widget.controller.request,
-                projects: widget.projects
-                    .where(
-                      (p) =>
-                          projectId == null ||
-                          p.id == projectId ||
-                          subprojects.contains(p.id),
-                    )
-                    .toList(),
-                onImported: widget.controller.refresh,
-                onOpenTask: (id) {
-                  final task = widget.controller.task(id);
-                  if (task != null) inspect(task);
-                },
+          if (showGitHubBoardControls)
+            Offstage(
+              offstage: !showGithub,
+              child: SizedBox(
+                width: 350,
+                child: GitHubInbox(
+                  key: ValueKey('$projectId:${subprojects.toList()..sort()}'),
+                  request: widget.controller.request,
+                  projects: widget.projects
+                      .where(
+                        (p) =>
+                            projectId == null ||
+                            p.id == projectId ||
+                            subprojects.contains(p.id),
+                      )
+                      .toList(),
+                  onImported: widget.controller.refresh,
+                  onOpenTask: (id) {
+                    final task = widget.controller.task(id);
+                    if (task != null) inspect(task);
+                  },
+                ),
               ),
             ),
           Expanded(
@@ -305,21 +345,119 @@ class _TaskBoardState extends State<TaskBoard> {
                         'Board',
                         style: Theme.of(context).textTheme.headlineSmall,
                       ),
-                      FilterChip(
-                        label: const Text('GitHub inbox'),
-                        selected: showGithub,
-                        onSelected: (v) => setState(() => showGithub = v),
+                      SizedBox(
+                        width: 190,
+                        child: DropdownButtonHideUnderline(
+                          child: DropdownButton<String>(
+                            isExpanded: true,
+                            value: projectId ?? '',
+                            items: [
+                              const DropdownMenuItem(
+                                value: '',
+                                child: Text('All projects'),
+                              ),
+                              ...widget.projects.map(
+                                (p) => DropdownMenuItem(
+                                  value: p.id,
+                                  child: Text(
+                                    p.name,
+                                    overflow: TextOverflow.ellipsis,
+                                  ),
+                                ),
+                              ),
+                            ],
+                            onChanged: (id) {
+                              setState(() {
+                                projectId = id == '' ? null : id;
+                                subprojects = {};
+                                repositoryFilter = null;
+                                issueRepository = null;
+                                selected.clear();
+                              });
+                              unawaited(loadSubprojects());
+                              if (projectId != null) {
+                                unawaited(c.loadBoardExecution(projectId!));
+                              }
+                              widget.onProjectChanged?.call(projectId);
+                            },
+                          ),
+                        ),
                       ),
-                      if (widget.onRunSelected != null) ...[
+                      if (projectId != null)
+                        Tooltip(
+                          message:
+                              c.boardExecutionErrors[projectId] ??
+                              (c.boardExecutions[projectId]?.paused == true
+                                  ? 'Resume this project’s queue'
+                                  : 'Pause this project’s queue after the current task finishes'),
+                          child: OutlinedButton.icon(
+                            key: const ValueKey('board-execution-toggle'),
+                            onPressed:
+                                !widget.connected ||
+                                    c.busy ||
+                                    c.executionLoading(projectId!)
+                                ? null
+                                : c.boardExecutionErrors.containsKey(projectId)
+                                ? () => c.loadBoardExecution(projectId!)
+                                : c.boardExecutions.containsKey(projectId)
+                                ? () => c.toggleBoardExecution(projectId!)
+                                : null,
+                            icon: c.executionLoading(projectId!)
+                                ? const SizedBox(
+                                    width: 16,
+                                    height: 16,
+                                    child: CircularProgressIndicator(
+                                      strokeWidth: 2,
+                                    ),
+                                  )
+                                : Icon(
+                                    c.boardExecutionErrors.containsKey(
+                                          projectId,
+                                        )
+                                        ? Icons.refresh
+                                        : c
+                                                  .boardExecutions[projectId]
+                                                  ?.paused ==
+                                              true
+                                        ? Icons.play_arrow
+                                        : Icons.pause,
+                                    size: 18,
+                                  ),
+                            label: Text(
+                              c.boardExecutionErrors.containsKey(projectId)
+                                  ? 'Retry status'
+                                  : c.executionLoading(projectId!)
+                                  ? 'Loading…'
+                                  : c.boardExecutions[projectId]?.paused == true
+                                  ? 'Play'
+                                  : 'Pause',
+                            ),
+                          ),
+                        ),
+                      OutlinedButton.icon(
+                        onPressed: () =>
+                            setState(() => showGithub = !showGithub),
+                        style: showGithub
+                            ? OutlinedButton.styleFrom(
+                                backgroundColor: context.ditch.surfaceSoft,
+                              )
+                            : null,
+                        icon: Icon(
+                          showGithub
+                              ? Icons.view_sidebar
+                              : Icons.view_sidebar_outlined,
+                          size: 18,
+                        ),
+                        label: const Text('GitHub'),
+                      ),
+                      if (showUnfinishedFeatureControls &&
+                          widget.onRunSelected != null &&
+                          (selected.isNotEmpty || pendingRun != null)) ...[
                         FilledButton.icon(
-                          onPressed:
-                              !widget.connected ||
-                                  dispatching ||
-                                  c.busy ||
-                                  (selected.isEmpty && pendingRun == null)
+                          onPressed: !widget.connected || dispatching || c.busy
                               ? null
                               : runSelected,
-                          icon: const Icon(Icons.play_arrow),
+                          icon: const Icon(Icons.play_arrow, size: 18),
                           label: Text(
                             pendingRun != null
                                 ? 'Retry Run request'
@@ -335,98 +473,7 @@ class _TaskBoardState extends State<TaskBoard> {
                             }),
                             child: const Text('Clear selection'),
                           ),
-                        TextButton(
-                          onPressed: widget.connected ? pause : null,
-                          child: const Text('Pause queued work'),
-                        ),
                       ],
-                      DropdownButton<String>(
-                        value: projectId ?? '',
-                        hint: const Text('All projects'),
-                        items: [
-                          const DropdownMenuItem(
-                            value: '',
-                            child: Text('All projects'),
-                          ),
-                          ...widget.projects.map(
-                            (p) => DropdownMenuItem(
-                              value: p.id,
-                              child: Text(p.name),
-                            ),
-                          ),
-                        ],
-                        onChanged: (id) {
-                          setState(() {
-                            projectId = id == '' ? null : id;
-                            subprojects = {};
-                            repositoryFilter = null;
-                            issueRepository = null;
-                            selected.clear();
-                          });
-                          unawaited(loadSubprojects());
-                          widget.onProjectChanged?.call(projectId);
-                        },
-                      ),
-                      if (projectId != null)
-                        TextButton(
-                          onPressed: chooseSubprojects,
-                          child: const Text('Include subprojects'),
-                        ),
-                      if (subprojects.isNotEmpty)
-                        DropdownButton<String>(
-                          value: repositoryFilter ?? '',
-                          items: [
-                            const DropdownMenuItem(
-                              value: '',
-                              child: Text('All included projects'),
-                            ),
-                            for (final p in widget.projects.where(
-                              (p) =>
-                                  p.id == projectId ||
-                                  subprojects.contains(p.id),
-                            ))
-                              DropdownMenuItem(
-                                value: p.id,
-                                child: Text(p.name),
-                              ),
-                          ],
-                          onChanged: (id) => setState(() {
-                            repositoryFilter = id == '' ? null : id;
-                            selected.clear();
-                          }),
-                        ),
-                      if (c.tasks.any((t) => t.githubSource != null))
-                        DropdownButton<String>(
-                          value: effectiveRepository ?? '',
-                          items: [
-                            const DropdownMenuItem(
-                              value: '',
-                              child: Text('All repositories'),
-                            ),
-                            for (final entry in repositories.entries)
-                              DropdownMenuItem(
-                                value: entry.key,
-                                child: Text(entry.value),
-                              ),
-                          ],
-                          onChanged: (v) => setState(() {
-                            issueRepository = v == '' ? null : v;
-                            selected.clear();
-                          }),
-                        ),
-                      FilterChip(
-                        label: const Text('Include archived'),
-                        selected: archived,
-                        onSelected: (v) => setState(() {
-                          archived = v;
-                          selected.clear();
-                        }),
-                      ),
-                      IconButton(
-                        tooltip: 'Refresh board',
-                        onPressed: c.busy ? null : c.refresh,
-                        icon: const Icon(Icons.refresh),
-                      ),
                       FilledButton.icon(
                         key: const Key('new-task'),
                         onPressed:
@@ -440,11 +487,147 @@ class _TaskBoardState extends State<TaskBoard> {
                                 widget.projects,
                                 projectId: projectId,
                               ),
-                        icon: const Icon(Icons.add),
-                        label: const Text('New Task'),
+                        icon: const Icon(Icons.add, size: 18),
+                        label: const Text('New task'),
+                      ),
+                      PopupMenuButton<String>(
+                        tooltip: 'Board options',
+                        icon: const Icon(Icons.more_horiz),
+                        onSelected: (value) {
+                          if (value == 'refresh') {
+                            unawaited(c.refresh());
+                          } else if (value == 'subprojects') {
+                            unawaited(chooseSubprojects());
+                          } else if (value == 'pause') {
+                            unawaited(pause());
+                          } else if (value == 'archived') {
+                            setState(() {
+                              archived = !archived;
+                              selected.clear();
+                            });
+                          } else if (value.startsWith('repo:')) {
+                            setState(() {
+                              issueRepository = value.substring(5).isEmpty
+                                  ? null
+                                  : value.substring(5);
+                              selected.clear();
+                            });
+                          } else if (value.startsWith('project:')) {
+                            setState(() {
+                              repositoryFilter = value.substring(8).isEmpty
+                                  ? null
+                                  : value.substring(8);
+                              selected.clear();
+                            });
+                          }
+                        },
+                        itemBuilder: (_) => [
+                          PopupMenuItem(
+                            value: 'refresh',
+                            enabled: !c.busy,
+                            child: const Text('Refresh board'),
+                          ),
+                          CheckedPopupMenuItem(
+                            value: 'archived',
+                            checked: archived,
+                            child: const Text('Show archived'),
+                          ),
+                          if (projectId != null)
+                            const PopupMenuItem(
+                              value: 'subprojects',
+                              child: Text('Include subprojects…'),
+                            ),
+                          if (showUnfinishedFeatureControls &&
+                              widget.onRunSelected != null)
+                            PopupMenuItem(
+                              value: 'pause',
+                              enabled: widget.connected,
+                              child: const Text('Pause queued work'),
+                            ),
+                          if (subprojects.isNotEmpty) ...[
+                            const PopupMenuDivider(),
+                            CheckedPopupMenuItem(
+                              value: 'project:',
+                              checked: repositoryFilter == null,
+                              child: const Text('All included projects'),
+                            ),
+                            for (final p in widget.projects.where(
+                              (p) =>
+                                  p.id == projectId ||
+                                  subprojects.contains(p.id),
+                            ))
+                              CheckedPopupMenuItem(
+                                value: 'project:${p.id}',
+                                checked: repositoryFilter == p.id,
+                                child: Text(p.name),
+                              ),
+                          ],
+                          if (repositories.isNotEmpty) ...[
+                            const PopupMenuDivider(),
+                            CheckedPopupMenuItem(
+                              value: 'repo:',
+                              checked: effectiveRepository == null,
+                              child: const Text('All repositories'),
+                            ),
+                            for (final entry in repositories.entries)
+                              CheckedPopupMenuItem(
+                                value: 'repo:${entry.key}',
+                                checked: effectiveRepository == entry.key,
+                                child: Text(entry.value),
+                              ),
+                          ],
+                        ],
                       ),
                     ],
                   ),
+                  if (archived ||
+                      subprojects.isNotEmpty ||
+                      repositoryFilter != null ||
+                      effectiveRepository != null)
+                    Padding(
+                      padding: const EdgeInsets.only(top: 8),
+                      child: Wrap(
+                        spacing: 8,
+                        runSpacing: 4,
+                        children: [
+                          if (archived)
+                            InputChip(
+                              label: const Text('Archived included'),
+                              onDeleted: () => setState(() {
+                                archived = false;
+                                selected.clear();
+                              }),
+                            ),
+                          if (subprojects.isNotEmpty)
+                            ActionChip(
+                              label: Text('${subprojects.length} subprojects'),
+                              onPressed: chooseSubprojects,
+                            ),
+                          if (repositoryFilter != null)
+                            InputChip(
+                              label: Text(
+                                widget.projects
+                                        .where((p) => p.id == repositoryFilter)
+                                        .firstOrNull
+                                        ?.name ??
+                                    'Project filter',
+                              ),
+                              onDeleted: () => setState(() {
+                                repositoryFilter = null;
+                                selected.clear();
+                              }),
+                            ),
+                          if (effectiveRepository != null)
+                            InputChip(
+                              label: Text(repositories[effectiveRepository]!),
+                              onDeleted: () => setState(() {
+                                issueRepository = null;
+                                selected.clear();
+                              }),
+                            ),
+                        ],
+                      ),
+                    ),
                   if (!widget.connected)
                     const Padding(
                       padding: EdgeInsets.symmetric(vertical: 8),
@@ -459,10 +642,6 @@ class _TaskBoardState extends State<TaskBoard> {
                       style: TextStyle(
                         color: Theme.of(context).colorScheme.error,
                       ),
-                    ),
-                  if (widget.onRunSelected != null)
-                    const Text(
-                      'Backlog is approved scope. To Do is ready work. Only Run selected starts Ditchmaster.',
                     ),
                   if (c.busy) const LinearProgressIndicator(),
                   const SizedBox(height: 12),
@@ -486,23 +665,69 @@ class _TaskBoardState extends State<TaskBoard> {
                                       ),
                                       child: SizedBox(
                                         width: 280,
-                                        child: DragTarget<TaskDto>(
-                                          onWillAcceptWithDetails: (d) =>
-                                              widget.connected &&
-                                              !c.busy &&
-                                              (column != TaskColumn.done ||
-                                                  d.data.column ==
-                                                      TaskColumn.inReview ||
-                                                  d.data.column ==
-                                                      TaskColumn.done),
-                                          onAcceptWithDetails: (d) => unawaited(
-                                            move(d.data, column, null),
+                                        child: DragTarget<Object>(
+                                          key: ValueKey(
+                                            'board-column-${column.name}',
                                           ),
-                                          builder: (context, candidates, rejected) => DecoratedBox(
+                                          onWillAcceptWithDetails: (d) {
+                                            if (!widget.connected || c.busy) {
+                                              return false;
+                                            }
+                                            if (d.data is GitHubIssueDrag) {
+                                              return column ==
+                                                      TaskColumn.backlog &&
+                                                  (d.data as GitHubIssueDrag)
+                                                      .canDrop();
+                                            }
+                                            if (d.data is! TaskDto) {
+                                              return false;
+                                            }
+                                            final task = d.data as TaskDto;
+                                            return !task.running &&
+                                                !task.archived &&
+                                                (task.column != column ||
+                                                    (projectId != null &&
+                                                        subprojects.isEmpty &&
+                                                        column ==
+                                                            TaskColumn
+                                                                .inProgress &&
+                                                        task.waitingInQueue)) &&
+                                                (column != TaskColumn.done ||
+                                                    task.column ==
+                                                        TaskColumn.inReview ||
+                                                    task.column ==
+                                                        TaskColumn.done);
+                                          },
+                                          onAcceptWithDetails: (d) {
+                                            if (d.data is GitHubIssueDrag) {
+                                              unawaited(
+                                                (d.data as GitHubIssueDrag)
+                                                    .importToBacklog(),
+                                              );
+                                            } else if (d.data is TaskDto) {
+                                              unawaited(
+                                                move(
+                                                  d.data as TaskDto,
+                                                  column,
+                                                  null,
+                                                ),
+                                              );
+                                            }
+                                          },
+                                          builder: (context, candidates, rejected) => AnimatedContainer(
+                                            duration: const Duration(
+                                              milliseconds: 160,
+                                            ),
                                             decoration: BoxDecoration(
                                               color: candidates.isEmpty
                                                   ? context.ditch.surfaceSoft
                                                   : context.ditch.selection,
+                                              border: Border.all(
+                                                color: candidates.isEmpty
+                                                    ? Colors.transparent
+                                                    : context.ditch.accent,
+                                                width: 2,
+                                              ),
                                               borderRadius:
                                                   BorderRadius.circular(12),
                                             ),
@@ -515,7 +740,9 @@ class _TaskBoardState extends State<TaskBoard> {
                                                     14,
                                                   ),
                                                   child: Text(
-                                                    '${column.label}  ${tasks.where((t) => t.column == column).length}',
+                                                    candidates.isEmpty
+                                                        ? '${column.label}  ${tasks.where((t) => t.column == column).length}'
+                                                        : 'Drop into ${column.label}',
                                                     style: Theme.of(
                                                       context,
                                                     ).textTheme.titleSmall,
@@ -531,14 +758,41 @@ class _TaskBoardState extends State<TaskBoard> {
                                                                 column,
                                                           )
                                                           .toList();
+                                                      if (column ==
+                                                              TaskColumn
+                                                                  .inProgress &&
+                                                          projectId != null &&
+                                                          subprojects.isEmpty) {
+                                                        cards.sort((a, b) {
+                                                          if (a.running !=
+                                                              b.running) {
+                                                            return a.running
+                                                                ? -1
+                                                                : 1;
+                                                          }
+                                                          if (a.queuePosition ==
+                                                                  null ||
+                                                              b.queuePosition ==
+                                                                  null) {
+                                                            return a.queuePosition ==
+                                                                    null
+                                                                ? (b.queuePosition ==
+                                                                          null
+                                                                      ? 0
+                                                                      : 1)
+                                                                : -1;
+                                                          }
+                                                          return a
+                                                              .queuePosition!
+                                                              .compareTo(
+                                                                b.queuePosition!,
+                                                              );
+                                                        });
+                                                      }
                                                       if (cards.isEmpty) {
                                                         return Center(
                                                           child: Text(
-                                                            column ==
-                                                                    TaskColumn
-                                                                        .todo
-                                                                ? 'Create a task to begin'
-                                                                : 'No tasks',
+                                                            '—',
                                                             style: TextStyle(
                                                               color: context
                                                                   .ditch
@@ -570,6 +824,26 @@ class _TaskBoardState extends State<TaskBoard> {
                                                           Widget
                                                           card() => TaskCard(
                                                             task: task,
+                                                            queuePaused:
+                                                                c
+                                                                    .boardExecutions[task
+                                                                        .projectId]
+                                                                    ?.paused ==
+                                                                true,
+                                                            hasAgent: c.agents
+                                                                .containsKey(
+                                                                  task.selectedAgentId,
+                                                                ),
+                                                            showQueueOrder:
+                                                                projectId !=
+                                                                    null &&
+                                                                subprojects
+                                                                    .isEmpty &&
+                                                                column ==
+                                                                    TaskColumn
+                                                                        .inProgress &&
+                                                                task.executionQueue !=
+                                                                    null,
                                                             projectName:
                                                                 project?.name ??
                                                                 'Unavailable project',
@@ -581,7 +855,17 @@ class _TaskBoardState extends State<TaskBoard> {
                                                                   column,
                                                                   null,
                                                                 ),
-                                                            onMoveUp: index == 0
+                                                            onMoveUp:
+                                                                index == 0 ||
+                                                                    projectId ==
+                                                                        null ||
+                                                                    subprojects
+                                                                        .isNotEmpty ||
+                                                                    !task
+                                                                        .waitingInQueue ||
+                                                                    !cards[index -
+                                                                            1]
+                                                                        .waitingInQueue
                                                                 ? null
                                                                 : () => move(
                                                                     task,
@@ -598,6 +882,33 @@ class _TaskBoardState extends State<TaskBoard> {
                                                                 widget
                                                                     .connected &&
                                                                 !c.busy &&
+                                                                !d
+                                                                    .data
+                                                                    .running &&
+                                                                !d
+                                                                    .data
+                                                                    .archived &&
+                                                                (d.data.column !=
+                                                                        column ||
+                                                                    (projectId !=
+                                                                            null &&
+                                                                        subprojects
+                                                                            .isEmpty &&
+                                                                        column ==
+                                                                            TaskColumn.inProgress &&
+                                                                        d
+                                                                            .data
+                                                                            .waitingInQueue &&
+                                                                        task.waitingInQueue)) &&
+                                                                (column !=
+                                                                        TaskColumn
+                                                                            .done ||
+                                                                    d.data.column ==
+                                                                        TaskColumn
+                                                                            .inReview ||
+                                                                    d.data.column ==
+                                                                        TaskColumn
+                                                                            .done) &&
                                                                 d.data.id !=
                                                                     task.id &&
                                                                 d.data.projectId ==
@@ -624,7 +935,8 @@ class _TaskBoardState extends State<TaskBoard> {
                                                                       thickness:
                                                                           3,
                                                                     ),
-                                                                  if (widget.onRunSelected !=
+                                                                  if (showUnfinishedFeatureControls &&
+                                                                      widget.onRunSelected !=
                                                                           null &&
                                                                       task.column ==
                                                                           TaskColumn
@@ -673,24 +985,28 @@ class _TaskBoardState extends State<TaskBoard> {
                                                                             !widget.connected
                                                                         ? 0
                                                                         : 1,
-                                                                    feedback: Material(
-                                                                      elevation:
-                                                                          8,
-                                                                      borderRadius:
-                                                                          BorderRadius.circular(
-                                                                            10,
-                                                                          ),
-                                                                      child: SizedBox(
-                                                                        width:
-                                                                            260,
-                                                                        child:
-                                                                            card(),
+                                                                    feedback: Transform.rotate(
+                                                                      angle:
+                                                                          -.025,
+                                                                      child: Material(
+                                                                        elevation:
+                                                                            14,
+                                                                        borderRadius:
+                                                                            BorderRadius.circular(
+                                                                              10,
+                                                                            ),
+                                                                        child: SizedBox(
+                                                                          width:
+                                                                              260,
+                                                                          child:
+                                                                              card(),
+                                                                        ),
                                                                       ),
                                                                     ),
                                                                     childWhenDragging:
                                                                         Opacity(
                                                                           opacity:
-                                                                              .4,
+                                                                              .25,
                                                                           child:
                                                                               card(),
                                                                         ),
@@ -735,12 +1051,18 @@ class TaskCard extends StatelessWidget {
     required this.onOpen,
     required this.onMove,
     this.onMoveUp,
+    this.showQueueOrder = false,
+    this.hasAgent = false,
+    this.queuePaused = false,
   });
   final TaskDto task;
   final String projectName;
   final VoidCallback onOpen;
   final ValueChanged<TaskColumn> onMove;
   final VoidCallback? onMoveUp;
+  final bool showQueueOrder;
+  final bool hasAgent;
+  final bool queuePaused;
   @override
   Widget build(BuildContext context) => Semantics(
     label:
@@ -784,6 +1106,19 @@ class TaskCard extends StatelessWidget {
                           '#${source['number']}',
                           style: Theme.of(context).textTheme.labelSmall,
                         ),
+                      ),
+                    ),
+                  if (showQueueOrder && (task.waitingInQueue || task.running))
+                    Tooltip(
+                      message: task.waitingInQueue
+                          ? 'Drag to change execution order'
+                          : 'Execution order is fixed while running',
+                      child: Icon(
+                        task.waitingInQueue
+                            ? Icons.drag_indicator
+                            : Icons.lock_outline,
+                        size: 16,
+                        color: context.ditch.muted,
                       ),
                     ),
                   PopupMenuButton<String>(
@@ -832,22 +1167,43 @@ class TaskCard extends StatelessWidget {
                 ],
               ),
               Text(projectName, style: Theme.of(context).textTheme.bodySmall),
+              if ((task.waitingInQueue && queuePaused) ||
+                  ((task.waitingInQueue || task.queueNeedsRetry) &&
+                      task.reason != null))
+                Padding(
+                  padding: const EdgeInsets.only(top: 4),
+                  child: Text(
+                    task.waitingInQueue && queuePaused
+                        ? 'Board paused'
+                        : task.reason!,
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                    style: Theme.of(context).textTheme.bodySmall,
+                  ),
+                ),
               const SizedBox(height: 6),
               Wrap(
                 spacing: 8,
                 runSpacing: 4,
                 children: [
-                  Text(
-                    task.priority,
-                    style: Theme.of(context).textTheme.labelSmall,
-                  ),
-                  Text(
-                    task.archived
-                        ? 'Archived · ${task.condition}'
-                        : task.condition,
-                    style: Theme.of(context).textTheme.labelSmall,
-                  ),
-                  if (task.agentId != null)
+                  if (task.planning['job'] != null ||
+                      (task.planning['text'] as String? ?? '').isNotEmpty)
+                    _TaskPlanStatus(task: task),
+                  if (task.priority != 'Normal')
+                    Text(
+                      task.priority,
+                      style: Theme.of(context).textTheme.labelSmall,
+                    ),
+                  if (task.archived || task.condition != 'Idle')
+                    Text(
+                      task.archived
+                          ? (task.condition == 'Idle'
+                                ? 'Archived'
+                                : 'Archived · ${task.condition}')
+                          : task.condition,
+                      style: Theme.of(context).textTheme.labelSmall,
+                    ),
+                  if (hasAgent)
                     const Icon(
                       Icons.smart_toy_outlined,
                       size: 16,
@@ -855,12 +1211,92 @@ class TaskCard extends StatelessWidget {
                     ),
                 ],
               ),
+              if (task.queueNeedsRetry)
+                TextButton(
+                  onPressed: onOpen,
+                  child: const Text('Review & retry'),
+                ),
             ],
           ),
         ),
       ),
     ),
   );
+}
+
+class _TaskPlanStatus extends StatelessWidget {
+  const _TaskPlanStatus({required this.task});
+  final TaskDto task;
+
+  @override
+  Widget build(BuildContext context) {
+    final job = task.planning['job'] as Map?;
+    final status = job?['status'];
+    final hasPlan = (task.planning['text'] as String? ?? '').trim().isNotEmpty;
+    final running = status == 'running';
+    final failed = !hasPlan && (status == 'failed' || status == 'interrupted');
+    final needsReview =
+        !hasPlan && (job?['result'] as String? ?? '').trim().isNotEmpty;
+    final label = running
+        ? 'Planning…'
+        : hasPlan
+        ? 'Plan ready'
+        : needsReview
+        ? 'Review plan'
+        : failed
+        ? 'Plan failed'
+        : status == 'canceled'
+        ? 'Plan canceled'
+        : 'No plan';
+    final color = failed
+        ? Theme.of(context).colorScheme.error
+        : running || needsReview || (!hasPlan && status == 'canceled')
+        ? context.ditch.muted
+        : context.ditch.success;
+    return Tooltip(
+      message: running
+          ? 'Generating an implementation plan in the background'
+          : failed
+          ? 'Open task for details and retry'
+          : 'Open task to review its implementation plan',
+      child: Semantics(
+        liveRegion: true,
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 3),
+          decoration: BoxDecoration(
+            color: color.withValues(alpha: 0.08),
+            borderRadius: BorderRadius.circular(6),
+          ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              if (running)
+                SizedBox.square(
+                  dimension: 12,
+                  child: CircularProgressIndicator(
+                    strokeWidth: 1.5,
+                    color: color,
+                  ),
+                )
+              else
+                Icon(
+                  failed ? Icons.error_outline : Icons.description_outlined,
+                  size: 13,
+                  color: color,
+                ),
+              const SizedBox(width: 5),
+              Text(
+                label,
+                style: Theme.of(
+                  context,
+                ).textTheme.labelSmall?.copyWith(color: color),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
 }
 
 class TaskErrorBanner extends StatelessWidget {
@@ -1090,6 +1526,7 @@ Future<void> showTaskInspector(
   ValueChanged<String> onOpenAgent,
 ) => showDialog<void>(
   context: context,
+  barrierDismissible: false,
   builder: (_) => _TaskInspector(
     controller: controller,
     taskId: task.id,
@@ -1118,12 +1555,24 @@ class _TaskInspector extends StatefulWidget {
 
 class _TaskInspectorState extends State<_TaskInspector> {
   final feedback = TextEditingController();
+  late final TextEditingController description;
+  late final TextEditingController plan;
+  late String savedDescription, savedPlan;
+  String? submittedDescription, submittedPlan;
+  bool saving = false;
+  bool get dirty =>
+      description.text != savedDescription || plan.text != savedPlan;
   late Future<List<TaskAuditDto>> history;
   int? historyRevision;
   bool useAppServer = false;
   @override
   void initState() {
     super.initState();
+    final task = widget.controller.task(widget.taskId);
+    savedDescription = task?.description ?? '';
+    savedPlan = task?.planning['text'] as String? ?? '';
+    description = TextEditingController(text: savedDescription);
+    plan = TextEditingController(text: savedPlan);
     useAppServer =
         widget.profile()['transport'] == 'AppServer' ||
         (widget.controller.task(widget.taskId)?.skills.isNotEmpty ?? false);
@@ -1134,6 +1583,32 @@ class _TaskInspectorState extends State<_TaskInspector> {
   void onTaskChanged() {
     if (mounted &&
         widget.controller.task(widget.taskId)?.revision != historyRevision) {
+      final task = widget.controller.task(widget.taskId);
+      if (task == null) {
+        setState(() {});
+        return;
+      }
+      final nextPlan = task.planning['text'] as String? ?? '';
+      if (description.text == savedDescription) {
+        description.text = task.description;
+        savedDescription = task.description;
+      } else if (task.description == submittedDescription) {
+        savedDescription = task.description;
+      }
+      if (plan.text == savedPlan) {
+        plan.text = nextPlan;
+        savedPlan = nextPlan;
+      } else if (nextPlan == submittedPlan) {
+        savedPlan = nextPlan;
+      } else {
+        final job = task.planning['job'] as Map?;
+        if (job?['status'] == 'completed' &&
+            job?['result'] == nextPlan &&
+            job?['previous_plan'] == savedPlan) {
+          // Rebase an unsaved plan edit onto the AI result without changing it.
+          savedPlan = nextPlan;
+        }
+      }
       setState(reload);
     }
   }
@@ -1150,7 +1625,70 @@ class _TaskInspectorState extends State<_TaskInspector> {
   void dispose() {
     widget.controller.removeListener(onTaskChanged);
     feedback.dispose();
+    description.dispose();
+    plan.dispose();
     super.dispose();
+  }
+
+  Future<bool> saveDescription() async {
+    if (!dirty) return true;
+    if (saving || widget.controller.busy) return false;
+    final task = widget.controller.task(widget.taskId);
+    if (task == null) return false;
+    setState(() => saving = true);
+    submittedDescription = description.text;
+    submittedPlan = plan.text;
+    final result = await widget.controller.mutate(task.projectId, {
+      'UpdateDescription': {
+        'task_id': task.id,
+        'expected_description': savedDescription,
+        'expected_plan': savedPlan,
+        'description': submittedDescription,
+        'plan': submittedPlan,
+      },
+    });
+    if (!mounted) return false;
+    if (result != null) {
+      savedDescription = submittedDescription!;
+      savedPlan = submittedPlan!;
+    }
+    submittedDescription = submittedPlan = null;
+    setState(() => saving = false);
+    return result != null && !dirty;
+  }
+
+  Future<void> close() async {
+    if (await saveDescription() && mounted) Navigator.pop(context);
+  }
+
+  Future<void> openGitHubTaskSource(Map source) async {
+    final uri = Uri.tryParse(source['url'] as String? ?? '');
+    if (uri == null || uri.scheme != 'https' || uri.host != 'github.com') {
+      return;
+    }
+    try {
+      await const MethodChannel(
+        'the_ditch/application',
+      ).invokeMethod<bool>('openURL', uri.toString());
+    } on Object {
+      if (mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(const SnackBar(content: Text('Could not open GitHub.')));
+      }
+    }
+  }
+
+  Future<void> generatePlan() async {
+    if (!await saveDescription() || !mounted) return;
+    final task = widget.controller.task(widget.taskId)!;
+    await widget.controller.mutate(task.projectId, {
+      'GeneratePlan': {
+        'task_id': task.id,
+        'expected_revision': task.revision,
+        'model': widget.profile()['model'],
+      },
+    });
   }
 
   Future<void> selectSkills(TaskDto task) async {
@@ -1182,6 +1720,8 @@ class _TaskInspectorState extends State<_TaskInspector> {
   }
 
   Future<void> transition(TaskDto task, Object action) async {
+    if (!await saveDescription() || !mounted) return;
+    task = widget.controller.task(task.id)!;
     await widget.controller.mutate(task.projectId, {
       'Transition': {
         'task_id': task.id,
@@ -1192,11 +1732,152 @@ class _TaskInspectorState extends State<_TaskInspector> {
     if (mounted) setState(reload);
   }
 
+  String agentName(Map<String, dynamic>? agent) => agent == null
+      ? 'Agent unavailable'
+      : sessionDisplayName(
+          agent['user_title'] as String?,
+          agent['codex_title'] as String?,
+          namingFailed: agent['naming_failed'] == true,
+        );
+
+  Future<void> selectAgent(TaskDto task, String? id) async {
+    if (!await saveDescription() || !mounted) return;
+    final c = widget.controller;
+    task = c.task(task.id)!;
+    final agent = c.agents[id];
+    final otherId = agent?['task_id'] as String?;
+    final other = otherId == null || otherId == task.id
+        ? null
+        : c.task(otherId);
+    if (other != null) {
+      final confirmed = await showDialog<bool>(
+        context: context,
+        builder: (context) => AlertDialog(
+          title: const Text('Reassign agent?'),
+          content: Text(
+            'Move this agent from “${other.title}” to “${task.title}”? Its conversation history is kept.',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context, false),
+              child: const Text('Cancel'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(context, true),
+              child: const Text('Reassign'),
+            ),
+          ],
+        ),
+      );
+      if (confirmed != true || !mounted) return;
+    }
+    await c.mutate(task.projectId, {
+      'SelectAgent': {
+        'task_id': task.id,
+        'expected_revision': task.revision,
+        'agent_id': id,
+        if (other != null) 'replace_task_id': other.id,
+        if (other != null) 'replace_task_revision': other.revision,
+      },
+    });
+    if (mounted) setState(reload);
+  }
+
+  Widget agentAssignment(TaskDto task, bool disabled) {
+    final c = widget.controller;
+    final selected = task.selectedAgentId;
+    final agent = c.agents[selected];
+    if (task.column != TaskColumn.todo || task.archived) {
+      return ListTile(
+        contentPadding: EdgeInsets.zero,
+        leading: const Icon(Icons.lock_outline, size: 18),
+        title: Text(
+          selected == null
+              ? 'New agent when this task starts'
+              : agentName(agent),
+        ),
+        subtitle: const Text('Move to Todo to change the agent.'),
+      );
+    }
+    final candidates = c.agents.values.where((a) {
+      if (a['project_id'] != task.projectId ||
+          a['coordinator_group'] != null ||
+          a['can_stop'] == true ||
+          a['native_session_id'] == null ||
+          a['resume_block_reason'] != null ||
+          const {
+            'Starting',
+            'Working',
+            'Stopping',
+            'AwaitingApproval',
+          }.contains(a['state'])) {
+        return false;
+      }
+      final otherId = a['task_id'] as String?;
+      if (otherId == null || otherId == task.id) return true;
+      final other = c.task(otherId);
+      return other != null &&
+          other.column == TaskColumn.todo &&
+          !other.archived &&
+          !other.running &&
+          other.coordinatorGroup == null;
+    }).toList();
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const SizedBox(height: 8),
+        InputDecorator(
+          decoration: const InputDecoration(labelText: 'Agent'),
+          child: DropdownButtonHideUnderline(
+            child: DropdownButton<String>(
+              key: const ValueKey('task-agent-selector'),
+              value: selected ?? '',
+              isExpanded: true,
+              items: [
+                const DropdownMenuItem(value: '', child: Text('New agent')),
+                if (selected != null &&
+                    !candidates.any((a) => a['id'] == selected))
+                  DropdownMenuItem(
+                    value: selected,
+                    enabled: false,
+                    child: Text(agentName(agent)),
+                  ),
+                for (final a in candidates)
+                  DropdownMenuItem(
+                    value: a['id'] as String,
+                    child: Text(agentName(a), overflow: TextOverflow.ellipsis),
+                  ),
+              ],
+              onChanged: disabled
+                  ? null
+                  : (id) {
+                      if (id != null && id != (selected ?? '')) {
+                        unawaited(selectAgent(task, id.isEmpty ? null : id));
+                      }
+                    },
+            ),
+          ),
+        ),
+        if (candidates.isEmpty)
+          Padding(
+            padding: const EdgeInsets.only(top: 4),
+            child: Text(
+              'No stopped conversations available in this project.',
+              style: Theme.of(context).textTheme.bodySmall,
+            ),
+          ),
+      ],
+    );
+  }
+
   Future<void> start(TaskDto task) async {
+    if (!await saveDescription() || !mounted) return;
+    task = widget.controller.task(task.id)!;
     final profile = {
       ...widget.profile(),
       'transport':
-          (useAppServer ||
+          (task.coordinatorGroup == null ||
+              useAppServer ||
               ((task.acceptance['config'] as Map?)?['criteria'] as List? ?? [])
                   .isNotEmpty ||
               ((task.acceptance['config'] as Map?)?['policy']
@@ -1228,7 +1909,7 @@ class _TaskInspectorState extends State<_TaskInspector> {
       if (confirmed != true) return;
     }
     await widget.controller.mutate(task.projectId, {
-      'Start': {
+      (task.coordinatorGroup == null ? 'Enqueue' : 'Start'): {
         'task_id': task.id,
         'expected_revision': task.revision,
         'execution_profile': profile,
@@ -1276,300 +1957,443 @@ class _TaskInspectorState extends State<_TaskInspector> {
           ],
         );
       }
-      final agent = task.agentId == null ? null : c.agents[task.agentId];
+      final agent = c.agents[task.selectedAgentId];
       final running = task.running || agent?['can_stop'] == true;
       final disabled = c.busy || running;
-      return AlertDialog(
-        title: Text(task.title),
-        content: SizedBox(
-          width: 680,
-          child: SingleChildScrollView(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                if (showUnfinishedFeatureControls)
-                  SkillChips(
-                    skills: task.skills,
-                    onEdit: disabled ? null : () => selectSkills(task),
-                  ),
-                SwitchListTile(
-                  contentPadding: EdgeInsets.zero,
-                  title: const Text('Use local App Server'),
-                  subtitle: const Text(
-                    'Opt-in: interactive approvals and explicit skills. Legacy execution cannot attach skills.',
-                  ),
-                  value: useAppServer,
-                  onChanged: disabled
-                      ? null
-                      : (v) => setState(() => useAppServer = v),
-                ),
-
-                Text(
-                  '${task.column.label} · ${task.condition} · ${task.priority}',
-                ),
-                const SizedBox(height: 12),
-                SelectableText(
-                  task.description.isEmpty
-                      ? 'No description'
-                      : task.description,
-                ),
-                if (task.githubSource case final Map source) ...[
-                  const SizedBox(height: 12),
-                  Text(
-                    '${source['repository']} #${source['number']} · ${source['state']} on GitHub',
-                  ),
-                  SelectableText('${source['url']}'),
-                  Text('Last synced: ${source['last_synced_at']}'),
-                  TextButton(
-                    onPressed: () async {
-                      try {
-                        await githubRequest(c.request, {
-                          'Refresh': {'task_id': task.id},
-                        });
-                        await c.refresh();
-                      } on Object catch (e) {
-                        c.error = '$e';
-                        await c.refresh(preserveError: true);
-                      }
-                    },
-                    child: const Text('Refresh GitHub metadata'),
-                  ),
-                ],
-                const SizedBox(height: 16),
-                Text(
-                  'Acceptance criteria',
-                  style: Theme.of(context).textTheme.titleSmall,
-                ),
-                if (task.criteria.isEmpty) const Text('No criteria recorded.'),
-                ...task.criteria.map(
-                  (text) => Padding(
-                    padding: const EdgeInsets.symmetric(vertical: 4),
-                    child: Text('• $text'),
-                  ),
-                ),
-                const SizedBox(height: 16),
-                Text(
-                  'Review summary',
-                  style: Theme.of(context).textTheme.titleSmall,
-                ),
-                SelectableText(task.summary ?? 'Not submitted for review.'),
-                if (task.reason != null)
-                  Padding(
-                    padding: const EdgeInsets.only(top: 8),
-                    child: SelectableText(task.reason!),
-                  ),
-                const SizedBox(height: 12),
-                AcceptanceReview(task: task, controller: c, running: running),
-                if (widget.projects.any(
-                  (p) => p.id == task.projectId && p.remote,
-                ))
-                  const Padding(
-                    padding: EdgeInsets.only(top: 8),
-                    child: Text(
-                      'SSH execution uses interactive approvals. Project-root confinement is not currently enforced; approved commands run with the SSH account’s access.',
-                    ),
-                  ),
-                if (task.agentId != null)
-                  TextButton.icon(
-                    onPressed: () {
-                      Navigator.pop(context);
-                      widget.onOpenAgent(task.agentId!);
-                    },
-                    icon: const Icon(Icons.chat_bubble_outline),
-                    label: Text(
-                      sessionDisplayName(
-                        agent?['user_title'] as String?,
-                        agent?['codex_title'] as String?,
-                        namingFailed: agent?['naming_failed'] == true,
-                      ),
-                    ),
-                  ),
-                if (!running &&
-                    !task.archived &&
-                    task.column != TaskColumn.done) ...[
-                  const SizedBox(height: 12),
-                  TextField(
-                    controller: feedback,
-                    minLines: 2,
-                    maxLines: 5,
-                    onChanged: (_) => setState(() {}),
-                    decoration: InputDecoration(
-                      labelText: task.column == TaskColumn.inReview
-                          ? 'Required review feedback'
-                          : 'Submission summary',
-                      hintText: task.column == TaskColumn.inReview
-                          ? 'Describe the changes needed'
-                          : 'Describe the work ready for review',
-                    ),
-                  ),
-                ],
-                if (c.error != null) TaskErrorBanner(controller: c),
-                const SizedBox(height: 12),
-                ExpansionTile(
-                  title: const Text('Transition history'),
-                  children: [
-                    FutureBuilder<List<TaskAuditDto>>(
-                      future: history,
-                      builder: (context, snapshot) {
-                        if (snapshot.hasError) {
-                          return Text('History unavailable: ${snapshot.error}');
-                        }
-                        if (!snapshot.hasData) {
-                          return const LinearProgressIndicator();
-                        }
-                        return Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            for (final a in snapshot.data!)
-                              ListTile(
-                                dense: true,
-                                title: Text(
-                                  '${a.action.replaceAll('_', ' ')} · ${a.actor}',
-                                ),
-                                subtitle: SelectableText(
-                                  '${a.createdAt.toLocal()}${a.reason == null ? '' : '\n${a.reason}'}${a.summary == null ? '' : '\n${a.summary}'}',
-                                ),
-                              ),
-                          ],
-                        );
-                      },
-                    ),
-                  ],
-                ),
-                if (!disabled &&
-                    !task.archived &&
-                    task.column != TaskColumn.done &&
-                    task.column != TaskColumn.inReview)
-                  DropdownButton<String>(
-                    hint: const Text('Link an existing idle agent'),
-                    isExpanded: true,
-                    items: [
-                      for (final a in c.agents.values.where(
-                        (a) =>
-                            a['project_id'] == task.projectId &&
-                            a['task_id'] == null &&
-                            a['can_stop'] != true &&
-                            !const {
-                              'Starting',
-                              'Working',
-                              'Stopping',
-                              'AwaitingApproval',
-                            }.contains(a['state']),
-                      ))
-                        DropdownMenuItem(
-                          value: a['id'] as String,
-                          child: Text(
-                            sessionDisplayName(
-                              a['user_title'] as String?,
-                              a['codex_title'] as String?,
-                              namingFailed: a['naming_failed'] == true,
-                            ),
-                          ),
-                        ),
-                    ],
-                    onChanged: (id) async {
-                      if (id == null) return;
-                      await c.mutate(task.projectId, {
-                        'Link': {
-                          'task_id': task.id,
-                          'expected_revision': task.revision,
-                          'agent_id': id,
-                        },
-                      });
-                      if (mounted) setState(reload);
-                    },
-                  ),
-              ],
-            ),
-          ),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context),
-            child: const Text('Close'),
-          ),
-          if (!task.archived &&
-              task.column != TaskColumn.done &&
-              task.column != TaskColumn.inReview)
-            TextButton(
-              onPressed: disabled
-                  ? null
-                  : () async {
+      final editable =
+          !disabled &&
+          !saving &&
+          !task.archived &&
+          task.column != TaskColumn.done &&
+          task.column != TaskColumn.inReview;
+      final job = task.planning['job'] as Map?;
+      final generating = job?['status'] == 'running';
+      final canSubmitWork =
+          !task.waitingInQueue &&
+          (task.executionQueue == null || agent != null);
+      return PopScope(
+        canPop: !dirty && !saving,
+        onPopInvokedWithResult: (didPop, _) {
+          if (!didPop) unawaited(close());
+        },
+        child: AlertDialog(
+          constraints: const BoxConstraints(maxWidth: 720, maxHeight: 800),
+          title: Row(
+            children: [
+              Expanded(child: Text(task.title)),
+              if (!disabled && !task.archived && task.column != TaskColumn.done)
+                PopupMenuButton<String>(
+                  tooltip: 'Task options',
+                  onSelected: (value) async {
+                    if (!await saveDescription() || !context.mounted) return;
+                    final current = c.task(task.id)!;
+                    if (value == 'edit') {
                       await showTaskEditor(
                         context,
                         c,
                         widget.projects,
-                        task: task,
+                        task: current,
                       );
-                      if (mounted) setState(reload);
-                    },
-              child: const Text('Edit'),
-            ),
-          if (!task.archived && task.column != TaskColumn.done)
-            TextButton(
-              onPressed: disabled
-                  ? null
-                  : () => transition(task, {
-                      'Cancel': {'reason': 'Cancelled by user'},
-                    }),
-              child: const Text('Cancel / Archive'),
-            ),
-          if (task.revision == 1 &&
-              task.agentId == null &&
-              task.githubSource == null)
-            TextButton(
-              onPressed: disabled
-                  ? null
-                  : () async {
-                      final result = await c.mutate(task.projectId, {
+                    } else if (value == 'archive') {
+                      await transition(current, {
+                        'Cancel': {'reason': 'Cancelled by user'},
+                      });
+                    } else if (value == 'delete') {
+                      final result = await c.mutate(current.projectId, {
                         'Delete': {
-                          'task_id': task.id,
-                          'expected_revision': task.revision,
+                          'task_id': current.id,
+                          'expected_revision': current.revision,
                         },
                       });
                       if (result != null && context.mounted) {
                         Navigator.pop(context);
                       }
-                    },
-              child: const Text('Delete Draft'),
+                    }
+                  },
+                  itemBuilder: (_) => [
+                    if (editable)
+                      const PopupMenuItem(
+                        value: 'edit',
+                        child: Text('Edit task…'),
+                      ),
+                    if (!disabled &&
+                        !task.archived &&
+                        task.column != TaskColumn.done)
+                      const PopupMenuItem(
+                        value: 'archive',
+                        child: Text('Archive task'),
+                      ),
+                    if (!disabled &&
+                        task.revision == 1 &&
+                        task.agentId == null &&
+                        task.githubSource == null)
+                      const PopupMenuItem(
+                        value: 'delete',
+                        child: Text('Delete draft'),
+                      ),
+                  ],
+                ),
+            ],
+          ),
+          content: SizedBox(
+            width: 680,
+            child: SingleChildScrollView(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Row(
+                    children: [
+                      Text(
+                        task.column.label,
+                        style: Theme.of(context).textTheme.bodySmall,
+                      ),
+                      if (task.githubSource case final Map source) ...[
+                        const SizedBox(width: 12),
+                        Flexible(
+                          child: TextButton.icon(
+                            onPressed: () => openGitHubTaskSource(source),
+                            icon: const Icon(Icons.open_in_new, size: 14),
+                            label: Text(
+                              '${source['repository']} #${source['number']}',
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                          ),
+                        ),
+                      ],
+                    ],
+                  ),
+                  if (task.coordinatorGroup == null &&
+                      task.column != TaskColumn.backlog)
+                    agentAssignment(task, disabled),
+                  const SizedBox(height: 16),
+                  TextField(
+                    key: const ValueKey('task-description'),
+                    controller: description,
+                    readOnly: !editable,
+                    minLines: 7,
+                    maxLines: 14,
+                    onChanged: (_) => setState(() {}),
+                    decoration: const InputDecoration(
+                      labelText: 'Description',
+                      alignLabelWithHint: true,
+                      hintText: 'What needs to be done?',
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                  Row(
+                    children: [
+                      if (generating) ...[
+                        const SizedBox(
+                          width: 14,
+                          height: 14,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        ),
+                        const SizedBox(width: 8),
+                        const Expanded(child: Text('Generating plan…')),
+                        TextButton(
+                          onPressed: c.busy
+                              ? null
+                              : () => c.mutate(task.projectId, {
+                                  'CancelPlan': {
+                                    'task_id': task.id,
+                                    'job_id': job!['id'],
+                                  },
+                                }),
+                          child: const Text('Cancel'),
+                        ),
+                      ] else
+                        OutlinedButton.icon(
+                          onPressed: editable ? generatePlan : null,
+                          icon: const Icon(
+                            Icons.auto_awesome_outlined,
+                            size: 16,
+                          ),
+                          label: const Text('Generate with AI'),
+                        ),
+                    ],
+                  ),
+                  if (job?['error'] case final String error)
+                    Padding(
+                      padding: const EdgeInsets.only(top: 8),
+                      child: Text(
+                        error,
+                        style: Theme.of(context).textTheme.bodySmall,
+                      ),
+                    ),
+                  if (job?['status'] == 'completed' &&
+                      (job?['description'] != task.description ||
+                          job?['title'] != task.title))
+                    const Padding(
+                      padding: EdgeInsets.only(top: 8),
+                      child: Text(
+                        'Task changed. Review or regenerate this plan.',
+                      ),
+                    ),
+                  if (plan.text.isNotEmpty || savedPlan.isNotEmpty) ...[
+                    const SizedBox(height: 16),
+                    TextField(
+                      key: const ValueKey('task-plan'),
+                      controller: plan,
+                      readOnly: !editable,
+                      minLines: 8,
+                      maxLines: 18,
+                      onChanged: (_) => setState(() {}),
+                      decoration: const InputDecoration(
+                        labelText: 'Implementation plan',
+                        alignLabelWithHint: true,
+                      ),
+                    ),
+                  ],
+                  if (job?['result'] is String &&
+                      job?['result'] != (task.planning['text'] ?? '') &&
+                      !generating)
+                    ExpansionTile(
+                      title: const Text('Generated plan'),
+                      children: [
+                        SelectableText(job!['result'] as String),
+                        TextButton(
+                          onPressed: editable
+                              ? () => setState(
+                                  () => plan.text = job['result'] as String,
+                                )
+                              : null,
+                          child: const Text('Use this plan'),
+                        ),
+                      ],
+                    ),
+                  const SizedBox(height: 12),
+                  ExpansionTile(
+                    tilePadding: EdgeInsets.zero,
+                    title: const Text('Details & options'),
+                    initiallyExpanded:
+                        task.column == TaskColumn.inReview ||
+                        task.column == TaskColumn.inProgress,
+                    children: [
+                      if (showUnfinishedFeatureControls)
+                        SkillChips(
+                          skills: task.skills,
+                          onEdit: disabled ? null : () => selectSkills(task),
+                        ),
+                      if (showUnfinishedFeatureControls &&
+                          task.coordinatorGroup != null)
+                        SwitchListTile(
+                          contentPadding: EdgeInsets.zero,
+                          title: const Text('Use local App Server'),
+                          subtitle: const Text(
+                            'Opt-in: interactive approvals and explicit skills. Legacy execution cannot attach skills.',
+                          ),
+                          value: useAppServer,
+                          onChanged: disabled
+                              ? null
+                              : (v) => setState(() => useAppServer = v),
+                        ),
+
+                      if (task.githubSource != null) ...[
+                        const SizedBox(height: 12),
+                        TextButton(
+                          onPressed: () async {
+                            try {
+                              await githubRequest(c.request, {
+                                'Refresh': {'task_id': task.id},
+                              });
+                              await c.refresh();
+                            } on Object catch (e) {
+                              c.error = '$e';
+                              await c.refresh(preserveError: true);
+                            }
+                          },
+                          child: const Text('Refresh GitHub metadata'),
+                        ),
+                      ],
+                      if (task.criteria.isNotEmpty)
+                        Text(
+                          'Acceptance criteria',
+                          style: Theme.of(context).textTheme.titleSmall,
+                        ),
+                      ...task.criteria.map(
+                        (text) => Padding(
+                          padding: const EdgeInsets.symmetric(vertical: 4),
+                          child: Text('• $text'),
+                        ),
+                      ),
+                      if (task.summary != null)
+                        Text(
+                          'Review summary',
+                          style: Theme.of(context).textTheme.titleSmall,
+                        ),
+                      if (task.summary != null) SelectableText(task.summary!),
+                      if (task.reason != null)
+                        Padding(
+                          padding: const EdgeInsets.only(top: 8),
+                          child: SelectableText(task.reason!),
+                        ),
+                      const SizedBox(height: 12),
+                      if (task.column == TaskColumn.inReview ||
+                          task.acceptance['latest_submission'] != null)
+                        AcceptanceReview(
+                          task: task,
+                          controller: c,
+                          running: running,
+                        ),
+                      if (widget.projects.any(
+                        (p) => p.id == task.projectId && p.remote,
+                      ))
+                        const Padding(
+                          padding: EdgeInsets.only(top: 8),
+                          child: Text(
+                            'SSH execution uses interactive approvals. Project-root confinement is not currently enforced; approved commands run with the SSH account’s access.',
+                          ),
+                        ),
+                      if (agent != null)
+                        TextButton.icon(
+                          onPressed: () async {
+                            if (!await saveDescription() || !context.mounted) {
+                              return;
+                            }
+                            Navigator.pop(context);
+                            widget.onOpenAgent(task.selectedAgentId!);
+                          },
+                          icon: const Icon(Icons.chat_bubble_outline),
+                          label: Text(
+                            sessionDisplayName(
+                              agent['user_title'] as String?,
+                              agent['codex_title'] as String?,
+                              namingFailed: agent['naming_failed'] == true,
+                            ),
+                          ),
+                        ),
+                      if (!running &&
+                          canSubmitWork &&
+                          !task.archived &&
+                          (task.column == TaskColumn.inProgress ||
+                              task.column == TaskColumn.inReview)) ...[
+                        const SizedBox(height: 12),
+                        TextField(
+                          controller: feedback,
+                          minLines: 2,
+                          maxLines: 5,
+                          onChanged: (_) => setState(() {}),
+                          decoration: InputDecoration(
+                            labelText: task.column == TaskColumn.inReview
+                                ? 'Required review feedback'
+                                : 'Submission summary',
+                            hintText: task.column == TaskColumn.inReview
+                                ? 'Describe the changes needed'
+                                : 'Describe the work ready for review',
+                          ),
+                        ),
+                      ],
+                      const SizedBox(height: 12),
+                      ExpansionTile(
+                        title: const Text('Transition history'),
+                        children: [
+                          FutureBuilder<List<TaskAuditDto>>(
+                            future: history,
+                            builder: (context, snapshot) {
+                              if (snapshot.hasError) {
+                                return Text(
+                                  'History unavailable: ${snapshot.error}',
+                                );
+                              }
+                              if (!snapshot.hasData) {
+                                return const LinearProgressIndicator();
+                              }
+                              return Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  for (final a in snapshot.data!)
+                                    ListTile(
+                                      dense: true,
+                                      title: Text(
+                                        '${a.action.replaceAll('_', ' ')} · ${a.actor}',
+                                      ),
+                                      subtitle: SelectableText(
+                                        '${a.createdAt.toLocal()}${a.reason == null ? '' : '\n${a.reason}'}${a.summary == null ? '' : '\n${a.summary}'}',
+                                      ),
+                                    ),
+                                ],
+                              );
+                            },
+                          ),
+                        ],
+                      ),
+                    ],
+                  ),
+                  if (c.error != null) ...[
+                    TaskErrorBanner(controller: c),
+                    if (dirty)
+                      TextButton(
+                        onPressed: saving
+                            ? null
+                            : () {
+                                setState(() {
+                                  savedDescription = task.description;
+                                  savedPlan =
+                                      task.planning['text'] as String? ?? '';
+                                  description.text = savedDescription;
+                                  plan.text = savedPlan;
+                                });
+                              },
+                        child: const Text('Discard my edits'),
+                      ),
+                  ],
+                ],
+              ),
             ),
-          if (task.archived || task.column == TaskColumn.done)
-            FilledButton(
-              onPressed: disabled ? null : () => transition(task, 'Reopen'),
-              child: const Text('Reopen'),
-            ),
-          if (!task.archived &&
-              (task.column == TaskColumn.todo ||
-                  task.column == TaskColumn.inProgress))
-            FilledButton(
-              onPressed: disabled ? null : () => start(task),
-              child: const Text('Start Task Agent'),
-            ),
-          if (!task.archived && task.column == TaskColumn.inProgress)
-            FilledButton(
-              onPressed: disabled || feedback.text.trim().isEmpty
-                  ? null
-                  : () => transition(task, {
-                      'Submit': {'summary': feedback.text.trim()},
-                    }),
-              child: const Text('Submit for Review'),
-            ),
-          if (!task.archived && task.column == TaskColumn.inReview) ...[
+          ),
+          actions: [
             TextButton(
-              onPressed: disabled || feedback.text.trim().isEmpty
-                  ? null
-                  : () => transition(task, {
-                      'RequestChanges': {'feedback': feedback.text.trim()},
-                    }),
-              child: const Text('Request Changes'),
+              onPressed: saving || c.busy ? null : close,
+              child: Text(dirty ? 'Save & close' : 'Close'),
             ),
-            FilledButton(
-              onPressed: disabled ? null : () => accept(task),
-              child: const Text('Accept…'),
-            ),
+            if (task.archived || task.column == TaskColumn.done)
+              FilledButton(
+                onPressed: disabled ? null : () => transition(task, 'Reopen'),
+                child: const Text('Reopen'),
+              ),
+            if (!task.archived &&
+                (task.column == TaskColumn.todo ||
+                    task.column == TaskColumn.inProgress))
+              FilledButton(
+                onPressed: disabled || task.waitingInQueue
+                    ? null
+                    : () => start(task),
+                child: Text(
+                  task.waitingInQueue
+                      ? 'Queued'
+                      : task.coordinatorGroup == null
+                      ? (task.queueNeedsRetry ? 'Retry task' : 'Add to queue')
+                      : 'Start Task Agent',
+                ),
+              ),
+            if (!task.archived &&
+                canSubmitWork &&
+                task.column == TaskColumn.inProgress)
+              FilledButton(
+                onPressed: disabled || feedback.text.trim().isEmpty
+                    ? null
+                    : () => transition(task, {
+                        'Submit': {'summary': feedback.text.trim()},
+                      }),
+                child: const Text('Submit for Review'),
+              ),
+            if (!task.archived && task.column == TaskColumn.inReview) ...[
+              TextButton(
+                onPressed: disabled || feedback.text.trim().isEmpty
+                    ? null
+                    : () => transition(task, {
+                        'RequestChanges': {'feedback': feedback.text.trim()},
+                      }),
+                child: const Text('Request Changes'),
+              ),
+              FilledButton(
+                onPressed: disabled ? null : () => accept(task),
+                child: const Text('Accept…'),
+              ),
+            ],
           ],
-        ],
+        ),
       );
     },
   );

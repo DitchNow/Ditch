@@ -755,7 +755,7 @@ pub fn verify_project_metadata(project: &Project) -> Result<(), StoreError> {
 
 pub fn save_project_config(project: &Project) -> Result<(), StoreError> {
     let path = project.ditch_dir().join(PROJECT_CONFIG_FILE);
-    let temporary = project.ditch_dir().join("project.json.tmp");
+    let temporary = project.ditch_dir().join(format!("project-{}.json.tmp", uuid::Uuid::new_v4()));
     let bytes = serde_json::to_vec_pretty(project)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     fs::write(&temporary, bytes)?;

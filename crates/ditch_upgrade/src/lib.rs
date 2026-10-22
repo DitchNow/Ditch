@@ -32,7 +32,7 @@ pub const CONFIGURED_UPGRADE_API_ORIGIN: &str = match option_env!("DITCH_RELAY_O
     Some(value) => value,
     None => OFFICIAL_UPGRADE_API_ORIGIN,
 };
-pub const CANONICAL_BUNDLE_ID: &str = "ai.theditch.app";
+pub const CANONICAL_BUNDLE_ID: &str = ditch_product::deployment::APP_ID;
 
 const OFFICIAL_BUILD_SESSION_SAFETY_MARGIN_SECONDS: i64 = 60;
 
@@ -561,10 +561,9 @@ impl HttpUpgradeBackend {
         {
             return Err(UpgradeError::InvalidResponse("GitHub App is staging-only".into()));
         }
-        let bearer = self.official_build_bearer(identity)?
-            .ok_or_else(|| UpgradeError::InvalidResponse("GitHub requires a signed staging Ditch build".into()))?;
+        let bearer = self.official_build_bearer(identity)?;
         let bytes = serde_json::to_vec(body).map_err(|e| UpgradeError::InvalidResponse(e.to_string()))?;
-        let response = self.machine_signed_response(identity, "POST", "/v1/github/commands", &bytes, Some(&bearer))?;
+        let response = self.github_machine_response(identity, &bytes, bearer.as_deref())?;
         let mut bytes = Vec::new();
         response.into_reader().take(4 * 1024 * 1024 + 1).read_to_end(&mut bytes)
             .map_err(|_| UpgradeError::InvalidResponse("Cannot read GitHub response".into()))?;
@@ -572,6 +571,34 @@ impl HttpUpgradeBackend {
             return Err(UpgradeError::InvalidResponse("GitHub response exceeded its limit".into()));
         }
         serde_json::from_slice(&bytes).map_err(|_| UpgradeError::InvalidResponse("Invalid GitHub response".into()))
+    }
+
+    fn github_machine_response(
+        &self,
+        identity: &InstallationIdentity,
+        body: &[u8],
+        bearer: Option<&str>,
+    ) -> Result<ureq::Response, UpgradeError> {
+        let send = || self.machine_signed_response(identity, "POST", "/v1/github/commands", body, bearer);
+        let response = match send() {
+            // A fresh development installation has no build session to register it.
+            // Register its public keys only on the first unknown-machine response,
+            // then retry once. Approval/revocation failures are never retried here.
+            Err(UpgradeError::Relay { code, .. }) if bearer.is_none() && code == "unauthorized" => {
+                self.register(identity)?;
+                send()
+            }
+            result => result,
+        };
+        response.map_err(|error| match error {
+            UpgradeError::Relay { code, message } if code == "github_development_approval_required" => {
+                UpgradeError::Relay {
+                    code,
+                    message: format!("{message} Installation ID: {}", identity.installation_id()),
+                }
+            }
+            other => other,
+        })
     }
 
     pub fn official() -> Result<Self, UpgradeError> {
@@ -1504,7 +1531,9 @@ mod tests {
                     }
                     headers.push_str(&line);
                 }
-                assert!(headers.to_ascii_lowercase().contains("x-ditch-signature:"));
+                if !request.starts_with("POST /v1/machines/register ") {
+                    assert!(headers.to_ascii_lowercase().contains("x-ditch-signature:"));
+                }
                 requests.push(request.trim().to_owned());
                 let body = body.to_string();
                 write!(stream, "HTTP/1.1 {status} Fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
@@ -1512,6 +1541,46 @@ mod tests {
             requests
         });
         (backend, server)
+    }
+
+    #[test]
+    fn github_development_registers_an_unknown_machine_once() {
+        let (backend, server) = relay_http_fixture(vec![
+            (401, serde_json::json!({"error":{"code":"unauthorized","message":"Unauthorized"}})),
+            (201, serde_json::json!({"state":"unclaimed"})),
+            (200, serde_json::json!({"connected":false})),
+        ]);
+        let response = backend.github_machine_response(
+            &InstallationIdentity::generate(), b"{\"operation\":\"status\"}", None,
+        ).unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(server.join().unwrap(), [
+            "POST /v1/github/commands HTTP/1.1",
+            "POST /v1/machines/register HTTP/1.1",
+            "POST /v1/github/commands HTTP/1.1",
+        ]);
+    }
+
+    #[test]
+    fn github_development_denial_includes_public_id_without_retrying() {
+        let (backend, server) = relay_http_fixture(vec![(403, serde_json::json!({
+            "error":{"code":"github_development_approval_required","message":"Installation needs approval."}
+        }))]);
+        let identity = InstallationIdentity::generate();
+        let result = backend.github_machine_response(&identity, b"{}", None);
+        assert!(matches!(result, Err(UpgradeError::Relay { code, message })
+            if code == "github_development_approval_required" && message.contains(&identity.installation_id().to_string())));
+        assert_eq!(server.join().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn github_development_does_not_register_a_revoked_machine() {
+        let (backend, server) = relay_http_fixture(vec![(401, serde_json::json!({
+            "error":{"code":"machine_revoked","message":"Revoked"}
+        }))]);
+        assert!(matches!(backend.github_machine_response(&InstallationIdentity::generate(), b"{}", None),
+            Err(UpgradeError::Relay { code, .. }) if code == "machine_revoked"));
+        assert_eq!(server.join().unwrap().len(), 1);
     }
 
     #[test]

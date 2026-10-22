@@ -5,6 +5,40 @@ pub fn initial_task_revision() -> u64 {
     1
 }
 
+/// Planning is auxiliary work, never the task's execution agent or board state.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TaskPlanning {
+    #[serde(default)]
+    pub text: String,
+    #[serde(default)]
+    pub job: Option<TaskPlanJob>,
+}
+
+/// User-authorized execution order, scoped to the task's project.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TaskExecutionQueue {
+    /// Locked for this In Progress admission, including failed launches/retries.
+    #[serde(default)]
+    pub agent_id: Option<AgentId>,
+    pub position: u64,
+    pub profile: AgentExecutionProfile,
+    #[serde(default)]
+    pub feedback: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TaskPlanJob {
+    pub id: Uuid,
+    pub status: String,
+    pub title: String,
+    pub description: String,
+    pub previous_plan: String,
+    pub started_at: DateTime<Utc>,
+    pub finished_at: Option<DateTime<Utc>>,
+    pub result: Option<String>,
+    pub error: Option<String>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum TaskColumn {
     Backlog,
@@ -98,7 +132,39 @@ pub struct TaskRequest {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum TaskOperation {
-    BoardProjects { members: Option<Vec<ProjectId>> },
+    BoardExecution {
+        paused: Option<bool>,
+        expected_revision: Option<u64>,
+    },
+    Enqueue {
+        task_id: TaskId,
+        expected_revision: u64,
+        execution_profile: AgentExecutionProfile,
+    },
+    ReorderQueue {
+        task_id: TaskId,
+        expected_revision: u64,
+        before_id: Option<TaskId>,
+    },
+    GeneratePlan {
+        task_id: TaskId,
+        expected_revision: u64,
+        model: Option<String>,
+    },
+    CancelPlan {
+        task_id: TaskId,
+        job_id: Uuid,
+    },
+    UpdateDescription {
+        task_id: TaskId,
+        expected_description: String,
+        expected_plan: String,
+        description: String,
+        plan: String,
+    },
+    BoardProjects {
+        members: Option<Vec<ProjectId>>,
+    },
     ConfigureAcceptance {
         task_id: TaskId,
         expected_revision: u64,
@@ -129,7 +195,9 @@ pub enum TaskOperation {
     Get {
         task_id: TaskId,
     },
-    CreateBacklog { draft: TaskDraft },
+    CreateBacklog {
+        draft: TaskDraft,
+    },
     CreateIdentified {
         #[serde(default)]
         board_task: Option<Box<Task>>,
@@ -169,6 +237,16 @@ pub enum TaskOperation {
         expected_revision: u64,
         agent_id: AgentId,
     },
+    SelectAgent {
+        task_id: TaskId,
+        expected_revision: u64,
+        agent_id: Option<AgentId>,
+        /// Explicit confirmation when taking a stopped agent from another Todo task.
+        #[serde(default)]
+        replace_task_id: Option<TaskId>,
+        #[serde(default)]
+        replace_task_revision: Option<u64>,
+    },
     Delete {
         task_id: TaskId,
         expected_revision: u64,
@@ -177,6 +255,7 @@ pub enum TaskOperation {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum TaskResponse {
+    BoardExecution(BoardExecutionState),
     BoardProjects(Vec<ProjectId>),
     Diff { text: String },
     TestPresets(std::collections::BTreeMap<String, CommandCheck>),
@@ -185,6 +264,13 @@ pub enum TaskResponse {
     Changed(Task),
     Deleted(TaskId),
     Error(TaskError),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct BoardExecutionState {
+    pub project_id: ProjectId,
+    pub paused: bool,
+    pub revision: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -246,6 +332,8 @@ impl Task {
         draft.validate()?;
         let now = Utc::now();
         Ok(Self {
+            execution_queue: None,
+            planning: TaskPlanning::default(),
             remote_pending: false,
             github_source: None,
             coordinator_group: None,
@@ -293,6 +381,13 @@ impl Task {
             ));
         }
         Ok(())
+    }
+    pub fn waiting_in_queue(&self) -> bool {
+        self.execution_queue.is_some()
+            && self.column() == TaskColumn::InProgress
+            && self.condition == TaskCondition::Queued
+            && self.assigned_agent_id.is_none()
+            && !self.archived
     }
     pub fn touch(&mut self) {
         self.revision += 1;

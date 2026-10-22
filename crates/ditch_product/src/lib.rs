@@ -1,3 +1,5 @@
+pub mod deployment { include!(concat!(env!("OUT_DIR"), "/deployment.rs")); }
+
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]

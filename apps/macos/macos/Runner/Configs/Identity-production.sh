@@ -1,0 +1,5 @@
+DITCH_APP_BUNDLE_ID=ai.theditch.app
+DITCH_RUNTIME_BUNDLE_ID=ai.theditch.runtime
+DITCH_HELPER_NAME='The Ditch Runtime'
+DITCH_APP_NAME=Ditch
+DITCH_SWIFT_IDENTITY_FLAGS=''

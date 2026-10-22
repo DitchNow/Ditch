@@ -19,6 +19,15 @@ static RATE_LIMIT: Mutex<Option<Instant>> = Mutex::new(None);
 /// Replaceable for deterministic tests; application IPC never exposes this method.
 trait GitHubService {
     fn get(&self, path: &str) -> Result<Value, String>;
+    /// App Relay can verify the repository and fetch a page in one round trip.
+    fn issue_page(
+        &self,
+        _id: u64,
+        _filter: &str,
+        _page: u32,
+    ) -> Result<Option<(GitHubRepository, Value)>, String> {
+        Ok(None)
+    }
     fn progress(&self, _detail: &str) {}
     fn link(&self, _project: ProjectId, _repository: u64) -> Result<(), String> {
         Ok(())
@@ -391,6 +400,16 @@ fn verified_repository(
     let repo: GitHubRepository =
         serde_json::from_value(service.get(&format!("repositories/{id}"))?)
             .map_err(|_| "Invalid repository response")?;
+    save_verified_repository(state, service, project, id, previous, repo)
+}
+fn save_verified_repository(
+    state: &Arc<Mutex<RuntimeState>>,
+    service: &dyn GitHubService,
+    project: ProjectId,
+    id: u64,
+    previous: GitHubRepository,
+    repo: GitHubRepository,
+) -> Result<GitHubRepository, String> {
     if repo.id != id || !repo.has_issues {
         return Err("Repository is unavailable or issues are disabled".into());
     }
@@ -715,16 +734,29 @@ fn handle_service(
         } => {
             check_registered(&state, project_id)?;
             valid_page(page)?;
-            let repo = verified_repository(&state, service, project_id, repository_id)?;
-            let name = repository_name(&repo.full_name)?;
             let filter = match filter {
                 IssueFilter::Open => "open",
                 IssueFilter::Closed => "closed",
                 IssueFilter::All => "all",
             };
-            let raw = service.get(&format!(
-                "repos/{name}/issues?state={filter}&per_page=50&page={page}"
-            ))?;
+            let previous = repository(&state.lock().unwrap(), project_id, repository_id)?;
+            let raw = if let Some((repo, raw)) = service.issue_page(repository_id, filter, page)? {
+                save_verified_repository(
+                    &state,
+                    service,
+                    project_id,
+                    repository_id,
+                    previous,
+                    repo,
+                )?;
+                raw
+            } else {
+                let repo = verified_repository(&state, service, project_id, repository_id)?;
+                let name = repository_name(&repo.full_name)?;
+                service.get(&format!(
+                    "repos/{name}/issues?state={filter}&per_page=50&page={page}"
+                ))?
+            };
             let rows = raw.as_array().ok_or("Invalid issue response")?;
             let issues = rows
                 .iter()
@@ -1203,6 +1235,51 @@ mod tests {
         request: GitHubRequest,
     ) -> Result<Value, String> {
         handle_service(state.clone(), request, fake, Path::new("unused-test-tool"))
+    }
+    #[test]
+    fn combined_issue_page_uses_one_request_and_checks_repository_identity() {
+        struct Combined {
+            repo: GitHubRepository,
+            rows: Value,
+            calls: std::cell::Cell<u32>,
+        }
+        impl GitHubService for Combined {
+            fn get(&self, _: &str) -> Result<Value, String> {
+                panic!("Combined page must not make a second request");
+            }
+            fn issue_page(
+                &self,
+                id: u64,
+                filter: &str,
+                page: u32,
+            ) -> Result<Option<(GitHubRepository, Value)>, String> {
+                assert_eq!((id, filter, page), (42, "open", 1));
+                self.calls.set(self.calls.get() + 1);
+                Ok(Some((self.repo.clone(), self.rows.clone())))
+            }
+        }
+        let (state, project, fake) = fixture();
+        let mut service = Combined {
+            repo: serde_json::from_value(fake.0["repositories/42"].clone()).unwrap(),
+            rows: json!([fake.0["repos/owner/repo/issues/7"], {"pull_request": {}}]),
+            calls: std::cell::Cell::new(0),
+        };
+        let request = || GitHubRequest::Issues {
+            project_id: project.id,
+            repository_id: 42,
+            state: IssueFilter::Open,
+            page: 1,
+        };
+        let result =
+            handle_service(state.clone(), request(), &service, Path::new("unused")).unwrap();
+        assert_eq!(service.calls.get(), 1);
+        assert_eq!(result["issues"].as_array().unwrap().len(), 1);
+        assert!(state.lock().unwrap().tasks.is_empty());
+        service.repo.id = 99;
+        assert!(handle_service(state.clone(), request(), &service, Path::new("unused")).is_err());
+        service.repo.id = 42;
+        service.repo.has_issues = false;
+        assert!(handle_service(state.clone(), request(), &service, Path::new("unused")).is_err());
     }
     #[test]
     fn selected_import_is_idempotent_and_refresh_preserves_local_work() {

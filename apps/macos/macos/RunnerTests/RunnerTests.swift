@@ -128,10 +128,10 @@ class RunnerTests: XCTestCase {
       AppDelegate.uninstallArtifactURLs(homeDirectory: home).map(\.path))
 
     XCTAssertTrue(paths.allSatisfy { $0.hasPrefix("/Users/tester/Library/") })
-    XCTAssertTrue(paths.contains("/Users/tester/Library/Application Support/The Ditch"))
-    XCTAssertTrue(paths.contains("/Users/tester/Library/Preferences/ai.theditch.app.plist"))
-    XCTAssertTrue(paths.contains("/Users/tester/Library/Caches/ai.theditch.runtime"))
-    XCTAssertTrue(paths.contains("/Users/tester/Library/Preferences/ai.theditch.status.plist"))
+    XCTAssertTrue(paths.contains("/Users/tester/" + DitchIdentity.supportRelativePath))
+    XCTAssertTrue(paths.contains("/Users/tester/Library/Preferences/\(DitchIdentity.app_id).plist"))
+    XCTAssertTrue(paths.contains("/Users/tester/Library/Caches/\(DitchIdentity.runtime_id)"))
+    XCTAssertTrue(paths.contains("/Users/tester/Library/Preferences/\(DitchIdentity.obsolete_runtime_id).plist"))
     XCTAssertFalse(paths.contains { $0.contains("/Documents/") })
   }
 

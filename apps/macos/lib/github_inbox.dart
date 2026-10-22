@@ -1,9 +1,85 @@
 import 'dart:async';
+import 'dart:convert';
 import 'package:flutter/services.dart';
 import 'package:flutter/material.dart';
 import 'application/task_board_controller.dart';
 import 'data/task_models.dart';
 import 'release_ui_visibility.dart';
+
+/// Memory-only cache scoped to the app's runtime connection, not a pane mount.
+/// Bound request methods compare by receiver, so Settings shares invalidation.
+class GitHubBoardSession extends ChangeNotifier {
+  static final _sessions = <TaskTransport, GitHubBoardSession>{};
+  static GitHubBoardSession forRequest(TaskTransport request) =>
+      _sessions.putIfAbsent(request, GitHubBoardSession.new);
+  Map<String, dynamic>? status;
+  Future<Map<String, dynamic>>? statusRead;
+  final reads = <String, Future<Map<String, dynamic>>>{};
+  final snapshots = <String, Map<String, dynamic>>{};
+  final selections = <String, Map<String, dynamic>>{};
+  bool initialIssuesClaimed = false;
+  int epoch = 0;
+
+  void observeStatus(Map<String, dynamic> next) {
+    final changed =
+        status != null &&
+        (status!['generation'] != next['generation'] ||
+            status!['connected'] != next['connected']);
+    status = next;
+    if (changed) {
+      epoch++;
+      reads.clear();
+      snapshots.clear();
+      selections.clear();
+      notifyListeners();
+    }
+  }
+
+  Future<Map<String, dynamic>> read(
+    Object operation,
+    TaskTransport request, {
+    bool force = false,
+  }) {
+    final key = jsonEncode(operation);
+    if (force) reads.remove(key);
+    return reads.putIfAbsent(key, () => githubRequest(request, operation));
+  }
+
+  void recordImport(Map operation, Map result) {
+    final numbers = operation['numbers'] as List? ?? [];
+    final ids = result['task_ids'] as List? ?? [];
+    for (final entry in snapshots.entries) {
+      if (!entry.key.startsWith(
+        '${operation['project_id']}:${operation['repository_id']}:',
+      )) {
+        continue;
+      }
+      final imported = Map<String, dynamic>.from(
+        entry.value['imported'] as Map? ?? {},
+      );
+      for (final issue in entry.value['issues'] as List) {
+        final index = numbers.indexOf(issue['number']);
+        if (index >= 0 && index < ids.length) {
+          imported['${issue['id']}'] = ids[index];
+        }
+      }
+      entry.value['imported'] = imported;
+    }
+    notifyListeners();
+  }
+}
+
+/// A snapshot of one drag. The source validates its connection again on drop.
+class GitHubIssueDrag {
+  const GitHubIssueDrag({
+    required this.count,
+    required this.canDrop,
+    required this.importToBacklog,
+  });
+  final int count;
+  final bool Function() canDrop;
+  final Future<void> Function() importToBacklog;
+}
 
 class GitHubRepositoryPicker extends StatefulWidget {
   const GitHubRepositoryPicker({
@@ -21,13 +97,19 @@ class _GitHubRepositoryPickerState extends State<GitHubRepositoryPicker> {
   final input = TextEditingController();
   String? project, error;
   List<Map<String, dynamic>> repositories = [];
-  bool busy = false, hasMore = true;
+  bool busy = false, hasMore = true, loadingSuggestions = false;
+  bool linking = false;
+  int inputRevision = 0;
   int page = 0;
   List<String> suggestions = [];
   int suggestionEpoch = 0;
   @override
   void initState() {
     super.initState();
+    input.addListener(() {
+      inputRevision++;
+      if (mounted) setState(() {});
+    });
     project = widget.projects.firstOrNull?.id;
     if (showGitHubBoardControls) loadSuggestions();
   }
@@ -36,17 +118,28 @@ class _GitHubRepositoryPickerState extends State<GitHubRepositoryPicker> {
     final id = project;
     final epoch = ++suggestionEpoch;
     if (id == null) return;
+    final revision = inputRevision;
+    setState(() => loadingSuggestions = true);
     try {
       final result = await githubRequest(widget.request, {
         'RemoteSuggestions': {'project_id': id},
       });
       if (mounted && epoch == suggestionEpoch) {
-        setState(
-          () => suggestions = (result['repositories'] as List).cast<String>(),
-        );
+        setState(() {
+          suggestions = (result['repositories'] as List).cast<String>();
+          if (suggestions.isNotEmpty &&
+              input.text.isEmpty &&
+              inputRevision == revision) {
+            input.text = 'https://github.com/${suggestions.first}';
+          }
+        });
       }
     } on Object catch (_) {
       if (mounted && epoch == suggestionEpoch) setState(() => suggestions = []);
+    } finally {
+      if (mounted && epoch == suggestionEpoch) {
+        setState(() => loadingSuggestions = false);
+      }
     }
   }
 
@@ -91,8 +184,10 @@ class _GitHubRepositoryPickerState extends State<GitHubRepositoryPicker> {
   }
 
   Future<void> link() async {
+    if (busy || project == null || input.text.trim().isEmpty) return;
     setState(() {
       busy = true;
+      linking = true;
       error = null;
     });
     try {
@@ -103,6 +198,32 @@ class _GitHubRepositoryPickerState extends State<GitHubRepositoryPicker> {
     } on Object catch (e) {
       if (mounted) setState(() => error = '$e');
     } finally {
+      if (mounted) {
+        setState(() {
+          busy = false;
+          linking = false;
+        });
+      }
+    }
+  }
+
+  Future<void> manageAccess() async {
+    setState(() {
+      busy = true;
+      error = null;
+    });
+    try {
+      await githubRequest(widget.request, 'ManageRepositories');
+      if (mounted) {
+        setState(() {
+          page = 0;
+          hasMore = true;
+          repositories = [];
+        });
+      }
+    } on Object catch (e) {
+      if (mounted) setState(() => error = '$e');
+    } finally {
       if (mounted) setState(() => busy = false);
     }
   }
@@ -110,18 +231,30 @@ class _GitHubRepositoryPickerState extends State<GitHubRepositoryPicker> {
   @override
   Widget build(BuildContext context) => AlertDialog(
     title: const Text('Link GitHub repository'),
+    scrollable: true,
     content: SizedBox(
-      width: 520,
-      height: 420,
+      width: 560,
       child: Column(
+        mainAxisSize: MainAxisSize.min,
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          DropdownButton<String>(
-            value: project,
+          const Text(
+            'Choose the repository whose issues you want to use in this project.',
+          ),
+          const SizedBox(height: 20),
+          DropdownButtonFormField<String>(
+            initialValue: project,
             isExpanded: true,
+            decoration: const InputDecoration(
+              labelText: 'Project',
+              border: OutlineInputBorder(),
+            ),
             items: [
               for (final p in widget.projects)
-                DropdownMenuItem(value: p.id, child: Text(p.name)),
+                DropdownMenuItem(
+                  value: p.id,
+                  child: Text(p.name, overflow: TextOverflow.ellipsis),
+                ),
             ],
             onChanged: busy
                 ? null
@@ -129,97 +262,155 @@ class _GitHubRepositoryPickerState extends State<GitHubRepositoryPicker> {
                     setState(() {
                       project = v;
                       suggestions = [];
+                      error = null;
                       input.clear();
                     });
                     if (showGitHubBoardControls) loadSuggestions();
                   },
           ),
-          if (suggestions.isNotEmpty)
-            Wrap(
-              children: [
-                for (final name in suggestions)
-                  ActionChip(
-                    label: Text('Git remote: $name'),
-                    onPressed: busy
-                        ? null
-                        : () => setState(() => input.text = name),
-                  ),
-              ],
-            ),
+          const SizedBox(height: 20),
           TextField(
             controller: input,
-            enabled: !busy,
+            enabled: !busy && project != null,
+            onChanged: (_) {
+              if (error != null) setState(() => error = null);
+            },
+            onSubmitted: (_) => link(),
             decoration: const InputDecoration(
-              labelText: 'OWNER/REPO or GitHub URL',
+              labelText: 'GitHub repository',
+              hintText: 'https://github.com/owner/repository',
+              helperText: 'GitHub URL or owner/repository',
+              border: OutlineInputBorder(),
             ),
           ),
-          const SizedBox(height: 12),
-          Text(
-            showGitHubBoardControls
-                ? 'Choose a repository explicitly granted to the Ditch GitHub App. Linking associates this project without changing Git remotes.'
-                : 'Browse repositories you can access, including organization and collaborator repositories. Linking does not clone or modify them.',
-          ),
-          if (showGitHubBoardControls)
-            TextButton(
-              onPressed: busy
-                  ? null
-                  : () async {
-                      try {
-                        await githubRequest(
-                          widget.request,
-                          'ManageRepositories',
-                        );
-                        if (mounted) {
-                          setState(() {
-                            page = 0;
-                            hasMore = true;
-                            repositories = [];
-                          });
-                        }
-                      } on Object catch (e) {
-                        if (mounted) setState(() => error = '$e');
-                      }
-                    },
-              child: const Text('Choose repositories on GitHub'),
-            ),
-          if (busy) const LinearProgressIndicator(),
-          if (error != null)
+          if (loadingSuggestions) ...[
+            const SizedBox(height: 8),
+            const Text('Checking project Git remotes…'),
+          ] else if (suggestions.isNotEmpty) ...[
+            const SizedBox(height: 8),
             Text(
-              error!,
-              style: TextStyle(color: Theme.of(context).colorScheme.error),
+              suggestions.length == 1
+                  ? 'Detected from this project’s Git remote.'
+                  : 'Multiple Git remotes found. Choose the repository to link.',
             ),
-          Expanded(
-            child: ListView(
-              children: [
-                for (final repo in repositories)
-                  ListTile(
-                    title: Text('${repo['full_name']}'),
-                    subtitle: showGitHubBoardControls
-                        ? null
-                        : Text(repo['private'] == true ? 'Private' : 'Public'),
-                    onTap: busy
-                        ? null
-                        : () => setState(
-                            () => input.text = '${repo['full_name']}',
-                          ),
-                  ),
-                if (hasMore)
-                  TextButton(
-                    onPressed: busy ? null : browse,
-                    child: Text(
-                      page == 0
-                          ? 'Browse accessible repositories'
-                          : 'Load more repositories',
+            if (suggestions.length > 1)
+              Padding(
+                padding: const EdgeInsets.only(top: 8),
+                child: Wrap(
+                  spacing: 8,
+                  runSpacing: 8,
+                  children: [
+                    for (final name in suggestions)
+                      ActionChip(
+                        label: Text(name),
+                        onPressed: busy
+                            ? null
+                            : () {
+                                input.text = 'https://github.com/$name';
+                                setState(() => error = null);
+                              },
+                      ),
+                  ],
+                ),
+              ),
+          ],
+          const SizedBox(height: 16),
+          Wrap(
+            spacing: 12,
+            runSpacing: 8,
+            children: [
+              OutlinedButton.icon(
+                onPressed: busy
+                    ? null
+                    : () async {
+                        setState(() {
+                          page = 0;
+                          hasMore = true;
+                          repositories = [];
+                        });
+                        await browse();
+                      },
+                icon: const Icon(Icons.search, size: 18),
+                label: Text(
+                  page == 0 ? 'Browse repositories' : 'Refresh repositories',
+                ),
+              ),
+              if (showGitHubBoardControls)
+                TextButton.icon(
+                  onPressed: busy ? null : manageAccess,
+                  icon: const Icon(Icons.open_in_new, size: 16),
+                  label: const Text('Manage GitHub access'),
+                ),
+            ],
+          ),
+          if (busy) ...[
+            const SizedBox(height: 12),
+            const LinearProgressIndicator(),
+          ],
+          if (error != null) ...[
+            const SizedBox(height: 12),
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.all(12),
+              decoration: BoxDecoration(
+                color: Theme.of(context).colorScheme.errorContainer,
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: SelectableText(
+                error!.replaceFirst(
+                  RegExp(r'^(Bad state: )?github_unavailable: '),
+                  '',
+                ),
+                style: TextStyle(
+                  color: Theme.of(context).colorScheme.onErrorContainer,
+                ),
+              ),
+            ),
+          ],
+          if (repositories.isNotEmpty) ...[
+            const SizedBox(height: 12),
+            SizedBox(
+              height: repositories.length < 4
+                  ? repositories.length * 60.0
+                  : 240,
+              child: ListView(
+                children: [
+                  for (final repo in repositories)
+                    ListTile(
+                      dense: true,
+                      title: Text('${repo['full_name']}'),
+                      selected:
+                          input.text ==
+                              'https://github.com/${repo['full_name']}' ||
+                          input.text == repo['full_name'],
+                      trailing: const Icon(Icons.arrow_forward, size: 18),
+                      onTap: busy
+                          ? null
+                          : () {
+                              input.text =
+                                  'https://github.com/${repo['full_name']}';
+                              setState(() => error = null);
+                            },
                     ),
-                  ),
-                if (page > 0 && repositories.isEmpty)
-                  Text(
-                    showGitHubBoardControls
-                        ? 'No selected repositories available. Choose “Only select repositories” on GitHub, then browse again.'
-                        : 'No repositories available. You can also enter a repository directly.',
-                  ),
-              ],
+                ],
+              ),
             ),
+          ],
+          if (page > 0 && hasMore)
+            TextButton(
+              onPressed: busy ? null : browse,
+              child: const Text('Load more repositories'),
+            ),
+          if (page > 0 && repositories.isEmpty) ...[
+            const SizedBox(height: 12),
+            const Text(
+              'No accessible repositories found. Check the GitHub App installation’s access, then refresh.',
+            ),
+          ],
+          const SizedBox(height: 16),
+          Text(
+            'Linking connects GitHub issues to this project. Your Git remotes stay unchanged.',
+            style: Theme.of(context).textTheme.bodySmall,
           ),
         ],
       ),
@@ -230,8 +421,10 @@ class _GitHubRepositoryPickerState extends State<GitHubRepositoryPicker> {
         child: const Text('Cancel'),
       ),
       FilledButton(
-        onPressed: busy || project == null ? null : link,
-        child: const Text('Verify and link'),
+        onPressed: busy || project == null || input.text.trim().isEmpty
+            ? null
+            : link,
+        child: Text(linking ? 'Linking…' : 'Verify and link'),
       ),
     ],
   );
@@ -357,12 +550,29 @@ Future<Map<String, dynamic>> githubRequest(
   TaskTransport request,
   Object operation,
 ) async {
+  final session = GitHubBoardSession.forRequest(request);
+  final epoch = session.epoch;
   final result = await request({'GitHub': operation});
   if (result['Error'] case final Map error) {
     throw StateError('${error['message']}');
   }
   if (result['GitHub'] case final Map body) {
-    return Map<String, dynamic>.from(body);
+    final value = Map<String, dynamic>.from(body);
+    if (operation == 'Status') {
+      if (epoch != session.epoch && session.status != null) {
+        return session.status!;
+      }
+      session.observeStatus(value);
+    }
+    if (operation == 'Disconnect' || operation == 'Cancel') {
+      session.observeStatus({'connected': false, 'generation': null});
+    }
+    if (epoch == session.epoch &&
+        operation is Map &&
+        operation['Import'] is Map) {
+      session.recordImport(operation['Import'] as Map, value);
+    }
+    return value;
   }
   throw const FormatException(
     'GitHub integration requires the matching Ditch Runtime.',
@@ -380,6 +590,7 @@ class _GitHubSettingsState extends State<GitHubSettingsDialog> {
   Map<String, dynamic>? status;
   String? error, attemptedGeneration;
   bool sending = false, polling = false, browserFailed = false;
+  bool statusFailed = false;
   int statusEpoch = 0;
   Timer? timer;
   bool get active => status?['busy'] == true;
@@ -388,7 +599,9 @@ class _GitHubSettingsState extends State<GitHubSettingsDialog> {
   void initState() {
     super.initState();
     poll();
-    timer = Timer.periodic(const Duration(seconds: 1), (_) => poll());
+    timer = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (active) poll();
+    });
   }
 
   @override
@@ -434,7 +647,8 @@ class _GitHubSettingsState extends State<GitHubSettingsDialog> {
       if (!mounted || epoch != statusEpoch) return;
       setState(() {
         status = result;
-        if (result['connected'] == true) error = null;
+        if (statusFailed || result['connected'] == true) error = null;
+        statusFailed = false;
       });
       if (result['browser_ready'] == true &&
           attemptedGeneration != result['generation']) {
@@ -442,7 +656,12 @@ class _GitHubSettingsState extends State<GitHubSettingsDialog> {
         await openBrowser();
       }
     } on Object catch (e) {
-      if (mounted && epoch == statusEpoch) setState(() => error = '$e');
+      if (mounted && epoch == statusEpoch) {
+        setState(() {
+          error = '$e';
+          statusFailed = true;
+        });
+      }
     } finally {
       polling = false;
     }
@@ -454,6 +673,7 @@ class _GitHubSettingsState extends State<GitHubSettingsDialog> {
     setState(() {
       sending = true;
       error = null;
+      statusFailed = false;
       browserFailed = false;
     });
     try {
@@ -473,6 +693,7 @@ class _GitHubSettingsState extends State<GitHubSettingsDialog> {
     final account = status?['account'] as Map?;
     final app = status?['provider'] == 'github_app' || showGitHubBoardControls;
     final code = status?['device_code'] as String?;
+    final detail = status?['detail'] as String?;
     final failed =
         phase == 'failed' || phase == 'account_changed' || error != null;
     return PopScope(
@@ -486,7 +707,7 @@ class _GitHubSettingsState extends State<GitHubSettingsDialog> {
               mainAxisSize: MainAxisSize.min,
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                if (active || sending || status == null) ...[
+                if (sending || (!failed && (active || status == null))) ...[
                   const LinearProgressIndicator(),
                   const SizedBox(height: 16),
                 ],
@@ -521,25 +742,28 @@ class _GitHubSettingsState extends State<GitHubSettingsDialog> {
                   ),
                 ] else if (active || failed)
                   Text(
-                    status?['detail'] as String? ??
-                        'Preparing browser sign-in…',
+                    failed
+                        ? error == null
+                              ? detail ?? 'GitHub connection needs attention.'
+                              : 'GitHub connection needs attention.'
+                        : detail ?? 'Preparing browser sign-in…',
                   )
                 else
                   Text(
                     app
-                        ? 'Connect the Ditch GitHub App in your browser, choose specific repositories, then link them to a project.'
+                        ? 'Connect the Ditch GitHub App in your browser, choose its repository access, then link repositories to a project.'
                         : 'Connect GitHub in your browser to browse issues and add them to Backlog.',
                   ),
                 if (error != null) ...[
                   const SizedBox(height: 12),
-                  Text(
+                  SelectableText(
                     error!,
                     style: TextStyle(
                       color: Theme.of(context).colorScheme.error,
                     ),
                   ),
                 ],
-                if (app && active && browserFailed)
+                if (app && code == null && active && browserFailed)
                   TextButton(
                     onPressed: sending ? null : openBrowser,
                     child: const Text('Open browser'),
@@ -732,109 +956,184 @@ class GitHubInbox extends StatefulWidget {
 }
 
 class _GitHubInboxState extends State<GitHubInbox> {
+  late final session = GitHubBoardSession.forRequest(widget.request);
+  String get scope =>
+      (widget.projects.map((p) => p.id).toList()..sort()).join(':');
+  String get query =>
+      '${link?['project_id']}:${link?['repository']['id']}:$filter';
+  bool listLoaded = false;
   List<Map<String, dynamic>> links = [], issues = [];
   Map<String, dynamic>? link;
   final selected = <int>{};
+  int? selectionAnchor;
+  bool confirmingImport = false;
+  bool draggingIssues = false;
+  bool skipImportConfirmation = false;
+  static const preferencesChannel = MethodChannel('the_ditch/application');
   String filter = 'Open';
   String? error, lastSync;
   bool busy = false, hasMore = false;
+  bool refreshing = false;
   bool connected = false, checkingConnection = false;
+  bool checkedConnection = false;
   String? connectionGeneration, importRequestId, readProgress;
   bool linksLoaded = false, loadingLinks = false;
   int requestGeneration = 0;
   Map<String, dynamic> imported = {};
-  Timer? connectionTimer;
-  Timer? syncTimer;
-  int syncCursor = 0;
-  DateTime? lastReconciliation;
   BuildContext? privateDialogContext;
   int page = 0;
   @override
   void initState() {
     super.initState();
+    unawaited(loadImportPreference());
+    session.addListener(connectionChanged);
     checkConnection();
-    connectionTimer = Timer.periodic(
-      const Duration(seconds: 2),
-      (_) => checkConnection(),
-    );
-    if (showGitHubBoardControls) {
-      syncTimer = Timer.periodic(
-        const Duration(seconds: 30),
-        (_) => syncChanges(),
+  }
+
+  Future<void> loadImportPreference() async {
+    try {
+      final skip = await preferencesChannel.invokeMethod<bool>(
+        'getSkipGitHubImportConfirmation',
       );
+      if (mounted) setState(() => skipImportConfirmation = skip == true);
+    } on MissingPluginException {
+      /* Tests and older hosts use the safe default. */
+    } on PlatformException {
+      /* Keep confirmation enabled if preferences cannot load. */
     }
+  }
+
+  Future<void> restoreImportConfirmation() async {
+    setState(() => skipImportConfirmation = false);
+    try {
+      await preferencesChannel.invokeMethod<void>(
+        'setSkipGitHubImportConfirmation',
+        false,
+      );
+    } on MissingPluginException {
+      /* Older host; keep the session preference. */
+    } on PlatformException {
+      /* Confirmation stays enabled for this session. */
+    }
+  }
+
+  void selectIssue(int number) {
+    final keys = HardwareKeyboard.instance;
+    setState(() {
+      importRequestId = null;
+      if (keys.isShiftPressed && selectionAnchor != null) {
+        final start = issues.indexWhere((v) => v['number'] == selectionAnchor);
+        final end = issues.indexWhere((v) => v['number'] == number);
+        if (start >= 0 && end >= 0) {
+          for (
+            var i = start < end ? start : end;
+            i <= (start > end ? start : end);
+            i++
+          ) {
+            if (!imported.containsKey('${issues[i]['id']}')) {
+              selected.add(issues[i]['number'] as int);
+            }
+          }
+        }
+      } else if (keys.isMetaPressed || keys.isControlPressed) {
+        if (!selected.remove(number)) selected.add(number);
+        selectionAnchor = number;
+      } else {
+        selected
+          ..clear()
+          ..add(number);
+        selectionAnchor = number;
+      }
+    });
   }
 
   @override
   void dispose() {
-    connectionTimer?.cancel();
-    syncTimer?.cancel();
-    if (busy) {
-      unawaited(
-        githubRequest(
-          widget.request,
-          'CancelRead',
-        ).then<void>((_) {}, onError: (Object _) {}),
-      );
-    }
+    session.removeListener(connectionChanged);
     super.dispose();
   }
 
-  Future<void> checkConnection() async {
-    if (checkingConnection) return;
-    checkingConnection = true;
-    try {
-      final result = await githubRequest(widget.request, 'Status');
-      if (!mounted) return;
-      final next = result['connected'] == true;
-      final changed =
-          result['generation'] != connectionGeneration || next != connected;
-      if (busy && readProgress != result['read_progress']) {
-        setState(() => readProgress = result['read_progress'] as String?);
+  void connectionChanged() {
+    if (mounted && checkedConnection && session.status != null) {
+      applyConnection(session.status!);
+      final saved = session.snapshots[query];
+      if (saved != null) {
+        setState(
+          () => imported = Map<String, dynamic>.from(
+            saved['imported'] as Map? ?? {},
+          ),
+        );
       }
-      if (changed) {
-        final dialog = privateDialogContext;
-        if (dialog != null && dialog.mounted) Navigator.pop(dialog);
-        privateDialogContext = null;
-        setState(() {
-          connected = next;
-          connectionGeneration = result['generation'] as String?;
-          requestGeneration++;
-          links = [];
-          linksLoaded = false;
-          readProgress = null;
-          issues = [];
-          link = null;
-          selected.clear();
-          imported = {};
-          lastSync = null;
-          importRequestId = null;
-          page = 0;
-          hasMore = false;
-          syncCursor = 0;
-          lastReconciliation = null;
-          busy = false;
-          error = next
-              ? null
-              : 'Connect GitHub to browse issues. Imported tasks remain on your board.';
-        });
-      }
-      if (next && !linksLoaded) await loadLinks();
-    } on Object catch (e) {
-      if (mounted) setState(() => error = '$e');
-    } finally {
-      checkingConnection = false;
     }
   }
 
-  Future<void> loadLinks() async {
+  void applyConnection(Map<String, dynamic> result) {
+    final next = result['connected'] == true;
+    if (result['generation'] == connectionGeneration && next == connected) {
+      return;
+    }
+    final dialog = privateDialogContext;
+    if (dialog != null && dialog.mounted) Navigator.pop(dialog);
+    privateDialogContext = null;
+    setState(() {
+      connected = next;
+      connectionGeneration = result['generation'] as String?;
+      requestGeneration++;
+      links = [];
+      linksLoaded = false;
+      readProgress = null;
+      issues = [];
+      link = null;
+      selected.clear();
+      imported = {};
+      lastSync = null;
+      importRequestId = null;
+      page = 0;
+      hasMore = false;
+      listLoaded = false;
+      busy = false;
+      error = null;
+    });
+  }
+
+  Future<bool> checkConnection({bool force = false}) async {
+    if (checkingConnection) return false;
+    checkingConnection = true;
+    try {
+      if (force) session.statusRead = null;
+      final result = !force && session.status != null
+          ? session.status!
+          : await (session.statusRead ??= githubRequest(
+              widget.request,
+              'Status',
+            ));
+      if (!mounted) return false;
+      applyConnection(result);
+      if (connected && (!linksLoaded || force)) await loadLinks(force: force);
+      return true;
+    } on Object catch (e) {
+      if (mounted) setState(() => error = '$e');
+      return false;
+    } finally {
+      checkingConnection = false;
+      if (mounted && !checkedConnection) {
+        setState(() => checkedConnection = true);
+      }
+    }
+  }
+
+  Future<void> loadLinks({bool force = false}) async {
     if (loadingLinks) return;
     loadingLinks = true;
     final generation = requestGeneration;
     try {
-      final result = await githubRequest(widget.request, {
-        'Links': {'project_id': null},
-      });
+      final result = await session.read(
+        {
+          'Links': {'project_id': null},
+        },
+        widget.request,
+        force: force,
+      );
       if (!mounted || generation != requestGeneration) return;
       final visible = widget.projects.map((p) => p.id).toSet();
       setState(() {
@@ -845,6 +1144,28 @@ class _GitHubInboxState extends State<GitHubInbox> {
             .where((v) => visible.contains(v['project_id']))
             .toList();
       });
+      final previous =
+          link ?? session.selections[scope]?['link'] as Map<String, dynamic>?;
+      final available = links
+          .where(
+            (v) =>
+                v['project_id'] == previous?['project_id'] &&
+                v['repository']['id'] == previous?['repository']['id'],
+          )
+          .toList();
+      if (available.isNotEmpty) {
+        filter = session.selections[scope]?['filter'] as String? ?? filter;
+        await chooseLink(available.first);
+      } else if (links.length == 1) {
+        await chooseLink(links.single);
+      } else if (link != null) {
+        setState(() {
+          link = null;
+          issues = [];
+          imported = {};
+          listLoaded = false;
+        });
+      }
     } on Object catch (e) {
       if (mounted && generation == requestGeneration) {
         setState(() => error = '$e');
@@ -865,12 +1186,69 @@ class _GitHubInboxState extends State<GitHubInbox> {
         );
       },
     );
-    if (linked == true && mounted) await loadLinks();
+    if (linked == true && mounted) await loadLinks(force: true);
   }
 
-  Future<void> fetch({bool more = false}) async {
+  Future<void> chooseLink(Map<String, dynamic> next) async {
+    setState(() {
+      link = next;
+      issues = [];
+      page = 0;
+      selected.clear();
+      selectionAnchor = null;
+      imported = {};
+      lastSync = null;
+      hasMore = false;
+      listLoaded = false;
+      importRequestId = null;
+      error = null;
+    });
+    session.selections[scope] = {'link': next, 'filter': filter};
+    final saved = session.snapshots[query];
+    if (saved != null) {
+      restoreList(saved);
+    } else {
+      await fetch();
+    }
+  }
+
+  Future<void> openConnection() async {
+    await showDialog<void>(
+      context: context,
+      builder: (_) => GitHubSettingsDialog(request: widget.request),
+    );
+    if (mounted) await checkConnection();
+  }
+
+  void restoreList(Map<String, dynamic> result) {
+    setState(() {
+      issues = List<Map<String, dynamic>>.from(result['issues'] as List);
+      imported = Map<String, dynamic>.from(result['imported'] as Map? ?? {});
+      page = result['page'] as int? ?? 1;
+      hasMore = result['has_more'] == true;
+      lastSync = result['last_synced_at']?.toString();
+      listLoaded = true;
+    });
+  }
+
+  Future<void> fetch({bool more = false, bool force = false}) async {
     final current = link;
     if (current == null || busy) return;
+    final nextPage = more ? page + 1 : 1;
+    final operation = {
+      'Issues': {
+        'project_id': current['project_id'],
+        'repository_id': current['repository']['id'],
+        'state': filter,
+        'page': nextPage,
+      },
+    };
+    if (!force && !more && !session.reads.containsKey(jsonEncode(operation))) {
+      if (session.initialIssuesClaimed) return;
+      session.initialIssuesClaimed = true;
+    }
+    final queryKey = query;
+    final epoch = session.epoch;
     final generation = requestGeneration;
     setState(() {
       busy = true;
@@ -878,33 +1256,38 @@ class _GitHubInboxState extends State<GitHubInbox> {
       error = null;
     });
     try {
-      final next = more ? page + 1 : 1;
-      final result = await githubRequest(widget.request, {
-        'Issues': {
-          'project_id': current['project_id'],
-          'repository_id': current['repository']['id'],
-          'state': filter,
-          'page': next,
-        },
-      });
+      final result = await session.read(
+        operation,
+        widget.request,
+        force: force,
+      );
+      if (epoch != session.epoch) return;
+      final prior = more
+          ? (session.snapshots[queryKey]?['issues'] as List? ?? [])
+          : [];
+      final rows = (result['issues'] as List).map(
+        (v) => Map<String, dynamic>.from(v as Map),
+      );
+      final byId = {
+        for (final i in [...prior, ...rows]) i['id']: i,
+      };
+      final snapshot = <String, dynamic>{
+        ...result,
+        'issues': byId.values
+            .map((v) => Map<String, dynamic>.from(v as Map))
+            .toList(),
+        'page': nextPage,
+      };
+      session.snapshots[queryKey] = snapshot;
       if (!mounted || generation != requestGeneration) return;
       setState(() {
         if (!more) {
           issues = [];
           selected.clear();
+          selectionAnchor = null;
         }
-        final rows = (result['issues'] as List).map(
-          (v) => Map<String, dynamic>.from(v as Map),
-        );
-        final byId = {
-          for (final i in [...issues, ...rows]) i['id']: i,
-        };
-        issues = byId.values.toList();
-        imported = Map<String, dynamic>.from(result['imported'] as Map? ?? {});
-        page = next;
-        hasMore = result['has_more'] == true;
-        lastSync = result['last_synced_at']?.toString();
       });
+      restoreList(snapshot);
     } on Object catch (e) {
       if (mounted && generation == requestGeneration) {
         setState(
@@ -918,31 +1301,104 @@ class _GitHubInboxState extends State<GitHubInbox> {
     }
   }
 
-  Future<void> importSelected() async {
-    if (link == null || selected.isEmpty || busy) return;
-    final current = link!;
-    final numbers = selected.toList();
-    final generation = requestGeneration;
-    final confirm = await showDialog<bool>(
-      context: context,
-      builder: (context) => AlertDialog(
-        title: Text('Add ${selected.length} issues to Backlog?'),
-        content: const Text(
-          'This confirms the selected work for your backlog. Closed GitHub issues retain their Closed source badge; they are not marked accepted in Ditch. No agents will start. Previously imported issues keep their local work and board position.',
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context, false),
-            child: const Text('Cancel'),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.pop(context, true),
-            child: const Text('Add to Backlog'),
-          ),
-        ],
-      ),
-    );
-    if (confirm != true || !mounted || generation != requestGeneration) return;
+  Future<void> importIssues(
+    Map<String, dynamic> current,
+    List<int> numbers,
+    int generation,
+  ) async {
+    if (!mounted ||
+        generation != requestGeneration ||
+        busy ||
+        confirmingImport ||
+        !connected ||
+        link != current ||
+        numbers.isEmpty ||
+        numbers.length > 50) {
+      return;
+    }
+    confirmingImport = true;
+    var skipNextTime = false;
+    var confirm = skipImportConfirmation;
+    try {
+      if (!confirm) {
+        confirm =
+            await showDialog<bool>(
+              context: context,
+              builder: (dialogContext) {
+                privateDialogContext = dialogContext;
+                return StatefulBuilder(
+                  builder: (context, update) => AlertDialog(
+                    constraints: const BoxConstraints(maxWidth: 400),
+                    title: Text(
+                      'Add ${numbers.length == 1 ? 'issue' : '${numbers.length} issues'} to Backlog?',
+                    ),
+                    content: SizedBox(
+                      width: 320,
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          const Text('Adds tasks without starting agents.'),
+                          const SizedBox(height: 12),
+                          CheckboxListTile(
+                            contentPadding: EdgeInsets.zero,
+                            dense: true,
+                            controlAffinity: ListTileControlAffinity.leading,
+                            title: const Text('Don’t show this again'),
+                            value: skipNextTime,
+                            onChanged: (v) =>
+                                update(() => skipNextTime = v == true),
+                          ),
+                        ],
+                      ),
+                    ),
+                    actions: [
+                      TextButton(
+                        onPressed: () => Navigator.pop(context, false),
+                        child: const Text('Cancel'),
+                      ),
+                      FilledButton(
+                        onPressed: () => Navigator.pop(context, true),
+                        child: const Text('Add to Backlog'),
+                      ),
+                    ],
+                  ),
+                );
+              },
+            ) ==
+            true;
+      }
+    } finally {
+      confirmingImport = false;
+      privateDialogContext = null;
+    }
+    if (!confirm ||
+        !mounted ||
+        generation != requestGeneration ||
+        !connected ||
+        link != current) {
+      return;
+    }
+    setState(() => busy = true);
+    if (skipNextTime) {
+      skipImportConfirmation = true;
+      try {
+        await preferencesChannel.invokeMethod<void>(
+          'setSkipGitHubImportConfirmation',
+          true,
+        );
+      } on MissingPluginException {
+        /* Older hosts retain this choice for this panel session. */
+      } on PlatformException {
+        /* A preference failure must not cancel the accepted import. */
+      }
+    }
+    if (!mounted ||
+        generation != requestGeneration ||
+        !connected ||
+        link != current) {
+      return;
+    }
     importRequestId ??= TaskBoardController.newRequestId();
     setState(() {
       busy = true;
@@ -965,7 +1421,6 @@ class _GitHubInboxState extends State<GitHubInbox> {
           importRequestId = null;
           busy = false;
         });
-        await fetch();
       }
     } on Object catch (e) {
       if (mounted && generation == requestGeneration) {
@@ -991,48 +1446,39 @@ class _GitHubInboxState extends State<GitHubInbox> {
     }
   }
 
-  Future<void> syncChanges() async {
-    if (!mounted || busy || !connected || !linksLoaded || links.isEmpty) return;
-    final generation = requestGeneration;
-    final reconcile =
-        lastReconciliation == null ||
-        DateTime.now().difference(lastReconciliation!) >
-            const Duration(minutes: 5);
-    setState(() {
-      busy = true;
-      readProgress = 'Refreshing GitHub source information…';
-    });
+  Future<void> refresh() async {
+    if (busy || refreshing || draggingIssues || confirmingImport) return;
+    setState(() => refreshing = true);
     try {
-      Map<String, dynamic>? result;
-      String? after;
-      int? firstCursor;
+      if (!await checkConnection(force: true)) return;
+      if (!mounted || !connected || !linksLoaded) return;
+      final generation = requestGeneration;
       var failures = 0;
-      do {
-        result = await githubRequest(widget.request, {
-          'SyncChanges': {
-            'cursor': reconcile ? 0 : syncCursor,
-            'after_task': after,
-          },
+      if (showGitHubBoardControls && links.isNotEmpty) {
+        setState(() {
+          busy = true;
+          readProgress = 'Refreshing GitHub source information…';
         });
+        String? after;
+        do {
+          final result = await githubRequest(widget.request, {
+            'SyncChanges': {'cursor': 0, 'after_task': after},
+          });
+          if (!mounted || generation != requestGeneration) return;
+          failures += result['refresh_failures'] as int? ?? 0;
+          after = result['after_task'] as String?;
+        } while (after != null);
+        await widget.onImported();
         if (!mounted || generation != requestGeneration) return;
-        firstCursor ??= result['cursor'] as int?;
-        failures += result['refresh_failures'] as int? ?? 0;
-        after = result['after_task'] as String?;
-      } while (after != null);
-      syncCursor = firstCursor ?? syncCursor;
-      if (reconcile) lastReconciliation = DateTime.now();
-      await widget.onImported();
-      if (!mounted || generation != requestGeneration) return;
-      setState(() {
-        busy = false;
-        readProgress = null;
-      });
-      if (link != null &&
-          (reconcile ||
-              (result['repository_ids'] as List? ?? []).contains(
-                link!['repository']['id'],
-              ))) {
-        await fetch();
+        setState(() {
+          busy = false;
+          readProgress = null;
+        });
+      }
+      // A refresh replaces this query's old pages as one new first page.
+      if (link != null) {
+        session.reads.removeWhere((key, _) => key.contains('"Issues"'));
+        await fetch(force: true);
       }
       if (failures > 0 && mounted) {
         setState(
@@ -1041,13 +1487,12 @@ class _GitHubInboxState extends State<GitHubInbox> {
         );
       }
     } on Object catch (e) {
-      if (mounted && generation == requestGeneration) {
-        setState(() => error = '$e');
-      }
+      if (mounted) setState(() => error = '$e');
     } finally {
-      if (mounted && generation == requestGeneration) {
+      if (mounted) {
         setState(() {
           busy = false;
+          refreshing = false;
           readProgress = null;
         });
       }
@@ -1068,172 +1513,382 @@ class _GitHubInboxState extends State<GitHubInbox> {
     privateDialogContext = null;
     if (created == true && mounted) {
       await widget.onImported();
-      if (mounted) await fetch();
+      // Creating is an explicit write; list reads still wait for Refresh.
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Issue created. Click Refresh to update the list.'),
+          ),
+        );
+      }
     }
   }
 
-  @override
-  Widget build(BuildContext context) => Padding(
-    padding: const EdgeInsets.all(12),
-    child: Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        Text('GitHub inbox', style: Theme.of(context).textTheme.titleLarge),
-        Wrap(
-          children: [
-            if (showGitHubBoardControls)
-              TextButton(
-                onPressed: busy || !connected || link == null
-                    ? null
-                    : createIssue,
-                child: const Text('Create issue'),
-              ),
-            TextButton(
-              onPressed: busy || !connected ? null : linkRepository,
-              child: const Text('Link repository'),
-            ),
-            TextButton(
-              onPressed: () async {
-                await showDialog<void>(
-                  context: context,
-                  builder: (_) => GitHubSettingsDialog(request: widget.request),
-                );
-                await checkConnection();
-              },
-              child: const Text('Connection'),
-            ),
-          ],
+  Widget issueCard(Map<String, dynamic> issue) {
+    final number = issue['number'] as int;
+    final alreadyImported = imported.containsKey('${issue['id']}');
+    final current = link!;
+    final generation = requestGeneration;
+    final numbers = List<int>.unmodifiable(
+      selected.contains(number) ? selected : [number],
+    );
+    final drag = GitHubIssueDrag(
+      count: numbers.length,
+      canDrop: () =>
+          mounted &&
+          connected &&
+          !busy &&
+          !confirmingImport &&
+          generation == requestGeneration &&
+          link == current &&
+          numbers.length <= 50,
+      importToBacklog: () => importIssues(current, numbers, generation),
+    );
+    Widget card({bool ghost = false}) => AnimatedContainer(
+      duration: const Duration(milliseconds: 140),
+      margin: const EdgeInsets.only(bottom: 8),
+      decoration: BoxDecoration(
+        color: selected.contains(number)
+            ? Theme.of(context).colorScheme.primary.withValues(alpha: .08)
+            : Theme.of(context).colorScheme.surface,
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(
+          color: selected.contains(number)
+              ? Theme.of(context).colorScheme.primary
+              : Theme.of(context).dividerColor,
         ),
-        DropdownButton<String>(
-          isExpanded: true,
-          value: link == null
-              ? null
-              : '${link!['project_id']}:${link!['repository']['id']}',
-          hint: const Text('Select a linked repository'),
-          items: [
-            for (final v in links)
-              DropdownMenuItem(
-                value: '${v['project_id']}:${v['repository']['id']}',
-                child: Text(
-                  '${v['repository']['full_name']}',
-                  overflow: TextOverflow.ellipsis,
+      ),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(10),
+        onTap: busy || alreadyImported || ghost
+            ? null
+            : () => selectIssue(number),
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(12, 10, 4, 10),
+          child: Row(
+            children: [
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      '${issue['title']}',
+                      maxLines: 3,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                    const SizedBox(height: 4),
+                    Text(
+                      '#$number · ${issue['state']}${alreadyImported ? ' · In board' : ''}',
+                      style: Theme.of(context).textTheme.bodySmall,
+                    ),
+                  ],
                 ),
               ),
-          ],
-          onChanged: busy
-              ? null
-              : (id) {
-                  setState(() {
-                    link = links.firstWhere(
-                      (v) =>
-                          '${v['project_id']}:${v['repository']['id']}' == id,
-                    );
-                    issues = [];
-                    page = 0;
-                    selected.clear();
-                    imported = {};
-                    lastSync = null;
-                    hasMore = false;
-                    importRequestId = null;
-                  });
-                  fetch();
-                },
+              IconButton(
+                tooltip: 'Issue info',
+                icon: const Icon(Icons.info_outline, size: 18),
+                onPressed: ghost ? null : () => showIssueDetails(issue),
+              ),
+              if (alreadyImported && widget.onOpenTask != null)
+                IconButton(
+                  tooltip: 'Open imported task',
+                  icon: const Icon(Icons.open_in_new, size: 16),
+                  onPressed: ghost
+                      ? null
+                      : () => widget.onOpenTask!(
+                          imported['${issue['id']}'] as String,
+                        ),
+                ),
+            ],
+          ),
         ),
-        Wrap(
-          spacing: 8,
+      ),
+    );
+    return Draggable<GitHubIssueDrag>(
+      key: ValueKey('github-issue-$number'),
+      data: drag,
+      maxSimultaneousDrags:
+          busy || confirmingImport || alreadyImported || numbers.length > 50
+          ? 0
+          : 1,
+      onDragStarted: () {
+        setState(() {
+          draggingIssues = true;
+          if (!selected.contains(number)) {
+            selected
+              ..clear()
+              ..add(number);
+            selectionAnchor = number;
+            importRequestId = null;
+          }
+        });
+      },
+      onDragEnd: (_) {
+        if (mounted) setState(() => draggingIssues = false);
+      },
+      feedback: Transform.rotate(
+        angle: -.025,
+        child: Material(
+          elevation: 12,
+          borderRadius: BorderRadius.circular(10),
+          child: SizedBox(
+            width: 280,
+            child: Padding(
+              padding: const EdgeInsets.all(14),
+              child: Text(
+                numbers.length == 1
+                    ? '${issue['title']}'
+                    : '${numbers.length} GitHub issues',
+                maxLines: 3,
+                overflow: TextOverflow.ellipsis,
+              ),
+            ),
+          ),
+        ),
+      ),
+      childWhenDragging: Opacity(opacity: .3, child: card(ghost: true)),
+      child: MouseRegion(
+        cursor: alreadyImported || busy
+            ? SystemMouseCursors.basic
+            : SystemMouseCursors.grab,
+        child: card(),
+      ),
+    );
+  }
+
+  void showIssueDetails(Map<String, dynamic> issue) {
+    showDialog<void>(
+      context: context,
+      builder: (context) {
+        privateDialogContext = context;
+        return GitHubIssueDetail(
+          request: widget.request,
+          issue: issue,
+          link: link!,
+        );
+      },
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) => Container(
+    decoration: BoxDecoration(
+      border: Border(right: BorderSide(color: Theme.of(context).dividerColor)),
+    ),
+    padding: const EdgeInsets.all(16),
+    child: Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Row(
           children: [
-            DropdownButton<String>(
-              value: filter,
-              items: [
-                for (final v in ['Open', 'Closed', 'All'])
-                  DropdownMenuItem(value: v, child: Text(v)),
-              ],
-              onChanged: busy
-                  ? null
-                  : (v) {
-                      setState(() => filter = v!);
-                      fetch();
-                    },
+            Expanded(
+              child: Text(
+                'GitHub',
+                style: Theme.of(context).textTheme.titleLarge,
+              ),
             ),
-            IconButton(
-              tooltip: 'Refresh GitHub issues',
-              onPressed: busy || link == null ? null : fetch,
-              icon: const Icon(Icons.refresh),
-            ),
+            if (checkedConnection && link == null)
+              IconButton(
+                tooltip: 'Refresh GitHub issues',
+                onPressed: busy || refreshing ? null : refresh,
+                icon: const Icon(Icons.refresh, size: 18),
+              ),
+            if (checkedConnection)
+              PopupMenuButton<String>(
+                tooltip: 'GitHub options',
+                icon: const Icon(Icons.more_horiz),
+                onSelected: (value) {
+                  if (value == 'link') unawaited(linkRepository());
+                  if (value == 'connection') unawaited(openConnection());
+                  if (value == 'create') unawaited(createIssue());
+                  if (value == 'confirm') {
+                    unawaited(restoreImportConfirmation());
+                  }
+                },
+                itemBuilder: (_) => [
+                  if (connected && links.isNotEmpty)
+                    PopupMenuItem(
+                      value: 'link',
+                      enabled: !busy,
+                      child: const Text('Link repository…'),
+                    ),
+                  if (showGitHubBoardControls && link != null)
+                    PopupMenuItem(
+                      value: 'create',
+                      enabled: !busy,
+                      child: const Text('Create issue…'),
+                    ),
+                  const PopupMenuItem(
+                    value: 'connection',
+                    child: Text('GitHub account…'),
+                  ),
+                  if (skipImportConfirmation)
+                    const PopupMenuItem(
+                      value: 'confirm',
+                      child: Text('Show import confirmation'),
+                    ),
+                ],
+              ),
           ],
         ),
-        if (busy) ...[
-          const LinearProgressIndicator(),
-          if (readProgress != null) Text(readProgress!),
-          TextButton(
-            onPressed: cancelLoading,
-            child: const Text('Cancel loading'),
-          ),
-        ],
-        if (error != null)
-          Text(
-            error!,
-            style: TextStyle(color: Theme.of(context).colorScheme.error),
-          ),
-        if (connected && !linksLoaded)
-          TextButton(
-            onPressed: loadingLinks ? null : loadLinks,
-            child: const Text('Retry repositories'),
-          ),
-        if (lastSync != null) Text('Last refreshed: $lastSync'),
-        if (links.isEmpty)
-          const Text(
-            'Connect GitHub and explicitly link repositories for this board.',
-          ),
-        Expanded(
-          child: issues.isEmpty
-              ? const Center(child: Text('No issues loaded'))
-              : ListView(
-                  children: [
-                    for (final issue in issues)
-                      CheckboxListTile(
-                        secondary:
-                            imported['${issue['id']}'] is String &&
-                                widget.onOpenTask != null
-                            ? IconButton(
-                                tooltip: 'Open imported task',
-                                icon: const Icon(Icons.open_in_new),
-                                onPressed: () => widget.onOpenTask!(
-                                  imported['${issue['id']}'] as String,
-                                ),
-                              )
-                            : null,
-                        value: selected.contains(issue['number']),
-                        onChanged:
-                            busy || imported.containsKey('${issue['id']}')
-                            ? null
-                            : (v) => setState(() {
-                                importRequestId = null;
-                                if (v == true) {
-                                  selected.add(issue['number'] as int);
-                                } else {
-                                  selected.remove(issue['number']);
-                                }
-                              }),
-                        title: Text('#${issue['number']} ${issue['title']}'),
-                        subtitle: TextButton(
-                          onPressed: () => showDialog<void>(
-                            context: context,
-                            builder: (context) {
-                              privateDialogContext = context;
-                              return GitHubIssueDetail(
-                                request: widget.request,
-                                issue: issue,
-                                link: link!,
-                              );
-                            },
-                          ),
-                          child: Text(
-                            '${issue['state']} · ${imported.containsKey('${issue['id']}') ? 'Already imported · ' : ''}View details',
-                          ),
+        if (connected && links.isNotEmpty) ...[
+          const SizedBox(height: 8),
+          if (links.length == 1)
+            Tooltip(
+              message: '${links.single['repository']['full_name']}',
+              child: Text(
+                '${links.single['repository']['full_name']}',
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+              ),
+            )
+          else
+            DropdownButtonHideUnderline(
+              child: DropdownButton<String>(
+                isExpanded: true,
+                value: link == null
+                    ? null
+                    : '${link!['project_id']}:${link!['repository']['id']}',
+                hint: const Text('Choose repository'),
+                items: [
+                  for (final v in links)
+                    DropdownMenuItem(
+                      value: '${v['project_id']}:${v['repository']['id']}',
+                      child: Text(
+                        '${v['repository']['full_name']}',
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ),
+                ],
+                onChanged: busy
+                    ? null
+                    : (id) => chooseLink(
+                        links.firstWhere(
+                          (v) =>
+                              '${v['project_id']}:${v['repository']['id']}' ==
+                              id,
                         ),
                       ),
+              ),
+            ),
+        ],
+        if (link != null)
+          Row(
+            children: [
+              DropdownButtonHideUnderline(
+                child: DropdownButton<String>(
+                  value: filter,
+                  items: [
+                    for (final v in ['Open', 'Closed', 'All'])
+                      DropdownMenuItem(value: v, child: Text(v)),
                   ],
+                  onChanged: busy
+                      ? null
+                      : (v) {
+                          filter = v!;
+                          chooseLink(link!);
+                        },
+                ),
+              ),
+              const Spacer(),
+              IconButton(
+                tooltip: lastSync == null
+                    ? 'Refresh GitHub issues'
+                    : 'Refresh GitHub issues • $lastSync',
+                onPressed: busy || refreshing ? null : refresh,
+                icon: const Icon(Icons.refresh, size: 18),
+              ),
+            ],
+          ),
+        if (busy)
+          Row(
+            children: [
+              const Expanded(child: LinearProgressIndicator()),
+              IconButton(
+                tooltip: 'Cancel loading',
+                onPressed: cancelLoading,
+                icon: const Icon(Icons.close, size: 16),
+              ),
+            ],
+          ),
+        if (error != null)
+          Padding(
+            padding: const EdgeInsets.symmetric(vertical: 8),
+            child: ConstrainedBox(
+              constraints: const BoxConstraints(maxHeight: 90),
+              child: SingleChildScrollView(
+                child: SelectableText(
+                  error!,
+                  style: TextStyle(
+                    color: Theme.of(context).colorScheme.error,
+                    fontSize: 12,
+                  ),
+                ),
+              ),
+            ),
+          ),
+        Expanded(
+          child:
+              !checkedConnection || (connected && !linksLoaded && loadingLinks)
+              ? const Center(child: CircularProgressIndicator())
+              : !connected
+              ? Center(
+                  child: FilledButton(
+                    onPressed: openConnection,
+                    child: const Text('Connect GitHub'),
+                  ),
+                )
+              : !linksLoaded
+              ? Center(
+                  child: TextButton(
+                    onPressed: loadingLinks
+                        ? null
+                        : () => loadLinks(force: true),
+                    child: const Text('Retry repositories'),
+                  ),
+                )
+              : links.isEmpty
+              ? Center(
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(
+                        Icons.link,
+                        size: 28,
+                        color: Theme.of(context).colorScheme.onSurfaceVariant,
+                      ),
+                      const SizedBox(height: 12),
+                      const Text(
+                        'Bring GitHub issues into your board.',
+                        textAlign: TextAlign.center,
+                      ),
+                      const SizedBox(height: 16),
+                      FilledButton(
+                        onPressed: busy ? null : linkRepository,
+                        child: const Text('Link repository'),
+                      ),
+                    ],
+                  ),
+                )
+              : link == null
+              ? const Center(child: Text('Choose a repository above.'))
+              : issues.isEmpty
+              ? Center(
+                  child: Text(
+                    busy
+                        ? 'Loading issues…'
+                        : !listLoaded
+                        ? 'Click Refresh to load issues.'
+                        : filter == 'All'
+                        ? 'No issues'
+                        : 'No ${filter.toLowerCase()} issues',
+                    style: TextStyle(
+                      color: Theme.of(context).colorScheme.onSurfaceVariant,
+                    ),
+                  ),
+                )
+              : ListView(
+                  children: [for (final issue in issues) issueCard(issue)],
                 ),
         ),
         if (hasMore)
@@ -1241,15 +1896,18 @@ class _GitHubInboxState extends State<GitHubInbox> {
             onPressed: busy ? null : () => fetch(more: true),
             child: const Text('Load more'),
           ),
-        FilledButton(
-          onPressed:
-              busy || !connected || selected.isEmpty || selected.length > 50
-              ? null
-              : importSelected,
-          child: Text('Add ${selected.length} to Backlog'),
-        ),
-        if (selected.length > 50)
-          const Text('Select up to 50 issues per import.'),
+        if (issues.isNotEmpty)
+          Padding(
+            padding: const EdgeInsets.only(top: 8),
+            child: Text(
+              selected.length > 50
+                  ? 'Select up to 50 issues.'
+                  : selected.isEmpty
+                  ? 'Drag to Backlog · Shift-click to select'
+                  : '${selected.length} selected · Drag to Backlog',
+              style: Theme.of(context).textTheme.bodySmall,
+            ),
+          ),
       ],
     ),
   );

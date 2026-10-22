@@ -295,6 +295,19 @@ impl AppService {
     }
 }
 impl GitHubService for AppService {
+    fn issue_page(
+        &self,
+        id: u64,
+        filter: &str,
+        page: u32,
+    ) -> Result<Option<(GitHubRepository, Value)>, String> {
+        let value = self.scope(
+            json!({"operation":"issue_page","repository_id":id,"state":filter,"page":page}),
+        )?;
+        let repo = serde_json::from_value(value["repository"].clone())
+            .map_err(|_| "Invalid repository response")?;
+        Ok(Some((repo, value["issues"].clone())))
+    }
     fn check_commit(&self, state: &RuntimeState) -> Result<(), String> {
         if self.cancel.load(Ordering::SeqCst) || stored(state)? != self.generation {
             return Err("GitHub connection changed or operation cancelled".into());

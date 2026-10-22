@@ -8,6 +8,7 @@ mod acceptance_evidence;
 mod app_server_client;
 mod codex_app_server;
 mod session_namer;
+mod task_planner;
 mod edition;
 mod github;
 mod skill_files;

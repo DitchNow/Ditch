@@ -2,16 +2,35 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
 
+const runtimeDeploymentEnvironment = String.fromEnvironment(
+  'DITCH_DEPLOYMENT_ENVIRONMENT',
+  defaultValue: 'production',
+);
+
 class RuntimeTransport {
-  RuntimeTransport({String? socketPath})
-    : socketPath = socketPath ?? defaultSocketPath();
+  RuntimeTransport({
+    String? socketPath,
+    String deploymentEnvironment = runtimeDeploymentEnvironment,
+  }) : socketPath =
+           socketPath ??
+           defaultSocketPath(deploymentEnvironment: deploymentEnvironment);
 
   final String socketPath;
   final _random = Random.secure();
 
-  static String defaultSocketPath() {
+  static String defaultSocketPath({
+    String deploymentEnvironment = runtimeDeploymentEnvironment,
+  }) {
     final home = Platform.environment['HOME'] ?? '.';
-    return '$home/Library/Application Support/The Ditch/ditchd.sock';
+    final directory = switch (deploymentEnvironment) {
+      'production' => 'The Ditch',
+      'staging' => 'The Ditch Staging',
+      _ => throw ArgumentError.value(
+        deploymentEnvironment,
+        'deploymentEnvironment',
+      ),
+    };
+    return '$home/Library/Application Support/$directory/ditchd.sock';
   }
 
   Future<Map<String, dynamic>> request(Object body) async {
@@ -56,36 +75,36 @@ class RuntimeTransport {
 
   Future<Stream<Map<String, dynamic>>> subscribeEvents({
     int sinceSequence = 0,
-  }) async {
-    final socket = await Socket.connect(
-      InternetAddress(socketPath, type: InternetAddressType.unix),
-      0,
-      timeout: const Duration(seconds: 2),
-    );
-    socket.writeln(
-      jsonEncode({
-        'protocol_version': 1,
-        'id': _newRequestUuid(),
-        'sent_at': DateTime.now().toUtc().toIso8601String(),
-        'body': {
-          'SubscribeEvents': {'since_sequence': sinceSequence},
-        },
-      }),
-    );
-    await socket.flush();
-    return utf8.decoder.bind(socket).transform(const LineSplitter()).map((
-      line,
-    ) {
-      final decoded = jsonDecode(line);
-      if (decoded is! Map<String, dynamic>) {
-        throw const FormatException('runtime event envelope was not an object');
+  }) async => _readEvents(sinceSequence);
+
+  Stream<Map<String, dynamic>> _readEvents(int sinceSequence) async* {
+    Socket? socket;
+    try {
+      // Open lazily so cancelling before listening cannot orphan a socket.
+      socket = await Socket.connect(
+        InternetAddress(socketPath, type: InternetAddressType.unix),
+        0,
+        timeout: const Duration(seconds: 2),
+      );
+      socket.writeln(
+        jsonEncode({
+          'protocol_version': 1,
+          'id': _newRequestUuid(),
+          'sent_at': DateTime.now().toUtc().toIso8601String(),
+          'body': {
+            'SubscribeEvents': {'since_sequence': sinceSequence},
+          },
+        }),
+      );
+      await socket.flush();
+      await for (final line
+          in utf8.decoder.bind(socket).transform(const LineSplitter())) {
+        // A denied subscription is a protocol error, not an ordinary event.
+        yield parseRuntimeResponseLine(line);
       }
-      final body = decoded['body'];
-      if (body is! Map<String, dynamic>) {
-        throw const FormatException('runtime event body was not an object');
-      }
-      return body;
-    });
+    } finally {
+      socket?.destroy();
+    }
   }
 
   String _newRequestUuid() {

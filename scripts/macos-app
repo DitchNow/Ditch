@@ -21,6 +21,11 @@ environment=${1:-}
 action=${2:-}
 [ "$#" -ge 2 ] || usage
 shift 2
+for argument in "$@"; do
+  case "$argument" in
+    --flavor|--flavor=*) echo "error: the staging/production argument selects the Xcode scheme" >&2; exit 2 ;;
+  esac
+done
 
 case "$environment" in
   staging|production) ;;
@@ -123,43 +128,10 @@ if [ "$action" = show ]; then
   exit 0
 fi
 
-release_verification_config="$workspace/apps/macos/macos/Runner/Configs/ReleaseVerification.xcconfig"
+release_verification_config="$workspace/apps/macos/macos/Runner/Configs/Environment-$environment.xcconfig"
+python3 "$workspace/scripts/configure-macos-environments.py" --workspace "$workspace"
 
-configure_release_verification() {
-  configured=0
-  for key in \
-    DITCH_SPARKLE_PUBLIC_ED_KEY \
-    DITCH_RELEASE_MANIFEST_PUBLIC_KEY_SEC1_B64 \
-    DITCH_COMMUNITY_RELEASE_MANIFEST_PUBLIC_KEY_SEC1_B64 \
-    DITCH_APPLE_TEAM_ID \
-    DITCH_COMMUNITY_BUILD_SEQUENCE
-  do
-    eval "value=\${$key:-}"
-    [ -n "$value" ] && configured=$((configured + 1))
-  done
-  if [ "$configured" -ne 0 ] && [ "$configured" -ne 5 ]; then
-    echo "error: release verification configuration is incomplete" >&2
-    echo "Set all five public DITCH release verification values in $release_environment_file." >&2
-    exit 1
-  fi
-  if [ "$configured" -eq 5 ]; then
-    # Certificate selection is release-machine configuration, never a private key.
-    signing_identity=${DITCH_CODESIGN_IDENTITY:--}
-    case "$signing_identity" in
-      *'
-'*|*'//'*) echo "error: invalid signing identity" >&2; exit 1 ;;
-    esac
-    umask 022
-    printf '%s\n' \
-      "DITCH_CODE_SIGN_IDENTITY = $signing_identity" \
-      "DITCH_SPARKLE_PUBLIC_ED_KEY = $DITCH_SPARKLE_PUBLIC_ED_KEY" \
-      "DITCH_RELEASE_MANIFEST_PUBLIC_KEY_SEC1_B64 = $DITCH_RELEASE_MANIFEST_PUBLIC_KEY_SEC1_B64" \
-      "DITCH_COMMUNITY_RELEASE_MANIFEST_PUBLIC_KEY_SEC1_B64 = $DITCH_COMMUNITY_RELEASE_MANIFEST_PUBLIC_KEY_SEC1_B64" \
-      "DITCH_APPLE_TEAM_ID = $DITCH_APPLE_TEAM_ID" \
-      "DITCH_COMMUNITY_BUILD_SEQUENCE = $DITCH_COMMUNITY_BUILD_SEQUENCE" \
-      > "$release_verification_config"
-  fi
-}
+configure_release_verification() { :; }
 
 release_value() {
   key=$1
@@ -264,13 +236,13 @@ flutter_command=$(resolve_flutter)
 cd "$workspace/apps/macos"
 case "$action" in
   run)
-    exec "$flutter_command" --suppress-analytics run -d macos \
+    exec "$flutter_command" --suppress-analytics run -d macos --flavor "$environment" \
       "--dart-define=DITCH_DEPLOYMENT_ENVIRONMENT=$DITCH_DEPLOYMENT_ENVIRONMENT" \
       "--dart-define=DITCH_RELAY_ORIGIN=$DITCH_RELAY_ORIGIN" \
       "$@"
     ;;
   build)
-    exec "$flutter_command" --suppress-analytics build macos \
+    exec "$flutter_command" --suppress-analytics build macos --flavor "$environment" \
       "--dart-define=DITCH_DEPLOYMENT_ENVIRONMENT=$DITCH_DEPLOYMENT_ENVIRONMENT" \
       "--dart-define=DITCH_RELAY_ORIGIN=$DITCH_RELAY_ORIGIN" \
       "$@"

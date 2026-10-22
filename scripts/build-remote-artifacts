@@ -2,6 +2,18 @@
 set -eu
 
 workspace=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
+environment=${DITCH_DEPLOYMENT_ENVIRONMENT:-production}
+case "$environment" in staging|production) ;; *) echo "Invalid environment" >&2; exit 1 ;; esac
+export DITCH_DEPLOYMENT_ENVIRONMENT="$environment"
+if [ -z "${DITCH_RELAY_ORIGIN:-}" ]; then
+  DITCH_RELAY_ORIGIN=$(sed -n 's/^DITCH_RELAY_ORIGIN=//p' "$workspace/apps/macos/config/.env.$environment")
+fi
+case "$environment:$DITCH_RELAY_ORIGIN" in
+  production:https://relay.ditchnow.nl|staging:https://ditch-remote-relay-staging.matin-1a7.workers.dev) ;;
+  *) echo "error: runtime environment and Relay disagree" >&2; exit 1 ;;
+esac
+export DITCH_RELAY_ORIGIN
+export CARGO_TARGET_DIR="$workspace/target/remote/$environment"
 version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' "$workspace/Cargo.toml" | head -n 1)
 DITCH_BUILD_IDENTIFIER=${DITCH_BUILD_IDENTIFIER:-$("$workspace/scripts/build-identifier")}
 case "$DITCH_BUILD_IDENTIFIER" in
@@ -11,7 +23,7 @@ export DITCH_BUILD_IDENTIFIER
 remote_protocol=$(sed -n 's/^pub const REMOTE_RUNTIME_PROTOCOL_VERSION: u16 = \([0-9][0-9]*\);/\1/p' "$workspace/crates/ditch_protocol/src/lib.rs")
 [ -n "$remote_protocol" ] || { echo 'error: remote runtime protocol version was not found' >&2; exit 1; }
 community_revision=$(git -C "$workspace" rev-parse HEAD)
-output=${DITCH_REMOTE_ARTIFACT_OUTPUT:-"$workspace/dist/remote/$version"}
+output=${DITCH_REMOTE_ARTIFACT_OUTPUT:-"$workspace/dist/remote/$environment/$version"}
 targets=${DITCH_REMOTE_TARGETS:-"x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu aarch64-apple-darwin x86_64-apple-darwin"}
 docker_image=${DITCH_REMOTE_DOCKER_IMAGE:-"rust:1.97-bookworm"}
 docker_cache=''
@@ -56,7 +68,9 @@ build_linux_with_docker() {
     -e DITCH_BUILD_IDENTIFIER="$DITCH_BUILD_IDENTIFIER" \
     -e DITCH_BUILD_NUMBER="${DITCH_BUILD_NUMBER:-0}" \
     -e DITCH_RELEASE_SEQUENCE="${DITCH_RELEASE_SEQUENCE:-0}" \
-    -e CARGO_TARGET_DIR="/workspace/target/$target" \
+    -e CARGO_TARGET_DIR="/workspace/target/remote/$environment/$target" \
+    -e DITCH_DEPLOYMENT_ENVIRONMENT="$environment" \
+    -e DITCH_RELAY_ORIGIN="$DITCH_RELAY_ORIGIN" \
     -v "$workspace:/workspace" \
     -v "$docker_cache:/cargo" \
     -w /workspace \
@@ -92,12 +106,12 @@ mkdir -p "$output"
 manifest="$output/remote-artifacts.json"
 temporary="$manifest.tmp"
 
-printf '{\n  "edition": "community",\n  "version": "%s",\n  "build_identifier": "%s",\n  "community_revision": "%s",\n  "remote_runtime_protocol_version": %s,\n  "artifacts": [\n' \
-  "$version" "$DITCH_BUILD_IDENTIFIER" "$community_revision" "$remote_protocol" > "$temporary"
+printf '{\n  "edition": "community",\n  "deployment_environment": "%s",\n  "version": "%s",\n  "build_identifier": "%s",\n  "community_revision": "%s",\n  "remote_runtime_protocol_version": %s,\n  "artifacts": [\n' \
+  "$environment" "$version" "$DITCH_BUILD_IDENTIFIER" "$community_revision" "$remote_protocol" > "$temporary"
 has_artifact=''
 for target in $targets; do
   build_target "$target"
-  source_binary="$workspace/target/$target/release/ditchd"
+  source_binary="$CARGO_TARGET_DIR/$target/release/ditchd"
   artifact="ditchd-$target"
   cp "$source_binary" "$output/$artifact"
   chmod 700 "$output/$artifact"

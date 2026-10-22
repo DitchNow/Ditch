@@ -184,12 +184,25 @@ impl DitchStore {
         receipt: Option<(&TaskRequest, &TaskResponse)>,
         linked_agent: Option<&AgentRun>,
     ) -> Result<(), StoreError> {
+        self.save_task_agent_changes(
+            changes,
+            receipt,
+            linked_agent.map(std::slice::from_ref).unwrap_or(&[]),
+        )
+    }
+
+    pub fn save_task_agent_changes(
+        &mut self,
+        changes: &[(Task, TaskAudit)],
+        receipt: Option<(&TaskRequest, &TaskResponse)>,
+        linked_agents: &[AgentRun],
+    ) -> Result<(), StoreError> {
         let tx = self.connection.transaction()?;
         for (task, audit) in changes {
             write_task(&tx, task)?;
             write_audit(&tx, audit)?;
         }
-        if let Some(agent) = linked_agent {
+        for agent in linked_agents {
             tx.execute(
                 "UPDATE agents SET task_id=?2,run_json=?3 WHERE id=?1",
                 params![
@@ -245,6 +258,10 @@ impl DitchStore {
 
     pub fn reconcile_tasks(&mut self) -> Result<(), StoreError> {
         for mut task in self.load_tasks()? {
+            // Waiting work has no process to recover. Its durable authorization survives.
+            if task.waiting_in_queue() {
+                continue;
+            }
             if matches!(
                 task.condition,
                 TaskCondition::Running | TaskCondition::Queued | TaskCondition::AwaitingApproval

@@ -15,8 +15,8 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
-const SERVICE: &str = "the-ditch.service";
-const LABEL: &str = "dev.theditch.runtime.remote";
+const SERVICE: &str = ditch_product::deployment::REMOTE_SERVICE;
+const LABEL: &str = ditch_product::deployment::REMOTE_LABEL;
 const MAINTENANCE: &str = "remote_maintenance_v1";
 
 fn fail(message: impl Into<String>) -> io::Error {
@@ -366,9 +366,10 @@ fn install_service(paths: &AppPaths, manager: Manager) -> io::Result<()> {
     fs::create_dir_all(&paths.logs_dir)?;
     match manager {
         Manager::Systemd => {
-            let file = home(paths)?.join(".config/systemd/user/the-ditch.service");
-            let expected = "ExecStart=%h/.ditch/bin/current/ditchd daemon --remote";
-            if file.exists() && !fs::read_to_string(&file)?.contains(expected) {
+            let file = home(paths)?.join(format!(".config/systemd/user/{SERVICE}"));
+            let remote = ditch_product::deployment::REMOTE_DIRECTORY;
+            let expected = format!("ExecStart=%h/{remote}/bin/current/ditchd daemon --remote");
+            if file.exists() && !fs::read_to_string(&file)?.contains(&expected) {
                 return Err(fail(
                     "Existing the-ditch.service has a custom executable. Repair will not overwrite it.",
                 ));
@@ -378,7 +379,7 @@ fn install_service(paths: &AppPaths, manager: Manager) -> io::Result<()> {
                 fs::write(
                     &file,
                     format!(
-                        "[Unit]\nDescription=The Ditch Remote Runtime\n[Service]\nType=simple\n{expected}\nRestart=on-failure\nRestartSec=2\nStandardOutput=append:%h/.ditch/logs/runtime.log\nStandardError=append:%h/.ditch/logs/runtime.log\n[Install]\nWantedBy=default.target\n"
+                        "[Unit]\nDescription=The Ditch Remote Runtime\n[Service]\nType=simple\n{expected}\nRestart=on-failure\nRestartSec=2\nStandardOutput=append:%h/{remote}/logs/runtime.log\nStandardError=append:%h/{remote}/logs/runtime.log\n[Install]\nWantedBy=default.target\n"
                     ),
                 )?;
             }
@@ -386,7 +387,7 @@ fn install_service(paths: &AppPaths, manager: Manager) -> io::Result<()> {
             command("systemctl", &["--user", "enable", SERVICE])?;
         }
         Manager::Launchd => {
-            let file = home(paths)?.join("Library/LaunchAgents/dev.theditch.runtime.remote.plist");
+            let file = home(paths)?.join(format!("Library/LaunchAgents/{LABEL}.plist"));
             let executable = paths.data_dir.join("bin/current/ditchd");
             let escaped = executable
                 .to_string_lossy()
@@ -430,7 +431,7 @@ fn start(paths: &AppPaths, manager: Manager) -> io::Result<()> {
             command("systemctl", &["--user", "start", SERVICE])?;
         }
         Manager::Launchd => {
-            let file = home(paths)?.join("Library/LaunchAgents/dev.theditch.runtime.remote.plist");
+            let file = home(paths)?.join(format!("Library/LaunchAgents/{LABEL}.plist"));
             command("launchctl", &["enable", &launchd_label()])?;
             if command("launchctl", &["print", &launchd_label()]).is_err() {
                 command(

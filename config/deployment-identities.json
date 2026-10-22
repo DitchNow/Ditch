@@ -1,0 +1,34 @@
+{
+  "production": {
+    "app_name": "Ditch",
+    "app_id": "ai.theditch.app",
+    "runtime_id": "ai.theditch.runtime",
+    "obsolete_runtime_id": "ai.theditch.status",
+    "support_directory": "The Ditch",
+    "helper_name": "The Ditch Runtime",
+    "keychain_service": "ai.theditch.installation-identity.v1",
+    "ssh_keychain_service": "dev.theditch.ssh-password.v1",
+    "remote_directory": ".ditch",
+    "remote_service": "the-ditch.service",
+    "remote_label": "dev.theditch.runtime.remote",
+    "remote_keychain_service": "dev.theditch.remote-control.v1",
+    "url_scheme": "theditch",
+    "url_name": "ai.theditch.agent"
+  },
+  "staging": {
+    "app_name": "Ditch Staging",
+    "app_id": "ai.theditch.app.staging",
+    "runtime_id": "ai.theditch.runtime.staging",
+    "obsolete_runtime_id": "ai.theditch.status.staging",
+    "support_directory": "The Ditch Staging",
+    "helper_name": "The Ditch Staging Runtime",
+    "keychain_service": "ai.theditch.installation-identity.staging.v1",
+    "ssh_keychain_service": "dev.theditch.ssh-password.staging.v1",
+    "remote_directory": ".ditch-staging",
+    "remote_service": "the-ditch-staging.service",
+    "remote_label": "dev.theditch.runtime.remote.staging",
+    "remote_keychain_service": "dev.theditch.remote-control.staging.v1",
+    "url_scheme": "theditch-staging",
+    "url_name": "ai.theditch.agent.staging"
+  }
+}

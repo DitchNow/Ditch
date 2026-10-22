@@ -27,3 +27,6 @@ apps/macos/macos/Runner/Configs/ReleaseVerification.xcconfig
 !.ditch/mcp/
 !.ditch/**/.gitkeep
 .ditch/project.json
+
+# Public environment values generated from local .env files
+apps/macos/macos/Runner/Configs/Environment-*.xcconfig

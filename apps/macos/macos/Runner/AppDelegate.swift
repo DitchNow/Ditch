@@ -62,7 +62,8 @@ class AppDelegate: FlutterAppDelegate, SPUUpdaterDelegate {
         rawHosts.split(separator: ",")
           .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
           .filter { !$0.isEmpty })
-      guard ["staging", "production"].contains(environment),
+      guard environment == DitchIdentity.environment,
+        Bundle.main.bundleIdentifier == DitchIdentity.app_id,
         ["community", "commercial"].contains(edition),
         let origin = URL(string: relayOrigin),
         origin.scheme == "https",
@@ -159,8 +160,8 @@ class AppDelegate: FlutterAppDelegate, SPUUpdaterDelegate {
     }
   }
 
-  private static let runtimeLoginItemIdentifier = "ai.theditch.runtime"
-  private static let obsoleteLoginItemIdentifier = "ai.theditch.status"
+  private static let runtimeLoginItemIdentifier = DitchIdentity.runtime_id
+  private static let obsoleteLoginItemIdentifier = DitchIdentity.obsolete_runtime_id
   private static let processTimeoutExitCode: Int32 = 124
   private static let notificationControlSocketName = "notification-control.sock"
   private static let runtimeDeploymentEnvironmentDefaultsKey =
@@ -184,6 +185,10 @@ class AppDelegate: FlutterAppDelegate, SPUUpdaterDelegate {
   }
 
   override func applicationDidFinishLaunching(_ notification: Notification) {
+    guard deploymentConfiguration.environment == DitchIdentity.environment else {
+      NSApp.terminate(nil)
+      return
+    }
     _ = updaterController
     NSLog(
       "Ditch \(deploymentConfiguration.edition) \(deploymentConfiguration.buildIdentifier) in \(deploymentConfiguration.environment); Relay: \(deploymentConfiguration.relayOrigin)")
@@ -228,7 +233,7 @@ class AppDelegate: FlutterAppDelegate, SPUUpdaterDelegate {
       codexHome.hasPrefix("/")
     else { return }
     let support = FileManager.default.homeDirectoryForCurrentUser
-      .appendingPathComponent("Library/Application Support/The Ditch", isDirectory: true)
+      .appendingPathComponent(DitchIdentity.supportRelativePath, isDirectory: true)
     do {
       try FileManager.default.createDirectory(at: support, withIntermediateDirectories: true)
       try codexHome.write(
@@ -260,7 +265,7 @@ class AppDelegate: FlutterAppDelegate, SPUUpdaterDelegate {
   private static func logRuntimeStartup(_ message: String) {
     NSLog("Ditch runtime startup: \(message)")
     let directory = FileManager.default.homeDirectoryForCurrentUser
-      .appendingPathComponent("Library/Application Support/The Ditch/logs", isDirectory: true)
+      .appendingPathComponent(DitchIdentity.supportRelativePath + "/logs", isDirectory: true)
     try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
     let path = directory.appendingPathComponent("runtime.log").path
     let descriptor = Darwin.open(path, O_WRONLY | O_APPEND | O_CREAT, mode_t(S_IRUSR | S_IWUSR))
@@ -274,7 +279,7 @@ class AppDelegate: FlutterAppDelegate, SPUUpdaterDelegate {
 
   private var runtimeHelperURL: URL {
     Bundle.main.bundleURL.appendingPathComponent(
-      "Contents/Library/LoginItems/The Ditch Runtime.app", isDirectory: true)
+      "Contents/Library/LoginItems/" + DitchIdentity.helper_name + ".app", isDirectory: true)
   }
 
   private func inspectRuntimeStartup() -> RuntimeStartupCoordinator.Observation {
@@ -368,7 +373,7 @@ class AppDelegate: FlutterAppDelegate, SPUUpdaterDelegate {
 
   private var runtimeSocketURL: URL {
     FileManager.default.homeDirectoryForCurrentUser
-      .appendingPathComponent("Library/Application Support/The Ditch", isDirectory: true)
+      .appendingPathComponent(DitchIdentity.supportRelativePath, isDirectory: true)
       .appendingPathComponent("ditchd.sock")
   }
 
@@ -482,7 +487,7 @@ class AppDelegate: FlutterAppDelegate, SPUUpdaterDelegate {
     notifications.removeAllDeliveredNotifications()
     notifications.removeAllPendingNotificationRequests()
     for identifier in [
-      "ai.theditch.app",
+      DitchIdentity.app_id,
       Self.runtimeLoginItemIdentifier,
       Self.obsoleteLoginItemIdentifier,
     ] {
@@ -516,12 +521,12 @@ class AppDelegate: FlutterAppDelegate, SPUUpdaterDelegate {
   static func uninstallArtifactURLs(homeDirectory: URL) -> [URL] {
     let library = homeDirectory.appendingPathComponent("Library", isDirectory: true)
     let identifiers = [
-      "ai.theditch.app",
+      DitchIdentity.app_id,
       runtimeLoginItemIdentifier,
       obsoleteLoginItemIdentifier,
     ]
     var urls = [
-      library.appendingPathComponent("Application Support/The Ditch", isDirectory: true),
+      library.appendingPathComponent("Application Support/" + DitchIdentity.support_directory, isDirectory: true),
     ]
     for identifier in identifiers {
       urls.append(
@@ -605,6 +610,15 @@ class AppDelegate: FlutterAppDelegate, SPUUpdaterDelegate {
         UserDefaults.standard.set(mode, forKey: "themeMode")
         self.applyThemeMode(mode)
         result(true)
+      case "getSkipGitHubImportConfirmation":
+        result(UserDefaults.standard.bool(forKey: "skipGitHubImportConfirmationV1"))
+      case "setSkipGitHubImportConfirmation":
+        guard let skip = call.arguments as? Bool else {
+          result(FlutterError(code: "invalid_preference", message: "Expected a boolean.", details: nil))
+          return
+        }
+        UserDefaults.standard.set(skip, forKey: "skipGitHubImportConfirmationV1")
+        result(nil)
       case "getProjectSidebarPreferences":
         result(UserDefaults.standard.string(forKey: "projectSidebarPreferencesV1"))
       case "setProjectSidebarPreferences":
@@ -950,7 +964,7 @@ class AppDelegate: FlutterAppDelegate, SPUUpdaterDelegate {
 
   private static func notificationControlSocketPath() -> String {
     FileManager.default.homeDirectoryForCurrentUser
-      .appendingPathComponent("Library/Application Support/The Ditch", isDirectory: true)
+      .appendingPathComponent(DitchIdentity.supportRelativePath, isDirectory: true)
       .appendingPathComponent(notificationControlSocketName)
       .path
   }
@@ -1045,7 +1059,7 @@ class AppDelegate: FlutterAppDelegate, SPUUpdaterDelegate {
     else { return false }
 
     let support = FileManager.default.homeDirectoryForCurrentUser
-      .appendingPathComponent("Library/Application Support/The Ditch", isDirectory: true)
+      .appendingPathComponent(DitchIdentity.supportRelativePath, isDirectory: true)
     let script = support.appendingPathComponent("Sign in to Codex.command")
     let quotedBinary = "'" + binary.replacingOccurrences(of: "'", with: "'\\''") + "'"
     let contents = """
@@ -1087,7 +1101,7 @@ class AppDelegate: FlutterAppDelegate, SPUUpdaterDelegate {
 
   @discardableResult
   private func handleAgentNavigationURL(_ url: URL) -> Bool {
-    guard url.scheme == "theditch", url.host == "agent",
+    guard url.scheme == DitchIdentity.url_scheme, url.host == "agent",
       let components = URLComponents(url: url, resolvingAgainstBaseURL: false)
     else { return false }
     let values = Dictionary(

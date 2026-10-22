@@ -1,4 +1,5 @@
 import 'dart:math';
+import 'dart:async';
 import 'package:flutter/foundation.dart';
 import '../data/task_models.dart';
 import 'skills_controller.dart';
@@ -11,6 +12,59 @@ class TaskBoardController extends ChangeNotifier {
   late final skills = SkillsController(request: request);
   final Map<String, TaskDto> _tasks = {};
   final Map<String, Map<String, dynamic>> agents = {};
+  final Map<String, BoardExecutionDto> boardExecutions = {};
+  final Map<String, String> boardExecutionErrors = {};
+  final Set<String> _boardExecutionLoading = {};
+  bool executionLoading(String projectId) =>
+      _boardExecutionLoading.contains(projectId);
+
+  void _upsertExecution(BoardExecutionDto value) {
+    if ((boardExecutions[value.projectId]?.revision ?? -1) <= value.revision) {
+      boardExecutions[value.projectId] = value;
+      boardExecutionErrors.remove(value.projectId);
+    }
+  }
+
+  Future<void> loadBoardExecution(String projectId) async {
+    if (!_boardExecutionLoading.add(projectId)) return;
+    _notify();
+    try {
+      final result = await _send({
+        'project_id': projectId,
+        'request_id': newRequestId(),
+        'operation': {
+          'BoardExecution': {'paused': null, 'expected_revision': null},
+        },
+      });
+      if (result['BoardExecution'] is! Map) {
+        throw const FormatException(
+          'Update this project’s runtime to control its queue.',
+        );
+      }
+      final value = BoardExecutionDto.fromJson(result['BoardExecution'] as Map);
+      if (value.projectId != projectId) {
+        throw const FormatException('Board status belongs to another project');
+      }
+      _upsertExecution(value);
+    } on Object catch (e) {
+      boardExecutionErrors[projectId] = '$e';
+    } finally {
+      _boardExecutionLoading.remove(projectId);
+      _notify();
+    }
+  }
+
+  Future<void> toggleBoardExecution(String projectId) async {
+    final value = boardExecutions[projectId];
+    if (value == null || executionLoading(projectId) || busy) return;
+    await mutate(projectId, {
+      'BoardExecution': {
+        'paused': !value.paused,
+        'expected_revision': value.revision,
+      },
+    });
+  }
+
   bool hydrated = false, busy = false;
   String? error;
   Map<String, dynamic>? _retry;
@@ -62,11 +116,17 @@ class TaskBoardController extends ChangeNotifier {
       ]);
     hydrated = true;
     _notify();
+    for (final id in boardExecutions.keys.toList()) {
+      unawaited(loadBoardExecution(id));
+    }
   }
 
   void applyEvent(Map<String, dynamic> event) {
     _generation++;
     if (event.containsKey('SkillsChanged')) skills.invalidate();
+    if (event['BoardExecutionChanged'] case final Map value) {
+      _upsertExecution(BoardExecutionDto.fromJson(value));
+    }
     if (event['TaskChanged'] case final Map value) {
       _upsert(TaskDto.fromJson(Map<String, dynamic>.from(value)));
     }
@@ -82,6 +142,8 @@ class TaskBoardController extends ChangeNotifier {
     }
     if (event['ProjectDeleted'] case final Map value) {
       _tasks.removeWhere((_, t) => t.projectId == value['project_id']);
+      boardExecutions.remove(value['project_id']);
+      boardExecutionErrors.remove(value['project_id']);
     }
     _notify();
   }
@@ -185,6 +247,9 @@ class TaskBoardController extends ChangeNotifier {
     _notify();
     try {
       final result = await _send(payload);
+      if (result['BoardExecution'] case final Map value) {
+        _upsertExecution(BoardExecutionDto.fromJson(value));
+      }
       if (result['Changed'] case final Map value) {
         _upsert(TaskDto.fromJson(Map<String, dynamic>.from(value)));
       }
@@ -195,7 +260,13 @@ class TaskBoardController extends ChangeNotifier {
       return result;
     } on TaskRequestException catch (e) {
       error = e.message;
-      if (e.code == 'RevisionConflict') await refresh(preserveError: true);
+      if (e.code == 'RevisionConflict') {
+        if ((payload['operation'] as Map).containsKey('BoardExecution')) {
+          await loadBoardExecution(payload['project_id'] as String);
+        } else {
+          await refresh(preserveError: true);
+        }
+      }
       return null;
     } on Object catch (e) {
       error = '$e';

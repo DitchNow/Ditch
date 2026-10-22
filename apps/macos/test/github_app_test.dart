@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:the_ditch/github_inbox.dart';
@@ -6,7 +7,7 @@ import 'package:the_ditch/release_ui_visibility.dart';
 
 void main() {
   testWidgets(
-    'paged source refresh keeps the first cursor for later arrivals',
+    'manual source refresh reconciles all pages without timer requests',
     (tester) async {
       final syncs = <Map>[];
       var refreshed = 0;
@@ -62,12 +63,18 @@ void main() {
       await tester.pumpAndSettle();
       await tester.pump(const Duration(seconds: 30));
       await tester.pumpAndSettle();
+      expect(syncs, isEmpty);
+      await tester.tap(find.byIcon(Icons.refresh));
+      await tester.pumpAndSettle();
       expect(syncs.map((v) => v['cursor']), [0, 0]);
       expect(syncs[1]['after_task'], '11111111-1111-4111-8111-111111111111');
       expect(refreshed, 1);
       await tester.pump(const Duration(seconds: 30));
       await tester.pumpAndSettle();
-      expect(syncs.last['cursor'], 11);
+      expect(refreshed, 1);
+      await tester.tap(find.byIcon(Icons.refresh));
+      await tester.pumpAndSettle();
+      expect(syncs.last['cursor'], 0);
       expect(refreshed, 2);
       await tester.pumpWidget(const SizedBox());
     },
@@ -85,7 +92,7 @@ void main() {
     },
   );
   testWidgets(
-    'remote suggestions require explicit selection and linking',
+    'remote fills the repository URL but still requires a link click',
     (tester) async {
       final links = <Map>[];
       await tester.pumpWidget(
@@ -118,21 +125,129 @@ void main() {
       expect(links, isEmpty);
       expect(
         tester.widget<TextField>(find.byType(TextField)).controller!.text,
-        isEmpty,
-      );
-      await tester.tap(find.text('Git remote: owner/selected'));
-      await tester.pump();
-      expect(links, isEmpty);
-      expect(
-        tester.widget<TextField>(find.byType(TextField)).controller!.text,
-        'owner/selected',
+        'https://github.com/owner/selected',
       );
       await tester.tap(find.text('Verify and link'));
       await tester.pumpAndSettle();
       expect(links.single, {
         'project_id': 'project',
-        'repository': 'owner/selected',
+        'repository': 'https://github.com/owner/selected',
       });
+      await tester.pumpWidget(const SizedBox());
+    },
+    skip: !showGitHubBoardControls,
+  );
+  testWidgets('late remote detection preserves typed input', (tester) async {
+    final remote = Completer<Map<String, dynamic>>();
+    await tester.pumpWidget(
+      MaterialApp(
+        home: GitHubRepositoryPicker(
+          projects: const [TaskProjectOption('a', 'Project A')],
+          request: (_) => remote.future,
+        ),
+      ),
+    );
+    await tester.enterText(find.byType(TextField), 'owner/manual');
+    remote.complete({
+      'GitHub': {
+        'repositories': ['owner/detected'],
+      },
+    });
+    await tester.pumpAndSettle();
+    expect(
+      tester.widget<TextField>(find.byType(TextField)).controller!.text,
+      'owner/manual',
+    );
+    expect(tester.takeException(), isNull);
+    await tester.pumpWidget(const SizedBox());
+  }, skip: !showGitHubBoardControls);
+  testWidgets(
+    'project changes ignore stale remotes and fill the new remote',
+    (tester) async {
+      final oldRemote = Completer<Map<String, dynamic>>();
+      await tester.pumpWidget(
+        MaterialApp(
+          home: GitHubRepositoryPicker(
+            projects: const [
+              TaskProjectOption('a', 'Project A'),
+              TaskProjectOption('b', 'Project B'),
+            ],
+            request: (request) async {
+              final project =
+                  (((request as Map)['GitHub'] as Map)['RemoteSuggestions']
+                      as Map)['project_id'];
+              if (project == 'a') return oldRemote.future;
+              return {
+                'GitHub': {
+                  'repositories': ['owner/new-project'],
+                },
+              };
+            },
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Project A'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Project B').last);
+      await tester.pumpAndSettle();
+      oldRemote.complete({
+        'GitHub': {
+          'repositories': ['owner/old-project'],
+        },
+      });
+      await tester.pumpAndSettle();
+      expect(
+        tester.widget<TextField>(find.byType(TextField)).controller!.text,
+        'https://github.com/owner/new-project',
+      );
+      expect(tester.takeException(), isNull);
+      await tester.pumpWidget(const SizedBox());
+    },
+    skip: !showGitHubBoardControls,
+  );
+  testWidgets(
+    'no remote leaves linking disabled until a repository is entered',
+    (tester) async {
+      await tester.pumpWidget(
+        MaterialApp(
+          home: GitHubRepositoryPicker(
+            projects: const [TaskProjectOption('a', 'Project A')],
+            request: (_) async => {
+              'GitHub': {'repositories': []},
+            },
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+      expect(
+        tester
+            .widget<FilledButton>(
+              find.widgetWithText(FilledButton, 'Verify and link'),
+            )
+            .onPressed,
+        isNull,
+      );
+      await tester.enterText(find.byType(TextField), 'owner/manual');
+      await tester.pump();
+      expect(
+        tester
+            .widget<FilledButton>(
+              find.widgetWithText(FilledButton, 'Verify and link'),
+            )
+            .onPressed,
+        isNotNull,
+      );
+      await tester.enterText(find.byType(TextField), '   ');
+      await tester.pump();
+      expect(
+        tester
+            .widget<FilledButton>(
+              find.widgetWithText(FilledButton, 'Verify and link'),
+            )
+            .onPressed,
+        isNull,
+      );
       await tester.pumpWidget(const SizedBox());
     },
     skip: !showGitHubBoardControls,

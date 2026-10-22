@@ -1,7 +1,15 @@
 #!/bin/sh
 set -eu
 
-HELPER_APP="$TARGET_BUILD_DIR/$CONTENTS_FOLDER_PATH/Library/LoginItems/The Ditch Runtime.app"
+case "${DITCH_DEPLOYMENT_ENVIRONMENT:-production}" in
+  staging|production) ;;
+  *) echo "error: invalid deployment environment" >&2; exit 1 ;;
+esac
+. "$PROJECT_DIR/Runner/Configs/Identity-${DITCH_DEPLOYMENT_ENVIRONMENT:-production}.sh"
+[ "$PRODUCT_BUNDLE_IDENTIFIER" = "$DITCH_APP_BUNDLE_ID" ] || {
+  echo "error: Xcode scheme and deployment identity disagree" >&2; exit 1;
+}
+HELPER_APP="$TARGET_BUILD_DIR/$CONTENTS_FOLDER_PATH/Library/LoginItems/$DITCH_HELPER_NAME.app"
 HELPER_CONTENTS="$HELPER_APP/Contents"
 HELPER_MACOS="$HELPER_CONTENTS/MacOS"
 MAIN_MACOS="$TARGET_BUILD_DIR/$CONTENTS_FOLDER_PATH/MacOS"
@@ -56,6 +64,8 @@ if [ "$DITCH_DEPLOYMENT_ENVIRONMENT" = staging ] && [ "$DITCH_RELAY_ORIGIN" = "$
   exit 1
 fi
 export DITCH_DEPLOYMENT_ENVIRONMENT DITCH_EDITION DITCH_RELAY_ORIGIN DITCH_UPDATE_ALLOWED_HOSTS
+python3 "$WORKSPACE_ROOT/scripts/configure-macos-environments.py" --workspace "$WORKSPACE_ROOT" --check --build-environment "$DITCH_DEPLOYMENT_ENVIRONMENT"
+export CARGO_TARGET_DIR="$WORKSPACE_ROOT/target/macos/$DITCH_DEPLOYMENT_ENVIRONMENT"
 
 # Official release machines inject a per-build credential from the protected
 # environment or an ignored mode-0600 file. Source builds intentionally omit
@@ -139,7 +149,7 @@ PATH="$RUST_TOOLCHAIN_BIN:$PATH"
 export PATH
 
 case "${CONFIGURATION:-Debug}" in
-  Release|Profile)
+  Release|Profile|Release-*|Profile-*)
     CARGO_PROFILE="release"
     CARGO_FLAGS="--release"
     ;;
@@ -162,9 +172,9 @@ export DITCH_APP_VERSION DITCH_BUILD_IDENTIFIER DITCH_BUILD_NUMBER DITCH_RELEASE
 # The app must never package whatever happens to be left in target/. Build the
 # runtime used by this exact app build first, and fail if Cargo cannot produce it.
 "$CARGO_BIN" build --locked -p ditchd -p ditch_cli $CARGO_FLAGS
-DITCHD_SOURCE="$WORKSPACE_ROOT/target/$CARGO_PROFILE/ditchd"
-DITCHD_LIBRARY="$WORKSPACE_ROOT/target/$CARGO_PROFILE/libditchd.a"
-DITCH_CLI_SOURCE="$WORKSPACE_ROOT/target/$CARGO_PROFILE/ditch_cli"
+DITCHD_SOURCE="$CARGO_TARGET_DIR/$CARGO_PROFILE/ditchd"
+DITCHD_LIBRARY="$CARGO_TARGET_DIR/$CARGO_PROFILE/libditchd.a"
+DITCH_CLI_SOURCE="$CARGO_TARGET_DIR/$CARGO_PROFILE/ditch_cli"
 test -x "$DITCHD_SOURCE"
 test -f "$DITCHD_LIBRARY"
 test -x "$DITCH_CLI_SOURCE"
@@ -216,8 +226,9 @@ mkdir -p "$SWIFT_CACHE"
 export SWIFT_MODULECACHE_PATH="$SWIFT_CACHE"
 export CLANG_MODULE_CACHE_PATH="$SWIFT_CACHE"
 
-/usr/bin/swiftc -parse-as-library \
+/usr/bin/swiftc -parse-as-library $DITCH_SWIFT_IDENTITY_FLAGS \
   -target "$BUILD_ARCH-apple-macos$DEPLOYMENT_TARGET" \
+  "$PROJECT_DIR/Runner/DeploymentIdentity.swift" \
   "$PROJECT_DIR/StatusHost/StatusHost.swift" \
   "$OFFICIAL_BUILD_SWIFT" \
   "$DITCHD_LIBRARY" \
@@ -227,7 +238,7 @@ export CLANG_MODULE_CACHE_PATH="$SWIFT_CACHE"
 rm -f "$OFFICIAL_BUILD_SWIFT"
 trap - EXIT HUP INT TERM
 
-cat > "$HELPER_CONTENTS/Info.plist" <<'PLIST'
+cat > "$HELPER_CONTENTS/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -238,7 +249,7 @@ cat > "$HELPER_CONTENTS/Info.plist" <<'PLIST'
   <key>CFBundleExecutable</key>
   <string>ditchd</string>
   <key>CFBundleIdentifier</key>
-  <string>ai.theditch.runtime</string>
+  <string>$DITCH_RUNTIME_BUNDLE_ID</string>
   <key>CFBundleInfoDictionaryVersion</key>
   <string>6.0</string>
   <key>CFBundleName</key>
@@ -276,8 +287,12 @@ cp "$DITCHD_SOURCE" "$HELPER_MACOS/ditchd-remote-$HOST_REMOTE_TARGET"
 # scripts/build-remote-artifacts. Keep these as checksum-verified resources;
 # the host-native sibling above remains available for ordinary development.
 WORKSPACE_VERSION=$(sed -n 's/^version = "\([^"]*\)"/\1/p' "$WORKSPACE_ROOT/Cargo.toml" | head -n 1)
-REMOTE_ARTIFACT_SOURCE="${DITCH_REMOTE_ARTIFACT_DIR:-$WORKSPACE_ROOT/dist/remote/$WORKSPACE_VERSION}"
+REMOTE_ARTIFACT_SOURCE="${DITCH_REMOTE_ARTIFACT_DIR:-$WORKSPACE_ROOT/dist/remote/$DITCH_DEPLOYMENT_ENVIRONMENT/$WORKSPACE_VERSION}"
 if [ -f "$REMOTE_ARTIFACT_SOURCE/remote-artifacts.json" ]; then
+  ARTIFACT_ENVIRONMENT=$(/usr/bin/plutil -extract deployment_environment raw "$REMOTE_ARTIFACT_SOURCE/remote-artifacts.json" 2>/dev/null || printf production)
+  [ "$ARTIFACT_ENVIRONMENT" = "$DITCH_DEPLOYMENT_ENVIRONMENT" ] || {
+    echo "error: remote runtime artifacts belong to the other environment" >&2; exit 1;
+  }
   ARTIFACT_BUILD_IDENTIFIER=$(sed -n 's/.*"build_identifier": "\([^"]*\)".*/\1/p' "$REMOTE_ARTIFACT_SOURCE/remote-artifacts.json" | head -n 1)
   if [ "$ARTIFACT_BUILD_IDENTIFIER" != "$DITCH_BUILD_IDENTIFIER" ]; then
     echo "error: remote runtime artifacts are stale for this source build." >&2

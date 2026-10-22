@@ -68,7 +68,7 @@ final class StatusHost: NSObject, NSApplicationDelegate, UNUserNotificationCente
       return
     }
     let obsoletePid = FileManager.default.homeDirectoryForCurrentUser
-      .appendingPathComponent("Library/Application Support/The Ditch/ditch-status-host.pid").path
+      .appendingPathComponent(DitchIdentity.supportRelativePath + "/ditch-status-host.pid").path
     try? FileManager.default.removeItem(atPath: obsoletePid)
     log("launch integrated ditchd appPath=\(appPath) helperDirectory=\(helperDirectory)")
     guard notificationControlServer.start(handler: { [weak self] command, reply in
@@ -125,14 +125,14 @@ final class StatusHost: NSObject, NSApplicationDelegate, UNUserNotificationCente
 
   private static func defaultPidFilePath() -> String {
     let support = FileManager.default.homeDirectoryForCurrentUser
-      .appendingPathComponent("Library/Application Support/The Ditch", isDirectory: true)
+      .appendingPathComponent(DitchIdentity.supportRelativePath, isDirectory: true)
     try? FileManager.default.createDirectory(at: support, withIntermediateDirectories: true)
     return support.appendingPathComponent("ditchd.pid").path
   }
 
   private static func defaultLogFilePath() -> String {
     let logs = FileManager.default.homeDirectoryForCurrentUser
-      .appendingPathComponent("Library/Application Support/The Ditch/logs", isDirectory: true)
+      .appendingPathComponent(DitchIdentity.supportRelativePath + "/logs", isDirectory: true)
     try? FileManager.default.createDirectory(at: logs, withIntermediateDirectories: true)
     return logs.appendingPathComponent("runtime.log").path
   }
@@ -141,7 +141,7 @@ final class StatusHost: NSObject, NSApplicationDelegate, UNUserNotificationCente
     var candidate = Bundle.main.bundleURL
     while candidate.path != "/" {
       if candidate.pathExtension == "app",
-        Bundle(url: candidate)?.bundleIdentifier == "ai.theditch.app"
+        Bundle(url: candidate)?.bundleIdentifier == DitchIdentity.app_id
       {
         return candidate.path
       }
@@ -152,7 +152,7 @@ final class StatusHost: NSObject, NSApplicationDelegate, UNUserNotificationCente
 
   private func restoreRuntimeEnvironment() {
     let file = FileManager.default.homeDirectoryForCurrentUser
-      .appendingPathComponent("Library/Application Support/The Ditch/codex-home")
+      .appendingPathComponent(DitchIdentity.supportRelativePath + "/codex-home")
     guard let value = try? String(contentsOf: file, encoding: .utf8)
       .trimmingCharacters(in: .whitespacesAndNewlines),
       !value.isEmpty,
@@ -681,7 +681,7 @@ final class StatusHost: NSObject, NSApplicationDelegate, UNUserNotificationCente
       !appPath.isEmpty
     else { return }
     var components = URLComponents()
-    components.scheme = "theditch"
+    components.scheme = DitchIdentity.url_scheme
     components.host = "agent"
     components.queryItems = [
       URLQueryItem(name: "project", value: projectId),
@@ -875,7 +875,7 @@ final class StatusHost: NSObject, NSApplicationDelegate, UNUserNotificationCente
   }
 
   @objc private func showTheDitch() {
-    if let app = NSRunningApplication.runningApplications(withBundleIdentifier: "ai.theditch.app").first {
+    if let app = NSRunningApplication.runningApplications(withBundleIdentifier: DitchIdentity.app_id).first {
       app.activate(options: [.activateAllWindows])
       return
     }
@@ -923,7 +923,7 @@ final class StatusHost: NSObject, NSApplicationDelegate, UNUserNotificationCente
   /// status-item quit so that reconnect loop cannot immediately revive us.
   private func terminateForegroundApplication() {
     for application in NSRunningApplication.runningApplications(
-      withBundleIdentifier: "ai.theditch.app"
+      withBundleIdentifier: DitchIdentity.app_id
     ) where !application.isTerminated {
       if !application.terminate() {
         log("foreground application refused termination pid=\(application.processIdentifier)")
@@ -1011,7 +1011,7 @@ private final class NotificationControlServer {
 
   private static var socketPath: String {
     FileManager.default.homeDirectoryForCurrentUser
-      .appendingPathComponent("Library/Application Support/The Ditch", isDirectory: true)
+      .appendingPathComponent(DitchIdentity.supportRelativePath, isDirectory: true)
       .appendingPathComponent("notification-control.sock")
       .path
   }
@@ -1237,7 +1237,8 @@ private struct RuntimeBuildIdentity {
       let releaseSequence = values["ReleaseSequence"] as? NSNumber,
       let communityRevision = values["CommunityRevision"] as? String,
       ["community", "commercial"].contains(edition),
-      ["staging", "production"].contains(deploymentEnvironment),
+      deploymentEnvironment == DitchIdentity.environment,
+      Bundle.main.bundleIdentifier == DitchIdentity.runtime_id,
       !buildIdentifier.isEmpty,
       !buildNumber.isEmpty,
       !communityRevision.isEmpty

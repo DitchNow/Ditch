@@ -669,6 +669,7 @@ pub enum ServerEvent {
         project_id: ProjectId,
     },
     TaskChanged(Task),
+    BoardExecutionChanged(ditch_core::BoardExecutionState),
     TaskDeleted {
         task_id: ditch_core::TaskId,
         project_id: ProjectId,

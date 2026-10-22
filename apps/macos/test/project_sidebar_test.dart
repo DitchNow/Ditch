@@ -24,6 +24,7 @@ const remote = DitchProject(
 const projects = [local, other, remote];
 
 class _SidebarRuntime extends DitchRuntimeClient {
+  _SidebarRuntime() : super(socketPath: '/tmp/sidebar-test.sock');
   final events = StreamController<Map<String, dynamic>>();
 
   Map<String, dynamic> get currentSnapshot => {
@@ -45,6 +46,7 @@ class _SidebarRuntime extends DitchRuntimeClient {
   @override
   Future<RuntimeStatusDto> runtimeStatus() async => const RuntimeStatusDto(
     identity: 'sidebar-test',
+    deploymentEnvironment: 'production',
     pid: 1,
     socketPath: '/tmp/sidebar-test.sock',
     activeSessionCount: 0,

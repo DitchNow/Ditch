@@ -2,8 +2,207 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:the_ditch/github_inbox.dart';
 import 'package:the_ditch/data/task_models.dart';
+import 'package:the_ditch/release_ui_visibility.dart';
 
 void main() {
+  testWidgets(
+    'empty connected inbox has one setup action and no unused controls',
+    (tester) async {
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: SizedBox(
+              width: 350,
+              child: GitHubInbox(
+                projects: const [TaskProjectOption('project', 'Project')],
+                onImported: () async {},
+                request: (request) async =>
+                    (request as Map)['GitHub'] == 'Status'
+                    ? {
+                        'GitHub': {'connected': true, 'generation': 'same'},
+                      }
+                    : {
+                        'GitHub': {'repositories': []},
+                      },
+              ),
+            ),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+      expect(find.text('Link repository'), findsOneWidget);
+      expect(find.text('Open'), findsNothing);
+      expect(find.text('Add 0 to Backlog'), findsNothing);
+      expect(find.text('Create issue'), findsNothing);
+      expect(find.text('Connection'), findsNothing);
+      await tester.tap(find.byTooltip('GitHub options'));
+      await tester.pumpAndSettle();
+      expect(find.text('GitHub account…'), findsOneWidget);
+      expect(tester.takeException(), isNull);
+      await tester.pumpWidget(const SizedBox());
+    },
+  );
+  testWidgets(
+    'one linked repository loads automatically and cards select without checkboxes',
+    (tester) async {
+      var reads = 0;
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: SizedBox(
+              width: 350,
+              child: GitHubInbox(
+                projects: const [TaskProjectOption('project', 'Project')],
+                onImported: () async {},
+                request: (request) async {
+                  final op = (request as Map)['GitHub'];
+                  if (op == 'Status') {
+                    return {
+                      'GitHub': {'connected': true, 'generation': 'same'},
+                    };
+                  }
+                  if (op is Map && op.containsKey('Links')) {
+                    return {
+                      'GitHub': {
+                        'repositories': [
+                          {
+                            'project_id': 'project',
+                            'repository': {'id': 42, 'full_name': 'org/repo'},
+                          },
+                        ],
+                      },
+                    };
+                  }
+                  if (op is Map && op.containsKey('Issues')) {
+                    reads++;
+                    return {
+                      'GitHub': {
+                        'issues': [
+                          {
+                            'id': 7,
+                            'number': 7,
+                            'title': 'Fix upload',
+                            'state': 'open',
+                          },
+                        ],
+                        'imported': {},
+                        'has_more': false,
+                      },
+                    };
+                  }
+                  throw StateError('Unexpected request');
+                },
+              ),
+            ),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+      expect(reads, 1);
+      expect(find.text('Fix upload'), findsOneWidget);
+      expect(find.byType(Checkbox), findsNothing);
+      expect(find.text('Add 1 to Backlog'), findsNothing);
+      await tester.tap(find.text('Fix upload'));
+      await tester.pump();
+      expect(find.text('1 selected · Drag to Backlog'), findsOneWidget);
+      expect(find.byTooltip('Issue info'), findsOneWidget);
+      await tester.pumpWidget(const SizedBox());
+    },
+  );
+  testWidgets('status polling preserves a failed Connect action', (
+    tester,
+  ) async {
+    await tester.pumpWidget(
+      MaterialApp(
+        home: GitHubSettingsDialog(
+          request: (request) async {
+            if ((request as Map)['GitHub'] == 'Connect') {
+              throw StateError('Connection was denied.');
+            }
+            return {
+              'GitHub': {'connected': false, 'busy': false},
+            };
+          },
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Connect GitHub'));
+    await tester.pumpAndSettle();
+    await tester.pump(const Duration(seconds: 2));
+    await tester.pumpAndSettle();
+    expect(find.textContaining('Connection was denied.'), findsOneWidget);
+    expect(find.byType(LinearProgressIndicator), findsNothing);
+    await tester.pumpWidget(const SizedBox());
+  });
+  testWidgets('failed initial status stops progress and retry recovers', (
+    tester,
+  ) async {
+    var approved = false;
+    await tester.pumpWidget(
+      MaterialApp(
+        home: GitHubSettingsDialog(
+          request: (_) async {
+            if (!approved) {
+              throw StateError(
+                'This staging installation needs approval. Installation ID: test-installation',
+              );
+            }
+            return {
+              'GitHub': {
+                'connected': false,
+                'busy': false,
+                'provider': 'github_app',
+              },
+            };
+          },
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+    expect(find.byType(LinearProgressIndicator), findsNothing);
+    expect(find.text('Preparing browser sign-in…'), findsNothing);
+    expect(
+      find.textContaining('Installation ID: test-installation'),
+      findsOneWidget,
+    );
+    expect(find.text('Try again'), findsOneWidget);
+    approved = true;
+    await tester.tap(find.text('Try again'));
+    await tester.pumpAndSettle();
+    expect(
+      find.textContaining('Installation ID: test-installation'),
+      findsNothing,
+    );
+    expect(find.text('Connect GitHub'), findsOneWidget);
+    await tester.pumpWidget(const SizedBox());
+  });
+
+  testWidgets(
+    'failed connection preserves detail without a progress indicator',
+    (tester) async {
+      await tester.pumpWidget(
+        MaterialApp(
+          home: GitHubSettingsDialog(
+            request: (_) async => {
+              'GitHub': {
+                'connected': false,
+                'busy': false,
+                'connection_state': 'failed',
+                'detail': 'Repository access was removed.',
+              },
+            },
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+      expect(find.byType(LinearProgressIndicator), findsNothing);
+      expect(find.text('Repository access was removed.'), findsOneWidget);
+      expect(find.text('Try again'), findsOneWidget);
+      await tester.pumpWidget(const SizedBox());
+    },
+  );
+
   testWidgets(
     'inbox disables imported issues and clears private data on disconnect',
     (tester) async {
@@ -67,35 +266,27 @@ void main() {
         ),
       );
       await tester.pumpAndSettle();
-      expect(find.text('No issues loaded'), findsOneWidget);
-      await tester.tap(find.text('Select a linked repository'));
-      await tester.pumpAndSettle();
-      await tester.tap(find.text('org/private').last);
-      await tester.pumpAndSettle();
+      expect(find.text('org/private'), findsOneWidget);
       // A page containing only PRs still allows reaching later issue pages.
-      expect(find.text('No issues loaded'), findsOneWidget);
+      expect(find.text('No open issues'), findsOneWidget);
       await tester.tap(find.text('Load more'));
       await tester.pumpAndSettle();
-      expect(find.text('#7 Private issue'), findsOneWidget);
+      expect(find.text('Private issue'), findsOneWidget);
       expect(
         tester
-            .widget<CheckboxListTile>(find.byType(CheckboxListTile))
-            .onChanged,
-        isNull,
-      );
-      expect(find.textContaining('Already imported'), findsOneWidget);
-      connected = false;
-      await tester.pump(const Duration(seconds: 2));
-      await tester.pumpAndSettle();
-      expect(find.text('#7 Private issue'), findsNothing);
-      expect(
-        tester
-            .widget<TextButton>(
-              find.widgetWithText(TextButton, 'Link repository'),
+            .widget<Draggable<GitHubIssueDrag>>(
+              find.byKey(const ValueKey('github-issue-7')),
             )
-            .onPressed,
-        isNull,
+            .maxSimultaneousDrags,
+        0,
       );
+      expect(find.textContaining('In board'), findsOneWidget);
+      connected = false;
+      await tester.tap(find.byIcon(Icons.refresh));
+      await tester.pumpAndSettle();
+      expect(find.text('Private issue'), findsNothing);
+      expect(find.text('Link repository'), findsNothing);
+      expect(find.text('Connect GitHub'), findsOneWidget);
       await tester.pumpWidget(const SizedBox());
     },
   );
@@ -128,7 +319,14 @@ void main() {
     );
     await tester.pumpAndSettle();
     expect(calls.every((v) => v == 'Status'), isTrue);
-    expect(find.textContaining('shared with other tools'), findsOneWidget);
+    expect(
+      find.textContaining(
+        showGitHubBoardControls
+            ? 'GitHub CLI credentials are not used'
+            : 'shared with other tools',
+      ),
+      findsOneWidget,
+    );
     for (final removed in [
       'Use this account',
       'Repair CLI',
@@ -238,6 +436,9 @@ void main() {
     await tester.pumpAndSettle();
     expect(find.text('Retry repositories'), findsOneWidget);
     await tester.pump(const Duration(seconds: 2));
+    await tester.pumpAndSettle();
+    expect(loads, 1);
+    await tester.tap(find.text('Retry repositories'));
     await tester.pumpAndSettle();
     expect(loads, 2);
     expect(find.text('Retry repositories'), findsNothing);
@@ -353,9 +554,10 @@ void main() {
         ),
       ),
     );
-    await tester.tap(find.text('Browse accessible repositories'));
+    await tester.tap(find.text('Browse repositories'));
     await tester.pumpAndSettle();
     expect(find.text('org/repo1'), findsOneWidget);
+    await tester.ensureVisible(find.text('Load more repositories'));
     await tester.tap(find.text('Load more repositories'));
     await tester.pumpAndSettle();
     expect(pages, [1, 2]);
