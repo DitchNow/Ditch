@@ -10,6 +10,7 @@ import 'package:flutter/services.dart';
 import 'package:xterm/xterm.dart';
 
 import 'application/command_center_controller.dart';
+import 'application/agent_prompt_drafts.dart';
 import 'application/project_sidebar_controller.dart';
 import 'application/product_update_controller.dart';
 import 'widgets/update_available_dot.dart';
@@ -1881,6 +1882,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen>
   final _agentListController = ScrollController();
   final _idleComposerKey = GlobalKey<AgentComposerState>();
   final _composerKeys = <String, GlobalKey<AgentComposerState>>{};
+  final _promptDrafts = AgentPromptDrafts();
   int _composerFocusGeneration = 0;
   late final _runtimeClient = widget.runtimeClient ??
       DitchRuntimeClient(deploymentEnvironment: widget.deploymentEnvironment);
@@ -3117,6 +3119,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen>
       _projects
         ..clear()
         ..addAll(projects);
+      _promptDrafts.retainProjects(_projects.map(_projectKey).toSet());
       if (_projects.isEmpty) {
         _selectedProjectKey = null;
       } else {
@@ -3132,6 +3135,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen>
       _agentSessions
         ..clear()
         ..addAll(sessions);
+      _promptDrafts.retainAgents(sessionsById.keys.toSet());
       for (final agentId in removedComposerKeyIds) {
         _composerKeys.remove(agentId);
       }
@@ -3546,6 +3550,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen>
         .whereType<ConversationViewportController>()
         .toList();
     final removedFiles = _projectFiles.remove(projectId);
+    _promptDrafts.removeProject(_projectKey(removedProject));
     setState(() {
       _projects.removeWhere((project) => project.id == projectId);
       _projectTerminals.remove(projectId);
@@ -3553,6 +3558,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen>
       _attention.removeWhere((event) => event.projectId == projectId);
       for (final id in removedSessionIds) {
         _composerKeys.remove(id);
+        _promptDrafts.removeAgent(id);
       }
       if (removedSessionIds.contains(_expandedAgentLocalId)) {
         _expandedAgentLocalId = null;
@@ -4330,6 +4336,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen>
         setState(() {
           _agentSessions.removeWhere((session) => session.localId == id);
           _composerKeys.remove(id);
+          _promptDrafts.removeAgent(id);
           _attention.removeWhere((event) => event.sessionLocalId == id);
           if (_expandedAgentLocalId == id) _expandedAgentLocalId = null;
           if (_focusedAgentLocalId == id) _focusedAgentLocalId = null;
@@ -5297,55 +5304,59 @@ class _CommandCenterScreenState extends State<CommandCenterScreen>
                 _maximumInspectorWidth(constraints.maxWidth, showSidebar),
               );
               final modelProjectId = _selectedProject.id;
-              final agentsSurface = AgentSettingsScope(
-                settings: _settingsForProject(_selectedProject.id),
-                loadModels:
-                    presentation.connection == RuntimeConnectionPhase.connected
-                    ? () => _runtimeClient.listCodexModels(
-                        projectId: modelProjectId,
-                      )
-                    : null,
-                child: AgentsSurface(
-                  onOpenBoard: () => _openBoard(_selectedProject.id),
-                  sessions: _visibleSessions,
-                  expandedAgentLocalId: _expandedAgentLocalId,
-                  focusedAgentLocalId: _focusedAgentLocalId,
-                  chatViewport: _chatViewport,
-                  agentListController: _agentListController,
-                  composerKey: _idleComposerKey,
-                  composerKeyForAgent: _composerKeyForAgent,
-                  headerKeyForAgent: _agentHeaderKey,
-                  initialPrompt: _defaultStartPrompt,
-                  effectiveCodexHome: _selectedProject.isRemote
-                      ? null
-                      : _effectiveRuntimeCodexHome,
-                  onStartCodex: _startCodex,
-                  onStartPrompt: _startCodexRuntime,
-                  onSubmitPrompt: _submitComposer,
-                  onLoadMessages: _loadAgentMessages,
-                  onStopCodex: _stopCodex,
-                  onDeleteAgent: _deleteAgent,
-                  onRenameAgent: _renameAgent,
-                  hasUnreadResult: (session) =>
-                      unreadResultAttentionIdsForAgent(
-                        attention: _attention,
-                        agentId: session.localId,
-                        readAttentionIds: _readAttentionIds,
-                      ).isNotEmpty,
-                  onFocusAgent: (session) {
-                    if (session != null) _markAgentResultsRead(session);
-                    setState(() {
-                      _focusedAgentLocalId = session?.localId;
-                      if (session != null) {
-                        _expandedAgentLocalId = session.localId;
+              final agentsSurface = AgentPromptDraftScope(
+                drafts: _promptDrafts,
+                projectKey: _projectKey(_selectedProject),
+                child: AgentSettingsScope(
+                  settings: _settingsForProject(_selectedProject.id),
+                  loadModels:
+                      presentation.connection == RuntimeConnectionPhase.connected
+                      ? () => _runtimeClient.listCodexModels(
+                          projectId: modelProjectId,
+                        )
+                      : null,
+                  child: AgentsSurface(
+                    onOpenBoard: () => _openBoard(_selectedProject.id),
+                    sessions: _visibleSessions,
+                    expandedAgentLocalId: _expandedAgentLocalId,
+                    focusedAgentLocalId: _focusedAgentLocalId,
+                    chatViewport: _chatViewport,
+                    agentListController: _agentListController,
+                    composerKey: _idleComposerKey,
+                    composerKeyForAgent: _composerKeyForAgent,
+                    headerKeyForAgent: _agentHeaderKey,
+                    initialPrompt: _defaultStartPrompt,
+                    effectiveCodexHome: _selectedProject.isRemote
+                        ? null
+                        : _effectiveRuntimeCodexHome,
+                    onStartCodex: _startCodex,
+                    onStartPrompt: _startCodexRuntime,
+                    onSubmitPrompt: _submitComposer,
+                    onLoadMessages: _loadAgentMessages,
+                    onStopCodex: _stopCodex,
+                    onDeleteAgent: _deleteAgent,
+                    onRenameAgent: _renameAgent,
+                    hasUnreadResult: (session) =>
+                        unreadResultAttentionIdsForAgent(
+                          attention: _attention,
+                          agentId: session.localId,
+                          readAttentionIds: _readAttentionIds,
+                        ).isNotEmpty,
+                    onFocusAgent: (session) {
+                      if (session != null) _markAgentResultsRead(session);
+                      setState(() {
+                        _focusedAgentLocalId = session?.localId;
+                        if (session != null) {
+                          _expandedAgentLocalId = session.localId;
+                        }
+                      });
+                      final agentId = session?.localId ?? _expandedAgentLocalId;
+                      if (agentId != null) {
+                        _focusAgentComposerAfterLayout(agentId);
                       }
-                    });
-                    final agentId = session?.localId ?? _expandedAgentLocalId;
-                    if (agentId != null) {
-                      _focusAgentComposerAfterLayout(agentId);
-                    }
-                  },
-                  onToggleExpanded: _toggleExpandedAgent,
+                    },
+                    onToggleExpanded: _toggleExpandedAgent,
+                  ),
                 ),
               );
               final selectedTerminal = _selectedProject.id == null
@@ -8047,10 +8058,17 @@ class AgentsSurface extends StatelessWidget {
                     ),
                   ),
                   if ((showUnfinishedFeatureControls || showGitHubBoardControls) && onOpenBoard != null)
-                    IconButton(
-                      onPressed: onOpenBoard,
-                      tooltip: 'Project Board — $projectWriteDisclosure',
-                      icon: const Icon(Icons.view_kanban_outlined, size: 20),
+                    Tooltip(
+                      message: 'Open project board',
+                      constraints: const BoxConstraints(maxWidth: 180),
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 10,
+                        vertical: 6,
+                      ),
+                      child: IconButton(
+                        onPressed: onOpenBoard,
+                        icon: const Icon(Icons.view_kanban_outlined, size: 20),
+                      ),
                     ),
                   FilledButton.icon(
                     key: const Key('agents-new-agent-button'),
@@ -8809,6 +8827,10 @@ class AgentChatPanel extends StatelessWidget {
         ),
       AgentComposer(
         key: composerKey,
+        draft: AgentPromptDraftScope.maybeOf(context)?.forConversation(
+          conversationId,
+          initialPrompt,
+        ),
         executionSettings: executionSettings,
         initialText: initialPrompt,
         hasSession: hasSession,
@@ -9212,6 +9234,7 @@ class _ThinkingStatusStripState extends State<ThinkingStatusStrip>
 class AgentComposer extends StatefulWidget {
   const AgentComposer({
     required this.initialText,
+    this.draft,
     required this.hasSession,
     required this.isWorking,
     this.canStop = false,
@@ -9225,6 +9248,7 @@ class AgentComposer extends StatefulWidget {
   });
 
   final String initialText;
+  final AgentPromptDraft? draft;
   final AgentExecutionSettings? executionSettings;
   final bool hasSession;
   final bool isWorking;
@@ -9240,7 +9264,7 @@ class AgentComposer extends StatefulWidget {
 }
 
 class AgentComposerState extends State<AgentComposer> {
-  final _nativeComposerKey = GlobalKey<NativeComposerTextViewState>();
+  var _nativeComposerKey = GlobalKey<NativeComposerTextViewState>();
   static const _minimumEditorHeight = 48.0;
   static const _maximumEditorHeight = 160.0;
   late String _draftText;
@@ -9259,13 +9283,18 @@ class AgentComposerState extends State<AgentComposer> {
   @override
   void initState() {
     super.initState();
-    _draftText = widget.initialText;
+    _draftText = widget.draft?.text ?? widget.initialText;
   }
 
   @override
   void didUpdateWidget(AgentComposer oldWidget) {
     super.didUpdateWidget(oldWidget);
-    if (oldWidget.initialText != widget.initialText &&
+    if (!identical(oldWidget.draft, widget.draft)) {
+      _draftText = widget.draft?.text ?? widget.initialText;
+      _nativeComposerKey = GlobalKey<NativeComposerTextViewState>();
+      _editorHeight = _minimumEditorHeight;
+    } else if (widget.draft == null &&
+        oldWidget.initialText != widget.initialText &&
         _draftText.trim().isEmpty) {
       _draftText = widget.initialText;
     }
@@ -9284,20 +9313,28 @@ class AgentComposerState extends State<AgentComposer> {
       return;
     }
 
-    final nativeText =
-        await _nativeComposerKey.currentState?.currentText() ?? _draftText;
+    final editor = _nativeComposerKey.currentState;
+    final draft = widget.draft;
+    final nativeText = await editor?.currentText() ?? _draftText;
+    if (!mounted ||
+        !identical(editor, _nativeComposerKey.currentState) ||
+        !identical(draft, widget.draft)) {
+      return;
+    }
     final prompt = nativeText.trim();
     if (prompt.isEmpty) {
       return;
     }
 
-    setState(() => _draftText = '');
-    await _nativeComposerKey.currentState?.clearText();
-    widget.onSubmit(prompt);
-    focus();
+    final onSubmit = widget.onSubmit;
+    _handleChanged('');
+    await editor?.clearText();
+    onSubmit(prompt);
+    if (mounted) focus();
   }
 
   void _handleChanged(String text) {
+    widget.draft?.text = text;
     if (_draftText == text) {
       return;
     }
@@ -9362,7 +9399,7 @@ class AgentComposerState extends State<AgentComposer> {
                           height: _editorHeight,
                           child: NativeComposerTextView(
                             key: _nativeComposerKey,
-                            initialText: widget.initialText,
+                            initialText: _draftText,
                             enabled: editable,
                             placeholder: widget.hasSession
                                 ? 'Send a follow-up to Codex'

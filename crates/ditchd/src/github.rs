@@ -9,6 +9,10 @@ use sha2::{Digest, Sha256};
 mod app;
 #[path = "github_auth.rs"]
 mod auth;
+#[path = "github_discovery.rs"]
+pub(super) mod discovery;
+#[path = "github_publish.rs"]
+pub(super) mod publishing;
 
 const NS: &str = "github";
 const VERSION: &str = "2.101.0";
@@ -39,8 +43,13 @@ trait GitHubService {
         _request: &str,
         _title: &str,
         _body: &str,
+        _issue_type: Option<&str>,
+        _task_id: Option<TaskId>,
     ) -> Result<Value, String> {
         Err("Issue creation requires the staging GitHub App".into())
+    }
+    fn issue_types(&self, _project: ProjectId, _repository: u64) -> Result<Value, String> {
+        Ok(json!({"types":[],"can_set_type":false}))
     }
     fn check_commit(&self, _state: &RuntimeState) -> Result<(), String> {
         Ok(())
@@ -370,7 +379,7 @@ fn initialize(store: &DitchStore) -> Result<(), String> {
     store.with_extension_connection(NS, |c| {
         c.execute_batch("CREATE TABLE IF NOT EXISTS github_links(project_id TEXT NOT NULL REFERENCES projects(id),repository_id TEXT NOT NULL,json TEXT NOT NULL,PRIMARY KEY(project_id,repository_id));
         CREATE TABLE IF NOT EXISTS github_sources(project_id TEXT NOT NULL REFERENCES projects(id),host TEXT NOT NULL,issue_id TEXT NOT NULL,repository_id TEXT NOT NULL,number TEXT NOT NULL,task_id TEXT NOT NULL UNIQUE REFERENCES tasks(id),snapshot TEXT NOT NULL,PRIMARY KEY(project_id,host,issue_id));")?;
-        c.execute_batch("CREATE TABLE IF NOT EXISTS github_import_receipts(request_id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, result TEXT NOT NULL);")?;
+        c.execute_batch("CREATE TABLE IF NOT EXISTS github_import_receipts(request_id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, result TEXT NOT NULL); CREATE TABLE IF NOT EXISTS github_publications(task_id TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE, payload TEXT NOT NULL, result TEXT);")?;
         Ok(())
     }).map_err(|e| e.to_string())
 }
@@ -408,8 +417,9 @@ fn save_verified_repository(
     project: ProjectId,
     id: u64,
     previous: GitHubRepository,
-    repo: GitHubRepository,
+    mut repo: GitHubRepository,
 ) -> Result<GitHubRepository, String> {
+    repo.project_paths = previous.project_paths.clone();
     if repo.id != id || !repo.has_issues {
         return Err("Repository is unavailable or issues are disabled".into());
     }
@@ -439,6 +449,16 @@ fn import_issues(
     repo: &GitHubRepository,
     issues: Vec<GitHubIssue>,
     request_id: Option<String>,
+) -> Result<Value, String> {
+    import_issues_with_kind(s, project, repo, issues, request_id, None)
+}
+fn import_issues_with_kind(
+    s: &mut RuntimeState,
+    project: ProjectId,
+    repo: &GitHubRepository,
+    issues: Vec<GitHubIssue>,
+    request_id: Option<String>,
+    kind: Option<ditch_core::TaskIssueKind>,
 ) -> Result<Value, String> {
     if !s
         .projects
@@ -516,6 +536,7 @@ fn import_issues(
         let mut task = new_backlog_task(
             project,
             TaskDraft {
+                issue_kind: kind.unwrap_or_else(|| issue.kind()),
                 title: issue.title.clone(),
                 description: issue.body.clone().unwrap_or_default(),
                 skills: vec![],
@@ -582,6 +603,8 @@ fn import_issues(
 
 fn issue_source(repo: &GitHubRepository, issue: &GitHubIssue) -> GitHubTaskSource {
     GitHubTaskSource {
+        issue_type: issue.issue_type.clone(),
+        project_paths: repo.project_paths.clone(),
         repository_id: repo.id,
         issue_id: issue.id,
         repository: repo.full_name.clone(),
@@ -650,35 +673,36 @@ fn handle_service(
         | GitHubRequest::SyncChanges { .. } => {
             Err("This operation requires the staging GitHub App".into())
         }
+        GitHubRequest::Publication { task_id } => publishing::status(&state, task_id),
+        GitHubRequest::IssueTypes {
+            project_id,
+            repository_id,
+        } => {
+            check_registered(&state, project_id)?;
+            repository(&state.lock().unwrap(), project_id, repository_id)?;
+            service.issue_types(project_id, repository_id)
+        }
         GitHubRequest::CreateIssue {
             project_id,
             repository_id,
             request_id,
             title,
             body,
-        } => {
-            check_registered(&state, project_id)?;
-            Uuid::parse_str(&request_id).map_err(|_| "Invalid creation request ID")?;
-            if title.trim().is_empty() || title.chars().count() > 256 || body.len() > 65536 {
-                return Err(
-                    "Enter a title of 1–256 characters and a body of at most 64 KiB".into(),
-                );
-            }
-            let repo = verified_repository(&state, service, project_id, repository_id)?;
-            let raw =
-                service.create(project_id, repository_id, &request_id, title.trim(), &body)?;
-            let issue: GitHubIssue =
-                serde_json::from_value(raw).map_err(|_| "Invalid created issue")?;
-            if !issue.html_url.eq_ignore_ascii_case(&format!(
-                "https://github.com/{}/issues/{}",
-                repo.full_name, issue.number
-            )) {
-                return Err("Created issue identity could not be verified".into());
-            }
-            let mut s = state.lock().unwrap();
-            service.check_commit(&s)?;
-            import_issues(&mut s, project_id, &repo, vec![issue], Some(request_id))
-        }
+            task_id,
+            issue_type,
+            issue_kind,
+        } => publishing::create(
+            state,
+            service,
+            project_id,
+            repository_id,
+            request_id,
+            title,
+            body,
+            task_id,
+            issue_type,
+            issue_kind,
+        ),
         GitHubRequest::Status
         | GitHubRequest::Connect
         | GitHubRequest::OpenBrowser
@@ -711,12 +735,19 @@ fn handle_service(
         } => {
             check_registered(&state, project_id)?;
             let name = repository_name(&input)?;
-            let repo: GitHubRepository =
+            let mut repo: GitHubRepository =
                 serde_json::from_value(service.get(&format!("repos/{name}"))?)
                     .map_err(|_| "Invalid repository response")?;
             if !repo.has_issues {
                 return Err("Issues are disabled for this repository".into());
             }
+            // Manual linking remains available when the checkout/SSH host is offline.
+            repo.project_paths = match app::remote_suggestions(&state, project_id) {
+                Ok(found) => discovery::paths_for(&found, &repo.full_name),
+                Err(_) => self::repository(&state.lock().unwrap(), project_id, repo.id)
+                    .map(|previous| previous.project_paths)
+                    .unwrap_or_default(),
+            };
             service.link(project_id, repo.id)?;
             let s = state.lock().unwrap();
             service.check_commit(&s)?;
@@ -865,6 +896,8 @@ fn handle_service(
             service.check_commit(&s)?;
             let mut task = s.tasks.get(&task_id).cloned().ok_or("Task was removed")?;
             let source = task.github_source.as_mut().ok_or("Source was removed")?;
+            source.issue_type = issue.issue_type.clone();
+            source.project_paths = repo.project_paths.clone();
             source.state = issue.state.clone();
             source.url = issue.html_url.clone();
             source.repository = repo.full_name.clone();
@@ -1151,6 +1184,8 @@ mod tests {
                 _: &str,
                 _: &str,
                 _: &str,
+                _: Option<&str>,
+                _: Option<TaskId>,
             ) -> Result<Value, String> {
                 self.1.set(self.1.get() + 1);
                 self.0.get("repos/owner/repo/issues/7")
@@ -1160,6 +1195,9 @@ mod tests {
         let service = Creator(fake, std::cell::Cell::new(0));
         let request_id = Uuid::new_v4().to_string();
         let request = |title: &str| GitHubRequest::CreateIssue {
+            task_id: None,
+            issue_type: None,
+            issue_kind: Default::default(),
             project_id: project.id,
             repository_id: 42,
             request_id: request_id.clone(),
@@ -1191,6 +1229,211 @@ mod tests {
         assert_eq!(task.column(), ditch_core::TaskColumn::Backlog);
         assert_eq!(task.github_source.as_ref().unwrap().issue_id, 70);
     }
+
+    #[test]
+    fn publication_preserves_local_task_and_recovers_saved_result_without_another_post() {
+        struct Publisher(Fake, std::cell::Cell<usize>);
+        impl GitHubService for Publisher {
+            fn get(&self, path: &str) -> Result<Value, String> {
+                self.0.get(path)
+            }
+            fn create(
+                &self,
+                _: ProjectId,
+                _: u64,
+                _: &str,
+                _: &str,
+                _: &str,
+                _: Option<&str>,
+                _: Option<TaskId>,
+            ) -> Result<Value, String> {
+                self.1.set(self.1.get() + 1);
+                self.0.get("repos/owner/repo/issues/7")
+            }
+        }
+        let (state, project, fake) = fixture();
+        let response = handle_task_request(
+            state.clone(),
+            ditch_core::TaskRequest {
+                project_id: Some(project.id),
+                request_id: Uuid::new_v4(),
+                operation: ditch_core::TaskOperation::CreateBacklog {
+                    draft: TaskDraft {
+                        issue_kind: ditch_core::TaskIssueKind::Bug,
+                        title: "Local task".into(),
+                        description: "Original requirement".into(),
+                        skills: vec![],
+                        acceptance_criteria: vec![],
+                        priority: TaskPriority::Normal,
+                    },
+                },
+            },
+        );
+        let ServerResponse::TaskResponse(ditch_core::TaskResponse::Changed(mut before)) = response
+        else {
+            panic!("{response:?}")
+        };
+        before.planning.text = "Approved plan".into();
+        before.state = ditch_core::TaskState::Running;
+        before.execution_queue = Some(ditch_core::TaskExecutionQueue {
+            position: 4096,
+            agent_id: None,
+            profile: Default::default(),
+            feedback: None,
+        });
+        {
+            let mut s = state.lock().unwrap();
+            let audit = before.audit(TaskActor::User, "fixture", None, None);
+            s.store
+                .save_task_changes(&[(before.clone(), audit)], None, None)
+                .unwrap();
+            s.tasks.insert(before.id, before.clone());
+        }
+        let publisher = Publisher(fake, std::cell::Cell::new(0));
+        let request = || GitHubRequest::CreateIssue {
+            project_id: project.id,
+            repository_id: 42,
+            request_id: Uuid::new_v4().to_string(),
+            title: before.title.clone(),
+            body: before.description.clone(),
+            task_id: Some(before.id),
+            issue_type: None,
+            issue_kind: before.issue_kind,
+        };
+        let first =
+            handle_service(state.clone(), request(), &publisher, Path::new("unused")).unwrap();
+        assert_eq!(first["task_ids"], json!([before.id]));
+        // Rebuild the in-memory projection from persisted rows, as on restart.
+        {
+            let mut s = state.lock().unwrap();
+            s.tasks = s
+                .store
+                .load_tasks()
+                .unwrap()
+                .into_iter()
+                .map(|t| (t.id, t))
+                .collect();
+        }
+        let second =
+            handle_service(state.clone(), request(), &publisher, Path::new("unused")).unwrap();
+        assert_eq!(second["task_ids"], first["task_ids"]);
+        assert_eq!(publisher.1.get(), 1);
+        let after = state.lock().unwrap().tasks[&before.id].clone();
+        assert_eq!(after.state, before.state);
+        assert_eq!(after.issue_kind, before.issue_kind);
+        assert_eq!(after.planning, before.planning);
+        assert_eq!(after.description, before.description);
+        assert_eq!(after.execution_queue, before.execution_queue);
+        assert_eq!(after.order_key, before.order_key);
+        assert_eq!(after.assigned_agent_id, before.assigned_agent_id);
+        let mut s = state.lock().unwrap();
+        let repo = repository(&s, project.id, 42).unwrap();
+        let issue =
+            serde_json::from_value(publisher.0.get("repos/owner/repo/issues/7").unwrap()).unwrap();
+        let imported = import_issues(
+            &mut s,
+            project.id,
+            &repo,
+            vec![issue],
+            Some(Uuid::new_v4().to_string()),
+        )
+        .unwrap();
+        assert_eq!(imported["task_ids"], json!([before.id]));
+        assert_eq!(s.tasks.len(), 1);
+    }
+
+    #[test]
+    fn task_metadata_attachment_initializes_a_fresh_ssh_host_without_github_login() {
+        let mut runtime = super::super::tests::test_runtime();
+        runtime.remote_runtime = true;
+        let project = Project::new("SSH fixture", runtime.paths.data_dir.join("remote"));
+        runtime.store.upsert_project(&project).unwrap();
+        runtime.projects.insert(project.root_key(), project.clone());
+        let task = Task::new(
+            project.id,
+            TaskDraft {
+                issue_kind: ditch_core::TaskIssueKind::Custom,
+                skills: vec![],
+                title: "Local".into(),
+                description: "Body".into(),
+                acceptance_criteria: vec![],
+                priority: TaskPriority::Normal,
+            },
+            1024,
+        )
+        .unwrap();
+        let audit = task.audit(TaskActor::User, "created", None, None);
+        runtime
+            .store
+            .save_task_changes(&[(task.clone(), audit)], None, None)
+            .unwrap();
+        runtime.tasks.insert(task.id, task.clone());
+        let state = Arc::new(Mutex::new(runtime));
+        let repo:GitHubRepository=serde_json::from_value(json!({"id":42,"full_name":"owner/repo","html_url":"https://github.com/owner/repo","has_issues":true,"project_paths":["modules/repo"]})).unwrap();
+        let issue:GitHubIssue=serde_json::from_value(json!({"id":70,"number":7,"title":"Local","body":"Body","state":"open","updated_at":"2026-10-24T00:00:00Z","html_url":"https://github.com/owner/repo/issues/7"})).unwrap();
+        let request = ditch_core::TaskRequest {
+            project_id: Some(project.id),
+            request_id: Uuid::new_v4(),
+            operation: ditch_core::TaskOperation::AttachGitHub {
+                task_id: task.id,
+                source: issue_source(&repo, &issue),
+                issue,
+            },
+        };
+        let response = handle_task_request(state.clone(), request);
+        let ServerResponse::TaskResponse(ditch_core::TaskResponse::Changed(attached)) = response
+        else {
+            panic!("{response:?}")
+        };
+        assert_eq!(
+            attached.github_source.as_ref().unwrap().project_paths,
+            vec!["modules/repo"]
+        );
+        assert_eq!(
+            state.lock().unwrap().store.load_tasks().unwrap()[0],
+            attached
+        );
+    }
+
+    #[test]
+    fn import_retains_github_types_and_publication_retains_local_category() {
+        let (state, project, fake) = fixture();
+        let repo = repository(&state.lock().unwrap(), project.id, 42).unwrap();
+        let mut value = fake.get("repos/owner/repo/issues/7").unwrap();
+        value["type"] = json!({"id":12,"name":"Feature","color":"blue"});
+        let issue: GitHubIssue = serde_json::from_value(value.clone()).unwrap();
+        let mut s = state.lock().unwrap();
+        let result = import_issues(&mut s, project.id, &repo, vec![issue], None).unwrap();
+        let id: TaskId = serde_json::from_value(result["task_ids"][0].clone()).unwrap();
+        assert_eq!(s.tasks[&id].issue_kind, ditch_core::TaskIssueKind::Feature);
+        assert_eq!(
+            s.tasks[&id]
+                .github_source
+                .as_ref()
+                .unwrap()
+                .issue_type
+                .as_ref()
+                .unwrap()
+                .name,
+            "Feature"
+        );
+        value["id"] = json!(71);
+        value["number"] = json!(8);
+        value["type"] = Value::Null;
+        let issue = serde_json::from_value(value).unwrap();
+        let result = import_issues_with_kind(
+            &mut s,
+            project.id,
+            &repo,
+            vec![issue],
+            None,
+            Some(ditch_core::TaskIssueKind::Bug),
+        )
+        .unwrap();
+        let id: TaskId = serde_json::from_value(result["task_ids"][0].clone()).unwrap();
+        assert_eq!(s.tasks[&id].issue_kind, ditch_core::TaskIssueKind::Bug);
+    }
+
     impl GitHubService for Fake {
         fn get(&self, path: &str) -> Result<Value, String> {
             self.0

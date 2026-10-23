@@ -115,6 +115,7 @@ fn task_planning_request(
 }
 
 struct TaskPlanLaunch {
+    context: serde_json::Value,
     binary: String,
     home: Option<PathBuf>,
     model: Option<String>,
@@ -187,6 +188,7 @@ fn prepare_task_plan(
         return Err(TaskError::new(TaskErrorCode::InvalidInput, "Invalid model"));
     }
     Ok(TaskPlanLaunch {
+        context: serde_json::json!({"type":task.issue_kind,"github_source":task.github_source}),
         binary,
         home: state.codex_home.clone(),
         model,
@@ -262,6 +264,7 @@ fn launch_task_plan(
                 launch.model.as_deref(),
                 &launch.job.title,
                 &launch.job.description,
+                &launch.context,
                 active,
             );
             finish_task_plan(&runtime, task_id, job_id, result);

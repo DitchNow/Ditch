@@ -4,6 +4,8 @@ import 'package:flutter/services.dart';
 import 'package:flutter/material.dart';
 import 'application/task_board_controller.dart';
 import 'data/task_models.dart';
+import 'data/task_templates.dart';
+import 'widgets/task_type_selector.dart';
 import 'release_ui_visibility.dart';
 
 /// Memory-only cache scoped to the app's runtime connection, not a pane mount.
@@ -18,6 +20,7 @@ class GitHubBoardSession extends ChangeNotifier {
   final snapshots = <String, Map<String, dynamic>>{};
   final selections = <String, Map<String, dynamic>>{};
   bool initialIssuesClaimed = false;
+  Future<void>? initialRead;
   int epoch = 0;
 
   void observeStatus(Map<String, dynamic> next) {
@@ -103,6 +106,10 @@ class _GitHubRepositoryPickerState extends State<GitHubRepositoryPicker> {
   int page = 0;
   List<String> suggestions = [];
   int suggestionEpoch = 0;
+  List<Map<String, dynamic>> submodules = [];
+  List<String> discoveryWarnings = [];
+  final selectedSubmodules = <String>{};
+  final linkedRepositories = <String>{};
   @override
   void initState() {
     super.initState();
@@ -127,6 +134,13 @@ class _GitHubRepositoryPickerState extends State<GitHubRepositoryPicker> {
       if (mounted && epoch == suggestionEpoch) {
         setState(() {
           suggestions = (result['repositories'] as List).cast<String>();
+          submodules = (result['candidates'] as List? ?? [])
+              .map((v) => Map<String, dynamic>.from(v as Map))
+              .where((v) => v['is_root'] != true)
+              .toList();
+          discoveryWarnings = (result['warnings'] as List? ?? [])
+              .cast<String>();
+          selectedSubmodules.clear();
           if (suggestions.isNotEmpty &&
               input.text.isEmpty &&
               inputRevision == revision) {
@@ -191,10 +205,24 @@ class _GitHubRepositoryPickerState extends State<GitHubRepositoryPicker> {
       error = null;
     });
     try {
-      await githubRequest(widget.request, {
-        'Link': {'project_id': project, 'repository': input.text.trim()},
-      });
-      if (mounted) Navigator.pop(context, true);
+      final failures = <String>[];
+      for (final repository in {input.text.trim(), ...selectedSubmodules}) {
+        if (linkedRepositories.contains('$project:$repository')) continue;
+        try {
+          await githubRequest(widget.request, {
+            'Link': {'project_id': project, 'repository': repository},
+          });
+          linkedRepositories.add('$project:$repository');
+        } on Object catch (e) {
+          failures.add('$repository: $e');
+        }
+        if (!mounted) return;
+      }
+      if (failures.isEmpty) {
+        if (mounted) Navigator.pop(context, true);
+      } else if (mounted) {
+        setState(() => error = failures.join('\n'));
+      }
     } on Object catch (e) {
       if (mounted) setState(() => error = '$e');
     } finally {
@@ -262,6 +290,8 @@ class _GitHubRepositoryPickerState extends State<GitHubRepositoryPicker> {
                     setState(() {
                       project = v;
                       suggestions = [];
+                      submodules = [];
+                      selectedSubmodules.clear();
                       error = null;
                       input.clear();
                     });
@@ -314,6 +344,35 @@ class _GitHubRepositoryPickerState extends State<GitHubRepositoryPicker> {
                 ),
               ),
           ],
+          if (submodules.isNotEmpty) ...[
+            const SizedBox(height: 12),
+            const Text('Also link submodules'),
+            for (final module in submodules)
+              CheckboxListTile(
+                dense: true,
+                contentPadding: EdgeInsets.zero,
+                controlAffinity: ListTileControlAffinity.leading,
+                title: Text(module['repository'] as String),
+                subtitle: Text((module['paths'] as List).join(', ')),
+                value: selectedSubmodules.contains(module['repository']),
+                onChanged: busy
+                    ? null
+                    : (selected) => setState(() {
+                        if (selected == true) {
+                          selectedSubmodules.add(
+                            module['repository'] as String,
+                          );
+                        } else {
+                          selectedSubmodules.remove(module['repository']);
+                        }
+                      }),
+              ),
+          ],
+          if (discoveryWarnings.isNotEmpty)
+            Text(
+              discoveryWarnings.join('\n'),
+              style: Theme.of(context).textTheme.bodySmall,
+            ),
           const SizedBox(height: 16),
           Wrap(
             spacing: 12,
@@ -417,8 +476,10 @@ class _GitHubRepositoryPickerState extends State<GitHubRepositoryPicker> {
     ),
     actions: [
       TextButton(
-        onPressed: () => Navigator.pop(context),
-        child: const Text('Cancel'),
+        onPressed: busy
+            ? null
+            : () => Navigator.pop(context, linkedRepositories.isNotEmpty),
+        child: Text(linkedRepositories.isEmpty ? 'Cancel' : 'Done'),
       ),
       FilledButton(
         onPressed: busy || project == null || input.text.trim().isEmpty
@@ -506,7 +567,7 @@ class _GitHubIssueDetailState extends State<GitHubIssueDetail> {
             children: [
               // Literal Markdown keeps HTML inert and never fetches remote images.
               SelectableText(
-                '${issue['html_url']}\n${issue['state']} · ${issue['state_reason'] ?? ''}\nAuthor: ${issue['user']?['login'] ?? 'Unknown'}\nCreated: ${issue['created_at'] ?? ''} · Updated: ${issue['updated_at'] ?? ''}\nLabels: ${(issue['labels'] as List? ?? []).map((v) => v['name']).join(', ')}\nAssignees: ${(issue['assignees'] as List? ?? []).map((v) => v['login']).join(', ')}\n\n${issue['body'] ?? ''}',
+                '${issue['html_url']}\n${issue['state']} · ${issue['state_reason'] ?? ''}\nAuthor: ${issue['user']?['login'] ?? 'Unknown'}\nCreated: ${issue['created_at'] ?? ''} · Updated: ${issue['updated_at'] ?? ''}\nType: ${issue['type']?['name'] ?? 'None'}\nLabels: ${(issue['labels'] as List? ?? []).map((v) => v['name']).join(', ')}\nAssignees: ${(issue['assignees'] as List? ?? []).map((v) => v['login']).join(', ')}\n\n${issue['body'] ?? ''}',
               ),
               const Divider(),
               for (final comment in comments)
@@ -831,21 +892,120 @@ class _GitHubSettingsState extends State<GitHubSettingsDialog> {
 
 class GitHubCreateIssueDialog extends StatefulWidget {
   const GitHubCreateIssueDialog({
-    super.key,
     required this.request,
-    required this.link,
+    this.link,
+    this.task,
+    this.repositoryLinks,
+    super.key,
   });
   final TaskTransport request;
-  final Map<String, dynamic> link;
+  final Map<String, dynamic>? link;
+  final TaskDto? task;
+  final List<Map<String, dynamic>>? repositoryLinks;
   @override
   State<GitHubCreateIssueDialog> createState() => _GitHubCreateIssueState();
 }
 
 class _GitHubCreateIssueState extends State<GitHubCreateIssueDialog> {
-  final title = TextEditingController(), body = TextEditingController();
-  final requestId = TaskBoardController.newRequestId();
-  bool sending = false, attempted = false;
-  String? error;
+  late final title = TextEditingController(text: widget.task?.title ?? '');
+  late final body = TextEditingController(
+    text: widget.task?.description ?? taskTemplates['Custom'],
+  );
+  late String issueKind = widget.task?.issueKind ?? 'Custom';
+  String requestId = TaskBoardController.newRequestId();
+  String? issueType, error;
+  List<Map<String, dynamic>> links = [], types = [];
+  Map<String, dynamic>? link;
+  bool sending = false, attempted = false, loading = true, canSetType = false;
+
+  @override
+  void initState() {
+    super.initState();
+    load();
+  }
+
+  Future<void> load() async {
+    try {
+      final pending = widget.task == null
+          ? null
+          : (await githubRequest(widget.request, {
+                  'Publication': {'task_id': widget.task!.id},
+                }))['publication']
+                as Map?;
+      if (widget.link != null) {
+        links = [widget.link!];
+      } else if (widget.repositoryLinks != null) {
+        links = widget.repositoryLinks!;
+      } else {
+        final result = await githubRequest(widget.request, {
+          'Links': {'project_id': widget.task!.projectId},
+        });
+        links = (result['repositories'] as List)
+            .map((v) => Map<String, dynamic>.from(v as Map))
+            .toList();
+      }
+      if (!mounted) return;
+      link = pending == null
+          ? links.firstOrNull
+          : links
+                .where((v) => v['repository']['id'] == pending['repository_id'])
+                .firstOrNull;
+      if (pending != null) {
+        requestId = pending['request_id'] as String;
+        title.text = pending['title'] as String;
+        body.text = pending['body'] as String;
+        issueKind = pending['issue_kind'] as String? ?? issueKind;
+        issueType = pending['issue_type'] as String?;
+        attempted = true;
+      }
+      if (link != null) await loadTypes();
+      if (links.isEmpty || link == null) {
+        error = 'Link the destination repository from the GitHub pane first.';
+      }
+    } on Object catch (e) {
+      error = '$e';
+    } finally {
+      if (mounted) setState(() => loading = false);
+    }
+  }
+
+  Future<void> loadTypes() async {
+    final current = link!;
+    setState(() {
+      loading = true;
+      error = null;
+    });
+    try {
+      final result = await githubRequest(widget.request, {
+        'IssueTypes': {
+          'project_id': current['project_id'],
+          'repository_id': current['repository']['id'],
+        },
+      });
+      if (!mounted) return;
+      types = (result['types'] as List? ?? [])
+          .map((v) => Map<String, dynamic>.from(v as Map))
+          .toList();
+      canSetType = result['can_set_type'] == true;
+      if (!attempted) {
+        issueType = canSetType
+            ? (types
+                      .where(
+                        (t) =>
+                            (t['name'] as String).toLowerCase() ==
+                            issueKind.toLowerCase(),
+                      )
+                      .firstOrNull?['name']
+                  as String?)
+            : null;
+      }
+    } on Object catch (e) {
+      if (mounted) error = 'Could not load GitHub types: $e';
+    } finally {
+      if (mounted) setState(() => loading = false);
+    }
+  }
+
   @override
   void dispose() {
     title.dispose();
@@ -854,7 +1014,7 @@ class _GitHubCreateIssueState extends State<GitHubCreateIssueDialog> {
   }
 
   Future<void> create() async {
-    if (sending || title.text.trim().isEmpty) return;
+    if (sending || loading || link == null || title.text.trim().isEmpty) return;
     setState(() {
       sending = true;
       attempted = true;
@@ -863,16 +1023,29 @@ class _GitHubCreateIssueState extends State<GitHubCreateIssueDialog> {
     try {
       await githubRequest(widget.request, {
         'CreateIssue': {
-          'project_id': widget.link['project_id'],
-          'repository_id': widget.link['repository']['id'],
+          'project_id': link!['project_id'],
+          'repository_id': link!['repository']['id'],
           'request_id': requestId,
+          'task_id': widget.task?.id,
           'title': title.text.trim(),
           'body': body.text,
+          'issue_kind': issueKind,
+          'issue_type': issueType,
         },
       });
       if (mounted) Navigator.pop(context, true);
     } on Object catch (e) {
-      if (mounted) setState(() => error = '$e');
+      if (mounted) {
+        setState(() {
+          error = '$e';
+          if (error!.contains(
+            'Ditch Relay rejected the request (github_issue_type_unavailable):',
+          )) {
+            attempted = false;
+            requestId = TaskBoardController.newRequestId();
+          }
+        });
+      }
     } finally {
       if (mounted) setState(() => sending = false);
     }
@@ -882,16 +1055,99 @@ class _GitHubCreateIssueState extends State<GitHubCreateIssueDialog> {
   Widget build(BuildContext context) => PopScope(
     canPop: !sending,
     child: AlertDialog(
-      title: const Text('Create GitHub issue'),
+      title: Text(
+        widget.task == null ? 'Create GitHub issue' : 'Create on GitHub',
+      ),
       content: SizedBox(
-        width: 520,
+        width: 560,
         child: SingleChildScrollView(
           child: Column(
             mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
-              Text('Repository: ${widget.link['repository']['full_name']}'),
-              const SizedBox(height: 12),
+              if (links.isNotEmpty)
+                DropdownButtonFormField<String>(
+                  key: ValueKey(
+                    'publish-repository-${link?['repository']['id']}',
+                  ),
+                  initialValue: link == null
+                      ? null
+                      : "${link!['project_id']}:${link!['repository']['id']}",
+                  decoration: const InputDecoration(labelText: 'Repository'),
+                  items: [
+                    for (final entry in links)
+                      DropdownMenuItem(
+                        value:
+                            "${entry['project_id']}:${entry['repository']['id']}",
+                        child: Text(entry['repository']['full_name'] as String),
+                      ),
+                  ],
+                  onChanged: attempted || loading
+                      ? null
+                      : (id) {
+                          setState(
+                            () => link = links.firstWhere(
+                              (v) =>
+                                  "${v['project_id']}:${v['repository']['id']}" ==
+                                  id,
+                            ),
+                          );
+                          loadTypes();
+                        },
+                ),
+              TaskTypeSelector(
+                value: issueKind,
+                onChanged: attempted || loading
+                    ? null
+                    : (kind) {
+                        setState(() {
+                          if (body.text.isEmpty ||
+                              body.text == taskTemplates[issueKind]) {
+                            body.text = taskTemplates[kind]!;
+                          }
+                          issueKind = kind;
+                          issueType = canSetType
+                              ? (types
+                                        .where(
+                                          (v) =>
+                                              (v['name'] as String)
+                                                  .toLowerCase() ==
+                                              kind.toLowerCase(),
+                                        )
+                                        .firstOrNull?['name']
+                                    as String?)
+                              : null;
+                        });
+                      },
+              ),
+              if (canSetType || issueType != null)
+                DropdownButtonFormField<String>(
+                  key: ValueKey('publish-type-$issueType'),
+                  initialValue: issueType ?? '',
+                  decoration: const InputDecoration(labelText: 'GitHub type'),
+                  items: [
+                    const DropdownMenuItem(
+                      value: '',
+                      child: Text('No GitHub type'),
+                    ),
+                    for (final type in types)
+                      DropdownMenuItem(
+                        value: type['name'] as String,
+                        child: Text(type['name'] as String),
+                      ),
+                    if (issueType != null &&
+                        !types.any((v) => v['name'] == issueType))
+                      DropdownMenuItem(
+                        value: issueType,
+                        child: Text(issueType!),
+                      ),
+                  ],
+                  onChanged: attempted || loading
+                      ? null
+                      : (value) => setState(
+                          () => issueType = value == '' ? null : value,
+                        ),
+                ),
               TextField(
                 controller: title,
                 enabled: !attempted,
@@ -901,26 +1157,28 @@ class _GitHubCreateIssueState extends State<GitHubCreateIssueDialog> {
               TextField(
                 controller: body,
                 enabled: !attempted,
-                minLines: 4,
-                maxLines: 12,
+                minLines: 6,
+                maxLines: 14,
                 maxLength: 65536,
                 decoration: const InputDecoration(
-                  labelText: 'Issue description',
+                  labelText: 'Description (Markdown)',
                 ),
               ),
-              const Text(
-                'Create publishes this text to GitHub and adds the issue to Backlog. No agent will start.',
+              Text(
+                widget.task == null
+                    ? 'Publishes to GitHub and adds to Backlog. No agent will start.'
+                    : 'Publishes to GitHub and links this task. Board state and agent stay the same.',
               ),
-              if (sending) const LinearProgressIndicator(),
-              if (error != null) ...[
+              if (loading || sending) const LinearProgressIndicator(),
+              if (error != null)
                 Text(
                   error!,
                   style: TextStyle(color: Theme.of(context).colorScheme.error),
                 ),
+              if (attempted && error != null)
                 const Text(
-                  'If the result is uncertain, check GitHub before starting another creation. Retry keeps the same request identity.',
+                  'Retry uses the same publication. An uncertain result will not be sent twice.',
                 ),
-              ],
             ],
           ),
         ),
@@ -931,7 +1189,7 @@ class _GitHubCreateIssueState extends State<GitHubCreateIssueDialog> {
           child: const Text('Close'),
         ),
         FilledButton(
-          onPressed: sending ? null : create,
+          onPressed: sending || loading || link == null ? null : create,
           child: Text(attempted ? 'Retry same request' : 'Create issue'),
         ),
       ],
@@ -964,8 +1222,48 @@ class _GitHubInboxState extends State<GitHubInbox> {
   bool listLoaded = false;
   List<Map<String, dynamic>> links = [], issues = [];
   Map<String, dynamic>? link;
-  final selected = <int>{};
-  int? selectionAnchor;
+  final selected = <String>{};
+  String? selectionAnchor;
+  static final allRepositories = <String, dynamic>{
+    'all': true,
+    'repository': {'id': 0},
+  };
+  List<Map<String, dynamic>> get visibleLinks =>
+      link?['all'] == true ? links : [?link];
+  String sourceKey(Map v) => "${v['project_id']}:${v['repository']['id']}";
+  String issueKey(Map v) => "${sourceKey(v['_link'] as Map)}:${v['id']}";
+  String snapshotKey(Map v) => "${sourceKey(v)}:$filter";
+  final importRequests = <String, String>{};
+  void restoreVisible() {
+    final rows = <Map<String, dynamic>>[];
+    final admitted = <String, dynamic>{};
+    var loaded = false, more = false;
+    String? synced;
+    for (final source in visibleLinks) {
+      final saved = session.snapshots[snapshotKey(source)];
+      if (saved == null) continue;
+      loaded = true;
+      more |= saved['has_more'] == true;
+      synced = saved['last_synced_at']?.toString() ?? synced;
+      for (final raw in saved['issues'] as List) {
+        final row = <String, dynamic>{
+          ...Map<String, dynamic>.from(raw as Map),
+          '_link': source,
+        };
+        rows.add(row);
+        final task = (saved['imported'] as Map?)?['${row['id']}'];
+        if (task != null) admitted[issueKey(row)] = task;
+      }
+    }
+    setState(() {
+      issues = rows;
+      imported = admitted;
+      hasMore = more;
+      lastSync = synced;
+      listLoaded = loaded;
+    });
+  }
+
   bool confirmingImport = false;
   bool draggingIssues = false;
   bool skipImportConfirmation = false;
@@ -1017,21 +1315,21 @@ class _GitHubInboxState extends State<GitHubInbox> {
     }
   }
 
-  void selectIssue(int number) {
+  void selectIssue(String number) {
     final keys = HardwareKeyboard.instance;
     setState(() {
       importRequestId = null;
       if (keys.isShiftPressed && selectionAnchor != null) {
-        final start = issues.indexWhere((v) => v['number'] == selectionAnchor);
-        final end = issues.indexWhere((v) => v['number'] == number);
+        final start = issues.indexWhere((v) => issueKey(v) == selectionAnchor);
+        final end = issues.indexWhere((v) => issueKey(v) == number);
         if (start >= 0 && end >= 0) {
           for (
             var i = start < end ? start : end;
             i <= (start > end ? start : end);
             i++
           ) {
-            if (!imported.containsKey('${issues[i]['id']}')) {
-              selected.add(issues[i]['number'] as int);
+            if (!imported.containsKey(issueKey(issues[i]))) {
+              selected.add(issueKey(issues[i]));
             }
           }
         }
@@ -1056,14 +1354,7 @@ class _GitHubInboxState extends State<GitHubInbox> {
   void connectionChanged() {
     if (mounted && checkedConnection && session.status != null) {
       applyConnection(session.status!);
-      final saved = session.snapshots[query];
-      if (saved != null) {
-        setState(
-          () => imported = Map<String, dynamic>.from(
-            saved['imported'] as Map? ?? {},
-          ),
-        );
-      }
+      restoreVisible();
     }
   }
 
@@ -1156,9 +1447,9 @@ class _GitHubInboxState extends State<GitHubInbox> {
       if (available.isNotEmpty) {
         filter = session.selections[scope]?['filter'] as String? ?? filter;
         await chooseLink(available.first);
-      } else if (links.length == 1) {
-        await chooseLink(links.single);
-      } else if (link != null) {
+      } else if (links.isNotEmpty) {
+        await chooseLink(links.length == 1 ? links.single : allRepositories);
+      } else {
         setState(() {
           link = null;
           issues = [];
@@ -1178,6 +1469,7 @@ class _GitHubInboxState extends State<GitHubInbox> {
   Future<void> linkRepository() async {
     final linked = await showDialog<bool>(
       context: context,
+      barrierDismissible: false,
       builder: (context) {
         privateDialogContext = context;
         return GitHubRepositoryPicker(
@@ -1204,12 +1496,8 @@ class _GitHubInboxState extends State<GitHubInbox> {
       error = null;
     });
     session.selections[scope] = {'link': next, 'filter': filter};
-    final saved = session.snapshots[query];
-    if (saved != null) {
-      restoreList(saved);
-    } else {
-      await fetch();
-    }
+    restoreVisible();
+    if (!listLoaded) await fetch();
   }
 
   Future<void> openConnection() async {
@@ -1220,90 +1508,93 @@ class _GitHubInboxState extends State<GitHubInbox> {
     if (mounted) await checkConnection();
   }
 
-  void restoreList(Map<String, dynamic> result) {
-    setState(() {
-      issues = List<Map<String, dynamic>>.from(result['issues'] as List);
-      imported = Map<String, dynamic>.from(result['imported'] as Map? ?? {});
-      page = result['page'] as int? ?? 1;
-      hasMore = result['has_more'] == true;
-      lastSync = result['last_synced_at']?.toString();
-      listLoaded = true;
-    });
-  }
-
   Future<void> fetch({bool more = false, bool force = false}) async {
-    final current = link;
-    if (current == null || busy) return;
-    final nextPage = more ? page + 1 : 1;
-    final operation = {
-      'Issues': {
-        'project_id': current['project_id'],
-        'repository_id': current['repository']['id'],
-        'state': filter,
-        'page': nextPage,
-      },
-    };
-    if (!force && !more && !session.reads.containsKey(jsonEncode(operation))) {
-      if (session.initialIssuesClaimed) return;
+    if (link == null || busy) return;
+    Completer<void>? initial;
+    if (!force && !more) {
+      if (session.initialIssuesClaimed) {
+        await session.initialRead;
+        if (mounted) restoreVisible();
+        return;
+      }
       session.initialIssuesClaimed = true;
+      initial = Completer<void>();
+      session.initialRead = initial.future;
     }
-    final queryKey = query;
     final epoch = session.epoch;
     final generation = requestGeneration;
+    final sources = List<Map<String, dynamic>>.from(visibleLinks);
+    final requestedFilter = filter;
     setState(() {
       busy = true;
-      readProgress = null;
       error = null;
+      readProgress = null;
     });
-    try {
-      final result = await session.read(
-        operation,
-        widget.request,
-        force: force,
-      );
-      if (epoch != session.epoch) return;
-      final prior = more
-          ? (session.snapshots[queryKey]?['issues'] as List? ?? [])
-          : [];
-      final rows = (result['issues'] as List).map(
-        (v) => Map<String, dynamic>.from(v as Map),
-      );
-      final byId = {
-        for (final i in [...prior, ...rows]) i['id']: i,
-      };
-      final snapshot = <String, dynamic>{
-        ...result,
-        'issues': byId.values
-            .map((v) => Map<String, dynamic>.from(v as Map))
-            .toList(),
-        'page': nextPage,
-      };
-      session.snapshots[queryKey] = snapshot;
-      if (!mounted || generation != requestGeneration) return;
+    final failures = <String>[];
+    for (final source in sources) {
+      if (generation != requestGeneration || epoch != session.epoch) {
+        break;
+      }
+      final key = "${sourceKey(source)}:$requestedFilter";
+      final prior = session.snapshots[key];
+      if (more && prior?['has_more'] != true) continue;
+      final nextPage = more ? (prior?['page'] as int? ?? 0) + 1 : 1;
+      try {
+        final result = await session.read(
+          {
+            'Issues': {
+              'project_id': source['project_id'],
+              'repository_id': source['repository']['id'],
+              'state': requestedFilter,
+              'page': nextPage,
+            },
+          },
+          widget.request,
+          force: force,
+        );
+        if (epoch != session.epoch || generation != requestGeneration) break;
+        final byId = <dynamic, dynamic>{
+          for (final row in [
+            ...(more ? (prior?['issues'] as List? ?? []) : []),
+            ...result['issues'] as List,
+          ])
+            row['id']: row,
+        };
+        session.snapshots[key] = {
+          ...result,
+          'issues': byId.values
+              .map((v) => Map<String, dynamic>.from(v as Map))
+              .toList(),
+          'page': nextPage,
+          'imported': {
+            ...(more ? (prior?['imported'] as Map? ?? {}) : {}),
+            ...result['imported'] as Map? ?? {},
+          },
+        };
+      } on Object catch (e) {
+        failures.add("${source['repository']['full_name']}: $e");
+      }
+    }
+    initial?.complete();
+    if (mounted && generation == requestGeneration) {
+      restoreVisible();
       setState(() {
+        busy = false;
         if (!more) {
-          issues = [];
           selected.clear();
           selectionAnchor = null;
         }
+        if (failures.isNotEmpty) {
+          error =
+              'Some repositories could not refresh. Their displayed issues may be stale.\n${failures.join('\n')}';
+        }
       });
-      restoreList(snapshot);
-    } on Object catch (e) {
-      if (mounted && generation == requestGeneration) {
-        setState(
-          () => error = 'Could not refresh. Displayed issues may be stale. $e',
-        );
-      }
-    } finally {
-      if (mounted && generation == requestGeneration) {
-        setState(() => busy = false);
-      }
     }
   }
 
   Future<void> importIssues(
     Map<String, dynamic> current,
-    List<int> numbers,
+    List<Map<String, dynamic>> rows,
     int generation,
   ) async {
     if (!mounted ||
@@ -1312,8 +1603,8 @@ class _GitHubInboxState extends State<GitHubInbox> {
         confirmingImport ||
         !connected ||
         link != current ||
-        numbers.isEmpty ||
-        numbers.length > 50) {
+        rows.isEmpty ||
+        rows.length > 50) {
       return;
     }
     confirmingImport = true;
@@ -1330,7 +1621,7 @@ class _GitHubInboxState extends State<GitHubInbox> {
                   builder: (context, update) => AlertDialog(
                     constraints: const BoxConstraints(maxWidth: 400),
                     title: Text(
-                      'Add ${numbers.length == 1 ? 'issue' : '${numbers.length} issues'} to Backlog?',
+                      'Add ${rows.length == 1 ? 'issue' : '${rows.length} issues'} to Backlog?',
                     ),
                     content: SizedBox(
                       width: 320,
@@ -1399,26 +1690,53 @@ class _GitHubInboxState extends State<GitHubInbox> {
         link != current) {
       return;
     }
-    importRequestId ??= TaskBoardController.newRequestId();
     setState(() {
       busy = true;
       readProgress = 'Preparing import…';
       error = null;
     });
     try {
-      await githubRequest(widget.request, {
-        'Import': {
-          'project_id': current['project_id'],
-          'repository_id': current['repository']['id'],
-          'numbers': numbers,
-          'request_id': importRequestId,
-        },
-      });
+      final groups = <String, List<Map<String, dynamic>>>{};
+      for (final row in rows) {
+        if (!imported.containsKey(issueKey(row))) {
+          groups.putIfAbsent(sourceKey(row['_link'] as Map), () => []).add(row);
+        }
+      }
+      final failures = <String>[];
+      for (final group in groups.values) {
+        if (!mounted || generation != requestGeneration || !connected) return;
+        final source = group.first['_link'] as Map;
+        final numbers = group.map((v) => v['number'] as int).toList()..sort();
+        final identity = '${sourceKey(source)}:${numbers.join(',')}';
+        final requestId = importRequests.putIfAbsent(
+          identity,
+          TaskBoardController.newRequestId,
+        );
+        try {
+          await githubRequest(widget.request, {
+            'Import': {
+              'project_id': source['project_id'],
+              'repository_id': source['repository']['id'],
+              'numbers': numbers,
+              'request_id': requestId,
+            },
+          });
+          if (!mounted || generation != requestGeneration) return;
+          setState(() {
+            for (final row in group) {
+              selected.remove(issueKey(row));
+            }
+          });
+          importRequests.remove(identity);
+        } on Object catch (e) {
+          failures.add("${source['repository']['full_name']}: $e");
+        }
+      }
       await widget.onImported();
       if (mounted && generation == requestGeneration) {
+        restoreVisible();
         setState(() {
-          selected.clear();
-          importRequestId = null;
+          error = failures.isEmpty ? null : failures.join('\n');
           busy = false;
         });
       }
@@ -1507,7 +1825,11 @@ class _GitHubInboxState extends State<GitHubInbox> {
       barrierDismissible: false,
       builder: (context) {
         privateDialogContext = context;
-        return GitHubCreateIssueDialog(request: widget.request, link: current);
+        return GitHubCreateIssueDialog(
+          request: widget.request,
+          link: current['all'] == true ? null : current,
+          repositoryLinks: links,
+        );
       },
     );
     privateDialogContext = null;
@@ -1526,11 +1848,14 @@ class _GitHubInboxState extends State<GitHubInbox> {
 
   Widget issueCard(Map<String, dynamic> issue) {
     final number = issue['number'] as int;
-    final alreadyImported = imported.containsKey('${issue['id']}');
+    final identity = issueKey(issue);
+    final alreadyImported = imported.containsKey(identity);
     final current = link!;
     final generation = requestGeneration;
-    final numbers = List<int>.unmodifiable(
-      selected.contains(number) ? selected : [number],
+    final numbers = List<Map<String, dynamic>>.unmodifiable(
+      selected.contains(identity)
+          ? issues.where((v) => selected.contains(issueKey(v)))
+          : [issue],
     );
     final drag = GitHubIssueDrag(
       count: numbers.length,
@@ -1548,12 +1873,12 @@ class _GitHubInboxState extends State<GitHubInbox> {
       duration: const Duration(milliseconds: 140),
       margin: const EdgeInsets.only(bottom: 8),
       decoration: BoxDecoration(
-        color: selected.contains(number)
+        color: selected.contains(identity)
             ? Theme.of(context).colorScheme.primary.withValues(alpha: .08)
             : Theme.of(context).colorScheme.surface,
         borderRadius: BorderRadius.circular(10),
         border: Border.all(
-          color: selected.contains(number)
+          color: selected.contains(identity)
               ? Theme.of(context).colorScheme.primary
               : Theme.of(context).dividerColor,
         ),
@@ -1562,7 +1887,7 @@ class _GitHubInboxState extends State<GitHubInbox> {
         borderRadius: BorderRadius.circular(10),
         onTap: busy || alreadyImported || ghost
             ? null
-            : () => selectIssue(number),
+            : () => selectIssue(identity),
         child: Padding(
           padding: const EdgeInsets.fromLTRB(12, 10, 4, 10),
           child: Row(
@@ -1578,7 +1903,7 @@ class _GitHubInboxState extends State<GitHubInbox> {
                     ),
                     const SizedBox(height: 4),
                     Text(
-                      '#$number · ${issue['state']}${alreadyImported ? ' · In board' : ''}',
+                      '${(issue['_link'] as Map)['repository']['full_name']} #$number · ${issue['state']}${issue['type']?['name'] == null ? '' : ' · ${issue['type']['name']}'}${alreadyImported ? ' · In board' : ''}',
                       style: Theme.of(context).textTheme.bodySmall,
                     ),
                   ],
@@ -1595,9 +1920,7 @@ class _GitHubInboxState extends State<GitHubInbox> {
                   icon: const Icon(Icons.open_in_new, size: 16),
                   onPressed: ghost
                       ? null
-                      : () => widget.onOpenTask!(
-                          imported['${issue['id']}'] as String,
-                        ),
+                      : () => widget.onOpenTask!(imported[identity] as String),
                 ),
             ],
           ),
@@ -1605,7 +1928,9 @@ class _GitHubInboxState extends State<GitHubInbox> {
       ),
     );
     return Draggable<GitHubIssueDrag>(
-      key: ValueKey('github-issue-$number'),
+      key: ValueKey(
+        links.length == 1 ? 'github-issue-$number' : 'github-issue-$identity',
+      ),
       data: drag,
       maxSimultaneousDrags:
           busy || confirmingImport || alreadyImported || numbers.length > 50
@@ -1614,11 +1939,11 @@ class _GitHubInboxState extends State<GitHubInbox> {
       onDragStarted: () {
         setState(() {
           draggingIssues = true;
-          if (!selected.contains(number)) {
+          if (!selected.contains(identity)) {
             selected
               ..clear()
-              ..add(number);
-            selectionAnchor = number;
+              ..add(identity);
+            selectionAnchor = identity;
             importRequestId = null;
           }
         });
@@ -1664,7 +1989,7 @@ class _GitHubInboxState extends State<GitHubInbox> {
         return GitHubIssueDetail(
           request: widget.request,
           issue: issue,
-          link: link!,
+          link: issue['_link'] as Map<String, dynamic>,
         );
       },
     );
@@ -1746,11 +2071,17 @@ class _GitHubInboxState extends State<GitHubInbox> {
             DropdownButtonHideUnderline(
               child: DropdownButton<String>(
                 isExpanded: true,
-                value: link == null
+                value: link?['all'] == true
+                    ? 'all'
+                    : link == null
                     ? null
                     : '${link!['project_id']}:${link!['repository']['id']}',
                 hint: const Text('Choose repository'),
                 items: [
+                  const DropdownMenuItem(
+                    value: 'all',
+                    child: Text('All linked repositories'),
+                  ),
                   for (final v in links)
                     DropdownMenuItem(
                       value: '${v['project_id']}:${v['repository']['id']}',
@@ -1763,11 +2094,13 @@ class _GitHubInboxState extends State<GitHubInbox> {
                 onChanged: busy
                     ? null
                     : (id) => chooseLink(
-                        links.firstWhere(
-                          (v) =>
-                              '${v['project_id']}:${v['repository']['id']}' ==
-                              id,
-                        ),
+                        id == 'all'
+                            ? allRepositories
+                            : links.firstWhere(
+                                (v) =>
+                                    '${v['project_id']}:${v['repository']['id']}' ==
+                                    id,
+                              ),
                       ),
               ),
             ),

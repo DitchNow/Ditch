@@ -48,6 +48,7 @@ for line in sys.stdin:
         let mut task = Task::new(
             project.id,
             TaskDraft {
+                issue_kind: Default::default(),
                 skills: vec![],
                 title: "Check work".into(),
                 description: "Fixture".into(),

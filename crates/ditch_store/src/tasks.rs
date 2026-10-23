@@ -468,6 +468,7 @@ mod tests {
         let task = Task::new(
             project.id,
             TaskDraft {
+                issue_kind: Default::default(),
                 skills: vec![],
                 title: "Atomic".into(),
                 description: String::new(),
@@ -520,6 +521,7 @@ mod hardening_tests {
                 let task = Task::new(
                     project.id,
                     TaskDraft {
+                        issue_kind: Default::default(),
                         title: format!("Task {n}"),
                         description: "Keep".into(),
                         acceptance_criteria: vec![],

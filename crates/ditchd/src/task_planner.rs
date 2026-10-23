@@ -16,6 +16,7 @@ pub fn generate(
     model: Option<&str>,
     title: &str,
     description: &str,
+    context: &Value,
     active: impl Fn() -> bool,
 ) -> io::Result<String> {
     let mut client = Client::open(binary, root, home, None)?;
@@ -59,7 +60,7 @@ pub fn generate(
         return Err(io::Error::other("Planning canceled"));
     }
     client.send(&json!({"id": "ditch:plan", "method": "turn/start", "params": {
-        "threadId": id, "input": [{"type": "text", "text": format!("{INSTRUCTIONS}\n\nTask requirements (JSON):\n{}", json!({"title":title,"description":description}))}],
+        "threadId": id, "input": [{"type": "text", "text": format!("{INSTRUCTIONS}\n\nTask requirements (JSON):\n{}", json!({"title":title,"description":description,"source_context":context}))}],
         "approvalPolicy": "never", "sandboxPolicy": {"type": "readOnly"},
         "outputSchema": {"type": "object", "properties": {"plan": {"type": "string"}}, "required": ["plan"], "additionalProperties": false}
     }}))?;

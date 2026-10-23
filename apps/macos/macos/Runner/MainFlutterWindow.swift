@@ -9,7 +9,8 @@ class MainFlutterWindow: NSWindow {
     self.setFrame(windowFrame, display: true)
     self.titleVisibility = .hidden
     self.titlebarAppearsTransparent = true
-    self.styleMask.insert(.fullSizeContentView)
+    // Leave title-bar gestures with AppKit (including the system double-click action).
+    self.styleMask.remove(.fullSizeContentView)
     self.isMovableByWindowBackground = false
     self.minSize = NSSize(width: 860, height: 620)
     self.backgroundColor = .windowBackgroundColor
@@ -27,6 +28,16 @@ class MainFlutterWindow: NSWindow {
     (NSApp.delegate as? AppDelegate)?.configureProjectPickerChannel(messenger: registrar.messenger)
 
     super.awakeFromNib()
+
+    // AppKit owns persistence and display constraints; bundle identity isolates staging.
+    let frameName = NSWindow.FrameAutosaveName(
+      "\(Bundle.main.bundleIdentifier ?? "Ditch").mainWindow")
+    if !self.setFrameUsingName(frameName) {
+      self.setContentSize(NSSize(width: 1280, height: 820))
+      self.setFrame(self.constrainFrameRect(self.frame, to: self.screen), display: false)
+      self.center()
+    }
+    self.setFrameAutosaveName(frameName)
 
     // Keep the native window identity aligned with the bundle's visible name.
     // AppKit may otherwise retain the nib or restored-state title across a

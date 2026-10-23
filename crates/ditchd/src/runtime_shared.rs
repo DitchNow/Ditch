@@ -480,6 +480,7 @@ impl RuntimeState {
             format!("edition_{RUNTIME_EDITION}"),
             "tasks_v1".to_owned(),
             "task_planning_v1".to_owned(),
+            "github_task_metadata_v1".to_owned(),
             "board_queue_v1".to_owned(),
             "board_agent_resume_v1".to_owned(),
             "board_execution_v1".to_owned(),

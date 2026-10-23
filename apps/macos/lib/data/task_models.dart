@@ -28,6 +28,7 @@ enum TaskColumn {
 @immutable
 class TaskDto {
   const TaskDto({
+    this.issueKind = 'Custom',
     required this.id,
     required this.projectId,
     required this.title,
@@ -87,6 +88,7 @@ class TaskDto {
       skills: (json['skills'] as List? ?? [])
           .map((s) => Map<String, dynamic>.from(s as Map))
           .toList(),
+      issueKind: json['issue_kind'] as String? ?? 'Custom',
       id: requiredString('id'),
       projectId: requiredString('project_id'),
       title: requiredString('title'),
@@ -107,6 +109,7 @@ class TaskDto {
       summary: json['review_summary'] as String?,
     );
   }
+  final String issueKind;
   final String id, projectId, title, description, state, condition, priority;
   final List<String> criteria;
   final List<Map<String, dynamic>> skills;

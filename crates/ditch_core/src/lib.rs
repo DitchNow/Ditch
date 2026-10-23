@@ -224,6 +224,8 @@ impl Project {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Task {
     #[serde(default)]
+    pub issue_kind: TaskIssueKind,
+    #[serde(default)]
     pub execution_queue: Option<TaskExecutionQueue>,
     #[serde(default)]
     pub planning: TaskPlanning,

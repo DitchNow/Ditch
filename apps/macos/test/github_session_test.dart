@@ -143,9 +143,21 @@ void main() {
       await tester.pumpAndSettle();
       expect(f.issueReads, 1);
       expect(find.text('Issue 1'), findsNothing);
-      await tester.tap(find.widgetWithText(OutlinedButton, 'GitHub'));
+      final githubToggle = find.byKey(const ValueKey('board-github-toggle'));
+      expect(
+        find.descendant(of: githubToggle, matching: find.byType(Text)),
+        findsNothing,
+      );
+      expect(tester.widget<IconButton>(githubToggle).isSelected, isFalse);
+      await tester.tap(find.byTooltip('GitHub'));
       await tester.pumpAndSettle();
       expect(find.text('Issue 1'), findsOneWidget);
+      expect(tester.widget<IconButton>(githubToggle).isSelected, isTrue);
+      expect(f.issueReads, 1);
+      await tester.tap(find.byTooltip('GitHub'));
+      await tester.pumpAndSettle();
+      expect(find.text('Issue 1'), findsNothing);
+      expect(tester.widget<IconButton>(githubToggle).isSelected, isFalse);
       expect(f.issueReads, 1);
       await tester.pumpWidget(const SizedBox());
       controller.dispose();

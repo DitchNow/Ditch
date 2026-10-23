@@ -56,6 +56,7 @@ for line in sys.stdin:
             &project,
             TaskOperation::CreateBacklog {
                 draft: ditch_core::TaskDraft {
+                    issue_kind: Default::default(),
                     skills: vec![],
                     title: "Plan this task".into(),
                     description: "Original requirement".into(),

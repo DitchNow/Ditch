@@ -173,6 +173,7 @@ pub(super) fn handle(
             let value = request(&state, json!({"operation":"status"}))?;
             save_status(&state, value, None)
         }
+        GitHubRequest::Publication { task_id } => publishing::status(&state, task_id),
         GitHubRequest::RemoteSuggestions { project_id } => remote_suggestions(&state, project_id),
         request_op => {
             let _operation = OPERATION
@@ -187,6 +188,7 @@ pub(super) fn handle(
             }
             let project = match &request_op {
                 GitHubRequest::Link { project_id, .. }
+                | GitHubRequest::IssueTypes { project_id, .. }
                 | GitHubRequest::Issues { project_id, .. }
                 | GitHubRequest::Import { project_id, .. }
                 | GitHubRequest::Comments { project_id, .. }
@@ -325,8 +327,13 @@ impl GitHubService for AppService {
         request_id: &str,
         title: &str,
         body: &str,
+        issue_type: Option<&str>,
+        task_id: Option<TaskId>,
     ) -> Result<Value, String> {
-        self.send(json!({"operation":"create","project_id":project,"repository_id":repository,"request_id":request_id,"title":title,"body":body}))
+        self.send(json!({"operation":"create","project_id":project,"repository_id":repository,"request_id":request_id,"title":title,"body":body,"issue_type":issue_type,"task_id":task_id}))
+    }
+    fn issue_types(&self, project: ProjectId, repository: u64) -> Result<Value, String> {
+        self.send(json!({"operation":"types","project_id":project,"repository_id":repository}))
     }
     fn get(&self, path: &str) -> Result<Value, String> {
         let (path, query) = path.split_once('?').unwrap_or((path, ""));
@@ -395,50 +402,25 @@ impl GitHubService for AppService {
         Err("Unsupported GitHub App operation".into())
     }
 }
-fn remote_suggestions(
+pub(super) fn remote_suggestions(
     state: &Arc<Mutex<RuntimeState>>,
     project: ProjectId,
 ) -> Result<Value, String> {
     check_registered(state, project)?;
-    let root = {
-        let s = state.lock().unwrap();
-        let p = s
-            .projects
-            .values()
-            .find(|p| p.id == project)
-            .ok_or("Project missing")?;
-        if p.is_remote() {
-            return Ok(json!({"repositories":[]}));
+    let response = handle_task_request(
+        state.clone(),
+        ditch_core::TaskRequest {
+            project_id: Some(project),
+            request_id: Uuid::new_v4(),
+            operation: ditch_core::TaskOperation::RepositoryDiscovery,
+        },
+    );
+    match response {
+        ServerResponse::TaskResponse(ditch_core::TaskResponse::RepositoryDiscovery(value)) => {
+            Ok(value)
         }
-        p.root.clone()
-    };
-    // Reading configuration does not execute hooks, credential helpers, or contact a remote.
-    let mut command = Command::new("/usr/bin/git");
-    command
-        .env_clear()
-        .env("PATH", "/usr/bin:/bin")
-        .current_dir(&root)
-        .args(["config", "--local", "--get-regexp", "^remote\\..*\\.url$"]);
-    let cancel = AtomicBool::new(false);
-    let raw = match bounded_output_cancel(command, 5, 65536, &cancel) {
-        Ok(v) => v,
-        Err(_) => return Ok(json!({"repositories":[]})),
-    };
-    let mut names = HashSet::new();
-    for line in String::from_utf8_lossy(&raw).lines() {
-        if let Some((_, url)) = line.split_once(' ') {
-            if (url.starts_with("https://github.com/")
-                || url.starts_with("git@github.com:")
-                || url.starts_with("ssh://git@github.com/"))
-                && let Ok(name) = repository_name(url)
-            {
-                names.insert(name);
-            }
-        }
+        _ => Err("Repository discovery is unavailable; update the project's runtime.".into()),
     }
-    let mut names: Vec<_> = names.into_iter().collect();
-    names.sort();
-    Ok(json!({"repositories":names}))
 }
 
 #[cfg(test)]
@@ -492,8 +474,8 @@ mod tests {
         runtime.projects.insert(project.root_key(), project.clone());
         let state = Arc::new(Mutex::new(runtime));
         assert_eq!(
-            remote_suggestions(&state, project.id).unwrap(),
-            json!({"repositories":["owner/repository"]})
+            remote_suggestions(&state, project.id).unwrap()["repositories"],
+            json!(["owner/repository"])
         );
         assert_eq!(
             fs::read_to_string(project.root.join(".git/config")).unwrap(),

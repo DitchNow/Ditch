@@ -9,6 +9,9 @@ import 'application/task_board_controller.dart';
 import 'data/task_models.dart';
 
 import 'data/session_title.dart';
+import 'data/task_templates.dart';
+import 'widgets/task_type_selector.dart';
+import 'widgets/github_mark.dart';
 import 'design_system/ditch_theme.dart';
 
 const projectWriteDisclosure =
@@ -434,21 +437,18 @@ class _TaskBoardState extends State<TaskBoard> {
                             ),
                           ),
                         ),
-                      OutlinedButton.icon(
+                      IconButton.outlined(
+                        key: const ValueKey('board-github-toggle'),
+                        tooltip: 'GitHub',
+                        isSelected: showGithub,
                         onPressed: () =>
                             setState(() => showGithub = !showGithub),
                         style: showGithub
-                            ? OutlinedButton.styleFrom(
+                            ? IconButton.styleFrom(
                                 backgroundColor: context.ditch.surfaceSoft,
                               )
                             : null,
-                        icon: Icon(
-                          showGithub
-                              ? Icons.view_sidebar
-                              : Icons.view_sidebar_outlined,
-                          size: 18,
-                        ),
-                        label: const Text('GitHub'),
+                        icon: const GitHubMark(),
                       ),
                       if (showUnfinishedFeatureControls &&
                           widget.onRunSelected != null &&
@@ -1096,6 +1096,10 @@ class TaskCard extends StatelessWidget {
                       style: Theme.of(context).textTheme.titleSmall,
                     ),
                   ),
+                  Text(
+                    task.issueKind,
+                    style: Theme.of(context).textTheme.labelSmall,
+                  ),
                   if (task.githubSource case final Map source)
                     Tooltip(
                       message:
@@ -1361,7 +1365,7 @@ class _TaskEditorState extends State<_TaskEditor> {
   final form = GlobalKey<FormState>();
   late final title = TextEditingController(text: widget.task?.title);
   late final description = TextEditingController(
-    text: widget.task?.description,
+    text: widget.task?.description ?? taskTemplates['Custom'],
   );
   late final criteria = TextEditingController(
     text: widget.task?.criteria.join('\n'),
@@ -1371,6 +1375,7 @@ class _TaskEditorState extends State<_TaskEditor> {
       widget.projectId ??
       widget.projects.firstOrNull?.id;
   late String priority = widget.task?.priority ?? 'Normal';
+  late String issueKind = widget.task?.issueKind ?? 'Custom';
   late List<Map<String, dynamic>> skills = widget.task?.skills ?? [];
   Future<void> selectSkills() async {
     if (projectId == null) return;
@@ -1394,6 +1399,7 @@ class _TaskEditorState extends State<_TaskEditor> {
   Future<void> save() async {
     if (!form.currentState!.validate() || projectId == null) return;
     final draft = {
+      'issue_kind': issueKind,
       'skills': skills,
       'title': title.text.trim(),
       'description': description.text,
@@ -1456,6 +1462,16 @@ class _TaskEditorState extends State<_TaskEditor> {
                           projectId = id;
                           skills = [];
                         }),
+                ),
+                TaskTypeSelector(
+                  value: issueKind,
+                  onChanged: (kind) => setState(() {
+                    if (description.text.isEmpty ||
+                        description.text == taskTemplates[issueKind]) {
+                      description.text = taskTemplates[kind]!;
+                    }
+                    issueKind = kind;
+                  }),
                 ),
                 TextFormField(
                   controller: title,
@@ -1555,6 +1571,7 @@ class _TaskInspector extends StatefulWidget {
 
 class _TaskInspectorState extends State<_TaskInspector> {
   final feedback = TextEditingController();
+  final modalScroll = ScrollController();
   late final TextEditingController description;
   late final TextEditingController plan;
   late String savedDescription, savedPlan;
@@ -1625,6 +1642,7 @@ class _TaskInspectorState extends State<_TaskInspector> {
   void dispose() {
     widget.controller.removeListener(onTaskChanged);
     feedback.dispose();
+    modalScroll.dispose();
     description.dispose();
     plan.dispose();
     super.dispose();
@@ -1660,6 +1678,30 @@ class _TaskInspectorState extends State<_TaskInspector> {
   Future<void> close() async {
     if (await saveDescription() && mounted) Navigator.pop(context);
   }
+
+  Future<void> goToAgent() async {
+    if (!await saveDescription() || !mounted) return;
+    final id = widget.controller.task(widget.taskId)?.selectedAgentId;
+    if (id == null || !widget.controller.agents.containsKey(id)) return;
+    Navigator.pop(context);
+    widget.onOpenAgent(id);
+  }
+
+  Widget handoffTextScroll(TextField field) =>
+      NotificationListener<OverscrollNotification>(
+        onNotification: (notification) {
+          // Wheel events already bubble at a boundary via Flutter's pointer
+          // signal resolver. A trackpad pan keeps its original gesture owner;
+          // pass only the overflow reported by Flutter to the modal instead.
+          if (notification.depth == 0 &&
+              notification.metrics.axis == Axis.vertical &&
+              modalScroll.hasClients) {
+            modalScroll.position.pointerScroll(notification.overscroll);
+          }
+          return false;
+        },
+        child: field,
+      );
 
   Future<void> openGitHubTaskSource(Map source) async {
     final uri = Uri.tryParse(source['url'] as String? ?? '');
@@ -1790,7 +1832,14 @@ class _TaskInspectorState extends State<_TaskInspector> {
     if (task.column != TaskColumn.todo || task.archived) {
       return ListTile(
         contentPadding: EdgeInsets.zero,
-        leading: const Icon(Icons.lock_outline, size: 18),
+        leading: task.column == TaskColumn.inProgress && agent != null
+            ? IconButton.filledTonal(
+                key: const ValueKey('task-go-to-agent'),
+                tooltip: 'Go to agent',
+                onPressed: saving ? null : goToAgent,
+                icon: const Icon(Icons.chat_bubble_outline, size: 20),
+              )
+            : const Icon(Icons.lock_outline, size: 18),
         title: Text(
           selected == null
               ? 'New agent when this task starts'
@@ -2038,6 +2087,7 @@ class _TaskInspectorState extends State<_TaskInspector> {
           content: SizedBox(
             width: 680,
             child: SingleChildScrollView(
+              controller: modalScroll,
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 mainAxisSize: MainAxisSize.min,
@@ -2063,21 +2113,56 @@ class _TaskInspectorState extends State<_TaskInspector> {
                       ],
                     ],
                   ),
+                  Padding(
+                    padding: const EdgeInsets.only(top: 8),
+                    child: Text(
+                      task.issueKind,
+                      style: Theme.of(context).textTheme.labelSmall,
+                    ),
+                  ),
+                  if (showGitHubBoardControls && task.githubSource == null)
+                    Align(
+                      alignment: Alignment.centerLeft,
+                      child: TextButton.icon(
+                        onPressed: saving
+                            ? null
+                            : () async {
+                                if (!await saveDescription() ||
+                                    !context.mounted) {
+                                  return;
+                                }
+                                await showDialog<bool>(
+                                  context: context,
+                                  barrierDismissible: false,
+                                  builder: (_) => GitHubCreateIssueDialog(
+                                    request: c.request,
+                                    task: c.task(task.id),
+                                  ),
+                                );
+                                await c.refresh();
+                              },
+                        icon: const Icon(Icons.add_link, size: 18),
+                        label: const Text('Create on GitHub…'),
+                      ),
+                    ),
                   if (task.coordinatorGroup == null &&
                       task.column != TaskColumn.backlog)
                     agentAssignment(task, disabled),
                   const SizedBox(height: 16),
-                  TextField(
-                    key: const ValueKey('task-description'),
-                    controller: description,
-                    readOnly: !editable,
-                    minLines: 7,
-                    maxLines: 14,
-                    onChanged: (_) => setState(() {}),
-                    decoration: const InputDecoration(
-                      labelText: 'Description',
-                      alignLabelWithHint: true,
-                      hintText: 'What needs to be done?',
+                  handoffTextScroll(
+                    TextField(
+                      key: const ValueKey('task-description'),
+                      controller: description,
+                      scrollPhysics: const ClampingScrollPhysics(),
+                      readOnly: !editable,
+                      minLines: 7,
+                      maxLines: 14,
+                      onChanged: (_) => setState(() {}),
+                      decoration: const InputDecoration(
+                        labelText: 'Description',
+                        alignLabelWithHint: true,
+                        hintText: 'What needs to be done?',
+                      ),
                     ),
                   ),
                   const SizedBox(height: 12),
@@ -2132,16 +2217,19 @@ class _TaskInspectorState extends State<_TaskInspector> {
                     ),
                   if (plan.text.isNotEmpty || savedPlan.isNotEmpty) ...[
                     const SizedBox(height: 16),
-                    TextField(
-                      key: const ValueKey('task-plan'),
-                      controller: plan,
-                      readOnly: !editable,
-                      minLines: 8,
-                      maxLines: 18,
-                      onChanged: (_) => setState(() {}),
-                      decoration: const InputDecoration(
-                        labelText: 'Implementation plan',
-                        alignLabelWithHint: true,
+                    handoffTextScroll(
+                      TextField(
+                        key: const ValueKey('task-plan'),
+                        controller: plan,
+                        scrollPhysics: const ClampingScrollPhysics(),
+                        readOnly: !editable,
+                        minLines: 8,
+                        maxLines: 18,
+                        onChanged: (_) => setState(() {}),
+                        decoration: const InputDecoration(
+                          labelText: 'Implementation plan',
+                          alignLabelWithHint: true,
+                        ),
                       ),
                     ),
                   ],
@@ -2245,15 +2333,9 @@ class _TaskInspectorState extends State<_TaskInspector> {
                             'SSH execution uses interactive approvals. Project-root confinement is not currently enforced; approved commands run with the SSH account’s access.',
                           ),
                         ),
-                      if (agent != null)
+                      if (agent != null && task.column != TaskColumn.inProgress)
                         TextButton.icon(
-                          onPressed: () async {
-                            if (!await saveDescription() || !context.mounted) {
-                              return;
-                            }
-                            Navigator.pop(context);
-                            widget.onOpenAgent(task.selectedAgentId!);
-                          },
+                          onPressed: saving ? null : goToAgent,
                           icon: const Icon(Icons.chat_bubble_outline),
                           label: Text(
                             sessionDisplayName(

@@ -94,11 +94,21 @@ pub enum TaskAction {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TaskDraft {
     #[serde(default)]
+    pub issue_kind: TaskIssueKind,
+    #[serde(default)]
     pub skills: Vec<crate::SkillBinding>,
     pub title: String,
     pub description: String,
     pub acceptance_criteria: Vec<String>,
     pub priority: TaskPriority,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub enum TaskIssueKind {
+    Bug,
+    Feature,
+    #[default]
+    Custom,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -132,6 +142,12 @@ pub struct TaskRequest {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum TaskOperation {
+    RepositoryDiscovery,
+    AttachGitHub {
+        task_id: TaskId,
+        source: crate::github::GitHubTaskSource,
+        issue: crate::github::GitHubIssue,
+    },
     BoardExecution {
         paused: Option<bool>,
         expected_revision: Option<u64>,
@@ -255,6 +271,7 @@ pub enum TaskOperation {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum TaskResponse {
+    RepositoryDiscovery(serde_json::Value),
     BoardExecution(BoardExecutionState),
     BoardProjects(Vec<ProjectId>),
     Diff { text: String },
@@ -332,6 +349,7 @@ impl Task {
         draft.validate()?;
         let now = Utc::now();
         Ok(Self {
+            issue_kind: draft.issue_kind,
             execution_queue: None,
             planning: TaskPlanning::default(),
             remote_pending: false,
@@ -555,6 +573,7 @@ mod tests {
         Task::new(
             ProjectId::new(),
             TaskDraft {
+                issue_kind: Default::default(),
                 skills: vec![],
                 title: "Work".into(),
                 description: String::new(),
@@ -564,6 +583,15 @@ mod tests {
             1024,
         )
         .unwrap()
+    }
+    #[test]
+    fn old_tasks_default_to_custom_and_new_types_round_trip() {
+        let mut current = task();
+        current.issue_kind = TaskIssueKind::Bug;
+        let mut value = serde_json::to_value(&current).unwrap();
+        assert_eq!(serde_json::from_value::<Task>(value.clone()).unwrap().issue_kind, TaskIssueKind::Bug);
+        value.as_object_mut().unwrap().remove("issue_kind");
+        assert_eq!(serde_json::from_value::<Task>(value).unwrap().issue_kind, TaskIssueKind::Custom);
     }
     #[test]
     fn every_state_action_and_actor_obeys_the_workflow() {

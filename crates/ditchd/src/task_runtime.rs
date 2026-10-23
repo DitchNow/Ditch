@@ -534,6 +534,7 @@ fn prepare_remote_board_task(
                 coordinator_group: task.coordinator_group,
                 continue_agent_id: task.continue_agent_id,
                 draft: ditch_core::TaskDraft {
+                    issue_kind: task.issue_kind,
                     skills: task.skills.clone(),
                     title: task.title.clone(),
                     description: task.description.clone(),
@@ -607,7 +608,8 @@ fn handle_task_request(state: Arc<Mutex<RuntimeState>>, request: TaskRequest) ->
             TaskOperation::Get { task_id } | TaskOperation::Update { task_id, .. }
             | TaskOperation::Move { task_id, .. } | TaskOperation::Delete { task_id, .. }
             | TaskOperation::Transition { task_id, .. }
-            | TaskOperation::UpdateDescription { task_id, .. } =>
+            | TaskOperation::UpdateDescription { task_id, .. }
+            | TaskOperation::AttachGitHub { task_id, .. } =>
                 s.tasks.get(task_id).is_some_and(|t| t.remote_pending),
             _ => false,
         }
@@ -644,7 +646,7 @@ fn handle_task_request(state: Arc<Mutex<RuntimeState>>, request: TaskRequest) ->
         match connections.request(&alias, ClientRequest::RuntimeStatus) {
             Ok(ServerResponse::RuntimeStatus(status))
                 if (!managed || status.capabilities.iter().any(|c| c == "coordinator_concurrency_v1")) && status.capabilities.iter().any(|c| {
-                    c == if matches!(request.operation, TaskOperation::BoardExecution { .. }) { "board_execution_v1" } else if matches!(request.operation, TaskOperation::Enqueue { .. } | TaskOperation::SelectAgent { .. }) { "board_agent_resume_v1" } else if matches!(request.operation, TaskOperation::ReorderQueue { .. }) { "board_queue_v1" } else if matches!(request.operation, TaskOperation::GeneratePlan { .. } | TaskOperation::CancelPlan { .. } | TaskOperation::UpdateDescription { .. }) { "task_planning_v1" } else if matches!(request.operation, TaskOperation::CreateIdentified { board_task: Some(_), .. }) { "board_workflow_v1" } else if matches!(request.operation, TaskOperation::CreateIdentified { .. }) { "identified_tasks_v1" } else if matches!(
+                    c == if matches!(request.operation, TaskOperation::RepositoryDiscovery | TaskOperation::AttachGitHub { .. }) { "github_task_metadata_v1" } else if matches!(request.operation, TaskOperation::BoardExecution { .. }) { "board_execution_v1" } else if matches!(request.operation, TaskOperation::Enqueue { .. } | TaskOperation::SelectAgent { .. }) { "board_agent_resume_v1" } else if matches!(request.operation, TaskOperation::ReorderQueue { .. }) { "board_queue_v1" } else if matches!(request.operation, TaskOperation::GeneratePlan { .. } | TaskOperation::CancelPlan { .. } | TaskOperation::UpdateDescription { .. }) { "task_planning_v1" } else if matches!(request.operation, TaskOperation::CreateIdentified { board_task: Some(_), .. }) { "board_workflow_v1" } else if matches!(request.operation, TaskOperation::CreateIdentified { .. }) { "identified_tasks_v1" } else if matches!(
                         request.operation,
                         TaskOperation::List { .. }
                             | TaskOperation::Get { .. }
@@ -709,6 +711,18 @@ fn handle_task_request(state: Arc<Mutex<RuntimeState>>, request: TaskRequest) ->
         if let Err(error) = validate_selected_skills(&state, &project, &draft.skills) {
             return task_error(TaskErrorCode::InvalidInput, error);
         }
+    }
+    if matches!(request.operation, TaskOperation::RepositoryDiscovery) {
+        return match request.project_id.and_then(|id| project_by_id(&state, id)) {
+            Some(project) => match github::discovery::discover(&project.root) {
+                Ok(value) => ServerResponse::TaskResponse(TaskResponse::RepositoryDiscovery(value)),
+                Err(error) => task_error(TaskErrorCode::InvalidInput, error),
+            },
+            None => task_error(TaskErrorCode::NotFound, "Select a project"),
+        };
+    }
+    if let TaskOperation::AttachGitHub { task_id, source, issue } = &request.operation {
+        return github::publishing::attach_source(&state, &request, *task_id, source.clone(), issue.clone());
     }
     let result = prepare_task_request(&state, &request);
     match result {
@@ -927,6 +941,7 @@ fn prepare_task_request(
             }
             next.title = draft.title.trim().into();
             next.description = draft.description.clone();
+            next.issue_kind = draft.issue_kind;
             next.acceptance_criteria = draft.acceptance_criteria.clone();
             next.priority = draft.priority;
             next.touch();

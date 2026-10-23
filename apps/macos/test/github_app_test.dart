@@ -265,9 +265,13 @@ void main() {
                 'repository': {'id': 42, 'full_name': 'owner/selected'},
               },
               request: (request) async {
-                submissions.add(
-                  ((request as Map)['GitHub'] as Map)['CreateIssue'] as Map,
-                );
+                final operation = (request as Map)['GitHub'] as Map;
+                if (operation.containsKey('IssueTypes')) {
+                  return {
+                    'GitHub': {'types': [], 'can_set_type': false},
+                  };
+                }
+                submissions.add(operation['CreateIssue'] as Map);
                 throw StateError('github_create_outcome_unknown');
               },
             ),

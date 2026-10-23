@@ -111,7 +111,7 @@ class Fixture {
       ),
     );
     await tester.pumpAndSettle();
-    await tester.tap(find.widgetWithText(OutlinedButton, 'GitHub'));
+    await tester.tap(find.byTooltip('GitHub'));
     await tester.pumpAndSettle();
   }
 }

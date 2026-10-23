@@ -19,6 +19,7 @@ mod task_queue_tests {
         let mut task = Task::new(
             p.id,
             ditch_core::TaskDraft {
+                issue_kind: Default::default(),
                 skills: vec![],
                 title: title.into(),
                 description: "Original requirement".into(),
