@@ -81,13 +81,9 @@ void main() {
     skip: !showGitHubBoardControls,
   );
   test(
-    'staging enables Board/GitHub without exposing other unfinished controls',
+    'released Board/GitHub controls leave other unfinished controls hidden',
     () {
-      const staging =
-          String.fromEnvironment('DITCH_DEPLOYMENT_ENVIRONMENT') == 'staging' &&
-          String.fromEnvironment('DITCH_RELAY_ORIGIN') ==
-              'https://ditch-remote-relay-staging.matin-1a7.workers.dev';
-      expect(showGitHubBoardControls, staging);
+      expect(showGitHubBoardControls, isTrue);
       expect(showUnfinishedFeatureControls, isFalse);
     },
   );

@@ -46,7 +46,7 @@ trait GitHubService {
         _issue_type: Option<&str>,
         _task_id: Option<TaskId>,
     ) -> Result<Value, String> {
-        Err("Issue creation requires the staging GitHub App".into())
+        Err("Issue creation requires the GitHub App".into())
     }
     fn issue_types(&self, _project: ProjectId, _repository: u64) -> Result<Value, String> {
         Ok(json!({"types":[],"can_set_type":false}))
@@ -671,7 +671,7 @@ fn handle_service(
         GitHubRequest::ManageRepositories
         | GitHubRequest::RemoteSuggestions { .. }
         | GitHubRequest::SyncChanges { .. } => {
-            Err("This operation requires the staging GitHub App".into())
+            Err("This operation requires the GitHub App".into())
         }
         GitHubRequest::Publication { task_id } => publishing::status(&state, task_id),
         GitHubRequest::IssueTypes {

@@ -549,17 +549,19 @@ pub struct HttpUpgradeBackend {
 }
 
 impl HttpUpgradeBackend {
-    /// Fixed staging-only GitHub endpoint; uses the existing Keychain machine identity.
+    /// Environment-bound GitHub endpoint; uses the existing Keychain machine identity.
     /// No GitHub token or app secret is accepted by the desktop client.
-    pub fn github_staging_request(
+    pub fn github_app_request(
         &self,
         identity: &InstallationIdentity,
         body: &serde_json::Value,
     ) -> Result<serde_json::Value, UpgradeError> {
-        if DEPLOYMENT_ENVIRONMENT != "staging"
-            || self.origin.as_str().trim_end_matches('/') != "https://ditch-remote-relay-staging.matin-1a7.workers.dev"
-        {
-            return Err(UpgradeError::InvalidResponse("GitHub App is staging-only".into()));
+        if !matches!(
+            (DEPLOYMENT_ENVIRONMENT, self.origin.as_str().trim_end_matches('/')),
+            ("staging", "https://ditch-remote-relay-staging.matin-1a7.workers.dev")
+                | ("production", "https://relay.ditchnow.nl")
+        ) {
+            return Err(UpgradeError::InvalidResponse("GitHub App Relay does not match the build environment".into()));
         }
         let bearer = self.official_build_bearer(identity)?;
         let bytes = serde_json::to_vec(body).map_err(|e| UpgradeError::InvalidResponse(e.to_string()))?;
