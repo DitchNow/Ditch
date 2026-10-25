@@ -10,6 +10,7 @@ import 'package:flutter/services.dart';
 import 'package:xterm/xterm.dart';
 
 import 'application/command_center_controller.dart';
+import 'application/agent_prompt_drafts.dart';
 import 'application/project_sidebar_controller.dart';
 import 'application/product_update_controller.dart';
 import 'widgets/update_available_dot.dart';
@@ -35,10 +36,7 @@ export 'data/commercial_models.dart';
 export 'data/project_models.dart';
 export 'widgets/project_sidebar.dart';
 
-const ditchDeploymentEnvironment = String.fromEnvironment(
-  'DITCH_DEPLOYMENT_ENVIRONMENT',
-  defaultValue: 'production',
-);
+const ditchDeploymentEnvironment = runtimeDeploymentEnvironment;
 const ditchRelayOrigin = String.fromEnvironment(
   'DITCH_RELAY_ORIGIN',
   defaultValue: 'https://relay.ditchnow.nl',
@@ -1269,8 +1267,13 @@ List<AttentionEvent> attentionForProject(
 }
 
 class DitchRuntimeClient {
-  DitchRuntimeClient({String? socketPath})
-    : _transport = RuntimeTransport(socketPath: socketPath);
+  DitchRuntimeClient({
+    String? socketPath,
+    String deploymentEnvironment = ditchDeploymentEnvironment,
+  }) : _transport = RuntimeTransport(
+         socketPath: socketPath,
+         deploymentEnvironment: deploymentEnvironment,
+       );
 
   final RuntimeTransport _transport;
 
@@ -1879,8 +1882,10 @@ class _CommandCenterScreenState extends State<CommandCenterScreen>
   final _agentListController = ScrollController();
   final _idleComposerKey = GlobalKey<AgentComposerState>();
   final _composerKeys = <String, GlobalKey<AgentComposerState>>{};
+  final _promptDrafts = AgentPromptDrafts();
   int _composerFocusGeneration = 0;
-  late final _runtimeClient = widget.runtimeClient ?? DitchRuntimeClient();
+  late final _runtimeClient = widget.runtimeClient ??
+      DitchRuntimeClient(deploymentEnvironment: widget.deploymentEnvironment);
   late final _tasks = TaskBoardController(request: _runtimeClient.request);
   EditionWorkspace? _editionWorkspace;
   bool _showBoard = false;
@@ -2003,7 +2008,9 @@ class _CommandCenterScreenState extends State<CommandCenterScreen>
   final _announcedProductReleases = <String>{};
   RuntimeStatusDto? _runtimeStatus;
   String? _runtimeInstanceId;
-  bool _runtimeReconnectScheduled = false;
+  Timer? _runtimeReconnectTimer;
+  Timer? _runtimeStableTimer;
+  int _runtimeConnectionAttempt = 0;
   bool _runtimeConnecting = false;
   int _runtimeConnectionRetries = 0;
   bool _runtimeHomeMismatchReported = false;
@@ -2420,46 +2427,80 @@ class _CommandCenterScreenState extends State<CommandCenterScreen>
     return session;
   }
 
+  void _validateRuntimeIdentity(RuntimeStatusDto status) {
+    if (status.deploymentEnvironment != widget.deploymentEnvironment ||
+        status.socketPath != _runtimeClient.socketPath) {
+      throw DitchRuntimeException(
+        'runtime_identity_mismatch',
+        'Ditch ${widget.deploymentEnvironment} connected to a runtime with a '
+            'different identity. The connection was stopped. Restart the matching app.',
+      );
+    }
+  }
+
+  bool _isCurrentRuntimeAttempt(int attempt) =>
+      mounted && attempt == _runtimeConnectionAttempt;
+
   Future<void> _connectRuntime({bool retrying = false}) async {
     if (_runtimeConnecting || !mounted) return;
     if (!retrying) _runtimeConnectionRetries = 0;
+    _runtimeReconnectTimer?.cancel();
+    _runtimeStableTimer?.cancel();
+    final attempt = ++_runtimeConnectionAttempt;
     _runtimeConnecting = true;
     _presentation.connecting(reconnecting: _runtimeInstanceId != null);
     try {
+      final previousEvents = _runtimeEvents;
+      _runtimeEvents = null;
+      await previousEvents?.cancel();
       await _ensureRuntimeStarted();
-      if (!mounted) return;
+      if (!_isCurrentRuntimeAttempt(attempt)) return;
       final status = await _runtimeClient.runtimeStatus();
+      if (!_isCurrentRuntimeAttempt(attempt)) return;
+      // Reject the wrong environment before reading any workspace state.
+      _validateRuntimeIdentity(status);
       _codexBinary = status.codexBinary;
       final instanceId = status.instanceId;
       final snapshot = await _runtimeClient.snapshot();
+      if (!_isCurrentRuntimeAttempt(attempt)) return;
       _hydrateRuntimeSnapshot(snapshot);
       _checkRuntimeCapabilities(status);
       _checkRuntimeCodexHome(status);
       final events = await _runtimeClient.subscribeEvents();
-      await _runtimeEvents?.cancel();
+      if (!_isCurrentRuntimeAttempt(attempt)) {
+        await events.listen(null).cancel();
+        return;
+      }
       _runtimeInstanceId = instanceId;
       _runtimeEvents = events.listen(
-        _handleRuntimeEvent,
-        onError: (Object error) {
-          _addAttentionRequired(
-            kind: AttentionKind.failed,
-            icon: Icons.error_outline,
-            title: 'Runtime event stream failed',
-            body: '$error',
-          );
-          _scheduleRuntimeReconnect();
+        (event) {
+          if (_isCurrentRuntimeAttempt(attempt)) _handleRuntimeEvent(event);
         },
-        onDone: _scheduleRuntimeReconnect,
+        onError: (Object error) => _runtimeConnectionFailed(error, attempt),
+        onDone: () => _runtimeConnectionFailed(
+          const DitchRuntimeException(
+            'runtime_disconnected',
+            'The runtime event connection closed. Click Retry to reconnect.',
+          ),
+          attempt,
+        ),
+        cancelOnError: true,
       );
       final confirmed = await _runtimeClient.runtimeStatus();
+      if (!_isCurrentRuntimeAttempt(attempt)) return;
+      _validateRuntimeIdentity(confirmed);
+      if (instanceId != confirmed.instanceId) {
+        throw const DitchRuntimeException(
+          'runtime_changed',
+          'The runtime changed while connecting. Click Retry to reconnect.',
+        );
+      }
       final previousRuntime = _runtimeStatus;
       _runtimeStatus = confirmed;
-      final confirmedInstanceId = confirmed.instanceId;
-      if (_runtimeInstanceId != confirmedInstanceId) {
-        await _runtimeEvents?.cancel();
-        _scheduleRuntimeReconnect();
-      }
-      _runtimeConnectionRetries = 0;
+      // Briefly connected subscriptions must not replenish their retry budget.
+      _runtimeStableTimer = Timer(const Duration(seconds: 30), () {
+        if (_isCurrentRuntimeAttempt(attempt)) _runtimeConnectionRetries = 0;
+      });
       _presentation.connected();
       final updateRuntime = previousRuntime ?? _productUpdates.context?.runtime;
       if (updateRuntime != null &&
@@ -2475,31 +2516,45 @@ class _CommandCenterScreenState extends State<CommandCenterScreen>
       unawaited(_refreshNotificationReadiness());
       await _refreshCodexReadiness();
     } on Object catch (error) {
-      if (!mounted) return;
-      // Native startup already retries within its deadline. Retry only a
-      // subsequent connection race, without extending a native startup failure.
-      final startupFailed =
-          error is DitchRuntimeException &&
-          error.code == 'runtime_startup_failed';
-      if (!startupFailed && _runtimeConnectionRetries < 2) {
-        _runtimeConnectionRetries++;
-        _scheduleRuntimeReconnect();
-        return;
-      }
-      final message = error is DitchRuntimeException
-          ? error.message
-          : 'Ditch could not connect to its runtime. Click Retry to try again.';
-      _presentation.unavailable(message);
-      _addAttentionRequired(
-        kind: AttentionKind.failed,
-        icon: Icons.cloud_off_outlined,
-        title: 'Runtime not connected',
-        body: message,
-        global: true,
-      );
+      _runtimeConnectionFailed(error, attempt);
     } finally {
       _runtimeConnecting = false;
     }
+  }
+
+  void _runtimeConnectionFailed(Object error, int attempt) {
+    if (!_isCurrentRuntimeAttempt(attempt)) return;
+    // Error/done callbacks and late status replies belong to one attempt.
+    final failedAttempt = ++_runtimeConnectionAttempt;
+    _runtimeStableTimer?.cancel();
+    _runtimeReconnectTimer?.cancel();
+    final events = _runtimeEvents;
+    _runtimeEvents = null;
+    if (events != null) unawaited(events.cancel());
+    _runtimeSnapshotHydrated = false;
+    final terminal = error is DitchRuntimeException &&
+        const {
+          'runtime_startup_failed',
+          'runtime_identity_mismatch',
+          'client_not_authorized',
+        }.contains(error.code);
+    if (!terminal && _runtimeConnectionRetries < 2) {
+      _runtimeConnectionRetries++;
+      _presentation.connecting(reconnecting: _runtimeInstanceId != null);
+      _scheduleRuntimeReconnect(failedAttempt);
+      return;
+    }
+    final message = error is DitchRuntimeException
+        ? error.message
+        : 'Ditch could not connect to its runtime. Click Retry to try again.';
+    _presentation.unavailable(message);
+    _addAttentionRequired(
+      kind: AttentionKind.failed,
+      icon: Icons.cloud_off_outlined,
+      title: 'Runtime not connected',
+      body: message,
+      global: true,
+    );
   }
 
   Future<void> _refreshCodexReadiness() async {
@@ -2778,7 +2833,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen>
     );
     final settingsSections = [
       ...editionSections.where(
-        (section) => showUnfinishedFeatureControls || section.id != 'github',
+        (section) => showUnfinishedFeatureControls || showGitHubBoardControls || section.id != 'github',
       ),
       EditionSettingsSection(
         id: 'license-plans',
@@ -2924,22 +2979,14 @@ class _CommandCenterScreenState extends State<CommandCenterScreen>
     );
   }
 
-  void _scheduleRuntimeReconnect() {
-    if (_runtimeReconnectScheduled || !mounted) {
-      return;
-    }
-    _runtimeSnapshotHydrated = false;
-    _runtimeReconnectScheduled = true;
-    Future<void>.delayed(const Duration(milliseconds: 500), () async {
-      if (!mounted) {
-        return;
-      }
-      _runtimeReconnectScheduled = false;
+  void _scheduleRuntimeReconnect(int failedAttempt) {
+    _runtimeReconnectTimer = Timer(const Duration(milliseconds: 500), () {
+      if (!_isCurrentRuntimeAttempt(failedAttempt)) return;
       if (_runtimeConnecting) {
-        _scheduleRuntimeReconnect();
+        _scheduleRuntimeReconnect(failedAttempt);
         return;
       }
-      await _connectRuntime(retrying: true);
+      unawaited(_connectRuntime(retrying: true));
     });
   }
 
@@ -3072,6 +3119,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen>
       _projects
         ..clear()
         ..addAll(projects);
+      _promptDrafts.retainProjects(_projects.map(_projectKey).toSet());
       if (_projects.isEmpty) {
         _selectedProjectKey = null;
       } else {
@@ -3087,6 +3135,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen>
       _agentSessions
         ..clear()
         ..addAll(sessions);
+      _promptDrafts.retainAgents(sessionsById.keys.toSet());
       for (final agentId in removedComposerKeyIds) {
         _composerKeys.remove(agentId);
       }
@@ -3200,6 +3249,9 @@ class _CommandCenterScreenState extends State<CommandCenterScreen>
     _tasks.dispose();
     _projectSidebar.dispose();
     _presentation.dispose();
+    _runtimeConnectionAttempt++;
+    _runtimeReconnectTimer?.cancel();
+    _runtimeStableTimer?.cancel();
     _runtimeEvents?.cancel();
     WidgetsBinding.instance.removeObserver(this);
     _productUpdates.removeListener(_productUpdateChanged);
@@ -3498,6 +3550,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen>
         .whereType<ConversationViewportController>()
         .toList();
     final removedFiles = _projectFiles.remove(projectId);
+    _promptDrafts.removeProject(_projectKey(removedProject));
     setState(() {
       _projects.removeWhere((project) => project.id == projectId);
       _projectTerminals.remove(projectId);
@@ -3505,6 +3558,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen>
       _attention.removeWhere((event) => event.projectId == projectId);
       for (final id in removedSessionIds) {
         _composerKeys.remove(id);
+        _promptDrafts.removeAgent(id);
       }
       if (removedSessionIds.contains(_expandedAgentLocalId)) {
         _expandedAgentLocalId = null;
@@ -4282,6 +4336,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen>
         setState(() {
           _agentSessions.removeWhere((session) => session.localId == id);
           _composerKeys.remove(id);
+          _promptDrafts.removeAgent(id);
           _attention.removeWhere((event) => event.sessionLocalId == id);
           if (_expandedAgentLocalId == id) _expandedAgentLocalId = null;
           if (_focusedAgentLocalId == id) _focusedAgentLocalId = null;
@@ -5249,55 +5304,59 @@ class _CommandCenterScreenState extends State<CommandCenterScreen>
                 _maximumInspectorWidth(constraints.maxWidth, showSidebar),
               );
               final modelProjectId = _selectedProject.id;
-              final agentsSurface = AgentSettingsScope(
-                settings: _settingsForProject(_selectedProject.id),
-                loadModels:
-                    presentation.connection == RuntimeConnectionPhase.connected
-                    ? () => _runtimeClient.listCodexModels(
-                        projectId: modelProjectId,
-                      )
-                    : null,
-                child: AgentsSurface(
-                  onOpenBoard: () => _openBoard(_selectedProject.id),
-                  sessions: _visibleSessions,
-                  expandedAgentLocalId: _expandedAgentLocalId,
-                  focusedAgentLocalId: _focusedAgentLocalId,
-                  chatViewport: _chatViewport,
-                  agentListController: _agentListController,
-                  composerKey: _idleComposerKey,
-                  composerKeyForAgent: _composerKeyForAgent,
-                  headerKeyForAgent: _agentHeaderKey,
-                  initialPrompt: _defaultStartPrompt,
-                  effectiveCodexHome: _selectedProject.isRemote
-                      ? null
-                      : _effectiveRuntimeCodexHome,
-                  onStartCodex: _startCodex,
-                  onStartPrompt: _startCodexRuntime,
-                  onSubmitPrompt: _submitComposer,
-                  onLoadMessages: _loadAgentMessages,
-                  onStopCodex: _stopCodex,
-                  onDeleteAgent: _deleteAgent,
-                  onRenameAgent: _renameAgent,
-                  hasUnreadResult: (session) =>
-                      unreadResultAttentionIdsForAgent(
-                        attention: _attention,
-                        agentId: session.localId,
-                        readAttentionIds: _readAttentionIds,
-                      ).isNotEmpty,
-                  onFocusAgent: (session) {
-                    if (session != null) _markAgentResultsRead(session);
-                    setState(() {
-                      _focusedAgentLocalId = session?.localId;
-                      if (session != null) {
-                        _expandedAgentLocalId = session.localId;
+              final agentsSurface = AgentPromptDraftScope(
+                drafts: _promptDrafts,
+                projectKey: _projectKey(_selectedProject),
+                child: AgentSettingsScope(
+                  settings: _settingsForProject(_selectedProject.id),
+                  loadModels:
+                      presentation.connection == RuntimeConnectionPhase.connected
+                      ? () => _runtimeClient.listCodexModels(
+                          projectId: modelProjectId,
+                        )
+                      : null,
+                  child: AgentsSurface(
+                    onOpenBoard: () => _openBoard(_selectedProject.id),
+                    sessions: _visibleSessions,
+                    expandedAgentLocalId: _expandedAgentLocalId,
+                    focusedAgentLocalId: _focusedAgentLocalId,
+                    chatViewport: _chatViewport,
+                    agentListController: _agentListController,
+                    composerKey: _idleComposerKey,
+                    composerKeyForAgent: _composerKeyForAgent,
+                    headerKeyForAgent: _agentHeaderKey,
+                    initialPrompt: _defaultStartPrompt,
+                    effectiveCodexHome: _selectedProject.isRemote
+                        ? null
+                        : _effectiveRuntimeCodexHome,
+                    onStartCodex: _startCodex,
+                    onStartPrompt: _startCodexRuntime,
+                    onSubmitPrompt: _submitComposer,
+                    onLoadMessages: _loadAgentMessages,
+                    onStopCodex: _stopCodex,
+                    onDeleteAgent: _deleteAgent,
+                    onRenameAgent: _renameAgent,
+                    hasUnreadResult: (session) =>
+                        unreadResultAttentionIdsForAgent(
+                          attention: _attention,
+                          agentId: session.localId,
+                          readAttentionIds: _readAttentionIds,
+                        ).isNotEmpty,
+                    onFocusAgent: (session) {
+                      if (session != null) _markAgentResultsRead(session);
+                      setState(() {
+                        _focusedAgentLocalId = session?.localId;
+                        if (session != null) {
+                          _expandedAgentLocalId = session.localId;
+                        }
+                      });
+                      final agentId = session?.localId ?? _expandedAgentLocalId;
+                      if (agentId != null) {
+                        _focusAgentComposerAfterLayout(agentId);
                       }
-                    });
-                    final agentId = session?.localId ?? _expandedAgentLocalId;
-                    if (agentId != null) {
-                      _focusAgentComposerAfterLayout(agentId);
-                    }
-                  },
-                  onToggleExpanded: _toggleExpandedAgent,
+                    },
+                    onToggleExpanded: _toggleExpandedAgent,
+                  ),
                 ),
               );
               final selectedTerminal = _selectedProject.id == null
@@ -7998,11 +8057,18 @@ class AgentsSurface extends StatelessWidget {
                       style: Theme.of(context).textTheme.headlineSmall,
                     ),
                   ),
-                  if (showUnfinishedFeatureControls && onOpenBoard != null)
-                    IconButton(
-                      onPressed: onOpenBoard,
-                      tooltip: 'Project Board — $projectWriteDisclosure',
-                      icon: const Icon(Icons.view_kanban_outlined, size: 20),
+                  if ((showUnfinishedFeatureControls || showGitHubBoardControls) && onOpenBoard != null)
+                    Tooltip(
+                      message: 'Open project board',
+                      constraints: const BoxConstraints(maxWidth: 180),
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 10,
+                        vertical: 6,
+                      ),
+                      child: IconButton(
+                        onPressed: onOpenBoard,
+                        icon: const Icon(Icons.view_kanban_outlined, size: 20),
+                      ),
                     ),
                   FilledButton.icon(
                     key: const Key('agents-new-agent-button'),
@@ -8761,6 +8827,10 @@ class AgentChatPanel extends StatelessWidget {
         ),
       AgentComposer(
         key: composerKey,
+        draft: AgentPromptDraftScope.maybeOf(context)?.forConversation(
+          conversationId,
+          initialPrompt,
+        ),
         executionSettings: executionSettings,
         initialText: initialPrompt,
         hasSession: hasSession,
@@ -9164,6 +9234,7 @@ class _ThinkingStatusStripState extends State<ThinkingStatusStrip>
 class AgentComposer extends StatefulWidget {
   const AgentComposer({
     required this.initialText,
+    this.draft,
     required this.hasSession,
     required this.isWorking,
     this.canStop = false,
@@ -9177,6 +9248,7 @@ class AgentComposer extends StatefulWidget {
   });
 
   final String initialText;
+  final AgentPromptDraft? draft;
   final AgentExecutionSettings? executionSettings;
   final bool hasSession;
   final bool isWorking;
@@ -9192,7 +9264,7 @@ class AgentComposer extends StatefulWidget {
 }
 
 class AgentComposerState extends State<AgentComposer> {
-  final _nativeComposerKey = GlobalKey<NativeComposerTextViewState>();
+  var _nativeComposerKey = GlobalKey<NativeComposerTextViewState>();
   static const _minimumEditorHeight = 48.0;
   static const _maximumEditorHeight = 160.0;
   late String _draftText;
@@ -9211,13 +9283,18 @@ class AgentComposerState extends State<AgentComposer> {
   @override
   void initState() {
     super.initState();
-    _draftText = widget.initialText;
+    _draftText = widget.draft?.text ?? widget.initialText;
   }
 
   @override
   void didUpdateWidget(AgentComposer oldWidget) {
     super.didUpdateWidget(oldWidget);
-    if (oldWidget.initialText != widget.initialText &&
+    if (!identical(oldWidget.draft, widget.draft)) {
+      _draftText = widget.draft?.text ?? widget.initialText;
+      _nativeComposerKey = GlobalKey<NativeComposerTextViewState>();
+      _editorHeight = _minimumEditorHeight;
+    } else if (widget.draft == null &&
+        oldWidget.initialText != widget.initialText &&
         _draftText.trim().isEmpty) {
       _draftText = widget.initialText;
     }
@@ -9236,20 +9313,28 @@ class AgentComposerState extends State<AgentComposer> {
       return;
     }
 
-    final nativeText =
-        await _nativeComposerKey.currentState?.currentText() ?? _draftText;
+    final editor = _nativeComposerKey.currentState;
+    final draft = widget.draft;
+    final nativeText = await editor?.currentText() ?? _draftText;
+    if (!mounted ||
+        !identical(editor, _nativeComposerKey.currentState) ||
+        !identical(draft, widget.draft)) {
+      return;
+    }
     final prompt = nativeText.trim();
     if (prompt.isEmpty) {
       return;
     }
 
-    setState(() => _draftText = '');
-    await _nativeComposerKey.currentState?.clearText();
-    widget.onSubmit(prompt);
-    focus();
+    final onSubmit = widget.onSubmit;
+    _handleChanged('');
+    await editor?.clearText();
+    onSubmit(prompt);
+    if (mounted) focus();
   }
 
   void _handleChanged(String text) {
+    widget.draft?.text = text;
     if (_draftText == text) {
       return;
     }
@@ -9314,7 +9399,7 @@ class AgentComposerState extends State<AgentComposer> {
                           height: _editorHeight,
                           child: NativeComposerTextView(
                             key: _nativeComposerKey,
-                            initialText: widget.initialText,
+                            initialText: _draftText,
                             enabled: editable,
                             placeholder: widget.hasSession
                                 ? 'Send a follow-up to Codex'

@@ -1,5 +1,18 @@
 import 'package:flutter/foundation.dart';
 
+@immutable
+class BoardExecutionDto {
+  const BoardExecutionDto(this.projectId, this.paused, this.revision);
+  factory BoardExecutionDto.fromJson(Map value) => BoardExecutionDto(
+    value['project_id'] as String,
+    value['paused'] as bool,
+    value['revision'] as int,
+  );
+  final String projectId;
+  final bool paused;
+  final int revision;
+}
+
 enum TaskColumn {
   backlog('Backlog', 'Backlog'),
   todo('Todo', 'Todo'),
@@ -15,6 +28,7 @@ enum TaskColumn {
 @immutable
 class TaskDto {
   const TaskDto({
+    this.issueKind = 'Custom',
     required this.id,
     required this.projectId,
     required this.title,
@@ -32,6 +46,10 @@ class TaskDto {
     this.skills = const [],
     this.acceptance = const {},
     this.githubSource,
+    this.planning = const {},
+    this.executionQueue,
+    this.coordinatorGroup,
+    this.continueAgentId,
   });
   factory TaskDto.fromJson(Map<String, dynamic> json) {
     String requiredString(String key) {
@@ -57,6 +75,12 @@ class TaskDto {
       throw FormatException('Unsupported task state: $state');
     }
     return TaskDto(
+      executionQueue: json['execution_queue'] is Map
+          ? Map<String, dynamic>.from(json['execution_queue'] as Map)
+          : null,
+      coordinatorGroup: json['coordinator_group'] as String?,
+      continueAgentId: json['continue_agent_id'] as String?,
+      planning: Map<String, dynamic>.from(json['planning'] as Map? ?? {}),
       acceptance: Map<String, dynamic>.from(json["acceptance"] as Map? ?? {}),
       githubSource: json['github_source'] is Map
           ? Map<String, dynamic>.from(json['github_source'] as Map)
@@ -64,6 +88,7 @@ class TaskDto {
       skills: (json['skills'] as List? ?? [])
           .map((s) => Map<String, dynamic>.from(s as Map))
           .toList(),
+      issueKind: json['issue_kind'] as String? ?? 'Custom',
       id: requiredString('id'),
       projectId: requiredString('project_id'),
       title: requiredString('title'),
@@ -84,10 +109,29 @@ class TaskDto {
       summary: json['review_summary'] as String?,
     );
   }
+  final String issueKind;
   final String id, projectId, title, description, state, condition, priority;
   final List<String> criteria;
   final List<Map<String, dynamic>> skills;
   final Map<String, dynamic> acceptance;
+  final Map<String, dynamic> planning;
+  final Map<String, dynamic>? executionQueue;
+  final String? coordinatorGroup;
+  final String? continueAgentId;
+  String? get selectedAgentId =>
+      continueAgentId ?? agentId ?? executionQueue?['agent_id'] as String?;
+  int? get queuePosition => executionQueue?['position'] as int?;
+  bool get queueNeedsRetry =>
+      executionQueue != null &&
+      column == TaskColumn.inProgress &&
+      const {'Blocked', 'Failed', 'Cancelled'}.contains(condition) &&
+      !archived;
+  bool get waitingInQueue =>
+      executionQueue != null &&
+      column == TaskColumn.inProgress &&
+      condition == 'Queued' &&
+      agentId == null &&
+      !archived;
   final Map<String, dynamic>? githubSource;
   final int orderKey, revision;
   final bool archived;
@@ -100,6 +144,7 @@ class TaskDto {
     _ => TaskColumn.todo,
   };
   bool get running =>
+      !waitingInQueue &&
       const {'Running', 'Queued', 'AwaitingApproval'}.contains(condition);
 }
 

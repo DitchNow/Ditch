@@ -38,6 +38,10 @@ pub fn with_operation_id<T>(id: Uuid, run: impl FnOnce() -> T) -> T {
     run()
 }
 
+fn preflight_script() -> String {
+    PREFLIGHT_SCRIPT.replace("$HOME/.ditch/", &format!("$HOME/{}/", ditch_product::deployment::REMOTE_DIRECTORY))
+}
+
 const PREFLIGHT_SCRIPT: &str = r#"set -eu
 printf 'home\t%s\n' "$HOME"
 printf 'os\t%s\n' "$(uname -s 2>/dev/null || printf unknown)"
@@ -606,7 +610,7 @@ pub fn check_setup(
         .clone()
         .or_else(|| connections.password_for(&resolved));
     let (output, prompts) =
-        run_fixed_admin_authenticated(alias, PREFLIGHT_SCRIPT, credential, trust_unknown_host)?;
+        run_fixed_admin_authenticated(alias, &preflight_script(), credential, trust_unknown_host)?;
     let stderr = String::from_utf8_lossy(&output.stderr);
     if stderr.contains("REMOTE HOST IDENTIFICATION HAS CHANGED") {
         return Ok(failed_setup(
@@ -996,7 +1000,7 @@ fn install_remote_runtime(
     if staged.is_none() {
     let (preflight, _) = run_fixed_admin_authenticated(
         alias,
-        PREFLIGHT_SCRIPT,
+        &preflight_script(),
         connections.password_for(&resolved),
         false,
     )?;
@@ -1131,6 +1135,11 @@ fn verify_artifact_metadata(artifact: &Path, target: &str, checksum: &str) -> Re
             return Err(SshError::Failed(
                 "remote artifact manifest version does not match this Ditch build".into(),
             ));
+        }
+        // Older production artifacts had no environment field. Never adopt those in staging.
+        let environment = value.get("deployment_environment").and_then(|v| v.as_str()).unwrap_or("production");
+        if environment != ditch_product::deployment::ENVIRONMENT {
+            return Err(SshError::Failed("remote artifact belongs to the other environment".into()));
         }
         if value.get("edition").and_then(|value| value.as_str()) != Some(crate::RUNTIME_EDITION) {
             return Err(SshError::Failed(format!(
@@ -1503,6 +1512,7 @@ mod tests {
             serde_json::to_vec(&serde_json::json!({
                 "version": env!("CARGO_PKG_VERSION"),
                 "edition": crate::RUNTIME_EDITION,
+                "deployment_environment": ditch_product::deployment::ENVIRONMENT,
                 "build_identifier": local_build,
                 "community_revision": "0123456789012345678901234567890123456789",
                 "remote_runtime_protocol_version": ditch_protocol::REMOTE_RUNTIME_PROTOCOL_VERSION,
@@ -1517,9 +1527,15 @@ mod tests {
         .unwrap();
         assert!(verify_artifact_metadata(&artifact, "x86_64-unknown-linux-gnu", &checksum).is_ok());
 
+        let manifest_path = root.join("remote-artifacts.json");
+        let mut wrong_environment: serde_json::Value = serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        wrong_environment["deployment_environment"] = serde_json::json!(if ditch_product::deployment::ENVIRONMENT == "staging" { "production" } else { "staging" });
+        fs::write(&manifest_path,serde_json::to_vec(&wrong_environment).unwrap()).unwrap();
+        assert!(verify_artifact_metadata(&artifact, "x86_64-unknown-linux-gnu", &checksum).is_err());
         let mismatched = serde_json::json!({
             "version": env!("CARGO_PKG_VERSION"),
             "edition": crate::RUNTIME_EDITION,
+                "deployment_environment": ditch_product::deployment::ENVIRONMENT,
             "build_identifier": local_build,
             "community_revision": "0123456789012345678901234567890123456789",
             "remote_runtime_protocol_version": ditch_protocol::REMOTE_RUNTIME_PROTOCOL_VERSION + 1,

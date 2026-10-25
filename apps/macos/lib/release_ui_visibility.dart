@@ -2,3 +2,6 @@
 /// Keep feature implementations, registrations, callbacks and saved state intact.
 /// Set to true when these surfaces are ready to return to the UI.
 const showUnfinishedFeatureControls = false;
+
+/// GitHub and Board are released in both staging and production editions.
+const showGitHubBoardControls = true;

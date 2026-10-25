@@ -342,7 +342,19 @@ impl RuntimeState {
         edition::initialize_store(&mut store)?;
         store.reconcile_active_agents().map_err(io::Error::other)?;
         store.reconcile_tasks().map_err(io::Error::other)?;
-        let durable = store.load().map_err(io::Error::other)?;
+        let mut durable = store.load().map_err(io::Error::other)?;
+        for task in &mut durable.tasks {
+            if durable.projects.iter().any(|p| p.id == task.project_id && !p.is_remote())
+                && task.planning.job.as_ref().is_some_and(|j| j.status == "running") {
+                let job = task.planning.job.as_mut().unwrap();
+                job.status = "interrupted".into();
+                job.finished_at = Some(Utc::now());
+                job.error = Some("Planning was interrupted by a runtime restart. Try again.".into());
+                task.touch();
+                let audit = task.audit(TaskActor::Daemon, "plan_interrupted", None, None);
+                store.save_task_changes(&[(task.clone(), audit)], None, None).map_err(io::Error::other)?;
+            }
+        }
         let mut writer_leases=HashMap::new();
         let mut orphan_writer_groups=HashMap::new();
         let mut remote_write_uncertain=HashMap::new();
@@ -467,6 +479,11 @@ impl RuntimeState {
         let mut capabilities = vec![
             format!("edition_{RUNTIME_EDITION}"),
             "tasks_v1".to_owned(),
+            "task_planning_v1".to_owned(),
+            "github_task_metadata_v1".to_owned(),
+            "board_queue_v1".to_owned(),
+            "board_agent_resume_v1".to_owned(),
+            "board_execution_v1".to_owned(),
             "acceptance_v1".to_owned(),
             "identified_tasks_v1".to_owned(),
             "board_workflow_v1".to_owned(),
@@ -660,6 +677,7 @@ fn serve(paths: AppPaths, remote_runtime: bool) -> io::Result<()> {
     edition::start(Arc::clone(&state));
     start_remote_reconciler(Arc::clone(&state));
     start_session_name_watcher(&state);
+    start_board_queue(&state);
 
     for stream in listener.incoming() {
         let stream = stream?;
@@ -870,6 +888,11 @@ fn forward_remote_event(state: &Arc<Mutex<RuntimeState>>, alias: &str, event: Se
 
 fn forward_remote_event_locked(state: &mut RuntimeState, alias: &str, event: ServerEvent) {
     match event {
+        ServerEvent::BoardExecutionChanged(execution) => {
+            if state.projects.values().any(|p| p.id == execution.project_id && ssh_remote::remote_alias(p) == Some(alias)) {
+                state.broadcast(ServerEvent::BoardExecutionChanged(execution));
+            }
+        }
         ServerEvent::AgentStreamingText {agent_id,text} => {
             if state.remote_agent_hosts.get(&agent_id).is_some_and(|host|host==alias) { state.broadcast(ServerEvent::AgentStreamingText{agent_id,text}); }
         }
@@ -1861,6 +1884,16 @@ fn handle_request(request: ClientRequest, state: Arc<Mutex<RuntimeState>>) -> Se
                 .projects
                 .get(root.to_string_lossy().as_ref())
                 .cloned();
+            // The two app environments share project metadata, but not their registries.
+            // Preserve an existing project's identity when adding it to the other app.
+            let existing = match existing {
+                Some(project) => Some(project),
+                None if root.join(".ditch/project.json").exists() => match load_project_config(&root) {
+                    Ok(project) => Some(project),
+                    Err(error) => return protocol_error("project_config_failed", error.to_string()),
+                },
+                None => None,
+            };
             let mut project = existing.unwrap_or_else(|| Project::new(&name, &root));
             project.name = name;
             project.root = root;
@@ -3692,6 +3725,12 @@ fn discover_codex_models(
 }
 
 include!("task_runtime.rs");
+include!("task_planning_runtime.rs");
+include!("task_queue_runtime.rs");
+#[cfg(test)]
+include!("task_queue_tests.rs");
+#[cfg(test)]
+include!("task_planning_tests.rs");
 include!("acceptance_runtime.rs");
 include!("skill_runtime.rs");
 include!("remote_app_server_runtime.rs");
@@ -5793,6 +5832,27 @@ esac
         };
         ensure_app_dirs(&paths).expect("test app directories should be created");
         RuntimeState::new(paths, false).expect("test runtime should initialize")
+    }
+
+    #[test]
+    fn separate_registries_reuse_shared_project_metadata_without_copying_app_state() {
+        let first = Arc::new(Mutex::new(test_runtime()));
+        let second = Arc::new(Mutex::new(test_runtime()));
+        let root = first.lock().unwrap().paths.data_dir.join("shared-project");
+        std::fs::create_dir_all(&root).unwrap();
+        let add = || ClientRequest::CreateProject {
+            name: "Shared project".into(), root: root.to_string_lossy().into(),
+            git_policy: ProjectGitPolicy::AllowOutsideGit,
+        };
+        let ServerResponse::ProjectCreated(a) = handle_request(add(), first.clone()) else { panic!("first registration failed") };
+        let ServerResponse::ProjectCreated(b) = handle_request(add(), second.clone()) else { panic!("second registration failed") };
+        assert_eq!(a.id,b.id);
+        assert_eq!(load_project_config(&root).unwrap().id,a.id);
+        assert!(root.join(".ditch/project.json").is_file());
+        assert!(!root.join(".ditch-staging").exists());
+        assert_ne!(first.lock().unwrap().paths.database_path, second.lock().unwrap().paths.database_path);
+        first.lock().unwrap().store.set_setting("isolation-probe","first-only").unwrap();
+        assert!(second.lock().unwrap().store.setting("isolation-probe").unwrap().is_none());
     }
 
     #[test]

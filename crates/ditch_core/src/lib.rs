@@ -223,6 +223,12 @@ impl Project {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Task {
+    #[serde(default)]
+    pub issue_kind: TaskIssueKind,
+    #[serde(default)]
+    pub execution_queue: Option<TaskExecutionQueue>,
+    #[serde(default)]
+    pub planning: TaskPlanning,
     /// Admitted on this Mac, not yet materialized on its SSH execution host.
     #[serde(default)]
     pub remote_pending: bool,
@@ -371,7 +377,7 @@ impl AppPaths {
         let data_dir = home
             .join("Library")
             .join("Application Support")
-            .join("The Ditch");
+            .join(ditch_product::deployment::SUPPORT_DIRECTORY);
 
         Self {
             database_path: data_dir.join("ditch.sqlite3"),
@@ -387,7 +393,7 @@ impl AppPaths {
         let home = std::env::var_os("HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("."));
-        let data_dir = home.join(".ditch");
+        let data_dir = home.join(ditch_product::deployment::REMOTE_DIRECTORY);
         Self {
             database_path: data_dir.join("state/ditch.sqlite3"),
             socket_path: data_dir.join("run/ditchd.sock"),
@@ -414,5 +420,20 @@ impl Default for ProductPolicy {
             allow_project_worktrees: true,
             global_codex_config_requires_explicit_approval: true,
         }
+    }
+}
+
+#[cfg(test)]
+mod deployment_isolation_tests {
+    use super::*;
+    #[test]
+    fn app_state_is_environment_scoped_but_project_metadata_is_shared() {
+        let paths = AppPaths::for_current_user();
+        let staging = ditch_product::deployment::ENVIRONMENT == "staging";
+        assert!(paths.data_dir.ends_with(if staging { "The Ditch Staging" } else { "The Ditch" }));
+        assert!(paths.database_path.starts_with(&paths.data_dir));
+        assert!(paths.socket_path.starts_with(&paths.data_dir));
+        assert!(AppPaths::for_remote_user().data_dir.ends_with(if staging { ".ditch-staging" } else { ".ditch" }));
+        assert_eq!(Project::new("Shared", "/project").ditch_dir(), PathBuf::from("/project/.ditch"));
     }
 }

@@ -12,6 +12,35 @@ pub enum GitHubRequest {
     CancelRead,
     OpenBrowser,
     Disconnect,
+    ManageRepositories,
+    RemoteSuggestions {
+        project_id: ProjectId,
+    },
+    SyncChanges {
+        cursor: u64,
+        #[serde(default)]
+        after_task: Option<String>,
+    },
+    CreateIssue {
+        #[serde(default)]
+        task_id: Option<TaskId>,
+        #[serde(default)]
+        issue_type: Option<String>,
+        #[serde(default)]
+        issue_kind: crate::TaskIssueKind,
+        project_id: ProjectId,
+        repository_id: u64,
+        request_id: String,
+        title: String,
+        body: String,
+    },
+    IssueTypes {
+        project_id: ProjectId,
+        repository_id: u64,
+    },
+    Publication {
+        task_id: TaskId,
+    },
     Repositories {
         page: u32,
     },
@@ -55,6 +84,8 @@ pub enum IssueFilter {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct GitHubRepository {
+    #[serde(default)]
+    pub project_paths: Vec<String>,
     pub id: u64,
     pub full_name: String,
     pub html_url: String,
@@ -63,6 +94,8 @@ pub struct GitHubRepository {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct GitHubIssue {
+    #[serde(default, rename = "type")]
+    pub issue_type: Option<GitHubIssueType>,
     pub id: u64,
     pub number: u64,
     pub title: String,
@@ -84,6 +117,24 @@ pub struct GitHubIssue {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GitHubIssueType {
+    pub id: u64,
+    pub name: String,
+    #[serde(default)]
+    pub color: Option<String>,
+}
+
+impl GitHubIssue {
+    pub fn kind(&self) -> crate::TaskIssueKind {
+        match self.issue_type.as_ref().map(|t| t.name.to_lowercase()).as_deref() {
+            Some("bug") => crate::TaskIssueKind::Bug,
+            Some("feature") => crate::TaskIssueKind::Feature,
+            _ => crate::TaskIssueKind::Custom,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct GitHubUser {
     pub login: String,
 }
@@ -96,6 +147,10 @@ pub struct GitHubLabel {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct GitHubTaskSource {
+    #[serde(default)]
+    pub issue_type: Option<GitHubIssueType>,
+    #[serde(default)]
+    pub project_paths: Vec<String>,
     pub repository_id: u64,
     pub issue_id: u64,
     pub repository: String,

@@ -6,3 +6,6 @@ license.workspace = true
 
 [dependencies]
 serde.workspace = true
+
+[build-dependencies]
+serde_json.workspace = true

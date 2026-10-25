@@ -26,6 +26,47 @@ Map<String, dynamic> taskJson({
   'archived': false,
 };
 void main() {
+  testWidgets('board keeps secondary controls in its menu', (tester) async {
+    await tester.binding.setSurfaceSize(const Size(1400, 900));
+    final c = TaskBoardController(
+      request: (_) async => {
+        'TaskResponse': {'Tasks': []},
+      },
+    );
+    c.replaceSnapshot({'tasks': [], 'agents': []});
+    await tester.pumpWidget(
+      MaterialApp(
+        theme: ThemeData(extensions: const [DitchTokens.light]),
+        home: Scaffold(
+          body: TaskBoard(
+            controller: c,
+            projects: const [TaskProjectOption('project', 'Project')],
+            connected: true,
+            executionProfile: () => {},
+            onOpenAgent: (_) {},
+            onRunSelected: (_, _) async {},
+            onPause: () async {},
+          ),
+        ),
+      ),
+    );
+    expect(find.text('Run selected (0)'), findsNothing);
+    expect(find.text('Pause queued work'), findsNothing);
+    expect(find.text('Show archived'), findsNothing);
+    expect(find.text('New task'), findsOneWidget);
+    await tester.tap(find.byTooltip('Board options'));
+    await tester.pumpAndSettle();
+    expect(find.text('Pause queued work'), findsNothing);
+    await tester.tap(
+      find.widgetWithText(CheckedPopupMenuItem<String>, 'Show archived'),
+    );
+    await tester.pumpAndSettle();
+    expect(find.text('Archived included'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+    await tester.pumpWidget(const SizedBox());
+    c.dispose();
+    await tester.binding.setSurfaceSize(null);
+  });
   test('backlog remains distinct from ready work', () {
     expect(
       TaskDto.fromJson(taskJson(state: 'Backlog')).column,
@@ -33,62 +74,52 @@ void main() {
     );
     expect(TaskDto.fromJson(taskJson()).column, TaskColumn.todo);
   });
-  testWidgets(
-    'Run requires selection and confirmation and retries the same authorization',
-    (tester) async {
-      await tester.binding.setSurfaceSize(const Size(1400, 900));
-      final c = TaskBoardController(
-        request: (_) async => {
-          'TaskResponse': {
-            'Tasks': [taskJson()],
-          },
+  testWidgets('legacy run controls stay hidden even with callbacks installed', (
+    tester,
+  ) async {
+    await tester.binding.setSurfaceSize(const Size(1400, 900));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    final c = TaskBoardController(
+      request: (_) async => {
+        'TaskResponse': {
+          'Tasks': [taskJson()],
         },
-      );
-      c.replaceSnapshot({
-        'tasks': [taskJson()],
-        'agents': [],
-      });
-      final ids = <String>[];
-      await tester.pumpWidget(
-        MaterialApp(
-          theme: ThemeData(extensions: const [DitchTokens.light]),
-          home: Scaffold(
-            body: TaskBoard(
-              controller: c,
-              projects: const [TaskProjectOption('project', 'Project')],
-              connected: true,
-              executionProfile: () => {'approval': 'Ask'},
-              onOpenAgent: (_) {},
-              onPause: () async {},
-              onRunSelected: (id, tasks) async {
-                ids.add(id);
-                expect(tasks.single.id, 'one');
-                if (ids.length == 1) throw StateError('Connection interrupted');
-              },
-            ),
+      },
+    );
+    addTearDown(c.dispose);
+    c.replaceSnapshot({
+      'tasks': [taskJson()],
+      'agents': [],
+    });
+    var calls = 0;
+    await tester.pumpWidget(
+      MaterialApp(
+        theme: ThemeData(extensions: const [DitchTokens.light]),
+        home: Scaffold(
+          body: TaskBoard(
+            controller: c,
+            projects: const [TaskProjectOption('project', 'Project')],
+            connected: true,
+            executionProfile: () => {'approval': 'Ask'},
+            onOpenAgent: (_) {},
+            onRunSelected: (_, _) async {
+              calls++;
+            },
+            onPause: () async {
+              calls++;
+            },
           ),
         ),
-      );
-      expect(ids, isEmpty);
-      await tester.tap(find.text('Select for Run'));
-      await tester.pump();
-      await tester.tap(find.text('Run selected (1)'));
-      await tester.pumpAndSettle();
-      expect(ids, isEmpty);
-      expect(find.textContaining('Project: Task one'), findsOneWidget);
-      await tester.tap(find.text('Run selected'));
-      await tester.pumpAndSettle();
-      expect(ids.length, 1);
-      await tester.tap(find.text('Retry Run request'));
-      await tester.pumpAndSettle();
-      expect(ids.length, 2);
-      expect(ids[0], ids[1]);
-      expect(tester.takeException(), isNull);
-      await tester.pumpWidget(const SizedBox());
-      c.dispose();
-      await tester.binding.setSurfaceSize(null);
-    },
-  );
+      ),
+    );
+    await tester.pumpAndSettle();
+    expect(find.text('Select for Run'), findsNothing);
+    expect(find.byType(CheckboxListTile), findsNothing);
+    await tester.tap(find.byTooltip('Board options'));
+    await tester.pumpAndSettle();
+    expect(find.text('Pause queued work'), findsNothing);
+    expect(calls, 0);
+  });
   test('legacy states map without fabricating review evidence', () {
     for (final state in [
       'Draft',

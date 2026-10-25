@@ -296,6 +296,7 @@ name = "ditch_core"
 version = "0.1.1"
 dependencies = [
  "chrono",
+ "ditch_product",
  "serde",
  "serde_json",
  "uuid",
@@ -306,6 +307,7 @@ name = "ditch_identity"
 version = "0.1.1"
 dependencies = [
  "base64",
+ "ditch_product",
  "p256",
  "rand_core",
  "security-framework",
@@ -332,6 +334,7 @@ name = "ditch_product"
 version = "0.1.1"
 dependencies = [
  "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -362,6 +365,7 @@ dependencies = [
 name = "ditch_ssh"
 version = "0.1.1"
 dependencies = [
+ "ditch_product",
  "security-framework",
  "serde",
  "serde_json",
@@ -426,6 +430,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "ureq",
+ "url",
  "uuid",
 ]
 

@@ -13,6 +13,7 @@ mod task_tests {
     }
     fn draft(title: &str) -> TaskDraft {
         TaskDraft {
+            issue_kind: Default::default(),
             skills: vec![],
             title: title.into(),
             description: "Implement safely".into(),

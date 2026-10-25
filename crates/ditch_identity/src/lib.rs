@@ -20,7 +20,7 @@ use uuid::Uuid;
 
 const IDENTITY_VERSION: u16 = 1;
 #[cfg(target_os = "macos")]
-const KEYCHAIN_SERVICE: &str = "ai.theditch.installation-identity.v1";
+const KEYCHAIN_SERVICE: &str = ditch_product::deployment::KEYCHAIN_SERVICE;
 #[cfg(target_os = "macos")]
 const KEYCHAIN_ACCOUNT: &str = "installation";
 
@@ -331,5 +331,15 @@ mod tests {
         assert_eq!(first.summary(), legacy.summary());
         assert_eq!(first.agreement_public_key(), second.agreement_public_key());
         let _ = fs::remove_dir_all(root);
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod deployment_isolation_tests {
+    #[test]
+    fn identity_service_cannot_overlap_the_other_environment() {
+        assert_eq!(super::KEYCHAIN_SERVICE, if ditch_product::deployment::ENVIRONMENT == "staging" {
+            "ai.theditch.installation-identity.staging.v1"
+        } else { "ai.theditch.installation-identity.v1" });
     }
 }

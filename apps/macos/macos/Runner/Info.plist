@@ -18,10 +18,10 @@
 	<array>
 		<dict>
 			<key>CFBundleURLName</key>
-			<string>ai.theditch.agent</string>
+			<string>$(DITCH_URL_NAME)</string>
 			<key>CFBundleURLSchemes</key>
 			<array>
-				<string>theditch</string>
+				<string>$(DITCH_URL_SCHEME)</string>
 			</array>
 		</dict>
 	</array>

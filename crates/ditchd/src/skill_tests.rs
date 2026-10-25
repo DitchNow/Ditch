@@ -253,6 +253,7 @@ for line in sys.stdin:
                 request_id: Uuid::new_v4(),
                 operation: TaskOperation::Create {
                     draft: ditch_core::TaskDraft {
+                        issue_kind: Default::default(),
                         skills: vec![],
                         title: "Bound task".into(),
                         description: String::new(),

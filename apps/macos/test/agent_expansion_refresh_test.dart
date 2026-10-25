@@ -15,6 +15,7 @@ Map<String, dynamic> _agent(String id, String projectId) => {
 };
 
 class _SnapshotClient extends DitchRuntimeClient {
+  _SnapshotClient() : super(socketPath: '/test/runtime.sock');
   final events = StreamController<Map<String, dynamic>>();
   final agents = [
     _agent('agent-a', 'project-a'),
@@ -44,6 +45,7 @@ class _SnapshotClient extends DitchRuntimeClient {
   @override
   Future<RuntimeStatusDto> runtimeStatus() async => const RuntimeStatusDto(
     identity: 'Test Runtime',
+    deploymentEnvironment: 'production',
     pid: 1,
     socketPath: '/test/runtime.sock',
     activeSessionCount: 0,

@@ -61,6 +61,14 @@ impl WriterGuard {
             return Err("Remote runtime is being upgraded; retry when repair finishes.".into());
         }
         locked.reap_orphan_writers();
+        // Board-owned execution is exclusive with every agent in this project,
+        // while ordinary manual-agent concurrency elsewhere remains unchanged.
+        let queue_owner = locked.tasks.values().any(|t| t.execution_queue.is_some()
+            && t.assigned_agent_id == Some(agent_id) && t.column() == TaskColumn::InProgress);
+        if (queue_owner && board_project_busy(&locked, project, Some(agent_id)))
+            || board_queue_reserved(&locked, project, Some(agent_id)) {
+            return Err("A board task or another agent is already running in this project.".into());
+        }
         if locked.acceptance_owners.contains(&agent_id)
             && locked.writer_leases.contains_key(&agent_id)
             && !locked.children.contains_key(&agent_id)
@@ -306,6 +314,7 @@ impl RuntimeState {
     }
 
     fn task_live(&self, task: &Task) -> bool {
+        if task.waiting_in_queue() { return false; }
         self.acceptance_controls.contains_key(&task.id)
             || task.assigned_agent_id.is_some_and(|id| {
                 self.agents.get(&id).is_none_or(|a| a.run.task_id == Some(task.id))
@@ -525,6 +534,7 @@ fn prepare_remote_board_task(
                 coordinator_group: task.coordinator_group,
                 continue_agent_id: task.continue_agent_id,
                 draft: ditch_core::TaskDraft {
+                    issue_kind: task.issue_kind,
                     skills: task.skills.clone(),
                     title: task.title.clone(),
                     description: task.description.clone(),
@@ -563,6 +573,14 @@ fn prepare_remote_board_task(
 }
 
 fn handle_task_request(state: Arc<Mutex<RuntimeState>>, request: TaskRequest) -> ServerResponse {
+    // Older controls must not bypass a board attachment or replace a locked owner.
+    if let TaskOperation::Link { task_id, .. } | TaskOperation::Start { task_id, .. } = &request.operation {
+        let s = state.lock().unwrap();
+        if s.tasks.get(task_id).is_some_and(|t| t.coordinator_group.is_none() &&
+            (matches!(request.operation, TaskOperation::Link { .. }) || t.execution_queue.is_some() || t.continue_agent_id.is_some())) {
+            return task_error(TaskErrorCode::IllegalTransition, "Select the agent in Todo, then use the task queue to start or retry it.");
+        }
+    }
     if let TaskOperation::Start { task_id, .. } = &request.operation {
         let s = state.lock().unwrap();
         if s.tasks.get(task_id).is_some_and(|task| {
@@ -589,7 +607,9 @@ fn handle_task_request(state: Arc<Mutex<RuntimeState>>, request: TaskRequest) ->
             TaskOperation::CreateBacklog { .. } => true,
             TaskOperation::Get { task_id } | TaskOperation::Update { task_id, .. }
             | TaskOperation::Move { task_id, .. } | TaskOperation::Delete { task_id, .. }
-            | TaskOperation::Transition { task_id, .. } =>
+            | TaskOperation::Transition { task_id, .. }
+            | TaskOperation::UpdateDescription { task_id, .. }
+            | TaskOperation::AttachGitHub { task_id, .. } =>
                 s.tasks.get(task_id).is_some_and(|t| t.remote_pending),
             _ => false,
         }
@@ -600,7 +620,10 @@ fn handle_task_request(state: Arc<Mutex<RuntimeState>>, request: TaskRequest) ->
         .and_then(|id| project_by_id(&state, id))
         .filter(|p| p.is_remote() && !local_pending)
     {
-        if let TaskOperation::Start { task_id, expected_revision, .. } = &request.operation {
+        if let TaskOperation::Start { task_id, expected_revision, .. }
+            | TaskOperation::Enqueue { task_id, expected_revision, .. }
+            | TaskOperation::SelectAgent { task_id, expected_revision, .. }
+            | TaskOperation::GeneratePlan { task_id, expected_revision, .. } = &request.operation {
             if let Err(e) = prepare_remote_board_task(&state, &project, *task_id, *expected_revision) {
                 return task_error(TaskErrorCode::InvalidInput, e);
             }
@@ -623,7 +646,7 @@ fn handle_task_request(state: Arc<Mutex<RuntimeState>>, request: TaskRequest) ->
         match connections.request(&alias, ClientRequest::RuntimeStatus) {
             Ok(ServerResponse::RuntimeStatus(status))
                 if (!managed || status.capabilities.iter().any(|c| c == "coordinator_concurrency_v1")) && status.capabilities.iter().any(|c| {
-                    c == if matches!(request.operation, TaskOperation::CreateIdentified { board_task: Some(_), .. }) { "board_workflow_v1" } else if matches!(request.operation, TaskOperation::CreateIdentified { .. }) { "identified_tasks_v1" } else if matches!(
+                    c == if matches!(request.operation, TaskOperation::RepositoryDiscovery | TaskOperation::AttachGitHub { .. }) { "github_task_metadata_v1" } else if matches!(request.operation, TaskOperation::BoardExecution { .. }) { "board_execution_v1" } else if matches!(request.operation, TaskOperation::Enqueue { .. } | TaskOperation::SelectAgent { .. }) { "board_agent_resume_v1" } else if matches!(request.operation, TaskOperation::ReorderQueue { .. }) { "board_queue_v1" } else if matches!(request.operation, TaskOperation::GeneratePlan { .. } | TaskOperation::CancelPlan { .. } | TaskOperation::UpdateDescription { .. }) { "task_planning_v1" } else if matches!(request.operation, TaskOperation::CreateIdentified { board_task: Some(_), .. }) { "board_workflow_v1" } else if matches!(request.operation, TaskOperation::CreateIdentified { .. }) { "identified_tasks_v1" } else if matches!(
                         request.operation,
                         TaskOperation::List { .. }
                             | TaskOperation::Get { .. }
@@ -666,6 +689,15 @@ fn handle_task_request(state: Arc<Mutex<RuntimeState>>, request: TaskRequest) ->
             }
         };
     }
+    if let Some(response) = board_execution_request(&state, &request) {
+        return response;
+    }
+    if let Some(response) = board_queue_request(&state, &request) {
+        return response;
+    }
+    if let Some(response) = task_planning_request(&state, &request) {
+        return response;
+    }
     if let Some(response) = acceptance_request(&state, &request) {
         return response;
     }
@@ -679,6 +711,18 @@ fn handle_task_request(state: Arc<Mutex<RuntimeState>>, request: TaskRequest) ->
         if let Err(error) = validate_selected_skills(&state, &project, &draft.skills) {
             return task_error(TaskErrorCode::InvalidInput, error);
         }
+    }
+    if matches!(request.operation, TaskOperation::RepositoryDiscovery) {
+        return match request.project_id.and_then(|id| project_by_id(&state, id)) {
+            Some(project) => match github::discovery::discover(&project.root) {
+                Ok(value) => ServerResponse::TaskResponse(TaskResponse::RepositoryDiscovery(value)),
+                Err(error) => task_error(TaskErrorCode::InvalidInput, error),
+            },
+            None => task_error(TaskErrorCode::NotFound, "Select a project"),
+        };
+    }
+    if let TaskOperation::AttachGitHub { task_id, source, issue } = &request.operation {
+        return github::publishing::attach_source(&state, &request, *task_id, source.clone(), issue.clone());
     }
     let result = prepare_task_request(&state, &request);
     match result {
@@ -695,6 +739,7 @@ fn prepare_task_request(
     state: &Arc<Mutex<RuntimeState>>,
     request: &TaskRequest,
 ) -> Result<PreparedTask, TaskError> {
+    let runtime = state;
     let mut state = state.lock().expect("runtime state lock poisoned");
     state.reap_orphan_writers();
     let storage =
@@ -896,6 +941,7 @@ fn prepare_task_request(
             }
             next.title = draft.title.trim().into();
             next.description = draft.description.clone();
+            next.issue_kind = draft.issue_kind;
             next.acceptance_criteria = draft.acceptance_criteria.clone();
             next.priority = draft.priority;
             next.touch();
@@ -1008,7 +1054,7 @@ fn prepare_task_request(
             next.assigned_agent_id = Some(task.continue_agent_id.unwrap_or_default());
             audit.agent_id = next.assigned_agent_id;
             next.condition = TaskCondition::Queued;
-            start = Some((next.clone(), project, execution_profile.clone()));
+            start = Some((next.clone(), project.clone(), execution_profile.clone()));
             audit
         }
         TaskOperation::Link { agent_id, .. } => {
@@ -1060,6 +1106,26 @@ fn prepare_task_request(
         }
         _ => unreachable!(),
     };
+    if task.execution_queue.is_some() && next.column() == TaskColumn::Todo {
+        // Returning to Todo unlocks selection but keeps the last real conversation.
+        let selected = task.execution_queue.as_ref().and_then(|q| q.agent_id)
+            .or(task.continue_agent_id).or(task.assigned_agent_id)
+            .filter(|id| state.agents.contains_key(id));
+        next.continue_agent_id = selected;
+        next.assigned_agent_id = selected;
+        next.execution_queue = None;
+        next.condition = TaskCondition::Idle;
+        next.last_reason = None;
+    } else if task.waiting_in_queue() && next.column() != TaskColumn::InProgress {
+        next.execution_queue = None;
+        next.condition = TaskCondition::Idle;
+        next.last_reason = None;
+    }
+    let planning = if task.column() == TaskColumn::Backlog && next.column() == TaskColumn::Todo {
+        prepare_automatic_task_plan(&state, &project, &mut next)
+    } else {
+        None
+    };
     let response = TaskResponse::Changed(next.clone());
     changes.push((next.clone(), audit));
     state
@@ -1075,6 +1141,10 @@ fn prepare_task_request(
     state.publish_tasks(changes);
     if next.column() == TaskColumn::InReview {
         state.task_attention(&next);
+    }
+    drop(state);
+    if let Some(launch) = planning {
+        launch_task_plan(runtime, project_id, task_id, launch);
     }
     Ok((response, start))
 }

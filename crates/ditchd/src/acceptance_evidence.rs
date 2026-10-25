@@ -2,7 +2,7 @@
 use chrono::Utc;
 use ditch_core::*;
 use sha2::{Digest, Sha256};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::{
     fs,
@@ -256,7 +256,7 @@ fn hash_files(root: &Path, mut names: Vec<String>, hash: &mut Sha256) -> Result<
     if names.len() > 20000 {
         return Err("Workspace snapshot exceeds 20000 files".into());
     }
-    let mut total = 0;
+    let deadline = Instant::now() + Duration::from_secs(60);
     for name in names {
         relative_check_path(&name)?;
         hash.update((name.len() as u64).to_le_bytes());
@@ -284,14 +284,50 @@ fn hash_files(root: &Path, mut names: Vec<String>, hash: &mut Sha256) -> Result<
             hash.update(capture(&path)?.fingerprint);
             continue;
         }
-        hash.update(meta.permissions().mode().to_le_bytes());
-        total += meta.len();
-        if total > 256 * 1024 * 1024 {
-            return Err("Workspace evidence exceeds 256 MiB".into());
+        // Evidence needs a digest, not file contents in memory. Retain the
+        // no-follow open and hash every byte, including large binary assets.
+        let mut file = open_scoped_file(root, &name)?;
+        let before = file.metadata().map_err(|e| e.to_string())?;
+        hash.update(before.permissions().mode().to_le_bytes());
+        hash.update(before.len().to_le_bytes());
+        let mut buffer = [0u8; 64 * 1024];
+        let mut read = 0u64;
+        loop {
+            if Instant::now() >= deadline {
+                return Err(
+                    "Workspace snapshot exceeded 60 seconds; retry when disk activity settles"
+                        .into(),
+                );
+            }
+            let count = file.read(&mut buffer).map_err(|e| e.to_string())?;
+            if count == 0 {
+                break;
+            }
+            read += count as u64;
+            hash.update(&buffer[..count]);
         }
-        let bytes = read_scoped_file(root, &name, 32 * 1024 * 1024)?;
-        hash.update((bytes.len() as u64).to_le_bytes());
-        hash.update(bytes);
+        let after = file.metadata().map_err(|e| e.to_string())?;
+        let current = fs::symlink_metadata(&path).map_err(|e| e.to_string())?;
+        let identity = |m: &fs::Metadata| {
+            (
+                m.dev(),
+                m.ino(),
+                m.len(),
+                m.mode(),
+                m.mtime(),
+                m.mtime_nsec(),
+                m.ctime(),
+                m.ctime_nsec(),
+            )
+        };
+        if read != before.len()
+            || identity(&before) != identity(&after)
+            || identity(&after) != identity(&current)
+        {
+            return Err(
+                "Workspace changed during snapshot; retry after file changes finish".into(),
+            );
+        }
     }
     Ok(())
 }
@@ -311,6 +347,18 @@ pub fn file_check(root: &Path, path: &str, predicate: &FilePredicate) -> Result<
 /// Open each component relative to an already-open directory, so a concurrent
 /// rename/symlink swap cannot redirect an automatic read outside its root.
 pub fn read_scoped_file(root: &Path, relative: &str, max_bytes: u32) -> Result<Vec<u8>, String> {
+    let file = open_scoped_file(root, relative)?;
+    let mut bytes = Vec::new();
+    std::io::Read::take(file, u64::from(max_bytes) + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| e.to_string())?;
+    if bytes.len() > max_bytes as usize {
+        return Err("Context byte limit exceeded".into());
+    }
+    Ok(bytes)
+}
+
+fn open_scoped_file(root: &Path, relative: &str) -> Result<fs::File, String> {
     use std::ffi::CString;
     use std::os::fd::{AsRawFd, FromRawFd};
     use std::os::unix::ffi::OsStrExt;
@@ -352,14 +400,7 @@ pub fn read_scoped_file(root: &Path, relative: &str, max_bytes: u32) -> Result<V
             if !file.metadata().map_err(|e| e.to_string())?.is_file() {
                 return Err("Context must be a regular file".into());
             }
-            let mut bytes = Vec::new();
-            std::io::Read::take(file, u64::from(max_bytes) + 1)
-                .read_to_end(&mut bytes)
-                .map_err(|e| e.to_string())?;
-            if bytes.len() > max_bytes as usize {
-                return Err("Context byte limit exceeded".into());
-            }
-            return Ok(bytes);
+            return Ok(file);
         }
         directory = file;
     }
@@ -369,6 +410,26 @@ pub fn read_scoped_file(root: &Path, relative: &str, max_bytes: u32) -> Result<V
 #[cfg(test)]
 mod hardening_tests {
     use super::*;
+    #[test]
+    fn snapshot_streams_large_files_and_detects_tail_changes() {
+        use std::io::{Seek, SeekFrom, Write};
+        let root =
+            std::env::temp_dir().join(format!("ditch-large-evidence-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let mut file = fs::File::create(root.join("asset.bin")).unwrap();
+        // Sparse fixture crosses both previous limits without consuming disk space.
+        file.set_len(257 * 1024 * 1024).unwrap();
+        let first = capture(&root).unwrap();
+        file.seek(SeekFrom::End(-1)).unwrap();
+        file.write_all(&[42]).unwrap();
+        file.sync_all().unwrap();
+        let second = capture(&root).unwrap();
+        assert_ne!(first.fingerprint, second.fingerprint);
+        assert_eq!(capture(&root).unwrap().fingerprint, second.fingerprint);
+        // Prompt/context reads still have their own strict memory limit.
+        assert!(read_scoped_file(&root, "asset.bin", 128).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn redaction_matches_normalized_bearer_and_private_key_markers() {
         for text in [
