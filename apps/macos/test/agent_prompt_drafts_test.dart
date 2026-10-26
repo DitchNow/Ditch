@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:the_ditch/application/agent_prompt_drafts.dart';
+import 'package:the_ditch/data/prompt_attachment.dart';
 import 'package:the_ditch/design_system/ditch_theme.dart';
 import 'package:the_ditch/main.dart';
 
@@ -74,6 +75,44 @@ class DraftHarness {
 }
 
 void main() {
+  testWidgets(
+    'attachments restore per agent and project through enlargement and removal',
+    (tester) async {
+      final f = DraftHarness();
+      f.drafts
+          .forAgent('agent-a', '')
+          .attachments
+          .add(PromptAttachment('/tmp/first.md'));
+      await f.mount(tester);
+      expect(find.text('first.md'), findsOneWidget);
+      f.update(() => f.agent = 'agent-b');
+      await f.settle(tester);
+      expect(find.text('first.md'), findsNothing);
+      f.update(() => f.agent = 'agent-a');
+      await f.settle(tester);
+      f.update(() => f.enlarged = true);
+      await f.settle(tester);
+      await f.recreate(tester);
+      expect(find.text('first.md'), findsOneWidget);
+      await tester.tap(find.byTooltip('Remove first.md'));
+      await f.recreate(tester);
+      expect(find.text('first.md'), findsNothing);
+      f.drafts
+          .forNewAgent('project-a', '')
+          .attachments
+          .add(PromptAttachment('/tmp/new.md'));
+      f.update(() => f.agent = 'new-agent');
+      await f.settle(tester);
+      expect(find.text('new.md'), findsOneWidget);
+      f.update(() => f.project = 'project-b');
+      await f.settle(tester);
+      expect(find.text('new.md'), findsNothing);
+      f.update(() => f.project = 'project-a');
+      await f.settle(tester);
+      expect(find.text('new.md'), findsOneWidget);
+    },
+  );
+
   testWidgets('macOS editor changes restore into a recreated native view', (
     tester,
   ) async {
@@ -136,9 +175,9 @@ void main() {
     expect(f.submitted, ['Native draft\nwith more detail']);
     await f.recreate(tester);
     expect(createdTexts.last, isEmpty);
-      await tester.pumpWidget(const SizedBox());
-      await tester.pumpAndSettle();
-      debugDefaultTargetPlatformOverride = null;
+    await tester.pumpWidget(const SizedBox());
+    await tester.pumpAndSettle();
+    debugDefaultTargetPlatformOverride = null;
   });
 
   testWidgets('drafts survive project switching, unmounting, and enlargement', (

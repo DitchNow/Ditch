@@ -329,6 +329,32 @@ impl DitchStore {
         Ok(())
     }
 
+    /// Persist a local rename in both stores, restoring metadata if SQLite fails.
+    /// Remote projects must only update their cache via upsert_project.
+    pub fn save_local_project_rename(&mut self, project: &Project) -> Result<(), StoreError> {
+        if project.is_remote() {
+            return Err(StoreError::InvalidData(
+                "Cannot write remote project metadata locally".into(),
+            ));
+        }
+        let previous = load_project_config(&project.root)?;
+        if previous.id != project.id {
+            return Err(StoreError::InvalidData(
+                "Project metadata identity has changed; reopen the project".into(),
+            ));
+        }
+        save_project_config(project)?;
+        if let Err(error) = self.upsert_project(project) {
+            if let Err(rollback) = save_project_config(&previous) {
+                return Err(StoreError::InvalidData(format!(
+                    "Rename was not committed: {error}. Restoring project metadata also failed: {rollback}. Restore the previous name in .ditch/project.json before retrying."
+                )));
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+
     /// Removes only Ditch's persisted state for a project. The project
     /// directory and its `.ditch` metadata are deliberately never touched.
     pub fn delete_project(&mut self, project_id: ProjectId) -> Result<(), StoreError> {
@@ -1247,3 +1273,31 @@ CREATE TABLE IF NOT EXISTS community_schema_migrations (
 );
 
 "#;
+
+/// Reject symlinks and special files before writing cloned metadata.
+pub fn validate_cloned_project_metadata(root: &Path) -> Result<(), StoreError> {
+    for (relative, directory) in [
+        (".ditch", true),
+        (".ditch/agents", true),
+        (".ditch/hooks", true),
+        (".ditch/mcp", true),
+        (".ditch/project.json", false),
+    ] {
+        match fs::symlink_metadata(root.join(relative)) {
+            Ok(metadata)
+                if metadata.file_type().is_symlink()
+                    || (directory && !metadata.is_dir())
+                    || (!directory && !metadata.is_file()) =>
+            {
+                return Err(StoreError::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Unsafe cloned metadata path: {relative}"),
+                )));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(StoreError::Io(error)),
+        }
+    }
+    Ok(())
+}

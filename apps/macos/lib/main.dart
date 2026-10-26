@@ -1,4 +1,8 @@
 import 'github_inbox.dart';
+import 'data/project_clone_models.dart';
+import 'widgets/clone_project_dialog.dart';
+import 'widgets/github_mark.dart';
+import 'widgets/assistant_message_content.dart';
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
@@ -11,6 +15,9 @@ import 'package:xterm/xterm.dart';
 
 import 'application/command_center_controller.dart';
 import 'application/agent_prompt_drafts.dart';
+import 'data/prompt_attachment.dart';
+import 'widgets/native_file_drop_region.dart';
+import 'widgets/prompt_attachments.dart';
 import 'application/project_sidebar_controller.dart';
 import 'application/product_update_controller.dart';
 import 'widgets/update_available_dot.dart';
@@ -1266,7 +1273,7 @@ List<AttentionEvent> attentionForProject(
       .toList();
 }
 
-class DitchRuntimeClient {
+class DitchRuntimeClient implements ProjectCloneClient {
   DitchRuntimeClient({
     String? socketPath,
     String deploymentEnvironment = ditchDeploymentEnvironment,
@@ -1310,6 +1317,13 @@ class DitchRuntimeClient {
     });
   }
 
+  Future<Map<String, dynamic>> renameProject({
+    required String projectId,
+    required String name,
+  }) => request({
+    'RenameProject': {'project_id': projectId, 'name': name},
+  });
+
   Future<Map<String, dynamic>> createProject({
     required String name,
     required String root,
@@ -1327,6 +1341,59 @@ class DitchRuntimeClient {
       },
     });
   }
+
+  @override
+  Future<ProjectCloneStatus> startProjectClone({
+    required String operationId,
+    required String url,
+    required String parent,
+    required String folder,
+    required String name,
+  }) async {
+    final runtime = await runtimeStatus();
+    if (!runtime.capabilities.contains('project_clone_v1')) {
+      throw const DitchRuntimeException(
+        'clone_unavailable',
+        'Update and restart the Ditch runtime to clone projects.',
+      );
+    }
+    return ProjectCloneStatus.fromResponse(
+      await request({
+        'StartProjectClone': {
+          'operation_id': operationId,
+          'url': url,
+          'parent': parent,
+          'folder': folder,
+          'name': name,
+        },
+      }),
+    );
+  }
+
+  @override
+  Future<ProjectCloneStatus> projectCloneStatus(String operationId) async =>
+      ProjectCloneStatus.fromResponse(
+        await request({
+          'ProjectCloneStatus': {'operation_id': operationId},
+        }),
+      );
+
+  @override
+  Future<ProjectCloneStatus> cancelProjectClone(String operationId) async =>
+      ProjectCloneStatus.fromResponse(
+        await request({
+          'CancelProjectClone': {'operation_id': operationId},
+        }),
+      );
+
+  @override
+  Future<ProjectCloneStatus> retryProjectCloneRegistration(
+    String operationId,
+  ) async => ProjectCloneStatus.fromResponse(
+    await request({
+      'RetryProjectCloneRegistration': {'operation_id': operationId},
+    }),
+  );
 
   Future<List<Map<String, dynamic>>> discoverSshHosts() async {
     final response = await request('DiscoverSshHosts');
@@ -3225,6 +3292,23 @@ class _CommandCenterScreenState extends State<CommandCenterScreen>
     return parseRuntimeProject(value);
   }
 
+  Future<DitchProject> _renameProject(DitchProject project, String name) async {
+    final id = project.id;
+    if (id == null || !_projects.any((candidate) => candidate.id == id)) {
+      throw StateError('Project is no longer registered');
+    }
+    final response = await _runtimeClient.renameProject(projectId: id, name: name);
+    final renamed = _projectFromRuntime(response['ProjectRenamed']);
+    if (renamed == null || renamed.id != id) {
+      throw StateError('Runtime returned an invalid project rename response');
+    }
+    if (!mounted || !_projects.any((candidate) => candidate.id == id)) {
+      throw StateError('Project is no longer available');
+    }
+    setState(() => upsertProject(_projects, renamed));
+    return renamed;
+  }
+
   @override
   void initState() {
     super.initState();
@@ -3354,6 +3438,10 @@ class _CommandCenterScreenState extends State<CommandCenterScreen>
       builder: (context) => const AddProjectKindDialog(),
     );
     if (kind == null) return;
+    if (kind == _AddProjectKind.github) {
+      await _cloneGitHubProject();
+      return;
+    }
     if (kind == _AddProjectKind.remote) {
       await _addRemoteProject();
       return;
@@ -3431,6 +3519,41 @@ class _CommandCenterScreenState extends State<CommandCenterScreen>
     }
   }
 
+  Future<void> _cloneGitHubProject() async {
+    try {
+      await _ensureRuntimeStarted();
+      if (!mounted) return;
+      final result = await showDialog<Map<String, dynamic>>(
+        context: context,
+        barrierDismissible: false,
+        builder: (context) => CloneProjectDialog(client: _runtimeClient),
+      );
+      if (result == null || !mounted) return;
+      final project = _projectFromRuntime(result);
+      if (project == null) {
+        throw const FormatException(
+          'The runtime did not return a registered project.',
+        );
+      }
+      setState(() {
+        // ProjectChanged may already have inserted this project.
+        upsertProject(_projects, project);
+        _selectedProjectKey = _projectKey(project);
+        _projectSidebar.revealProject(project);
+        _createAgentSession(expand: true);
+      });
+      unawaited(_ensureSelectedProjectTerminal());
+    } on Object catch (error) {
+      if (mounted) {
+        _showProjectSetupResult(
+          title: 'Setup incomplete',
+          message: '$error',
+          isError: true,
+        );
+      }
+    }
+  }
+
   Future<void> _addRemoteProject() async {
     await _ensureRuntimeStarted();
     if (!mounted) return;
@@ -3455,6 +3578,31 @@ class _CommandCenterScreenState extends State<CommandCenterScreen>
     ScaffoldMessenger.of(
       context,
     ).showSnackBar(const SnackBar(content: Text('Project path copied.')));
+  }
+
+  Future<void> _copyFilePath(
+    DitchProject project,
+    ProjectFileEntry entry,
+  ) async {
+    // Join lexically: remote paths and symlinks must not resolve locally.
+    final root = project.path.replaceFirst(RegExp(r'/+$'), '');
+    final path = '$root/${entry.relativePath}';
+    try {
+      await Clipboard.setData(ClipboardData(text: path));
+    } on Object catch (error) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('Could not copy path: $error')));
+      return;
+    }
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+        content: Text('Path copied.'),
+        duration: Duration(seconds: 2),
+      ),
+    );
   }
 
   Future<void> _setupRemoteProject(DitchProject project) async {
@@ -5307,6 +5455,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen>
               final agentsSurface = AgentPromptDraftScope(
                 drafts: _promptDrafts,
                 projectKey: _projectKey(_selectedProject),
+                isRemote: _selectedProject.isRemote,
                 child: AgentSettingsScope(
                   settings: _settingsForProject(_selectedProject.id),
                   loadModels:
@@ -5373,6 +5522,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen>
                       ProjectFilesState.new,
                     );
               ProjectToolsPanel projectToolsPanel({required bool showFiles}) {
+                final displayedProject = _selectedProject;
                 final editorOwnsHorizontalPresentation =
                     _presentedTool == WorkspaceToolKind.editor &&
                     _terminalPresentation == TerminalPresentation.horizontal;
@@ -5421,6 +5571,8 @@ class _CommandCenterScreenState extends State<CommandCenterScreen>
                   },
                   onRevealFile: (entry) =>
                       unawaited(_revealProjectEntry(entry)),
+                  onCopyFilePath: (entry) =>
+                      unawaited(_copyFilePath(displayedProject, entry)),
                   onBackToFiles: selectedFiles == null
                       ? null
                       : () => unawaited(_closeProjectFile(selectedFiles)),
@@ -5606,6 +5758,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen>
                           _showBoard = false;
                         }),
                         onAddProject: _addProject,
+                        onRenameProject: _renameProject,
                         onSelectProject: (project) {
                           setState(() {
                             _editionWorkspace = null;
@@ -8827,6 +8980,7 @@ class AgentChatPanel extends StatelessWidget {
         ),
       AgentComposer(
         key: composerKey,
+        isRemote: AgentPromptDraftScope.maybeOf(context)?.isRemote ?? false,
         draft: AgentPromptDraftScope.maybeOf(context)?.forConversation(
           conversationId,
           initialPrompt,
@@ -8984,6 +9138,10 @@ class _ConversationTranscriptState extends State<ConversationTranscript> {
       children: [
         NotificationListener<ScrollNotification>(
           onNotification: (notification) {
+            if (notification.depth != 0 ||
+                notification.metrics.axis != Axis.vertical) {
+              return false;
+            }
             widget.viewport.handleScrollNotification(notification);
             if ((notification is ScrollUpdateNotification ||
                     notification is ScrollEndNotification) &&
@@ -9235,6 +9393,7 @@ class AgentComposer extends StatefulWidget {
   const AgentComposer({
     required this.initialText,
     this.draft,
+    this.isRemote = false,
     required this.hasSession,
     required this.isWorking,
     this.canStop = false,
@@ -9249,6 +9408,7 @@ class AgentComposer extends StatefulWidget {
 
   final String initialText;
   final AgentPromptDraft? draft;
+  final bool isRemote;
   final AgentExecutionSettings? executionSettings;
   final bool hasSession;
   final bool isWorking;
@@ -9268,6 +9428,14 @@ class AgentComposerState extends State<AgentComposer> {
   static const _minimumEditorHeight = 48.0;
   static const _maximumEditorHeight = 160.0;
   late String _draftText;
+  final _localAttachments = <PromptAttachment>[];
+  List<PromptAttachment> get _attachments =>
+      widget.draft?.attachments ?? _localAttachments;
+  String? _attachmentError;
+  int _generation = 0;
+  int _attachmentRevision = 0;
+  int? _submittingGeneration;
+  Future<void> _dropQueue = Future.value();
   double _editorHeight = _minimumEditorHeight;
   bool _composerHasFocus = false;
   AgentSettingsScope? _scope;
@@ -9290,6 +9458,11 @@ class AgentComposerState extends State<AgentComposer> {
   void didUpdateWidget(AgentComposer oldWidget) {
     super.didUpdateWidget(oldWidget);
     if (!identical(oldWidget.draft, widget.draft)) {
+      _generation++;
+      _dropQueue = Future.value();
+      _attachmentRevision++;
+      _localAttachments.clear();
+      _attachmentError = null;
       _draftText = widget.draft?.text ?? widget.initialText;
       _nativeComposerKey = GlobalKey<NativeComposerTextViewState>();
       _editorHeight = _minimumEditorHeight;
@@ -9308,29 +9481,113 @@ class AgentComposerState extends State<AgentComposer> {
     await _nativeComposerKey.currentState?.blur();
   }
 
+  void _includeFiles(List<String> paths) {
+    final generation = _generation;
+    // Serial validation preserves the order of consecutive multi-file drops.
+    _dropQueue = _dropQueue.then((_) async {
+      if (!mounted || generation != _generation || !widget.enabled) return;
+      if (widget.isRemote) {
+        setState(
+          () => _attachmentError =
+              'Local file inclusion is unavailable for SSH projects. Use a path on the remote machine.',
+        );
+        return;
+      }
+      final valid = <PromptAttachment>[];
+      final invalid = <String>[];
+      for (final path in paths) {
+        final attachment = PromptAttachment(path);
+        if (path.startsWith('/') && await attachment.isReadable) {
+          valid.add(attachment);
+        } else {
+          invalid.add(attachment.filename);
+        }
+      }
+      if (!mounted ||
+          generation != _generation ||
+          !widget.enabled ||
+          widget.isRemote) {
+        return;
+      }
+      setState(() {
+        final existing = _attachments.map((file) => file.path).toSet();
+        for (final file in valid) {
+          if (existing.add(file.path)) _attachments.add(file);
+        }
+        _attachmentRevision++;
+        _attachmentError = invalid.isEmpty
+            ? null
+            : 'Cannot include ${invalid.join(', ')}. Choose readable regular files.';
+      });
+    });
+  }
+
   Future<void> submit() async {
-    if (!widget.enabled || widget.isWorking || widget.canStop) {
+    if (!widget.enabled ||
+        widget.isWorking ||
+        widget.canStop ||
+        _submittingGeneration == _generation) {
       return;
     }
-
+    final generation = _generation;
+    _submittingGeneration = generation;
     final editor = _nativeComposerKey.currentState;
     final draft = widget.draft;
-    final nativeText = await editor?.currentText() ?? _draftText;
-    if (!mounted ||
-        !identical(editor, _nativeComposerKey.currentState) ||
-        !identical(draft, widget.draft)) {
-      return;
+    bool current() =>
+        mounted &&
+        generation == _generation &&
+        identical(editor, _nativeComposerKey.currentState) &&
+        identical(draft, widget.draft) &&
+        widget.enabled &&
+        !widget.isWorking &&
+        !widget.canStop;
+    try {
+      await _dropQueue;
+      if (!current()) return;
+      final revision = _attachmentRevision;
+      final nativeText = await editor?.currentText() ?? _draftText;
+      if (!current()) return;
+      final attachments = List<PromptAttachment>.of(_attachments);
+      if (attachments.isNotEmpty && widget.isRemote) {
+        setState(
+          () => _attachmentError =
+              'Local file inclusion is unavailable for SSH projects. Remove these files to send.',
+        );
+        return;
+      }
+      for (final attachment in attachments) {
+        if (!await attachment.isReadable) {
+          if (current()) {
+            setState(
+              () => _attachmentError =
+                  'Cannot read ${attachment.filename}. Restore the file or remove it to send.',
+            );
+          }
+          return;
+        }
+      }
+      if (!current() || revision != _attachmentRevision) return;
+      // Do not clear edits made while file availability was being checked.
+      if ((await editor?.currentText() ?? _draftText) != nativeText ||
+          !current() ||
+          revision != _attachmentRevision) {
+        return;
+      }
+      final prompt = serializeAttachedPrompt(nativeText, attachments);
+      if (prompt.isEmpty) return;
+      final onSubmit = widget.onSubmit;
+      _handleChanged('');
+      setState(() {
+        _attachments.clear();
+        _attachmentRevision++;
+        _attachmentError = null;
+      });
+      await editor?.clearText();
+      onSubmit(prompt);
+      if (current()) focus();
+    } finally {
+      if (_submittingGeneration == generation) _submittingGeneration = null;
     }
-    final prompt = nativeText.trim();
-    if (prompt.isEmpty) {
-      return;
-    }
-
-    final onSubmit = widget.onSubmit;
-    _handleChanged('');
-    await editor?.clearText();
-    onSubmit(prompt);
-    if (mounted) focus();
   }
 
   void _handleChanged(String text) {
@@ -9356,95 +9613,130 @@ class AgentComposerState extends State<AgentComposer> {
 
   @override
   Widget build(BuildContext context) {
-    final hasText = _draftText.trim().isNotEmpty;
+    final hasText = _draftText.trim().isNotEmpty || _attachments.isNotEmpty;
     final actionLabel = widget.hasSession ? 'Send' : 'Start';
     final actionIcon = widget.hasSession ? Icons.send : Icons.play_arrow;
     final editable = widget.enabled;
     final canSubmit = widget.enabled && !widget.isWorking && !widget.canStop;
 
-    return Padding(
-      padding: const EdgeInsets.all(12),
-      child: GestureDetector(
-        key: const Key('composer-focus-surface'),
-        behavior: HitTestBehavior.opaque,
-        excludeFromSemantics: true,
-        onTap: editable ? focus : null,
-        child: Container(
-          decoration: BoxDecoration(
-            color: context.ditch.surfaceHover,
-            borderRadius: BorderRadius.circular(context.ditch.radiusMedium),
-            border: Border.all(
-              color: _composerHasFocus
-                  ? context.ditch.accent.withValues(alpha: 0.72)
-                  : context.ditch.separator.withValues(alpha: 0.72),
+    return NativeFileDropRegion(
+      key: ValueKey(_generation),
+      enabled: widget.enabled,
+      remote: widget.isRemote,
+      onDrop: _includeFiles,
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: GestureDetector(
+          key: const Key('composer-focus-surface'),
+          behavior: HitTestBehavior.opaque,
+          excludeFromSemantics: true,
+          onTap: editable ? focus : null,
+          child: Container(
+            decoration: BoxDecoration(
+              color: context.ditch.surfaceHover,
+              borderRadius: BorderRadius.circular(context.ditch.radiusMedium),
+              border: Border.all(
+                color: _composerHasFocus
+                    ? context.ditch.accent.withValues(alpha: 0.72)
+                    : context.ditch.separator.withValues(alpha: 0.72),
+              ),
             ),
-          ),
-          padding: const EdgeInsets.all(10),
-          child: ListenableBuilder(
-            listenable: _settings,
-            builder: (context, _) => Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                LayoutBuilder(
-                  builder: (context, constraints) => Row(
-                    crossAxisAlignment: CrossAxisAlignment.end,
-                    children: [
-                      Expanded(
-                        child: AnimatedContainer(
-                          key: const Key('composer-editor-shell'),
-                          duration: MediaQuery.disableAnimationsOf(context)
-                              ? const Duration(milliseconds: 1)
-                              : const Duration(milliseconds: 120),
-                          curve: Curves.easeOut,
-                          height: _editorHeight,
-                          child: NativeComposerTextView(
-                            key: _nativeComposerKey,
-                            initialText: _draftText,
-                            enabled: editable,
-                            placeholder: widget.hasSession
-                                ? 'Send a follow-up to Codex'
-                                : 'Tell Codex what to do',
-                            onChanged: _handleChanged,
-                            onFocusChanged: _handleFocusChanged,
-                            onContentHeightChanged: _handleContentHeightChanged,
-                            onSubmitRequested: submit,
-                            onEnlarge: widget.onEnlarge,
-                            onEscape: widget.onEscape,
+            padding: const EdgeInsets.all(10),
+            child: ListenableBuilder(
+              listenable: _settings,
+              builder: (context, _) => Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  if (_attachments.isNotEmpty) ...[
+                    PromptAttachments(
+                      attachments: _attachments,
+                      onRemove: widget.enabled
+                          ? (file) => setState(() {
+                              _attachments.remove(file);
+                              _attachmentRevision++;
+                              _attachmentError = null;
+                            })
+                          : null,
+                    ),
+                    const SizedBox(height: 8),
+                  ],
+                  if (_attachmentError != null)
+                    Padding(
+                      padding: const EdgeInsets.only(bottom: 8),
+                      child: Semantics(
+                        liveRegion: true,
+                        child: Text(
+                          _attachmentError!,
+                          style: TextStyle(
+                            color: Theme.of(context).colorScheme.error,
                           ),
                         ),
                       ),
-                      const SizedBox(width: 6),
-                      if (widget.canStop)
-                        IconButton.filledTonal(
-                          onPressed: widget.onStop,
-                          tooltip: 'Stop Codex',
-                          icon: const Icon(Icons.stop_circle_outlined),
-                        )
-                      else if (constraints.maxWidth < 190)
-                        FilledButton.icon(
-                          onPressed: hasText && canSubmit ? submit : null,
-                          icon: Icon(actionIcon),
-                          label: Text(actionLabel),
-                          style: FilledButton.styleFrom(
-                            padding: const EdgeInsets.symmetric(horizontal: 10),
+                    ),
+                  LayoutBuilder(
+                    builder: (context, constraints) => Row(
+                      crossAxisAlignment: CrossAxisAlignment.end,
+                      children: [
+                        Expanded(
+                          child: AnimatedContainer(
+                            key: const Key('composer-editor-shell'),
+                            duration: MediaQuery.disableAnimationsOf(context)
+                                ? const Duration(milliseconds: 1)
+                                : const Duration(milliseconds: 120),
+                            curve: Curves.easeOut,
+                            height: _editorHeight,
+                            child: NativeComposerTextView(
+                              key: _nativeComposerKey,
+                              initialText: _draftText,
+                              enabled: editable,
+                              placeholder: widget.hasSession
+                                  ? 'Send a follow-up to Codex'
+                                  : 'Tell Codex what to do',
+                              onChanged: _handleChanged,
+                              onFocusChanged: _handleFocusChanged,
+                              onContentHeightChanged:
+                                  _handleContentHeightChanged,
+                              onSubmitRequested: submit,
+                              onEnlarge: widget.onEnlarge,
+                              onEscape: widget.onEscape,
+                            ),
                           ),
-                        )
-                      else
-                        FilledButton.icon(
-                          onPressed: hasText && canSubmit ? submit : null,
-                          icon: Icon(actionIcon),
-                          label: Text(actionLabel),
                         ),
-                    ],
+                        const SizedBox(width: 6),
+                        if (widget.canStop)
+                          IconButton.filledTonal(
+                            onPressed: widget.onStop,
+                            tooltip: 'Stop Codex',
+                            icon: const Icon(Icons.stop_circle_outlined),
+                          )
+                        else if (constraints.maxWidth < 190)
+                          FilledButton.icon(
+                            onPressed: hasText && canSubmit ? submit : null,
+                            icon: Icon(actionIcon),
+                            label: Text(actionLabel),
+                            style: FilledButton.styleFrom(
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 10,
+                              ),
+                            ),
+                          )
+                        else
+                          FilledButton.icon(
+                            onPressed: hasText && canSubmit ? submit : null,
+                            icon: Icon(actionIcon),
+                            label: Text(actionLabel),
+                          ),
+                      ],
+                    ),
                   ),
-                ),
-                const SizedBox(height: 8),
-                AgentExecutionControls(
-                  settings: _settings,
-                  loadModels: _scope?.loadModels,
-                  appliesNextTurn: widget.isWorking || widget.canStop,
-                ),
-              ],
+                  const SizedBox(height: 8),
+                  AgentExecutionControls(
+                    settings: _settings,
+                    loadModels: _scope?.loadModels,
+                    appliesNextTurn: widget.isWorking || widget.canStop,
+                  ),
+                ],
+              ),
             ),
           ),
         ),
@@ -10176,7 +10468,9 @@ class AgentChatBubble extends StatelessWidget {
                       ],
                     ),
                     const SizedBox(height: 8),
-                    if (message.role == ChatMessageRole.tool)
+                    if (message.role == ChatMessageRole.assistant)
+                      AssistantMessageContent(text: message.text)
+                    else if (message.role == ChatMessageRole.tool)
                       SelectionArea(
                         child: Text(
                           message.text,
@@ -10233,6 +10527,7 @@ class ProjectToolsPanel extends StatefulWidget {
     required this.onToggleDirectory,
     required this.onOpenFile,
     required this.onRevealFile,
+    required this.onCopyFilePath,
     required this.onBackToFiles,
     required this.onSaveFile,
     required this.onReloadFile,
@@ -10261,6 +10556,7 @@ class ProjectToolsPanel extends StatefulWidget {
   final ValueChanged<ProjectFileEntry> onToggleDirectory;
   final ValueChanged<ProjectFileEntry> onOpenFile;
   final ValueChanged<ProjectFileEntry> onRevealFile;
+  final ValueChanged<ProjectFileEntry> onCopyFilePath;
   final VoidCallback? onBackToFiles;
   final VoidCallback? onSaveFile;
   final VoidCallback? onReloadFile;
@@ -10356,6 +10652,7 @@ class _ProjectToolsPanelState extends State<ProjectToolsPanel> {
                   onToggleDirectory: widget.onToggleDirectory,
                   onOpenFile: widget.onOpenFile,
                   onRevealFile: widget.onRevealFile,
+                  onCopyFilePath: widget.onCopyFilePath,
                   onBack: widget.onBackToFiles,
                   onSave: widget.onSaveFile,
                   onReload: widget.onReloadFile,
@@ -10448,6 +10745,7 @@ class ProjectFilesBody extends StatelessWidget {
     required this.onToggleDirectory,
     required this.onOpenFile,
     required this.onRevealFile,
+    required this.onCopyFilePath,
     required this.onBack,
     required this.onSave,
     required this.onReload,
@@ -10461,11 +10759,30 @@ class ProjectFilesBody extends StatelessWidget {
   final ValueChanged<ProjectFileEntry> onToggleDirectory;
   final ValueChanged<ProjectFileEntry> onOpenFile;
   final ValueChanged<ProjectFileEntry> onRevealFile;
+  final ValueChanged<ProjectFileEntry> onCopyFilePath;
   final VoidCallback? onBack;
   final VoidCallback? onSave;
   final VoidCallback? onReload;
   final VoidCallback? onOverwrite;
   final ValueChanged<TerminalPresentation> onPresentationChanged;
+
+  Future<void> _showContextMenu(
+    BuildContext context,
+    TapDownDetails details,
+    ProjectFileEntry entry,
+  ) async {
+    final overlay = Overlay.of(context).context.findRenderObject() as RenderBox;
+    final position = overlay.globalToLocal(details.globalPosition);
+    final copyPath = await showMenu<bool>(
+      context: context,
+      position: RelativeRect.fromRect(
+        position & Size.zero,
+        Offset.zero & overlay.size,
+      ),
+      items: const [PopupMenuItem(value: true, child: Text('Copy Path'))],
+    );
+    if (copyPath == true) onCopyFilePath(entry);
+  }
 
   List<(ProjectFileEntry, int)> _visibleEntries(ProjectFilesState state) {
     final visible = <(ProjectFileEntry, int)>[];
@@ -10529,44 +10846,51 @@ class ProjectFilesBody extends StatelessWidget {
                     final loading = state.loadingDirectories.contains(
                       entry.relativePath,
                     );
-                    return ListTile(
-                      dense: true,
-                      contentPadding: EdgeInsets.only(
-                        left: 10 + depth * 16,
-                        right: 8,
+                    return GestureDetector(
+                      behavior: HitTestBehavior.opaque,
+                      onSecondaryTapDown: (details) =>
+                          _showContextMenu(context, details, entry),
+                      child: ListTile(
+                        dense: true,
+                        contentPadding: EdgeInsets.only(
+                          left: 10 + depth * 16,
+                          right: 8,
+                        ),
+                        leading: loading
+                            ? const SizedBox.square(
+                                dimension: 16,
+                                child: CircularProgressIndicator(
+                                  strokeWidth: 2,
+                                ),
+                              )
+                            : Icon(
+                                entry.isDirectory
+                                    ? expanded
+                                          ? Icons.folder_open_outlined
+                                          : Icons.folder_outlined
+                                    : entry.isFile
+                                    ? Icons.description_outlined
+                                    : Icons.link,
+                                size: 17,
+                              ),
+                        title: Text(
+                          entry.name,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(fontSize: 13),
+                        ),
+                        trailing: IconButton(
+                          tooltip: 'Reveal in Finder',
+                          visualDensity: VisualDensity.compact,
+                          onPressed: () => onRevealFile(entry),
+                          icon: const Icon(Icons.open_in_new, size: 15),
+                        ),
+                        onTap: entry.isDirectory
+                            ? () => onToggleDirectory(entry)
+                            : entry.isFile
+                            ? () => onOpenFile(entry)
+                            : null,
                       ),
-                      leading: loading
-                          ? const SizedBox.square(
-                              dimension: 16,
-                              child: CircularProgressIndicator(strokeWidth: 2),
-                            )
-                          : Icon(
-                              entry.isDirectory
-                                  ? expanded
-                                        ? Icons.folder_open_outlined
-                                        : Icons.folder_outlined
-                                  : entry.isFile
-                                  ? Icons.description_outlined
-                                  : Icons.link,
-                              size: 17,
-                            ),
-                      title: Text(
-                        entry.name,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: const TextStyle(fontSize: 13),
-                      ),
-                      trailing: IconButton(
-                        tooltip: 'Reveal in Finder',
-                        visualDensity: VisualDensity.compact,
-                        onPressed: () => onRevealFile(entry),
-                        icon: const Icon(Icons.open_in_new, size: 15),
-                      ),
-                      onTap: entry.isDirectory
-                          ? () => onToggleDirectory(entry)
-                          : entry.isFile
-                          ? () => onOpenFile(entry)
-                          : null,
                     );
                   },
                 ),
@@ -10996,13 +11320,14 @@ class ProjectTerminalHeader extends StatelessWidget {
   }
 }
 
-enum _AddProjectKind { local, remote }
+enum _AddProjectKind { local, remote, github }
 
 class AddProjectKindDialog extends StatelessWidget {
   const AddProjectKindDialog({super.key});
 
   @override
   Widget build(BuildContext context) => AlertDialog(
+    scrollable: true,
     title: const Text('Add Project'),
     content: SizedBox(
       width: 480,
@@ -11016,6 +11341,13 @@ class AddProjectKindDialog extends StatelessWidget {
             title: const Text('Local Project'),
             subtitle: const Text('Runs on this Mac'),
             onTap: () => Navigator.pop(context, _AddProjectKind.local),
+          ),
+          const SizedBox(height: 8),
+          ListTile(
+            leading: const GitHubMark(size: 24),
+            title: const Text('GitHub'),
+            subtitle: const Text('Clone a repository onto this Mac'),
+            onTap: () => Navigator.pop(context, _AddProjectKind.github),
           ),
           const SizedBox(height: 8),
           ListTile(

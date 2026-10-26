@@ -21,6 +21,7 @@ class ProjectSidebar extends StatefulWidget {
     required this.onDeleteProject,
     required this.summaryForProject,
     this.onSetupRemoteProject,
+    this.onRenameProject,
     this.onOpenBoard,
     this.onOpenSkills,
     this.editionNavigation = const [],
@@ -40,6 +41,7 @@ class ProjectSidebar extends StatefulWidget {
   final ValueChanged<DitchProject> onCopyProjectPath;
   final ValueChanged<DitchProject> onReconnectRemoteProject;
   final ValueChanged<DitchProject>? onSetupRemoteProject;
+  final Future<void> Function(DitchProject, String)? onRenameProject;
   final ValueChanged<DitchProject> onDeleteProject;
   final ProjectAgentSummary Function(DitchProject) summaryForProject;
   final VoidCallback? onOpenBoard;
@@ -321,7 +323,11 @@ class _ProjectSidebarState extends State<ProjectSidebar> {
       key: ValueKey('sidebar-project-${projectKey(project)}'),
       padding: EdgeInsets.only(left: indented ? 10 : 0, bottom: 4),
       child: ProjectTile(
+        key: ValueKey(projectKey(project)),
         identity: projectKey(project),
+        onRename: project.id == null || widget.onRenameProject == null
+            ? null
+            : (name) => widget.onRenameProject!(project, name),
         name: project.name,
         path: project.path,
         isRemote: project.isRemote,
@@ -827,9 +833,10 @@ class _ProjectActivityDotState extends State<_ProjectActivityDot>
   );
 }
 
-class ProjectTile extends StatelessWidget {
+class ProjectTile extends StatefulWidget {
   const ProjectTile({
     this.identity,
+    this.onRename,
     this.onMoveToGroup,
     this.onRemoveFromGroup,
     required this.name,
@@ -851,6 +858,7 @@ class ProjectTile extends StatelessWidget {
   });
 
   final String? identity;
+  final Future<void> Function(String)? onRename;
   final VoidCallback? onMoveToGroup;
   final VoidCallback? onRemoveFromGroup;
   final String name;
@@ -869,6 +877,135 @@ class ProjectTile extends StatelessWidget {
   final String? sshHostAlias;
   final String? remoteStatus;
 
+  @override
+  State<ProjectTile> createState() => _ProjectTileState();
+}
+
+class _ProjectTileState extends State<ProjectTile> {
+  final _nameController = TextEditingController();
+  final _nameFocus = FocusNode();
+  bool _editing = false;
+  bool _saving = false;
+  String? _error;
+
+  @override
+  void initState() {
+    super.initState();
+    _nameFocus.addListener(_focusChanged);
+  }
+
+  void _focusChanged() {
+    if (!_nameFocus.hasFocus && _editing && !_saving && _error == null) {
+      _commitRename();
+    }
+  }
+
+  void _startRename() {
+    if (widget.onRename == null || _saving) return;
+    _nameController.value = TextEditingValue(
+      text: widget.name,
+      selection: TextSelection(baseOffset: 0, extentOffset: widget.name.length),
+    );
+    setState(() {
+      _editing = true;
+      _error = null;
+    });
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted && _editing) _nameFocus.requestFocus();
+    });
+  }
+
+  void _cancelRename() {
+    if (_saving) return;
+    setState(() {
+      _editing = false;
+      _error = null;
+    });
+    _nameFocus.unfocus();
+  }
+
+  Future<void> _commitRename() async {
+    if (!_editing || _saving || widget.onRename == null) return;
+    final name = _nameController.text.trim();
+    if (name.isEmpty) {
+      setState(() => _error = 'Project name cannot be empty');
+      return;
+    }
+    if (name == widget.name) {
+      _cancelRename();
+      return;
+    }
+    setState(() {
+      _saving = true;
+      _error = null;
+    });
+    try {
+      await widget.onRename!(name);
+      if (!mounted) return;
+      setState(() {
+        _editing = false;
+        _saving = false;
+      });
+    } catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _saving = false;
+        _error = error.toString();
+      });
+      _nameFocus.requestFocus();
+    }
+  }
+
+  Widget _nameEditor() => CallbackShortcuts(
+    bindings: {const SingleActivator(LogicalKeyboardKey.escape): _cancelRename},
+    child: Semantics(
+      label: 'Project name',
+      child: TextField(
+        controller: _nameController,
+        focusNode: _nameFocus,
+        readOnly: _saving,
+        maxLines: 1,
+        style: Theme.of(context).textTheme.bodyMedium,
+        decoration: InputDecoration(
+          isDense: true,
+          contentPadding: const EdgeInsets.symmetric(vertical: 4),
+          hintText: 'Project name',
+          suffixIcon: _saving
+              ? const SizedBox(
+                  width: 14,
+                  height: 14,
+                  child: Padding(
+                    padding: EdgeInsets.all(3),
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  ),
+                )
+              : null,
+          suffixIconConstraints: const BoxConstraints(
+            maxWidth: 20,
+            maxHeight: 20,
+          ),
+        ),
+        onChanged: (_) {
+          if (_error != null) setState(() => _error = null);
+        },
+        onSubmitted: (_) => _commitRename(),
+        onEditingComplete: () {},
+        onTapOutside: (_) {
+          _nameFocus.unfocus();
+          if (_error == null) _commitRename();
+        },
+      ),
+    ),
+  );
+
+  @override
+  void dispose() {
+    _nameFocus.removeListener(_focusChanged);
+    _nameFocus.dispose();
+    _nameController.dispose();
+    super.dispose();
+  }
+
   Future<void> _showContextMenu(
     BuildContext context,
     TapDownDetails details,
@@ -886,26 +1023,31 @@ class ProjectTile extends StatelessWidget {
         Offset.zero & overlay.size,
       ),
       items: [
+        PopupMenuItem(
+          value: _ProjectMenuAction.rename,
+          enabled: widget.onRename != null && !_saving,
+          child: const Text('Rename'),
+        ),
         const PopupMenuItem(
           value: _ProjectMenuAction.copyPath,
           child: Text('Copy Project Path'),
         ),
-        if (onSetup != null)
+        if (widget.onSetup != null)
           const PopupMenuItem(
             value: _ProjectMenuAction.setup,
             child: Text('Remote Runtime Setup…'),
           ),
-        if (onReconnect != null)
+        if (widget.onReconnect != null)
           const PopupMenuItem(
             value: _ProjectMenuAction.reconnect,
             child: Text('Reconnect'),
           ),
-        if (onMoveToGroup != null)
+        if (widget.onMoveToGroup != null)
           const PopupMenuItem(
             value: _ProjectMenuAction.moveToGroup,
             child: Text('Move to Group…'),
           ),
-        if (onRemoveFromGroup != null)
+        if (widget.onRemoveFromGroup != null)
           const PopupMenuItem(
             value: _ProjectMenuAction.removeFromGroup,
             child: Text('Remove from Group'),
@@ -917,19 +1059,22 @@ class ProjectTile extends StatelessWidget {
         ),
       ],
     );
+    if (!mounted) return;
     switch (action) {
+      case _ProjectMenuAction.rename:
+        _startRename();
       case _ProjectMenuAction.moveToGroup:
-        onMoveToGroup?.call();
+        widget.onMoveToGroup?.call();
       case _ProjectMenuAction.removeFromGroup:
-        onRemoveFromGroup?.call();
+        widget.onRemoveFromGroup?.call();
       case _ProjectMenuAction.copyPath:
-        onCopyPath();
+        widget.onCopyPath();
       case _ProjectMenuAction.setup:
-        onSetup?.call();
+        widget.onSetup?.call();
       case _ProjectMenuAction.reconnect:
-        onReconnect?.call();
+        widget.onReconnect?.call();
       case _ProjectMenuAction.delete:
-        onDelete();
+        widget.onDelete();
       case null:
         break;
     }
@@ -943,24 +1088,24 @@ class ProjectTile extends StatelessWidget {
       builder: (context, constraints) {
         final compact = constraints.maxWidth < 190;
         return InkWell(
-          key: ValueKey('project-tile-${identity ?? path}'),
+          key: ValueKey('project-tile-${widget.identity ?? widget.path}'),
           borderRadius: BorderRadius.circular(tokens.radiusSmall),
-          onTap: onTap,
+          onTap: _editing ? null : widget.onTap,
           onSecondaryTapDown: (details) => _showContextMenu(context, details),
           child: DecoratedBox(
             decoration: BoxDecoration(
-              color: selected ? tokens.selection : Colors.transparent,
+              color: widget.selected ? tokens.selection : Colors.transparent,
               borderRadius: BorderRadius.circular(tokens.radiusSmall),
             ),
             child: Padding(
               padding: EdgeInsets.all(compact ? 6 : 10),
               child: Row(
                 children: [
-                  if (!compact || runningCount > 0) ...[
+                  if (!compact || widget.runningCount > 0) ...[
                     SizedBox(
                       width: 18,
                       height: 18,
-                      child: runningCount > 0
+                      child: widget.runningCount > 0
                           ? Tooltip(
                               message: 'Running agents',
                               child: Semantics(
@@ -968,7 +1113,7 @@ class ProjectTile extends StatelessWidget {
                                 child: Center(
                                   child: _ProjectActivityDot(
                                     key: ValueKey(
-                                      'project-activity-${identity ?? path}',
+                                      'project-activity-${widget.identity ?? widget.path}',
                                     ),
                                   ),
                                 ),
@@ -985,17 +1130,21 @@ class ProjectTile extends StatelessWidget {
                         Row(
                           children: [
                             Expanded(
-                              child: Text(
-                                name,
-                                maxLines: 1,
-                                overflow: TextOverflow.ellipsis,
-                              ),
+                              child: _editing
+                                  ? _nameEditor()
+                                  : Text(
+                                      widget.name,
+                                      maxLines: 1,
+                                      overflow: TextOverflow.ellipsis,
+                                    ),
                             ),
-                            if (hasUnreadResult)
+                            if (widget.hasUnreadResult)
                               Tooltip(
                                 message: 'New agent result',
                                 child: Container(
-                                  key: ValueKey('project-unread-$path'),
+                                  key: ValueKey(
+                                    'project-unread-${widget.path}',
+                                  ),
                                   width: 8,
                                   height: 8,
                                   decoration: BoxDecoration(
@@ -1006,15 +1155,26 @@ class ProjectTile extends StatelessWidget {
                               ),
                           ],
                         ),
-                        if (isRemote) ...[
+                        if (_error != null)
+                          Semantics(
+                            liveRegion: true,
+                            child: Text(
+                              _error!,
+                              style: TextStyle(
+                                color: tokens.error,
+                                fontSize: 11,
+                              ),
+                            ),
+                          ),
+                        if (widget.isRemote) ...[
                           const SizedBox(height: 3),
                           const RemoteProjectTag(),
                           const SizedBox(height: 3),
                           Tooltip(
                             message:
-                                '$sshHostAlias · ${_titleCase(remoteStatus ?? "connecting")}',
+                                '${widget.sshHostAlias} · ${_titleCase(widget.remoteStatus ?? "connecting")}',
                             child: Text(
-                              '$sshHostAlias · ${_titleCase(remoteStatus ?? "connecting")}',
+                              '${widget.sshHostAlias} · ${_titleCase(widget.remoteStatus ?? "connecting")}',
                               maxLines: 1,
                               overflow: TextOverflow.ellipsis,
                               style: Theme.of(context).textTheme.bodySmall,
@@ -1022,17 +1182,17 @@ class ProjectTile extends StatelessWidget {
                           ),
                         ] else
                           Text(
-                            path,
+                            widget.path,
                             maxLines: 1,
                             overflow: TextOverflow.ellipsis,
                             style: Theme.of(context).textTheme.bodySmall,
                           ),
                         const SizedBox(height: 3),
                         Text(
-                          '$runningCount running · $stoppedCount stopped',
+                          '${widget.runningCount} running · ${widget.stoppedCount} stopped',
                           maxLines: 1,
                           overflow: TextOverflow.ellipsis,
-                          key: ValueKey('project-counts-$path'),
+                          key: ValueKey('project-counts-${widget.path}'),
                           style: Theme.of(context).textTheme.labelSmall
                               ?.copyWith(color: context.ditch.mutedText),
                         ),
@@ -1040,10 +1200,10 @@ class ProjectTile extends StatelessWidget {
                     ),
                   ),
                   const SizedBox(width: 4),
-                  if (isRemote)
+                  if (widget.isRemote)
                     IconButton(
-                      key: ValueKey('reconnect-project-$path'),
-                      onPressed: onReconnect,
+                      key: ValueKey('reconnect-project-${widget.path}'),
+                      onPressed: widget.onReconnect,
                       tooltip: 'Reconnect',
                       visualDensity: VisualDensity.compact,
                       constraints: const BoxConstraints.tightFor(
@@ -1055,8 +1215,8 @@ class ProjectTile extends StatelessWidget {
                     )
                   else
                     IconButton(
-                      key: ValueKey('reveal-project-$path'),
-                      onPressed: onReveal,
+                      key: ValueKey('reveal-project-${widget.path}'),
+                      onPressed: widget.onReveal,
                       tooltip: 'Show in Finder',
                       visualDensity: VisualDensity.compact,
                       constraints: const BoxConstraints.tightFor(
@@ -1077,6 +1237,7 @@ class ProjectTile extends StatelessWidget {
 }
 
 enum _ProjectMenuAction {
+  rename,
   copyPath,
   setup,
   reconnect,

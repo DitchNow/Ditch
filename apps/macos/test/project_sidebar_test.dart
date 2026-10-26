@@ -26,6 +26,8 @@ const projects = [local, other, remote];
 class _SidebarRuntime extends DitchRuntimeClient {
   _SidebarRuntime() : super(socketPath: '/tmp/sidebar-test.sock');
   final events = StreamController<Map<String, dynamic>>();
+  final renameCalls = <Map<String, dynamic>>[];
+  Completer<Map<String, dynamic>>? pendingRename;
 
   Map<String, dynamic> get currentSnapshot => {
     'projects': [
@@ -69,7 +71,20 @@ class _SidebarRuntime extends DitchRuntimeClient {
   Future<Stream<Map<String, dynamic>>> subscribeEvents() async => events.stream;
 
   @override
-  Future<Map<String, dynamic>> request(Object body) async => {};
+  Future<Map<String, dynamic>> request(Object body) async {
+    if (body is Map && body['RenameProject'] is Map<String, dynamic>) {
+      final request = body['RenameProject'] as Map<String, dynamic>;
+      renameCalls.add(request);
+      if (pendingRename != null) return pendingRename!.future;
+      final project = (currentSnapshot['projects'] as List)
+          .cast<Map<String, dynamic>>()
+          .singleWhere((project) => project['id'] == request['project_id']);
+      return {
+        'ProjectRenamed': {...project, 'name': request['name']},
+      };
+    }
+    return {};
+  }
 }
 
 ProjectSidebarController memoryController() =>
@@ -82,6 +97,8 @@ Widget sidebar(
   bool disableAnimations = true,
   Map<String, int>? runningCounts,
   ValueChanged<DitchProject>? onSelect,
+  Future<void> Function(DitchProject, String)? onRename,
+  List<DitchProject> shownProjects = projects,
 }) => MaterialApp(
   theme: dark ? DitchTheme.dark() : DitchTheme.light(),
   builder: (context, child) => MediaQuery(
@@ -93,11 +110,12 @@ Widget sidebar(
       alignment: Alignment.topLeft,
       child: ProjectSidebar(
         width: width,
-        projects: projects,
+        projects: shownProjects,
         controller: controller,
         remoteHostStatus: const {'production': 'offline'},
         selectedProjectKey: local.id,
         onAddProject: () {},
+        onRenameProject: onRename,
         onSelectProject: onSelect ?? (_) {},
         onRevealProject: (_) {},
         onCopyProjectPath: (_) {},
@@ -117,6 +135,309 @@ Widget sidebar(
 
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
+
+  Future<void> beginRename(WidgetTester tester, String id) async {
+    await tester.tap(
+      find.byKey(ValueKey('project-tile-$id')),
+      buttons: kSecondaryMouseButton,
+    );
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Rename'));
+    await tester.pumpAndSettle();
+  }
+
+  testWidgets(
+    'rename focuses and selects name, commits once, and preserves selection and group',
+    (tester) async {
+      final controller = memoryController();
+      addTearDown(controller.dispose);
+      final group = controller.createGroup('Work');
+      controller.moveProject(local, group);
+      final pending = Completer<void>();
+      final calls = <String>[];
+      var selected = 0;
+      await tester.pumpWidget(
+        sidebar(
+          controller,
+          onSelect: (_) => selected++,
+          onRename: (p, name) {
+            expect(p.id, local.id);
+            calls.add(name);
+            return pending.future;
+          },
+        ),
+      );
+      await beginRename(tester, 'local');
+      final field = tester.widget<TextField>(find.byType(TextField));
+      expect(field.focusNode!.hasFocus, isTrue);
+      expect(
+        field.controller!.selection,
+        const TextSelection(baseOffset: 0, extentOffset: 7),
+      );
+      await tester.tap(find.byType(TextField));
+      await tester.enterText(find.byType(TextField), '  New website  ');
+      await tester.testTextInput.receiveAction(TextInputAction.done);
+      await tester.pump();
+      expect(calls, ['New website']);
+      expect(tester.widget<TextField>(find.byType(TextField)).readOnly, isTrue);
+      expect(controller.groupFor(local), group);
+      expect(selected, 0);
+      field.focusNode!.unfocus();
+      await tester.testTextInput.receiveAction(TextInputAction.done);
+      await tester.pump();
+      expect(calls, hasLength(1));
+      pending.complete();
+      await tester.pumpAndSettle();
+      expect(find.byType(TextField), findsNothing);
+    },
+  );
+
+  testWidgets('rename Escape, blank and unchanged names send no mutation', (
+    tester,
+  ) async {
+    final controller = memoryController();
+    addTearDown(controller.dispose);
+    final calls = <String>[];
+    await tester.pumpWidget(
+      sidebar(controller, onRename: (_, name) async => calls.add(name)),
+    );
+    await beginRename(tester, 'local');
+    await tester.enterText(find.byType(TextField), 'Cancelled');
+    await tester.sendKeyEvent(LogicalKeyboardKey.escape);
+    await tester.pumpAndSettle();
+    expect(find.byType(TextField), findsNothing);
+    await beginRename(tester, 'local');
+    await tester.enterText(find.byType(TextField), '   ');
+    await tester.testTextInput.receiveAction(TextInputAction.done);
+    await tester.pumpAndSettle();
+    expect(find.text('Project name cannot be empty'), findsOneWidget);
+    await tester.enterText(find.byType(TextField), ' Website ');
+    await tester.testTextInput.receiveAction(TextInputAction.done);
+    await tester.pumpAndSettle();
+    expect(find.byType(TextField), findsNothing);
+    expect(calls, isEmpty);
+  });
+
+  testWidgets(
+    'remote rename commits on blur and retains draft after failure for retry',
+    (tester) async {
+      final controller = memoryController()..setScope(ProjectScope.remote);
+      addTearDown(controller.dispose);
+      final calls = <String>[];
+      await tester.pumpWidget(
+        sidebar(
+          controller,
+          width: 160,
+          onRename: (p, name) async {
+            expect(p.id, remote.id);
+            calls.add(name);
+            if (calls.length == 1) {
+              throw StateError('Host unavailable. Reconnect and retry.');
+            }
+          },
+        ),
+      );
+      await beginRename(tester, 'remote');
+      await tester.enterText(find.byType(TextField), 'New server');
+      await tester.tapAt(const Offset(600, 500));
+      await tester.pumpAndSettle();
+      expect(calls, ['New server']);
+      expect(find.textContaining('Host unavailable'), findsOneWidget);
+      expect(
+        tester.widget<TextField>(find.byType(TextField)).controller!.text,
+        'New server',
+      );
+      expect(find.textContaining('production'), findsOneWidget);
+      await tester.testTextInput.receiveAction(TextInputAction.done);
+      await tester.pumpAndSettle();
+      expect(calls, ['New server', 'New server']);
+      expect(find.byType(TextField), findsNothing);
+      expect(tester.takeException(), isNull);
+    },
+  );
+
+  testWidgets(
+    'live activity rebuild preserves rename draft and pending removal is safe',
+    (tester) async {
+      final controller = memoryController();
+      addTearDown(controller.dispose);
+      final pending = Completer<void>();
+      Future<void> rename(DitchProject _, String name) => pending.future;
+      await tester.pumpWidget(sidebar(controller, onRename: rename));
+      await beginRename(tester, 'local');
+      await tester.enterText(find.byType(TextField), 'Draft');
+      await tester.pumpWidget(
+        sidebar(controller, runningCounts: {'local': 4}, onRename: rename),
+      );
+      expect(
+        tester.widget<TextField>(find.byType(TextField)).controller!.text,
+        'Draft',
+      );
+      await tester.testTextInput.receiveAction(TextInputAction.done);
+      await tester.pump();
+      await tester.pumpWidget(const MaterialApp(home: SizedBox()));
+      pending.completeError(StateError('Project removed'));
+      await tester.pumpAndSettle();
+      expect(tester.takeException(), isNull);
+    },
+  );
+
+  testWidgets('provisional project cannot start rename', (tester) async {
+    final controller = memoryController();
+    addTearDown(controller.dispose);
+    const provisional = DitchProject(name: 'Pending', path: '/pending');
+    final base = sidebar(
+      controller,
+      shownProjects: [provisional],
+      onRename: (_, _) async {
+        fail('Provisional project must not send a rename');
+      },
+    );
+    await tester.pumpWidget(base);
+    await tester.tap(
+      find.byKey(ValueKey('project-tile-${projectKey(provisional)}')),
+      buttons: kSecondaryMouseButton,
+    );
+    await tester.pumpAndSettle();
+    final item = tester.widget<PopupMenuItem>(
+      find.ancestor(
+        of: find.text('Rename'),
+        matching: find.byWidgetPredicate((widget) => widget is PopupMenuItem),
+      ),
+    );
+    expect(item.enabled, isFalse);
+  });
+
+  test(
+    'renamed projects retain identity and group while sorting and searching by new name',
+    () {
+      final controller = memoryController();
+      addTearDown(controller.dispose);
+      final group = controller.createGroup('Work');
+      controller.moveProject(local, group);
+      const renamed = DitchProject(
+        id: 'local',
+        name: 'AAA',
+        path: '/work/site',
+      );
+      expect(projectKey(renamed), projectKey(local));
+      expect(controller.groupFor(renamed), group);
+      expect(controller.matchingProjects([renamed, other]), [renamed, other]);
+      controller.setQuery('AAA');
+      expect(controller.matchingProjects([renamed, other]), [renamed]);
+      controller.setQuery('Website');
+      expect(controller.matchingProjects([renamed, other]), isEmpty);
+    },
+  );
+
+  for (final project in [local, remote]) {
+    testWidgets(
+      'screen persists ${project.id} rename and preserves selection, groups and drafts',
+      (tester) async {
+        tester.view.physicalSize = const Size(1400, 900);
+        tester.view.devicePixelRatio = 1;
+        addTearDown(tester.view.resetPhysicalSize);
+        addTearDown(tester.view.resetDevicePixelRatio);
+        const channel = MethodChannel('the_ditch/application');
+        tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+          channel,
+          (call) async => call.method == 'runtimeAvailable' ? true : null,
+        );
+        addTearDown(
+          () => tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+            channel,
+            null,
+          ),
+        );
+        final runtime = _SidebarRuntime();
+        await tester.pumpWidget(
+          MaterialApp(
+            theme: DitchTheme.light(),
+            home: CommandCenterScreen(runtimeClient: runtime),
+          ),
+        );
+        await tester.pumpAndSettle();
+        ProjectSidebar currentSidebar() =>
+            tester.widget<ProjectSidebar>(find.byType(ProjectSidebar));
+        final controller = currentSidebar().controller;
+        controller.setScope(ProjectScope.all);
+        final group = controller.createGroup('Work');
+        controller.moveProject(project, group);
+        await tester.pumpAndSettle();
+        await tester.tap(find.byKey(ValueKey('project-tile-${project.id}')));
+        await tester.pumpAndSettle();
+        final prompt = find.byType(TextField);
+        expect(prompt, findsOneWidget);
+        await tester.enterText(prompt, 'Keep this prompt draft');
+        runtime.pendingRename = Completer<Map<String, dynamic>>();
+        await beginRename(tester, project.id!);
+        final editor = find.descendant(
+          of: find.byType(ProjectTile),
+          matching: find.byType(TextField),
+        );
+        await tester.enterText(editor, 'AAA renamed');
+        await tester.testTextInput.receiveAction(TextInputAction.done);
+        await tester.pump();
+        expect(
+          currentSidebar().projects.singleWhere((p) => p.id == project.id).name,
+          project.name,
+        );
+        expect(runtime.renameCalls, [
+          {'project_id': project.id, 'name': 'AAA renamed'},
+        ]);
+        final json = (runtime.currentSnapshot['projects'] as List)
+            .cast<Map<String, dynamic>>()
+            .singleWhere((p) => p['id'] == project.id);
+        runtime.pendingRename!.complete({
+          'ProjectRenamed': {...json, 'name': 'AAA renamed'},
+        });
+        await tester.pumpAndSettle();
+        final renamed = currentSidebar().projects.singleWhere(
+          (p) => p.id == project.id,
+        );
+        expect(renamed.name, 'AAA renamed');
+        expect(renamed.path, project.path);
+        expect(renamed.sshHostAlias, project.sshHostAlias);
+        expect(currentSidebar().selectedProjectKey, project.id);
+        expect(controller.groupFor(renamed), group);
+        expect(find.text('Keep this prompt draft'), findsOneWidget);
+        runtime.events.add({
+          'event': {
+            'ProjectChanged': {...json, 'name': 'From another client'},
+          },
+        });
+        await tester.pumpAndSettle();
+        expect(
+          currentSidebar().projects.singleWhere((p) => p.id == project.id).name,
+          'From another client',
+        );
+        expect(currentSidebar().selectedProjectKey, project.id);
+        runtime.pendingRename = Completer<Map<String, dynamic>>();
+        final lateRename = currentSidebar().onRenameProject!(
+          renamed,
+          'Too late',
+        );
+        final rejected = expectLater(lateRename, throwsStateError);
+        runtime.events.add({
+          'event': {
+            'ProjectDeleted': {'project_id': project.id},
+          },
+        });
+        await tester.pumpAndSettle();
+        runtime.pendingRename!.complete({
+          'ProjectRenamed': {...json, 'name': 'Too late'},
+        });
+        await rejected;
+        await tester.pumpAndSettle();
+        expect(
+          currentSidebar().projects.any((p) => p.id == project.id),
+          isFalse,
+        );
+        await tester.pumpWidget(const MaterialApp(home: SizedBox()));
+        unawaited(runtime.events.close());
+      },
+    );
+  }
 
   test('search applies scope, project fields and group names together', () {
     final controller = memoryController();

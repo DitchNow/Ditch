@@ -1,10 +1,12 @@
 import 'package:flutter/widgets.dart';
+import '../data/prompt_attachment.dart';
 
-/// Session-only text. It deliberately has no listeners, timers, or disk writes.
+/// Session-only prompt. It has no listeners, timers, or disk writes.
 class AgentPromptDraft {
   AgentPromptDraft(this.text);
 
   String text;
+  final attachments = <PromptAttachment>[];
 }
 
 class AgentPromptDrafts {
@@ -32,12 +34,14 @@ class AgentPromptDraftScope extends InheritedWidget {
   const AgentPromptDraftScope({
     required this.drafts,
     required this.projectKey,
+    this.isRemote = false,
     required super.child,
     super.key,
   });
 
   final AgentPromptDrafts drafts;
   final String projectKey;
+  final bool isRemote;
 
   static AgentPromptDraftScope? maybeOf(BuildContext context) =>
       context.dependOnInheritedWidgetOfExactType<AgentPromptDraftScope>();
@@ -49,5 +53,7 @@ class AgentPromptDraftScope extends InheritedWidget {
 
   @override
   bool updateShouldNotify(AgentPromptDraftScope oldWidget) =>
-      drafts != oldWidget.drafts || projectKey != oldWidget.projectKey;
+      drafts != oldWidget.drafts ||
+      projectKey != oldWidget.projectKey ||
+      isRemote != oldWidget.isRemote;
 }
