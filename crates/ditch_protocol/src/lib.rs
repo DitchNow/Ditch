@@ -70,6 +70,26 @@ pub enum ClientRequest {
     DiscoverProjects {
         search_root: String,
     },
+    StartProjectClone {
+        operation_id: Uuid,
+        url: String,
+        parent: String,
+        folder: String,
+        name: String,
+    },
+    ProjectCloneStatus {
+        operation_id: Uuid,
+    },
+    CancelProjectClone {
+        operation_id: Uuid,
+    },
+    RetryProjectCloneRegistration {
+        operation_id: Uuid,
+    },
+    RenameProject {
+        project_id: ProjectId,
+        name: String,
+    },
     CreateProject {
         name: String,
         root: String,
@@ -347,6 +367,8 @@ pub enum ServerResponse {
     ProjectFile(ProjectFile),
     ProjectFileSaved(ProjectFileSaved),
     ProjectCreated(Project),
+    ProjectRenamed(Project),
+    ProjectClone(CloneOperationStatus),
     AgentStarted(AgentRun),
     AgentMessages(AgentMessagePage),
     OperationOutcome {
@@ -767,5 +789,104 @@ mod tests {
         ] {
             assert!(!text.contains(obsolete));
         }
+    }
+}
+
+/// Percentages describe only `progress_label`, never the entire operation.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CloneOperationStatus {
+    pub operation_id: Uuid,
+    pub destination: String,
+    pub phase: ClonePhase,
+    pub percentage: Option<u8>,
+    pub progress_label: Option<String>,
+    pub error: Option<String>,
+    pub project: Option<Project>,
+    pub checkout_ready: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClonePhase {
+    Validating,
+    Cloning,
+    Checkout,
+    Configuring,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+#[cfg(test)]
+mod clone_protocol_tests {
+    use super::*;
+    #[test]
+    fn clone_requests_and_status_round_trip() {
+        let id = Uuid::new_v4();
+        for request in [
+            ClientRequest::StartProjectClone {
+                operation_id: id,
+                url: "git@github.com:owner/repo.git".into(),
+                parent: "/projects".into(),
+                folder: "repo".into(),
+                name: "Repo".into(),
+            },
+            ClientRequest::ProjectCloneStatus { operation_id: id },
+            ClientRequest::CancelProjectClone { operation_id: id },
+            ClientRequest::RetryProjectCloneRegistration { operation_id: id },
+        ] {
+            let envelope = Envelope::new(request);
+            let json = serde_json::to_string(&envelope).unwrap();
+            assert_eq!(
+                serde_json::from_str::<Envelope<ClientRequest>>(&json).unwrap(),
+                envelope
+            );
+        }
+        let project = Project::new("Repo", "/projects/repo");
+        let status = ServerResponse::ProjectClone(CloneOperationStatus {
+            operation_id: id,
+            destination: "/projects/repo".into(),
+            phase: ClonePhase::Completed,
+            percentage: None,
+            progress_label: None,
+            error: None,
+            project: Some(project),
+            checkout_ready: true,
+        });
+        let json = serde_json::to_string(&status).unwrap();
+        assert_eq!(
+            serde_json::from_str::<ServerResponse>(&json).unwrap(),
+            status
+        );
+    }
+}
+
+#[cfg(test)]
+mod project_rename_protocol_tests {
+    use super::*;
+
+    #[test]
+    fn project_rename_request_and_response_round_trip() {
+        let project = Project::new("Renamed", "/projects/app");
+        let request = ClientRequest::RenameProject {
+            project_id: project.id,
+            name: project.name.clone(),
+        };
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(
+            json["RenameProject"]["project_id"],
+            project.id.0.to_string()
+        );
+        assert_eq!(
+            serde_json::from_value::<ClientRequest>(json).unwrap(),
+            request
+        );
+        let response = ServerResponse::ProjectRenamed(project);
+        let json = serde_json::to_value(&response).unwrap();
+        assert_eq!(json["ProjectRenamed"]["name"], "Renamed");
+        assert_eq!(
+            serde_json::from_value::<ServerResponse>(json).unwrap(),
+            response
+        );
     }
 }

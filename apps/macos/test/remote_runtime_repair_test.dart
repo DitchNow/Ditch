@@ -116,6 +116,7 @@ void main() {
               onToggleDirectory: (_) {},
               onOpenFile: (_) {},
               onRevealFile: (_) {},
+              onCopyFilePath: (_) {},
               onBackToFiles: null,
               onSaveFile: null,
               onReloadFile: null,

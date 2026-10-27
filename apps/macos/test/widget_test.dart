@@ -12,6 +12,7 @@ import 'package:the_ditch/main.dart';
 import 'package:the_ditch/application/command_center_controller.dart';
 import 'package:the_ditch/data/runtime_models.dart';
 import 'package:the_ditch/design_system/ditch_theme.dart';
+import 'package:the_ditch/widgets/assistant_message_content.dart';
 
 final _testAgentHeaderKeys = <String, GlobalKey>{};
 
@@ -22,6 +23,99 @@ const _testProject = DitchProject(
   name: 'Ditch',
   path: '/tmp/the-ditch-test-project',
 );
+
+const _copyPathDirectories = <String, List<ProjectFileEntry>>{
+  '': [
+    ProjectFileEntry(
+      name: 'docs',
+      relativePath: 'docs',
+      kind: ProjectFileEntryKind.directory,
+      size: 0,
+    ),
+    ProjectFileEntry(
+      name: 'README.md',
+      relativePath: 'README.md',
+      kind: ProjectFileEntryKind.file,
+      size: 10,
+    ),
+  ],
+  'docs': [
+    ProjectFileEntry(
+      name: '日本語 notes.md',
+      relativePath: 'docs/日本語 notes.md',
+      kind: ProjectFileEntryKind.file,
+      size: 10,
+    ),
+    ProjectFileEntry(
+      name: 'nested',
+      relativePath: 'docs/nested',
+      kind: ProjectFileEntryKind.directory,
+      size: 0,
+    ),
+    ProjectFileEntry(
+      name: 'shortcut',
+      relativePath: 'docs/shortcut',
+      kind: ProjectFileEntryKind.symlink,
+      size: 0,
+    ),
+  ],
+};
+
+class _CopyPathRuntime extends DitchRuntimeClient {
+  @override
+  Future<Map<String, dynamic>> request(Object body) async => {};
+
+  @override
+  Future<Map<String, dynamic>> listProjectDirectory({
+    required String projectId,
+    required String relativePath,
+  }) async => {
+    'ProjectDirectory': {
+      'entries': [
+        for (final entry
+            in _copyPathDirectories[relativePath] ?? const <ProjectFileEntry>[])
+          {
+            'name': entry.name,
+            'relative_path': entry.relativePath,
+            'kind': switch (entry.kind) {
+              ProjectFileEntryKind.directory => 'Directory',
+              ProjectFileEntryKind.file => 'File',
+              ProjectFileEntryKind.symlink => 'Symlink',
+            },
+            'size': entry.size,
+          },
+      ],
+    },
+  };
+}
+
+Future<void> _pumpCopyPathApp(
+  WidgetTester tester,
+  List<DitchProject> projects,
+) async {
+  tester.view.physicalSize = const Size(1400, 1000);
+  tester.view.devicePixelRatio = 1;
+  addTearDown(tester.view.resetPhysicalSize);
+  addTearDown(tester.view.resetDevicePixelRatio);
+  await tester.pumpWidget(
+    MaterialApp(
+      theme: DitchTheme.light(),
+      home: CommandCenterScreen(
+        connectRuntimeOnStart: false,
+        initialProjects: projects,
+        runtimeClient: _CopyPathRuntime(),
+      ),
+    ),
+  );
+  await tester.pumpAndSettle();
+}
+
+Future<void> _chooseCopyPath(WidgetTester tester, String name) async {
+  await tester.tap(find.text(name), buttons: kSecondaryMouseButton);
+  await tester.pumpAndSettle();
+  await tester.tap(find.text('Copy Path'));
+  await tester.pumpAndSettle();
+}
 
 class _PendingRemoteSetupClient extends DitchRuntimeClient {
   _PendingRemoteSetupClient()
@@ -2683,6 +2777,23 @@ void main() {
   });
 
   testWidgets('chat messages expose copy actions', (tester) async {
+    const source = '**Copy** this response with `code | symbols`';
+    String? copied;
+    tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+      SystemChannels.platform,
+      (call) async {
+        if (call.method == 'Clipboard.setData') {
+          copied = (call.arguments as Map)['text'] as String;
+        }
+        return null;
+      },
+    );
+    addTearDown(
+      () => tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+        SystemChannels.platform,
+        null,
+      ),
+    );
     final session = AgentSession(
       localId: 'copy-agent',
       provider: AgentProvider.codex,
@@ -2690,7 +2801,7 @@ void main() {
       messages: [
         AgentChatMessage(
           role: ChatMessageRole.assistant,
-          text: 'Copy this response',
+          text: source,
           createdAt: DateTime(2026),
         ),
       ],
@@ -2722,6 +2833,10 @@ void main() {
     expect(find.byTooltip('Copy message'), findsOneWidget);
     expect(find.byTooltip('Copy conversation'), findsOneWidget);
     expect(find.byType(SelectionArea), findsWidgets);
+    await tester.tap(find.byTooltip('Copy message'));
+    expect(copied, source);
+    await tester.tap(find.byTooltip('Copy conversation'));
+    expect(copied, 'assistant: $source');
   });
 
   testWidgets('focused agent view exposes return and delete controls', (
@@ -3248,6 +3363,7 @@ void main() {
       ];
     ProjectFileEntry? toggled;
     ProjectFileEntry? opened;
+    ProjectFileEntry? revealed;
     await tester.pumpWidget(
       MaterialApp(
         home: Scaffold(
@@ -3256,7 +3372,8 @@ void main() {
             presentation: TerminalPresentation.docked,
             onToggleDirectory: (entry) => toggled = entry,
             onOpenFile: (entry) => opened = entry,
-            onRevealFile: (_) {},
+            onRevealFile: (entry) => revealed = entry,
+            onCopyFilePath: (_) {},
             onBack: () {},
             onSave: () {},
             onReload: () {},
@@ -3271,7 +3388,252 @@ void main() {
     await tester.tap(find.text('README.md'));
     expect(toggled?.relativePath, 'lib');
     expect(opened?.relativePath, 'README.md');
+    await tester.tap(find.byTooltip('Reveal in Finder').last);
+    expect(revealed?.relativePath, 'README.md');
     files.dispose();
+  });
+
+  for (final dark in [false, true]) {
+    testWidgets('file Copy Path menu preserves row actions (dark: $dark)', (
+      tester,
+    ) async {
+      final files = ProjectFilesState()
+        ..directories.addAll(_copyPathDirectories)
+        ..expandedDirectories.add('docs');
+      addTearDown(files.dispose);
+      final copied = <ProjectFileEntry>[];
+      final opened = <ProjectFileEntry>[];
+      final toggled = <ProjectFileEntry>[];
+      final revealed = <ProjectFileEntry>[];
+      await tester.pumpWidget(
+        MaterialApp(
+          theme: dark ? DitchTheme.dark() : DitchTheme.light(),
+          home: Scaffold(
+            body: ProjectFilesBody(
+              files: files,
+              presentation: TerminalPresentation.docked,
+              onToggleDirectory: toggled.add,
+              onOpenFile: opened.add,
+              onRevealFile: revealed.add,
+              onCopyFilePath: copied.add,
+              onBack: null,
+              onSave: null,
+              onReload: null,
+              onOverwrite: null,
+              onPresentationChanged: (_) {},
+            ),
+          ),
+        ),
+      );
+
+      for (final entry in _copyPathDirectories.values.expand(
+        (items) => items,
+      )) {
+        final row = find.ancestor(
+          of: find.text(entry.name),
+          matching: find.byType(ListTile),
+        );
+        final rect = tester.getRect(row);
+        // The label, leading padding, blank space, and reveal button all
+        // belong to the row's secondary-click target.
+        for (final position in [
+          tester.getCenter(find.text(entry.name)),
+          Offset(rect.left + 2, rect.center.dy),
+          Offset(rect.right - 80, rect.center.dy),
+          tester.getCenter(
+            find.descendant(of: row, matching: find.byType(IconButton)),
+          ),
+        ]) {
+          await tester.tapAt(position, buttons: kSecondaryMouseButton);
+          await tester.pumpAndSettle();
+          expect(find.text('Copy Path'), findsOneWidget);
+          expect(opened, isEmpty);
+          expect(toggled, isEmpty);
+          expect(revealed, isEmpty);
+          final count = copied.length;
+          await tester.sendKeyEvent(LogicalKeyboardKey.escape);
+          await tester.pumpAndSettle();
+          expect(find.text('Copy Path'), findsNothing);
+          expect(copied, hasLength(count));
+        }
+        await _chooseCopyPath(tester, entry.name);
+        expect(copied.last, same(entry));
+      }
+      expect(copied, hasLength(5));
+      expect(opened, isEmpty);
+      expect(toggled, isEmpty);
+      expect(revealed, isEmpty);
+      await tester.tap(find.text('日本語 notes.md'));
+      await tester.tap(find.text('nested'));
+      await tester.tap(find.byTooltip('Reveal in Finder').first);
+      expect(opened.single.relativePath, 'docs/日本語 notes.md');
+      expect(toggled.single.relativePath, 'docs/nested');
+      expect(revealed.single.relativePath, 'docs');
+    });
+  }
+
+  for (final (root, prefix, host) in [
+    ('/work/project', '/work/project', null),
+    ('/work/日本語 project', '/work/日本語 project', null),
+    ('/work/project/', '/work/project', null),
+    ('/work/project///', '/work/project', null),
+    ('/', '', null),
+    ('/srv/remote project/', '/srv/remote project', 'dev-box'),
+  ]) {
+    testWidgets('file Copy Path writes absolute text for $root ($host)', (
+      tester,
+    ) async {
+      final copied = <String>[];
+      tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+        SystemChannels.platform,
+        (call) async {
+          if (call.method == 'Clipboard.setData') {
+            copied.add((call.arguments as Map)['text'] as String);
+          }
+          return null;
+        },
+      );
+      addTearDown(
+        () => tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+          SystemChannels.platform,
+          null,
+        ),
+      );
+      await _pumpCopyPathApp(tester, [
+        DitchProject(
+          id: 'copy',
+          name: 'Copy project',
+          path: root,
+          sshHostAlias: host,
+        ),
+      ]);
+      await _chooseCopyPath(tester, 'README.md');
+      expect(copied, ['$prefix/README.md']);
+      expect(find.text('Path copied.'), findsOneWidget);
+      await tester.pump(const Duration(seconds: 3));
+      await tester.pumpAndSettle();
+      expect(find.text('Path copied.'), findsNothing);
+
+      await tester.tap(find.text('docs'));
+      await tester.pumpAndSettle();
+      for (final entry in _copyPathDirectories['docs']!) {
+        await _chooseCopyPath(tester, entry.name);
+        expect(copied.last, '$prefix/${entry.relativePath}');
+      }
+      expect(copied, hasLength(4));
+      await tester.pumpWidget(const SizedBox());
+    });
+  }
+
+  testWidgets('file Copy Path reports clipboard failure without success', (
+    tester,
+  ) async {
+    tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+      SystemChannels.platform,
+      (call) async {
+        if (call.method == 'Clipboard.setData') {
+          throw PlatformException(code: 'clipboard_unavailable');
+        }
+        return null;
+      },
+    );
+    addTearDown(
+      () => tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+        SystemChannels.platform,
+        null,
+      ),
+    );
+    await _pumpCopyPathApp(tester, const [
+      DitchProject(id: 'copy', name: 'Copy project', path: '/work/project'),
+    ]);
+    await _chooseCopyPath(tester, 'README.md');
+    expect(find.textContaining('Could not copy path:'), findsOneWidget);
+    expect(find.text('Path copied.'), findsNothing);
+    expect(tester.takeException(), isNull);
+    await tester.pumpWidget(const SizedBox());
+  });
+
+  for (final fail in [false, true]) {
+    testWidgets('file Copy Path tolerates disposal while copying (fail: $fail)', (
+      tester,
+    ) async {
+      final pending = Completer<void>();
+      tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+        SystemChannels.platform,
+        (call) async {
+          if (call.method == 'Clipboard.setData') await pending.future;
+          return null;
+        },
+      );
+      addTearDown(
+        () => tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+          SystemChannels.platform,
+          null,
+        ),
+      );
+      await _pumpCopyPathApp(tester, const [
+        DitchProject(id: 'copy', name: 'Copy project', path: '/work/project'),
+      ]);
+      await _chooseCopyPath(tester, 'README.md');
+      expect(find.text('Path copied.'), findsNothing);
+      await tester.pumpWidget(const SizedBox());
+      if (fail) {
+        pending.completeError(PlatformException(code: 'clipboard_unavailable'));
+      } else {
+        pending.complete();
+      }
+      await tester.pumpAndSettle();
+      expect(tester.takeException(), isNull);
+    });
+  }
+
+  testWidgets('file Copy Path keeps the menu owning project after a switch', (
+    tester,
+  ) async {
+    final copied = <String>[];
+    tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+      SystemChannels.platform,
+      (call) async {
+        if (call.method == 'Clipboard.setData') {
+          copied.add((call.arguments as Map)['text'] as String);
+        }
+        return null;
+      },
+    );
+    addTearDown(
+      () => tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+        SystemChannels.platform,
+        null,
+      ),
+    );
+    const first = DitchProject(id: 'first', name: 'First', path: '/work/first');
+    const second = DitchProject(
+      id: 'second',
+      name: 'Second',
+      path: '/work/second',
+    );
+    await _pumpCopyPathApp(tester, [first, second]);
+    await tester.tap(find.text('docs'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('日本語 notes.md'), buttons: kSecondaryMouseButton);
+    await tester.pumpAndSettle();
+    // Simulate selection changing while the popup route is still open.
+    tester
+        .widget<ProjectSidebar>(find.byType(ProjectSidebar))
+        .onSelectProject(second);
+    await tester.pumpAndSettle();
+    expect(
+      tester
+          .widget<ProjectToolsPanel>(find.byType(ProjectToolsPanel))
+          .projectId,
+      'second',
+    );
+    await tester.tap(find.text('Copy Path'));
+    await tester.pumpAndSettle();
+    expect(copied, ['/work/first/docs/日本語 notes.md']);
+    await _chooseCopyPath(tester, 'README.md');
+    expect(copied.last, '/work/second/README.md');
+    await tester.pumpWidget(const SizedBox());
   });
 
   testWidgets('project editor edits saves and exposes every presentation', (
@@ -4352,6 +4714,156 @@ void main() {
     await tester.pumpAndSettle();
     expect(tester.getTopLeft(header), headerTop);
     expect(tester.getTopLeft(composer), composerTop);
+  });
+
+  testWidgets('only assistant messages interpret Markdown in narrow bubbles', (
+    tester,
+  ) async {
+    const source = '**literal** | `code`';
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: SingleChildScrollView(
+            child: SizedBox(
+              width: 280,
+              child: Column(
+                children: [
+                  for (final role in ChatMessageRole.values)
+                    AgentChatBubble(
+                      message: AgentChatMessage(
+                        role: role,
+                        text: source,
+                        createdAt: DateTime(2026),
+                      ),
+                    ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+    expect(find.byType(AssistantMessageContent), findsOneWidget);
+    expect(find.text(source), findsNWidgets(3));
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets(
+    'horizontal content cannot paginate or move a detached transcript',
+    (tester) async {
+      final viewport = ConversationViewportController();
+      addTearDown(viewport.dispose);
+      var loads = 0;
+      late StateSetter rebuild;
+      final messages = List.generate(
+        15,
+        (index) => AgentChatMessage(
+          identity: 'formatted-$index',
+          role: ChatMessageRole.assistant,
+          text:
+              '## Response $index\n\n| ${'wide' * 35} | Value |\n| --- | --- |\n| row | 12 |\n\n```text\n${'code ' * 80}\n```',
+          createdAt: DateTime(2026),
+        ),
+      );
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: SizedBox(
+              width: 340,
+              child: StatefulBuilder(
+                builder: (context, setState) {
+                  rebuild = setState;
+                  return ConversationTranscript(
+                    messages: messages,
+                    viewport: viewport,
+                    hasOlderMessages: true,
+                    onLoadOlder: () => loads++,
+                  );
+                },
+              ),
+            ),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+      await tester.drag(find.byType(ListView), const Offset(0, 400));
+      await tester.pumpAndSettle();
+      expect(viewport.mode, ConversationViewportMode.detached);
+      viewport.scrollController.jumpTo(
+        viewport.scrollController.position.maxScrollExtent,
+      );
+      await tester.pumpAndSettle();
+      final baselineLoads = loads;
+      final offset = viewport.scrollController.offset;
+      final horizontal = find
+          .byWidgetPredicate(
+            (w) =>
+                w is SingleChildScrollView &&
+                w.scrollDirection == Axis.horizontal,
+          )
+          .hitTestable()
+          .first;
+      await tester.drag(horizontal, const Offset(-120, 0));
+      await tester.pumpAndSettle();
+      expect(loads, baselineLoads);
+      expect(viewport.mode, ConversationViewportMode.detached);
+      expect(viewport.scrollController.offset, moreOrLessEquals(offset));
+      rebuild(
+        () => messages.insert(
+          0,
+          AgentChatMessage(
+            identity: 'older-formatted',
+            role: ChatMessageRole.assistant,
+            text: '**Older history**',
+            createdAt: DateTime(2025),
+          ),
+        ),
+      );
+      await tester.pump();
+      expect(viewport.scrollController.offset, moreOrLessEquals(offset));
+      expect(viewport.unseenCount, 0);
+      expect(tester.takeException(), isNull);
+    },
+  );
+
+  testWidgets('image preview failure preserves detached history position', (
+    tester,
+  ) async {
+    final viewport = ConversationViewportController();
+    addTearDown(viewport.dispose);
+    final messages = List.generate(
+      10,
+      (index) => AgentChatMessage(
+        identity: 'preview-$index',
+        role: ChatMessageRole.assistant,
+        text: '![Mockup $index](https://example.com/mockup.png)',
+        createdAt: DateTime(2026),
+      ),
+    );
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: SizedBox(
+            width: 340,
+            child: ConversationTranscript(
+              messages: messages,
+              viewport: viewport,
+            ),
+          ),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+    await tester.drag(find.byType(ListView), const Offset(0, 350));
+    await tester.pumpAndSettle();
+    expect(viewport.mode, ConversationViewportMode.detached);
+    final offset = viewport.scrollController.offset;
+    await tester.tap(find.text('Load image preview').hitTestable().first);
+    await tester.pumpAndSettle();
+    expect(find.text('Retry preview'), findsOneWidget);
+    expect(viewport.mode, ConversationViewportMode.detached);
+    expect(viewport.scrollController.offset, moreOrLessEquals(offset));
+    expect(tester.takeException(), isNull);
   });
 
   testWidgets('chat messages alternate clearly between left and right', (

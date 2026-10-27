@@ -256,6 +256,7 @@ struct RuntimeState {
     paths: AppPaths,
     store: DitchStore,
     projects: HashMap<String, Project>,
+    project_clones: project_clone::Registry,
     agents: HashMap<AgentId, AgentRecord>,
     tasks: HashMap<TaskId, Task>,
     app_server_streams: HashMap<AgentId, String>,
@@ -429,6 +430,7 @@ impl RuntimeState {
             paths,
             store,
             projects,
+            project_clones: project_clone::Registry::default(),
             agents,
             app_server_streams: HashMap::new(),
             validator_owners,
@@ -478,6 +480,8 @@ impl RuntimeState {
     fn runtime_status(&self) -> RuntimeStatus {
         let mut capabilities = vec![
             format!("edition_{RUNTIME_EDITION}"),
+            "project_clone_v1".to_owned(),
+            "project_rename_v1".to_owned(),
             "tasks_v1".to_owned(),
             "task_planning_v1".to_owned(),
             "github_task_metadata_v1".to_owned(),
@@ -888,6 +892,14 @@ fn forward_remote_event(state: &Arc<Mutex<RuntimeState>>, alias: &str, event: Se
 
 fn forward_remote_event_locked(state: &mut RuntimeState, alias: &str, event: ServerEvent) {
     match event {
+        ServerEvent::ProjectChanged(project) => {
+            // Unregistered projects and events for other hosts are ignored.
+            if state.projects.values().any(|p| p.id == project.id && ssh_remote::remote_alias(p) == Some(alias)) {
+                if let Err(error) = cache_remote_project_name(state, alias, &project) {
+                    ssh_remote::observe("remote_project_name_sync_failed", alias, Some(&error.message));
+                }
+            }
+        }
         ServerEvent::BoardExecutionChanged(execution) => {
             if state.projects.values().any(|p| p.id == execution.project_id && ssh_remote::remote_alias(p) == Some(alias)) {
                 state.broadcast(ServerEvent::BoardExecutionChanged(execution));
@@ -1066,6 +1078,13 @@ fn reconcile_remote_snapshot_locked(
     state
         .remote_event_cursors
         .insert(alias.to_owned(), (epoch, snapshot.event_sequence));
+    for project in &snapshot.projects {
+        if project_ids.contains(&project.id) {
+            if let Err(error) = cache_remote_project_name(state, alias, project) {
+                ssh_remote::observe("remote_project_name_sync_failed", alias, Some(&error.message));
+            }
+        }
+    }
     let previous_epoch = state.remote_epochs.insert(alias.to_owned(), epoch);
     if previous_epoch != Some(epoch) {
         ssh_remote::observe(
@@ -1872,6 +1891,12 @@ fn handle_request(request: ClientRequest, state: Arc<Mutex<RuntimeState>>) -> Se
             remote_root,
             git_policy,
         } => create_remote_project(state, ssh_host_alias, name, remote_root, git_policy),
+        request @ (ClientRequest::StartProjectClone { .. }
+            | ClientRequest::ProjectCloneStatus { .. }
+            | ClientRequest::CancelProjectClone { .. }
+            | ClientRequest::RetryProjectCloneRegistration { .. }) => {
+            project_clone::handle(request, state)
+        }
         ClientRequest::CreateProject {
             name,
             root,
@@ -1916,25 +1941,15 @@ fn handle_request(request: ClientRequest, state: Arc<Mutex<RuntimeState>>) -> Se
                     Err(error) => return protocol_error("git_init_failed", error.to_string()),
                 }
             }
-            if let Err(error) = ensure_project_metadata(&project) {
-                return protocol_error("project_metadata_failed", error.to_string());
+            match register_local_project(&state, project) {
+                Ok(project) => ServerResponse::ProjectCreated(project),
+                Err(error) => ServerResponse::Error(error),
             }
-            if let Err(error) = save_project_config(&project) {
-                return protocol_error("project_config_failed", error.to_string());
-            }
-            let mut state = state
-                .lock()
-                .expect("runtime state lock should not be poisoned");
-            if let Err(error) = state.store.upsert_project(&project) {
-                return protocol_error("project_store_failed", error.to_string());
-            }
-            state.projects.insert(project.root_key(), project.clone());
-            state.broadcast(ServerEvent::ProjectChanged(project.clone()));
-            ServerResponse::ProjectCreated(project)
         }
         ClientRequest::SkillRequest(request) => handle_skill_request(state,request),
         ClientRequest::TaskRequest(request) => handle_task_request(state,request),
         ClientRequest::GitHub(request) => github::handle(state, request),
+        ClientRequest::RenameProject { project_id, name } => rename_project_for_target(state, project_id, name),
         ClientRequest::DeleteProject { project_id } => delete_project_for_target(state, project_id),
         ClientRequest::StartCodexSession {
             project_id,
@@ -2501,6 +2516,119 @@ fn project_by_id(state: &Arc<Mutex<RuntimeState>>, project_id: ProjectId) -> Opt
         .values()
         .find(|project| project.id == project_id)
         .cloned()
+}
+
+fn cache_remote_project_name(
+    state: &mut RuntimeState,
+    alias: &str,
+    incoming: &Project,
+) -> Result<Project, ProtocolError> {
+    let project = state
+        .projects
+        .values()
+        .find(|project| project.id == incoming.id)
+        .and_then(|project| ssh_remote::renamed_remote_project(project, alias, incoming))
+        .ok_or_else(|| ProtocolError {
+            code: "remote_project_identity_mismatch".into(),
+            message: "Remote rename did not match a registered project on this SSH host".into(),
+        })?;
+    let previous = &state.projects[&project.root_key()];
+    if previous.name != project.name {
+        state.store.upsert_project(&project).map_err(|error| ProtocolError {
+            code: "remote_project_cache_failed".into(),
+            message: format!("The remote name was saved, but the local cache could not be updated: {error}. Reconnect or retry to synchronize it."),
+        })?;
+        state.projects.insert(project.root_key(), project.clone());
+        state.broadcast(ServerEvent::ProjectChanged(project.clone()));
+    }
+    Ok(project)
+}
+
+fn rename_project_for_target(
+    state: Arc<Mutex<RuntimeState>>,
+    project_id: ProjectId,
+    name: String,
+) -> ServerResponse {
+    let name = name.trim().to_owned();
+    if name.is_empty() {
+        return protocol_error("invalid_project_name", "Project name cannot be empty");
+    }
+    let Some(project) = project_by_id(&state, project_id) else {
+        return protocol_error("project_not_found", "Project is no longer registered");
+    };
+    if project.is_remote() {
+        match forward_project_command(&state, &project, ClientRequest::RuntimeStatus) {
+            ServerResponse::RuntimeStatus(status)
+                if status
+                    .capabilities
+                    .iter()
+                    .any(|capability| capability == "project_rename_v1") => {}
+            response @ ServerResponse::Error(_) => return response,
+            _ => {
+                return protocol_error(
+                    "remote_rename_unsupported",
+                    "Update the runtime on this SSH host using Remote Runtime Setup, then retry renaming.",
+                );
+            }
+        }
+        // Contact the authority even if the cache already has this name: a
+        // previous remote success may have failed to update the local cache.
+        return match forward_project_command(
+            &state,
+            &project,
+            ClientRequest::RenameProject { project_id, name },
+        ) {
+            ServerResponse::ProjectRenamed(incoming) => {
+                if ssh_remote::renamed_remote_project(
+                    &project,
+                    ssh_remote::remote_alias(&project).unwrap(),
+                    &incoming,
+                )
+                .is_none()
+                {
+                    return protocol_error(
+                        "remote_project_identity_mismatch",
+                        "Remote rename response did not match the requested project",
+                    );
+                }
+                match cache_remote_project_name(
+                    &mut state.lock().unwrap(),
+                    ssh_remote::remote_alias(&project).unwrap(),
+                    &incoming,
+                ) {
+                    Ok(project) => ServerResponse::ProjectRenamed(project),
+                    Err(error) => ServerResponse::Error(error),
+                }
+            }
+            response @ ServerResponse::Error(_) => response,
+            _ => protocol_error(
+                "remote_rename_failed",
+                "Remote runtime returned an unexpected rename response; reconnect and retry",
+            ),
+        };
+    }
+    // Serialize persistence with project removal and other local renames.
+    let mut state = state
+        .lock()
+        .expect("runtime state lock should not be poisoned");
+    let Some(mut project) = state
+        .projects
+        .values()
+        .find(|project| project.id == project_id)
+        .cloned()
+    else {
+        return protocol_error("project_not_found", "Project is no longer registered");
+    };
+    if project.name == name {
+        return ServerResponse::ProjectRenamed(project);
+    }
+    project.name = name;
+    if let Err(error) = state.store.save_local_project_rename(&project) {
+        return protocol_error("project_rename_failed", error.to_string());
+    }
+    state.projects.insert(project.root_key(), project.clone());
+    state.broadcast(ServerEvent::ProjectChanged(project.clone()));
+    ServerResponse::ProjectRenamed(project)
 }
 
 fn forward_project_command(
@@ -5819,6 +5947,7 @@ esac
 
     include!("remote_recovery_tests.rs");
     include!("session_name_tests.rs");
+    include!("project_rename_tests.rs");
     include!("model_discovery_tests.rs");
 
     pub(super) fn test_runtime() -> RuntimeState {
@@ -6673,3 +6802,29 @@ include!("skill_tests.rs");
 
 #[cfg(test)]
 include!("acceptance_tests.rs");
+
+/// Shared registration for local additions and completed clones.
+fn register_local_project(
+    state: &Arc<Mutex<RuntimeState>>,
+    project: Project,
+) -> Result<Project, ProtocolError> {
+    ensure_project_metadata(&project).map_err(|error| ProtocolError {
+        code: "project_metadata_failed".into(),
+        message: error.to_string(),
+    })?;
+    save_project_config(&project).map_err(|error| ProtocolError {
+        code: "project_config_failed".into(),
+        message: error.to_string(),
+    })?;
+    let mut state = state.lock().expect("runtime state lock");
+    state
+        .store
+        .upsert_project(&project)
+        .map_err(|error| ProtocolError {
+            code: "project_store_failed".into(),
+            message: error.to_string(),
+        })?;
+    state.projects.insert(project.root_key(), project.clone());
+    state.broadcast(ServerEvent::ProjectChanged(project.clone()));
+    Ok(project)
+}

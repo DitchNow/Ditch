@@ -250,3 +250,38 @@ Ditch can execute processes and read or write files inside registered projects, 
 Ditch Community Edition is open-source software licensed under the [GNU Affero General Public License v3.0](LICENSE) (`AGPL-3.0-only`).
 
 See [LICENSE](LICENSE) for the full license text.
+
+### Clone a GitHub project
+
+Choose **Add Project → GitHub**, paste an HTTPS or SSH Git URL (including
+`git@github.com:owner/repository.git`), and select a destination parent folder.
+Edit the inferred repository folder and project names as needed. Ditch shows the
+exact destination and creates a **new child directory** there; existing files,
+folders, and symlinks are never overwritten. The result is a normal local project
+on this Mac. Repository browsing, OAuth, remote-host cloning, and recursive
+submodules are not part of this flow.
+
+Git must be installed and available to the runtime. Private repositories use your
+existing Git credential helper or SSH agent. Configure credentials and verify SSH
+host keys in Terminal first: Ditch disables interactive password prompts and does
+not automatically accept unknown host keys. Do not put passwords or access tokens
+in the URL. The GitHub issue integration's credentials are separate.
+
+The modal stays open during cloning and Ditch configuration. Progress percentages
+refer to the named Git phase (such as receiving objects), not total elapsed work;
+phases without a Git percentage show an indeterminate bar. Cancel stops Git and
+its transport processes and removes only the operation's partial checkout.
+Clones have a one-hour execution limit.
+
+If checkout succeeds but project registration fails, Ditch retains the checkout
+and offers **Retry registration** without downloading it again. Inspect destination
+permissions, free space, and any symlinks or special files in `.ditch` before
+retrying. Clones receive a fresh local project identity even when the repository
+contains committed Ditch metadata.
+
+Closing the app or losing the connection does not imply that a daemon-owned clone
+was cancelled. If the runtime restarts, an old operation may be unknown; Ditch
+does not delete or overwrite its destination. Inspect that folder, use **Local
+Project** to add a complete checkout, or remove an unwanted partial checkout
+yourself before starting again. An older runtime must be updated and restarted
+before this feature is available.

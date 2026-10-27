@@ -1354,6 +1354,26 @@ pub fn remote_alias(project: &Project) -> Option<&str> {
     }
 }
 
+/// Accept only the owning daemon's local project identity. Copying just the
+/// name retains the client's SSH alias, machine identity and other metadata.
+pub fn renamed_remote_project(
+    existing: &Project,
+    alias: &str,
+    incoming: &Project,
+) -> Option<Project> {
+    if remote_alias(existing) != Some(alias)
+        || existing.id != incoming.id
+        || existing.root != incoming.root
+        || incoming.is_remote()
+        || incoming.name.trim().is_empty()
+    {
+        return None;
+    }
+    let mut updated = existing.clone();
+    updated.name = incoming.name.clone();
+    Some(updated)
+}
+
 pub fn create_remote_project(
     connections: &RemoteConnectionManager,
     alias: &str,

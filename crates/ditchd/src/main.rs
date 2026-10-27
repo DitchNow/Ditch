@@ -5,6 +5,7 @@
 // not launch plugins or a second service.
 
 mod acceptance_evidence;
+mod project_clone;
 mod app_server_client;
 mod codex_app_server;
 mod session_namer;

@@ -6,6 +6,81 @@ import XCTest
 
 class RunnerTests: XCTestCase {
 
+  func testComposerDecodesFileURLsAndRejectsTextAndWebURLs() throws {
+    let board = NSPasteboard(name: .init("composer-drop-\(UUID())"))
+    defer { board.releaseGlobally() }
+    let path = "/tmp/space ü # % \".png"
+    guard board.writeObjects([NSURL(fileURLWithPath: path), NSURL(fileURLWithPath: "/tmp/second.md")]) else {
+      throw XCTSkip("The macOS pasteboard service is unavailable in this test environment")
+    }
+    XCTAssertEqual(ComposerFileDrop.filePaths(from: board), [path, "/tmp/second.md"])
+    board.clearContents()
+    board.setString("/tmp/not-a-file-url", forType: .string)
+    XCTAssertTrue(ComposerFileDrop.filePaths(from: board).isEmpty)
+    board.clearContents()
+    board.writeObjects([NSURL(string: "https://example.com/image.png")!])
+    XCTAssertTrue(ComposerFileDrop.filePaths(from: board).isEmpty)
+  }
+
+  func testComposerDropBoundsUseLogicalPointsAndFlippedCoordinates() {
+    let path = "/tmp/space ü # % \".png"
+    XCTAssertEqual(ComposerFileDrop.normalizedFilePaths([
+      URL(fileURLWithPath: path), URL(fileURLWithPath: path),
+      URL(fileURLWithPath: "/tmp/sub/../second.md"), URL(string: "https://example.com")!,
+    ]), [path, "/tmp/second.md"])
+    let bounds = NSRect(x: 0, y: 0, width: 1000, height: 800)
+    let region = NSRect(x: 20, y: 600, width: 500, height: 180)
+    XCTAssertEqual(ComposerFileDrop.appKitRect(region, in: bounds, flipped: true), region)
+    XCTAssertEqual(ComposerFileDrop.appKitRect(region, in: bounds, flipped: false),
+      NSRect(x: 20, y: 20, width: 500, height: 180))
+    XCTAssertNil(ComposerDropOverlay().hitTest(.zero))
+  }
+
+  func testComposerDropLifecycleAndNativeEditorNeverInsertDuplicatePaths() throws {
+    let window = ComposerDropWindow(contentRect: NSRect(x: 0, y: 0, width: 500, height: 300),
+      styleMask: .borderless, backing: .buffered, defer: false)
+    let view = NSView(frame: NSRect(x: 0, y: 0, width: 500, height: 300))
+    window.contentView = view
+    let messenger = ComposerDropTestMessenger()
+    let bridge = ComposerFileDrop(view: view, messenger: messenger)
+    window.composerFileDrop = bridge
+    messenger.registerRegion(enabled: true)
+    let drag = ComposerTestDraggingInfo()
+    drag.draggingLocation = NSPoint(x: 100, y: 100)
+    guard drag.draggingPasteboard.writeObjects([NSURL(fileURLWithPath: "/tmp/one.md")]) else {
+      throw XCTSkip("The macOS pasteboard service is unavailable in this test environment")
+    }
+    XCTAssertEqual(window.draggingEntered(drag), .copy)
+    XCTAssertTrue(view.subviews.contains { $0 is ComposerDropOverlay })
+    let editor = ComposerTextView(frame: view.bounds)
+    view.addSubview(editor)
+    editor.string = "existing text"
+    XCTAssertEqual(editor.draggingUpdated(drag), .copy)
+    XCTAssertTrue(editor.performDragOperation(drag))
+    XCTAssertEqual(editor.string, "existing text")
+    XCTAssertEqual(messenger.drops.count, 1)
+    XCTAssertFalse(window.performDragOperation(drag))
+    XCTAssertEqual(messenger.drops.count, 1)
+    XCTAssertFalse(view.subviews.contains { $0 is ComposerDropOverlay })
+
+    drag.draggingSequenceNumber += 1
+    XCTAssertEqual(window.draggingEntered(drag), .copy)
+    drag.draggingLocation = NSPoint(x: 600, y: 100)
+    XCTAssertEqual(window.draggingUpdated(drag), [])
+    XCTAssertFalse(view.subviews.contains { $0 is ComposerDropOverlay })
+    drag.draggingLocation = NSPoint(x: 100, y: 100)
+    messenger.registerRegion(enabled: false)
+    XCTAssertEqual(editor.draggingEntered(drag), [])
+    XCTAssertFalse(editor.performDragOperation(drag))
+    XCTAssertEqual(editor.string, "existing text")
+    messenger.registerRegion(enabled: true)
+    XCTAssertEqual(window.draggingEntered(drag), .copy)
+    window.draggingEnded(drag)
+    XCTAssertFalse(view.subviews.contains { $0 is ComposerDropOverlay })
+    messenger.unregisterRegion()
+    XCTAssertEqual(window.draggingUpdated(drag), [])
+  }
+
   func testAuthorizedUpdatePathsBindCommunityAndCommercialToTheirOwnRelease() {
     let id = "11111111-1111-4111-8111-111111111111"
     for origin in ["https://relay.ditchnow.nl", "https://ditch-remote-relay-staging.matin-1a7.workers.dev"] {
@@ -410,4 +485,58 @@ final class RuntimeStartupTests: XCTestCase {
     wait(for: [recovered], timeout: 2)
     XCTAssertEqual(fixture.events.filter { $0 == "register" }.count, 2)
   }
+}
+
+private final class ComposerDropTestMessenger: NSObject, FlutterBinaryMessenger {
+  var handler: FlutterBinaryMessageHandler?
+  var drops: [FlutterMethodCall] = []
+  let codec = FlutterStandardMethodCodec.sharedInstance()
+  func send(onChannel channel: String, message: Data?) {
+    if let message {
+      let call = codec.decodeMethodCall(message)
+      if call.method == "drop" { drops.append(call) }
+    }
+  }
+  func send(onChannel channel: String, message: Data?, binaryReply callback: FlutterBinaryReply?) {
+    send(onChannel: channel, message: message)
+    callback?(codec.encodeSuccessEnvelope(nil))
+  }
+  func setMessageHandlerOnChannel(_ channel: String,
+    binaryMessageHandler handler: FlutterBinaryMessageHandler?) -> FlutterBinaryMessengerConnection {
+    self.handler = handler
+    return 1
+  }
+  func cleanUpConnection(_ connection: FlutterBinaryMessengerConnection) {}
+  func registerRegion(enabled: Bool) {
+    handler?(codec.encode(FlutterMethodCall(methodName: "register", arguments: [
+      "id": 1, "x": 0.0, "y": 0.0, "width": 500.0, "height": 300.0, "enabled": enabled,
+    ])), { _ in })
+  }
+  func unregisterRegion() {
+    handler?(codec.encode(FlutterMethodCall(methodName: "unregister",
+      arguments: ["id": 1])), { _ in })
+  }
+}
+
+private final class ComposerTestDraggingInfo: NSObject, NSDraggingInfo {
+  var draggingDestinationWindow: NSWindow? { nil }
+  var draggingSourceOperationMask: NSDragOperation { .copy }
+  var draggingLocation = NSPoint.zero
+  var draggedImageLocation: NSPoint { .zero }
+  var draggedImage: NSImage? { nil }
+  let draggingPasteboard = NSPasteboard(name: .init("composer-drag-\(UUID())"))
+  var draggingSource: Any? { nil }
+  var draggingSequenceNumber = 1
+  var draggingFormation: NSDraggingFormation = .none
+  var animatesToDestination = false
+  var numberOfValidItemsForDrop = 0
+  var springLoadingHighlight: NSSpringLoadingHighlight { .none }
+  func slideDraggedImage(to screenPoint: NSPoint) {}
+  override func namesOfPromisedFilesDropped(atDestination dropDestination: URL) -> [String]? { nil }
+  func resetSpringLoading() {}
+  func enumerateDraggingItems(options enumOpts: NSDraggingItemEnumerationOptions,
+    for view: NSView?, classes classArray: [AnyClass],
+    searchOptions: [NSPasteboard.ReadingOptionKey: Any],
+    using block: (NSDraggingItem, Int, UnsafeMutablePointer<ObjCBool>) -> Void) {}
+  deinit { draggingPasteboard.releaseGlobally() }
 }
