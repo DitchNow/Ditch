@@ -26,6 +26,20 @@ fn build_id() -> &'static str {
     option_env!("DITCH_BUILD_IDENTIFIER").unwrap_or(env!("CARGO_PKG_VERSION"))
 }
 
+fn validate_environment(running: &RuntimeStatus) -> io::Result<()> {
+    // Pre-isolation production daemons omitted this field. They may only be
+    // adopted by production, never by staging.
+    if running.deployment_environment != ditch_product::deployment::ENVIRONMENT
+        && !(running.deployment_environment.is_empty() && ditch_product::deployment::ENVIRONMENT == "production") {
+        return Err(fail("Remote runtime belongs to another environment. Nothing was stopped."));
+    }
+    Ok(())
+}
+
+fn blocks_downgrade(environment: &str, same_edition: bool, remote: u64, local: u64) -> bool {
+    environment != "staging" && same_edition && remote > local && remote > 0
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum Manager {
@@ -166,7 +180,10 @@ fn rpc(paths: &AppPaths, body: ClientRequest) -> io::Result<ServerResponse> {
 
 fn status(paths: &AppPaths) -> io::Result<Option<RuntimeStatus>> {
     match rpc(paths, ClientRequest::RuntimeStatus) {
-        Ok(ServerResponse::RuntimeStatus(status)) => Ok(Some(status)),
+        Ok(ServerResponse::RuntimeStatus(status)) => {
+            validate_environment(&status)?;
+            Ok(Some(status))
+        },
         Ok(_) => Err(fail(
             "Unexpected runtime status response; nothing was stopped.",
         )),
@@ -492,9 +509,7 @@ pub(super) fn wait_for_socket(paths: &AppPaths) -> io::Result<()> {
             return Ok(());
         }
         if Instant::now() >= until {
-            return Err(fail(
-                "Service did not start the remote runtime. Inspect the service and ~/.ditch/logs/runtime.log.",
-            ));
+            return Err(fail(format!("Service did not start the remote runtime. Inspect the service and {}.", paths.logs_dir.join("runtime.log").display())));
         }
         std::thread::sleep(Duration::from_millis(100));
     }
@@ -639,6 +654,7 @@ fn wait_build(
             Ok(Some(s))
                 if s.build_identifier == build
                     && s.edition == edition
+                    && validate_environment(&s).is_ok()
                     && Some(s.instance_id) != old_instance
                     && s.capabilities
                         .iter()
@@ -657,7 +673,7 @@ fn wait_build(
         }
         if Instant::now() >= deadline {
             return Err(fail(format!(
-                "New runtime health check failed: {last}. Inspect ~/.ditch/logs/runtime.log."
+                "New runtime health check failed: {last}. Inspect {}.", paths.logs_dir.join("runtime.log").display()
             )));
         }
         std::thread::sleep(Duration::from_millis(150));
@@ -681,6 +697,7 @@ fn recover(paths: &AppPaths, journal: &Journal, confirmed: bool) -> io::Result<b
         validate_release(previous)?;
     }
     if let Some(running) = status(paths)? {
+        validate_environment(&running)?;
         if running.build_identifier == journal.replacement_build
             && running.edition == super::RUNTIME_EDITION
             && running
@@ -769,15 +786,18 @@ pub(super) fn upgrade(target: &str, checksum: &str, confirmed: bool) -> io::Resu
     }
     let running = status(&paths)?;
     if let Some(running) = &running {
+        validate_environment(running)?;
         if running.build_identifier == build_id() && running.edition == super::RUNTIME_EDITION {
             println!("Requested runtime is already running.");
             return Ok(());
         }
         let local_number = option_env!("DITCH_BUILD_NUMBER").and_then(|s| s.parse::<u64>().ok());
         let remote_number = running.build_number.parse::<u64>().ok();
-        if running.edition == super::RUNTIME_EDITION
-            && remote_number.is_some_and(|remote| remote > local_number.unwrap_or(0) && remote > 0)
-        {
+        if blocks_downgrade(
+            ditch_product::deployment::ENVIRONMENT,
+            running.edition == super::RUNTIME_EDITION,
+            remote_number.unwrap_or(0), local_number.unwrap_or(0),
+        ) {
             return Err(fail(
                 "client_update_required: The remote runtime is newer. Update this Mac's Ditch app; the remote was not downgraded.",
             ));

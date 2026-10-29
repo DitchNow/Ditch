@@ -13,6 +13,7 @@ class DraftHarness {
   final viewport = ConversationViewportController();
   final composerKey = GlobalKey<AgentComposerState>();
   final submitted = <String>[];
+  Future<bool> Function(String)? accept;
   String project = 'project-a', agent = 'agent-a';
   bool visible = true, enlarged = false, working = false;
   late StateSetter update;
@@ -40,7 +41,10 @@ class DraftHarness {
                         initialPrompt: '',
                         hasSession: agent != 'new-agent',
                         isWorking: working,
-                        onSubmitPrompt: submitted.add,
+                        onSubmitPrompt: (prompt) async {
+                          submitted.add(prompt);
+                          return accept == null ? true : await accept!(prompt);
+                        },
                         onStopCodex: () {},
                       )
                     : const SizedBox(),
@@ -75,6 +79,90 @@ class DraftHarness {
 }
 
 void main() {
+  for (final accepted in [false, true]) {
+    testWidgets(
+      'delayed acceptance $accepted survives navigation and duplicate clicks',
+      (tester) async {
+        final acknowledgement = Completer<bool>();
+        final f = DraftHarness()..accept = (_) => acknowledgement.future;
+        await f.mount(tester);
+        await tester.enterText(find.byType(TextField), 'Original follow-up');
+        await tester.pump();
+        await tester.tap(find.text('Send'));
+        await tester.pumpAndSettle();
+        expect(f.text(tester), 'Original follow-up');
+        await f.composerKey.currentState!.submit();
+        await f.recreate(tester);
+        await f.composerKey.currentState!.submit();
+        expect(f.submitted, ['Original follow-up']);
+        f.update(() {
+          f.project = 'project-b';
+          f.agent = 'agent-b';
+        });
+        await tester.pumpAndSettle();
+        await tester.enterText(find.byType(TextField), 'Other project draft');
+        acknowledgement.complete(accepted);
+        await tester.pumpAndSettle();
+        expect(f.text(tester), 'Other project draft');
+        f.update(() {
+          f.project = 'project-a';
+          f.agent = 'agent-a';
+        });
+        await tester.pumpAndSettle();
+        expect(f.text(tester), accepted ? '' : 'Original follow-up');
+        expect(f.drafts.forAgent('agent-a', '').submitting, isFalse);
+      },
+    );
+  }
+
+  testWidgets(
+    'accepted acknowledgement preserves edits in a remounted composer',
+    (tester) async {
+      final acknowledgement = Completer<bool>();
+      final f = DraftHarness()..accept = (_) => acknowledgement.future;
+      await f.mount(tester);
+      await tester.enterText(find.byType(TextField), 'Original');
+      await tester.pump();
+      await tester.tap(find.text('Send'));
+      await tester.pumpAndSettle();
+      await f.recreate(tester);
+      await tester.enterText(find.byType(TextField), 'Next turn');
+      acknowledgement.complete(true);
+      await tester.pumpAndSettle();
+      expect(f.text(tester), 'Next turn');
+      expect(f.submitted, ['Original']);
+    },
+  );
+
+  testWidgets('acknowledgement clears a remounted visible composer', (
+    tester,
+  ) async {
+    final acknowledgement = Completer<bool>();
+    final f = DraftHarness()..accept = (_) => acknowledgement.future;
+    await f.mount(tester);
+    await tester.enterText(find.byType(TextField), 'Original');
+    await tester.pump();
+    await tester.tap(find.text('Send'));
+    await tester.pumpAndSettle();
+    await f.recreate(tester);
+    acknowledgement.complete(true);
+    await tester.pumpAndSettle();
+    expect(f.text(tester), isEmpty);
+    expect(f.drafts.forAgent('agent-a', '').text, isEmpty);
+  });
+
+  testWidgets('throwing submission retains an editable draft', (tester) async {
+    final f = DraftHarness()..accept = (_) async => throw StateError('busy');
+    await f.mount(tester);
+    await tester.enterText(find.byType(TextField), 'Retry this');
+    await tester.pump();
+    await tester.tap(find.text('Send'));
+    await tester.pumpAndSettle();
+    expect(f.text(tester), 'Retry this');
+    expect(find.textContaining('Prompt was not accepted'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
+
   testWidgets(
     'attachments restore per agent and project through enlargement and removal',
     (tester) async {
@@ -175,6 +263,19 @@ void main() {
     expect(f.submitted, ['Native draft\nwith more detail']);
     await f.recreate(tester);
     expect(createdTexts.last, isEmpty);
+    final acknowledgement = Completer<bool>();
+    f.accept = (_) => acknowledgement.future;
+    nativeText = 'Another native prompt';
+    unawaited(f.composerKey.currentState!.submit());
+    await tester.pumpAndSettle();
+    expect(f.submitted.last, 'Another native prompt');
+    // The native editor may contain an edit before textChanged reaches Dart.
+    nativeText = 'Keep this newer native edit';
+    acknowledgement.complete(true);
+    await tester.pumpAndSettle();
+    expect(f.drafts.forAgent('agent-a', '').text, nativeText);
+    await f.recreate(tester);
+    expect(createdTexts.last, 'Keep this newer native edit');
     await tester.pumpWidget(const SizedBox());
     await tester.pumpAndSettle();
     debugDefaultTargetPlatformOverride = null;

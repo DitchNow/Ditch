@@ -142,6 +142,20 @@ pub struct TaskRequest {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum TaskOperation {
+    ListReleases,
+    AcceptRelease {
+        tasks: Vec<TaskRevision>,
+        destination: ReleaseDestination,
+    },
+    AssignRelease {
+        tasks: Vec<TaskRevision>,
+        destination: ReleaseDestination,
+    },
+    /// Versioned SSH handoff. Copies an idle board task; never authorizes execution.
+    MaterializeBoardTask {
+        task: Box<Task>,
+        expected_remote: Option<Box<Task>>,
+    },
     RepositoryDiscovery,
     AttachGitHub {
         task_id: TaskId,
@@ -271,10 +285,19 @@ pub enum TaskOperation {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum TaskResponse {
+    Releases(Vec<ProjectRelease>),
+    ReleaseBatch {
+        tasks: Vec<Task>,
+        releases: Vec<ProjectRelease>,
+    },
+    /// Immutable transfer receipt, unlike Changed which replays the latest task.
+    Materialized(Box<Task>),
     RepositoryDiscovery(serde_json::Value),
     BoardExecution(BoardExecutionState),
     BoardProjects(Vec<ProjectId>),
-    Diff { text: String },
+    Diff {
+        text: String,
+    },
     TestPresets(std::collections::BTreeMap<String, CommandCheck>),
     Tasks(Vec<Task>),
     Detail(TaskDetail),
@@ -349,6 +372,7 @@ impl Task {
         draft.validate()?;
         let now = Utc::now();
         Ok(Self {
+            release_id: None,
             issue_kind: draft.issue_kind,
             execution_queue: None,
             planning: TaskPlanning::default(),
@@ -519,6 +543,7 @@ impl Task {
                 next.condition = TaskCondition::Idle;
                 next.archived = false;
                 next.completed_at = None;
+                next.release_id = None;
                 next.cancelled_at = None;
                 "reopen"
             }
@@ -760,5 +785,77 @@ mod tests {
         assert!(!local.conflicts(&other));
         other.coordinator_group = Some(Uuid::new_v4());
         assert!(!local.conflicts(&other));
+    }
+}
+
+/// Project-owned labels, independent of Git tags.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProjectRelease {
+    pub id: Uuid,
+    pub project_id: ProjectId,
+    pub name: String,
+    pub created_at: DateTime<Utc>,
+}
+impl ProjectRelease {
+    pub fn new(project_id: ProjectId, name: &str) -> Result<Self, TaskError> {
+        let name = name.trim();
+        if name.is_empty() || name.len() > 128 {
+            return Err(TaskError::new(
+                TaskErrorCode::InvalidInput,
+                "Release names must contain 1–128 bytes after trimming.",
+            ));
+        }
+        Ok(Self {
+            id: Uuid::new_v4(),
+            project_id,
+            name: name.into(),
+            created_at: Utc::now(),
+        })
+    }
+}
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TaskRevision {
+    pub task_id: TaskId,
+    pub expected_revision: u64,
+}
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ReleaseDestination {
+    Other,
+    Existing(Uuid),
+    New(String),
+}
+
+#[cfg(test)]
+mod release_tests {
+    use super::*;
+    #[test]
+    fn legacy_tasks_default_to_other_and_release_names_are_trimmed() {
+        let task = Task::new(
+            ProjectId::new(),
+            TaskDraft {
+                issue_kind: Default::default(),
+                skills: vec![],
+                title: "Legacy".into(),
+                description: String::new(),
+                acceptance_criteria: vec![],
+                priority: TaskPriority::Normal,
+            },
+            1,
+        )
+        .unwrap();
+        let mut json = serde_json::to_value(&task).unwrap();
+        json.as_object_mut().unwrap().remove("release_id");
+        assert_eq!(
+            serde_json::from_value::<Task>(json).unwrap().release_id,
+            None
+        );
+        assert_eq!(
+            ProjectRelease::new(task.project_id, " Preview 1 ")
+                .unwrap()
+                .name,
+            "Preview 1"
+        );
+        assert!(ProjectRelease::new(task.project_id, " ").is_err());
+        assert!(ProjectRelease::new(task.project_id, &"x".repeat(129)).is_err());
     }
 }

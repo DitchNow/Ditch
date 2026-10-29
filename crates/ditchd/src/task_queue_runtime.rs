@@ -514,45 +514,67 @@ fn board_workspace(project: &Project) -> (String, PathBuf) {
     (target, root)
 }
 
-fn board_queue_reserved(s: &RuntimeState, project: &Project, except: Option<AgentId>) -> bool {
-    let workspace = board_workspace(project);
-    s.tasks.values().any(|t| {
-        t.execution_queue.is_some()
-            && t.column() == TaskColumn::InProgress
-            && !t.archived
-            && t.assigned_agent_id.is_some()
-            && t.assigned_agent_id != except
-            && matches!(
-                t.condition,
-                TaskCondition::Queued | TaskCondition::Running | TaskCondition::AwaitingApproval
-            )
-            && s.projects
-                .values()
-                .any(|p| p.id == t.project_id && board_workspace(p) == workspace)
-    })
+fn board_task_owns_agent(s: &RuntimeState, task: &Task, id: AgentId) -> bool {
+    task.execution_queue.is_some()
+        && (task.assigned_agent_id == Some(id)
+            || task
+                .execution_queue
+                .as_ref()
+                .is_some_and(|q| q.agent_id == Some(id))
+            || s.agents
+                .get(&id)
+                .is_some_and(|a| a.run.task_id == Some(task.id))
+            || s.acceptance_controls
+                .get(&task.id)
+                .is_some_and(|c| c.owner == id))
 }
 
-fn board_project_busy(s: &RuntimeState, project: &Project, except: Option<AgentId>) -> bool {
-    let (target, root) = board_workspace(project);
-    board_queue_reserved(s, project, except)
-        || s.writer_leases
-            .iter()
-            .any(|(id, lease)| Some(*id) != except && lease.target == target && lease.root == root)
-        || s.agents.values().any(|a| {
-            Some(a.run.id) != except
-                && (a.run.can_stop
-                    || s.children.contains_key(&a.run.id)
-                    || matches!(
-                        a.run.state,
-                        AgentState::Starting
-                            | AgentState::Working
-                            | AgentState::Stopping
-                            | AgentState::AwaitingApproval
-                    ))
-                && s.projects.values().any(|p| {
-                    p.id == a.run.project_id && board_workspace(p) == (target.clone(), root.clone())
-                })
-        })
+fn board_agent_owned(s: &RuntimeState, id: AgentId) -> bool {
+    s.tasks
+        .values()
+        .any(|task| board_task_owns_agent(s, task, id))
+}
+
+// Shared by queue claims and writer admission. Task status can change before its
+// worker/validator exits, so durable reservations and live ownership both count.
+fn board_execution_busy(s: &RuntimeState, project: &Project, except: Option<AgentId>) -> bool {
+    let workspace = board_workspace(project);
+    s.tasks.values().any(|task| {
+        if task.execution_queue.is_none()
+            || !s
+                .projects
+                .values()
+                .any(|p| p.id == task.project_id && board_workspace(p) == workspace)
+        {
+            return false;
+        }
+        let owns = |id: AgentId| Some(id) != except && board_task_owns_agent(s, task, id);
+        // The assigned ID consumes launch authorization before any process exists.
+        (task.column() == TaskColumn::InProgress
+            && !task.archived
+            && task.assigned_agent_id.is_some_and(|id| Some(id) != except)
+            && matches!(
+                task.condition,
+                TaskCondition::Queued | TaskCondition::Running | TaskCondition::AwaitingApproval
+            ))
+            || s.acceptance_controls
+                .get(&task.id)
+                .is_some_and(|c| Some(c.owner) != except)
+            || s.acceptance_owners.iter().any(|id| owns(*id))
+            || s.writer_leases.keys().any(|id| owns(*id))
+            || s.children.keys().any(|id| owns(*id))
+            || s.agents.values().any(|a| {
+                owns(a.run.id)
+                    && (a.run.can_stop
+                        || matches!(
+                            a.run.state,
+                            AgentState::Starting
+                                | AgentState::Working
+                                | AgentState::Stopping
+                                | AgentState::AwaitingApproval
+                        ))
+            })
+    })
 }
 
 // Selection and reservation are one transaction under the same lock as manual starts.
@@ -581,21 +603,29 @@ fn claim_board_task(
     else {
         return Ok(None);
     };
-    let reason = if board_project_busy(&s, project, None) {
-        Some("Waiting for the project's active agent".to_string())
-    } else if task
-        .planning
-        .job
+    let selected = task
+        .execution_queue
         .as_ref()
-        .is_some_and(|j| j.status == "running")
-    {
-        Some("Waiting for implementation plan".to_string())
-    } else if task.planning.text.trim().is_empty() {
-        // A generation attempt never invalidates the saved, user-editable plan.
-        Some("Add an implementation plan to run this task".to_string())
-    } else {
-        None
-    };
+        .and_then(|q| q.agent_id)
+        .or(task.continue_agent_id);
+    let reason =
+        if selected.is_some_and(|id| s.agents.contains_key(&id) && !board_agent_idle(&s, id)) {
+            Some("Waiting for the selected agent to become idle".to_string())
+        } else if board_execution_busy(&s, project, None) {
+            Some("Waiting for another board task in this project".to_string())
+        } else if task
+            .planning
+            .job
+            .as_ref()
+            .is_some_and(|j| j.status == "running")
+        {
+            Some("Waiting for implementation plan".to_string())
+        } else if task.planning.text.trim().is_empty() {
+            // A generation attempt never invalidates the saved, user-editable plan.
+            Some("Add an implementation plan to run this task".to_string())
+        } else {
+            None
+        };
     if reason.is_some() {
         if task.last_reason != reason {
             task.last_reason = reason;

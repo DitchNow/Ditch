@@ -2,7 +2,7 @@ mod task_planning_tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
-    fn fixture(mode: &str) -> (Arc<Mutex<RuntimeState>>, Project, Task) {
+    pub(super) fn fixture(mode: &str) -> (Arc<Mutex<RuntimeState>>, Project, Task) {
         let mut runtime = super::tests::test_runtime();
         let root = runtime.paths.data_dir.join("planning-project");
         fs::create_dir_all(&root).unwrap();

@@ -2,6 +2,10 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:the_ditch/main.dart';
 
+const runtimeInstallLabel = ditchDeploymentEnvironment == 'staging'
+    ? 'Install / Repair Staging Runtime'
+    : 'Install / Repair Ditch Runtime';
+
 const setup = <String, dynamic>{
   'ready': false,
   'connection_state': 'setup_required',
@@ -82,6 +86,26 @@ Widget repair(RepairClient client, {Map<String, dynamic> initial = setup}) =>
     );
 
 void main() {
+  testWidgets('compatible staging runtime can be explicitly replaced', (tester) async {
+    final client = RepairClient();
+    await tester.pumpWidget(repair(client, initial: {
+      'ready': true,
+      'connection_state': 'connected',
+      'checks': [
+        {'key': 'runtime', 'label': 'Ditch Staging Runtime', 'state': 'ready'},
+        {'key': 'runtime_update', 'label': 'Staging runtime update',
+          'state': 'install_available'},
+      ],
+    }));
+    await tester.pump();
+    expect(client.installations, 0);
+    await tester.tap(find.text(runtimeInstallLabel));
+    await tester.pump();
+    expect(client.installations, 1);
+    await tester.pumpWidget(const SizedBox.shrink());
+    await tester.pump(const Duration(seconds: 2));
+  });
+
   for (final hadTerminal in [false, true]) {
     testWidgets(
       'closed remote terminal waits for a click (existing: $hadTerminal)',
@@ -169,7 +193,7 @@ void main() {
     final client = RepairClient()..lostResponses = 1;
     await tester.pumpWidget(repair(client));
     await tester.pumpAndSettle();
-    await tester.tap(find.text('Install / Repair Ditch Runtime'));
+    await tester.tap(find.text(runtimeInstallLabel));
     await tester.pump();
     await tester.pump(const Duration(seconds: 1));
     await tester.pump(const Duration(seconds: 1));
@@ -186,7 +210,7 @@ void main() {
       final client = RepairClient();
       await tester.pumpWidget(repair(client));
       await tester.pumpAndSettle();
-      await tester.tap(find.text('Install / Repair Ditch Runtime'));
+      await tester.tap(find.text(runtimeInstallLabel));
       await tester.pump();
       expect(client.installations, 1);
       expect(find.text('Waiting for remote work to finish…'), findsOneWidget);
@@ -207,7 +231,7 @@ void main() {
     final client = RepairClient()..fail = true;
     await tester.pumpWidget(repair(client));
     await tester.pumpAndSettle();
-    await tester.tap(find.text('Install / Repair Ditch Runtime'));
+    await tester.tap(find.text(runtimeInstallLabel));
     await tester.pump();
     await tester.pump(const Duration(seconds: 1));
     await tester.pumpAndSettle();

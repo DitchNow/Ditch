@@ -138,6 +138,179 @@ mod task_queue_tests {
         )
     }
 
+    #[test]
+    fn direct_followup_admission_preserves_inactive_links_and_ownership() {
+        let (s, p) = fixture();
+        let id = stopped_agent(&s, &p);
+        let mut linked = task(&s, &p, "Historical work");
+        linked.assigned_agent_id = Some(id);
+        let profile = AgentExecutionProfile::default();
+        s.lock().unwrap().agents.get_mut(&id).unwrap().run.task_id = Some(linked.id);
+        for state in [ditch_core::TaskState::InReview, ditch_core::TaskState::Accepted,
+                      ditch_core::TaskState::Ready, ditch_core::TaskState::Backlog] {
+            for archived in [false, true] {
+                linked.state = state.clone();
+                linked.archived = archived;
+                s.lock().unwrap().tasks.insert(linked.id, linked.clone());
+                let writer = WriterGuard::acquire_direct_prompt(&s, id, &p, &profile).unwrap();
+                assert!(WriterGuard::acquire_direct_prompt(&s, id, &p, &profile).is_err());
+                s.lock().unwrap().sync_agent_task(id);
+                assert_eq!(s.lock().unwrap().tasks[&linked.id], linked);
+                drop(writer);
+                assert!(WriterGuard::acquire(&s, id, &p, &profile).is_err());
+            }
+        }
+        {
+            let mut locked = s.lock().unwrap();
+            locked.agents.get_mut(&id).unwrap().run.state = AgentState::Failed;
+            locked.persist_agent(id);
+            locked.store.save_task_changes(&[(linked.clone(), linked.audit(TaskActor::User, "fixture", None, None))], None, None).unwrap();
+        }
+        let restored = Arc::new(Mutex::new(RuntimeState::new(s.lock().unwrap().paths.clone(), false).unwrap()));
+        assert!(WriterGuard::acquire_direct_prompt(&restored, id, &p, &profile).is_ok());
+        assert_eq!(restored.lock().unwrap().agents[&id].run.task_id, Some(linked.id));
+        linked.coordinator_group = Some(Uuid::new_v4());
+        s.lock().unwrap().tasks.insert(linked.id, linked.clone());
+        assert!(WriterGuard::acquire_direct_prompt(&s, id, &p, &profile).is_err());
+        linked.coordinator_group = None;
+        s.lock().unwrap().tasks.insert(linked.id, linked.clone());
+        s.lock().unwrap().acceptance_owners.insert(id);
+        assert!(WriterGuard::acquire_direct_prompt(&s, id, &p, &profile).is_err());
+        s.lock().unwrap().acceptance_owners.remove(&id);
+        s.lock().unwrap().agents.get_mut(&id).unwrap().run.can_stop = true;
+        assert!(WriterGuard::acquire_direct_prompt(&s, id, &p, &profile).is_err());
+        s.lock().unwrap().agents.get_mut(&id).unwrap().run.can_stop = false;
+        linked.project_id = ProjectId::new();
+        s.lock().unwrap().tasks.insert(linked.id, linked.clone());
+        assert!(WriterGuard::acquire_direct_prompt(&s, id, &p, &profile).is_err());
+        s.lock().unwrap().tasks.remove(&linked.id);
+        assert!(WriterGuard::acquire_direct_prompt(&s, id, &p, &profile).is_err());
+        s.lock().unwrap().agents.get_mut(&id).unwrap().run.task_id = None;
+        assert!(WriterGuard::acquire_direct_prompt(&s, id, &p, &profile).is_ok());
+    }
+
+    #[test]
+    fn direct_followup_and_queue_claim_are_atomic() {
+        for _ in 0..8 {
+            let (s, p) = fixture();
+            let id = stopped_agent(&s, &p);
+            enqueue(&s, &task(&s, &p, "Queued work"));
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let claim = {
+                let s = s.clone(); let p = p.clone(); let barrier = barrier.clone();
+                thread::spawn(move || {
+                    barrier.wait();
+                    claim_board_task(&s, &p).unwrap()
+                })
+            };
+            barrier.wait();
+            let writer = WriterGuard::acquire_direct_prompt(&s, id, &p, &AgentExecutionProfile::default());
+            let claimed = claim.join().unwrap();
+            assert!(writer.is_ok());
+            assert!(claimed.is_some());
+            drop(writer);
+        }
+    }
+
+    #[test]
+    fn claimed_queue_agent_cannot_consume_launch_authorization_with_a_prompt() {
+        let (s, p) = fixture();
+        let id = stopped_agent(&s, &p);
+        let t = task(&s, &p, "Continue queued work");
+        let selected = changed(handle_task_request(s.clone(), select_request(&t, Some(id), None)));
+        enqueue(&s, &selected);
+        assert!(WriterGuard::acquire_direct_prompt(&s, id, &p, &AgentExecutionProfile::default()).is_err());
+        let claimed = claim_board_task(&s, &p).unwrap().unwrap();
+        assert_eq!(claimed.assigned_agent_id, Some(id));
+        assert!(WriterGuard::acquire_direct_prompt(&s, id, &p, &AgentExecutionProfile::default()).is_err());
+        assert_eq!(s.lock().unwrap().tasks[&t.id], claimed);
+        assert!(WriterGuard::acquire(&s, id, &p, &AgentExecutionProfile::default()).is_ok());
+    }
+
+    #[test]
+    fn ssh_followup_admits_on_both_sides_and_retains_uncertain_ownership() {
+        let (host, local) = fixture();
+        let id = stopped_agent(&host, &local);
+        let mut linked = task(&host, &local, "Reviewed remote work");
+        linked.state = ditch_core::TaskState::InReview;
+        linked.assigned_agent_id = Some(id);
+        let binary = local.root.join("followup-codex");
+        fs::write(&binary, r#"#!/usr/bin/python3
+import json, sys
+if '--version' in sys.argv: print('codex-cli 0.154.0'); sys.exit(0)
+for line in sys.stdin:
+ r=json.loads(line); m=r.get('method'); p=r.get('params',{})
+ if m=='initialized': continue
+ if m=='thread/start': raise Exception('Must resume')
+ result={}
+ if m=='thread/resume':
+  assert p['threadId']=='existing-thread'
+  result={'thread':{'id':'existing-thread'}}
+ if m=='turn/start': result={'turn':{'id':'followup'}}
+ print(json.dumps({'id':r['id'],'result':result}),flush=True)
+ if m=='turn/start':
+  print(json.dumps({'method':'item/completed','params':{'item':{'type':'agentMessage','text':'Follow-up result'}}}),flush=True)
+  print(json.dumps({'method':'turn/completed','params':{'turn':{'status':'completed'}}}),flush=True)
+  break
+"#).unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+        {
+            let mut s = host.lock().unwrap();
+            s.remote_runtime = true;
+            s.codex_binary = Some(binary.to_string_lossy().into_owned());
+            s.agents.get_mut(&id).unwrap().run.task_id = Some(linked.id);
+            s.tasks.insert(linked.id, linked.clone());
+        }
+        let remote = Project::new_remote(local.id, &local.name, local.root.to_str().unwrap(), Uuid::new_v4(), "followup-host");
+        let mut desktop = super::tests::test_runtime();
+        desktop.projects.insert(remote.root_key(), remote.clone());
+        desktop.store.upsert_project(&remote).unwrap();
+        desktop.remote_event_subscriptions.insert("followup-host".into());
+        let lose_ack = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let target = host.clone(); let flag = lose_ack.clone(); let count = calls.clone();
+        desktop.remote_connections.test_rpc = Some(Arc::new(move |_, _, request| {
+            count.fetch_add(1, Ordering::SeqCst);
+            let response = handle_request(request, target.clone());
+            if flag.load(Ordering::SeqCst) {
+                Err(ditch_ssh::SshError::Failed("acknowledgement lost".into()))
+            } else { Ok(response) }
+        }));
+        let desktop = Arc::new(Mutex::new(desktop));
+        let reconcile = || {
+            let (epoch, snapshot) = { let s = host.lock().unwrap(); (s.instance_id, s.snapshot()) };
+            reconcile_remote_snapshot(&desktop, "followup-host", std::slice::from_ref(&remote), epoch, snapshot, 0);
+        };
+        reconcile();
+        for uncertain in [false, true] {
+            lose_ack.store(uncertain, Ordering::SeqCst);
+            let response = forward_or_prompt_agent(desktop.clone(), id, "Follow-up".into(), AgentExecutionProfile::default());
+            if uncertain {
+                assert!(matches!(response, ServerResponse::Error(e) if e.code == "remote_unavailable"));
+            } else { assert_eq!(response, ServerResponse::Accepted); }
+            let before = calls.load(Ordering::SeqCst);
+            assert!(matches!(forward_or_prompt_agent(desktop.clone(), id, "Do not duplicate".into(), AgentExecutionProfile::default()), ServerResponse::Error(_)));
+            assert_eq!(calls.load(Ordering::SeqCst), before);
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let s = host.lock().unwrap();
+                if !s.children.contains_key(&id) && !s.writer_leases.contains_key(&id) { break; }
+                drop(s);
+                assert!(Instant::now() < deadline);
+                thread::sleep(Duration::from_millis(20));
+            }
+            assert!(desktop.lock().unwrap().remote_write_uncertain.contains_key(&id));
+            assert_eq!(host.lock().unwrap().tasks[&linked.id], linked);
+            reconcile();
+            assert!(!desktop.lock().unwrap().writer_leases.contains_key(&id));
+            assert_eq!(desktop.lock().unwrap().tasks[&linked.id], linked);
+        }
+        let s = host.lock().unwrap();
+        let record = &s.agents[&id];
+        assert_eq!(record.run.native_session_id.as_deref(), Some("existing-thread"));
+        assert_eq!(record.messages.iter().filter(|m| m.role == AgentChatRole::User).count(), 3);
+    }
+
     fn play_pause(
         s: &Arc<Mutex<RuntimeState>>,
         p: &Project,
@@ -459,21 +632,186 @@ mod task_queue_tests {
     }
 
     #[test]
-    fn manual_agent_lease_blocks_queue_and_claim_blocks_manual_start() {
+    fn manual_agents_and_board_coexist_in_both_startup_orders() {
+        for board_first in [false, true] {
+            let (s, p) = fixture();
+            let first = enqueue(&s, &task(&s, &p, "first"));
+            let next = enqueue(&s, &task(&s, &p, "next"));
+            let claimed = board_first.then(|| claim_board_task(&s, &p).unwrap().unwrap());
+            let manual =
+                WriterGuard::acquire(&s, AgentId::new(), &p, &AgentExecutionProfile::default())
+                    .unwrap();
+            let resumed = stopped_agent(&s, &p);
+            let followup = WriterGuard::acquire_direct_prompt(
+                &s,
+                resumed,
+                &p,
+                &AgentExecutionProfile::default(),
+            )
+            .unwrap();
+            assert!(
+                WriterGuard::acquire_direct_prompt(
+                    &s,
+                    resumed,
+                    &p,
+                    &AgentExecutionProfile::default()
+                )
+                .is_err()
+            );
+            let claimed = claimed.unwrap_or_else(|| claim_board_task(&s, &p).unwrap().unwrap());
+            assert_eq!(claimed.id, first.id);
+            let owner = claimed.assigned_agent_id.unwrap();
+            let board =
+                WriterGuard::acquire(&s, owner, &p, &AgentExecutionProfile::default()).unwrap();
+            assert!(
+                WriterGuard::acquire(&s, owner, &p, &AgentExecutionProfile::default()).is_err()
+            );
+            assert!(
+                WriterGuard::acquire_direct_prompt(
+                    &s,
+                    owner,
+                    &p,
+                    &AgentExecutionProfile::default()
+                )
+                .is_err()
+            );
+            assert!(claim_board_task(&s, &p).unwrap().is_none());
+            assert_eq!(
+                s.lock().unwrap().tasks[&next.id].last_reason.as_deref(),
+                Some("Waiting for another board task in this project")
+            );
+            s.lock()
+                .unwrap()
+                .tasks
+                .get_mut(&first.id)
+                .unwrap()
+                .condition = TaskCondition::Failed;
+            assert!(
+                claim_board_task(&s, &p).unwrap().is_none(),
+                "cleanup still owns the slot"
+            );
+            drop(board);
+            assert_eq!(claim_board_task(&s, &p).unwrap().unwrap().id, next.id);
+            assert!(
+                s.lock()
+                    .unwrap()
+                    .writer_leases
+                    .contains_key(&manual.agent_id)
+            );
+            assert!(s.lock().unwrap().writer_leases.contains_key(&resumed));
+            drop(followup);
+            assert!(
+                s.lock()
+                    .unwrap()
+                    .writer_leases
+                    .contains_key(&manual.agent_id)
+            );
+        }
+    }
+
+    #[test]
+    fn busy_selected_conversation_waits_without_consuming_authorization() {
         let (s, p) = fixture();
-        let t = enqueue(&s, &task(&s, &p, "queued"));
-        let manual =
-            WriterGuard::acquire(&s, AgentId::new(), &p, &AgentExecutionProfile::default())
-                .unwrap();
+        let owner = stopped_agent(&s, &p);
+        let t = task(&s, &p, "resume");
+        let selected = changed(handle_task_request(
+            s.clone(),
+            select_request(&t, Some(owner), None),
+        ));
+        enqueue(&s, &selected);
+        // Activity can arrive after selection/enqueue (for example via reconciliation).
+        s.lock().unwrap().agents.get_mut(&owner).unwrap().run.state = AgentState::Working;
+        let next = enqueue(&s, &task(&s, &p, "next"));
         assert!(claim_board_task(&s, &p).unwrap().is_none());
-        drop(manual);
+        {
+            let locked = s.lock().unwrap();
+            let waiting = &locked.tasks[&t.id];
+            assert!(waiting.waiting_in_queue());
+            assert!(waiting.assigned_agent_id.is_none());
+            assert!(waiting.started_at.is_none());
+            assert_eq!(
+                waiting.last_reason.as_deref(),
+                Some("Waiting for the selected agent to become idle")
+            );
+            assert!(locked.tasks[&next.id].waiting_in_queue());
+        }
+        // An approval wait must also be rechecked, even without a writer lease.
+        s.lock().unwrap().agents.get_mut(&owner).unwrap().run.state = AgentState::AwaitingApproval;
+        assert!(claim_board_task(&s, &p).unwrap().is_none());
+        s.lock().unwrap().agents.get_mut(&owner).unwrap().run.state = AgentState::Completed;
         let claimed = claim_board_task(&s, &p).unwrap().unwrap();
         assert_eq!(claimed.id, t.id);
+        assert_eq!(claimed.assigned_agent_id, Some(owner));
+    }
+
+    #[test]
+    fn board_conversation_followup_keeps_board_ownership() {
+        let (s, p) = fixture();
+        let owner = stopped_agent(&s, &p);
+        let t = task(&s, &p, "reviewed");
+        let selected = changed(handle_task_request(
+            s.clone(),
+            select_request(&t, Some(owner), None),
+        ));
+        enqueue(&s, &selected);
+        claim_board_task(&s, &p).unwrap().unwrap();
+        {
+            let mut locked = s.lock().unwrap();
+            let t = locked.tasks.get_mut(&t.id).unwrap();
+            t.state = ditch_core::TaskState::InReview;
+            t.condition = TaskCondition::Idle;
+        }
+        let writer =
+            WriterGuard::acquire_direct_prompt(&s, owner, &p, &AgentExecutionProfile::default())
+                .unwrap();
+        enqueue(&s, &task(&s, &p, "next"));
+        assert!(claim_board_task(&s, &p).unwrap().is_none());
+        drop(writer);
+        claim_board_task(&s, &p).unwrap().unwrap();
         assert!(
-            WriterGuard::acquire(&s, AgentId::new(), &p, &AgentExecutionProfile::default())
+            WriterGuard::acquire_direct_prompt(&s, owner, &p, &AgentExecutionProfile::default())
                 .is_err()
         );
-        // The reserved queue owner can acquire the normal agent launcher lease.
+        assert!(
+            WriterGuard::acquire_direct_prompt(
+                &s,
+                stopped_agent(&s, &p),
+                &p,
+                &AgentExecutionProfile::default()
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn canonical_aliases_share_board_slot_but_not_manual_slot() {
+        let (s, p) = fixture();
+        let path = p.root.with_file_name("alias");
+        std::os::unix::fs::symlink(&p.root, &path).unwrap();
+        let alias = Project::new("Alias", path);
+        s.lock().unwrap().store.upsert_project(&alias).unwrap();
+        s.lock()
+            .unwrap()
+            .projects
+            .insert(alias.root_key(), alias.clone());
+        enqueue(&s, &task(&s, &p, "first"));
+        let next = enqueue(&s, &task(&s, &alias, "alias"));
+        let claimed = claim_board_task(&s, &p).unwrap().unwrap();
+        assert!(claim_board_task(&s, &alias).unwrap().is_none());
+        let manual = WriterGuard::acquire(
+            &s,
+            AgentId::new(),
+            &alias,
+            &AgentExecutionProfile::default(),
+        )
+        .unwrap();
+        s.lock()
+            .unwrap()
+            .tasks
+            .get_mut(&claimed.id)
+            .unwrap()
+            .condition = TaskCondition::Failed;
+        assert_eq!(claim_board_task(&s, &alias).unwrap().unwrap().id, next.id);
         assert!(
             WriterGuard::acquire(
                 &s,
@@ -481,8 +819,96 @@ mod task_queue_tests {
                 &p,
                 &AgentExecutionProfile::default()
             )
-            .is_ok()
+            .is_err()
         );
+        drop(manual);
+    }
+
+    #[test]
+    fn board_slot_survives_acceptance_status_changes_and_cleanup() {
+        let (s, p) = fixture();
+        enqueue(&s, &task(&s, &p, "first"));
+        let next = enqueue(&s, &task(&s, &p, "next"));
+        let claimed = claim_board_task(&s, &p).unwrap().unwrap();
+        let owner = claimed.assigned_agent_id.unwrap();
+        let guard = WriterGuard::acquire(&s, owner, &p, &AgentExecutionProfile::default()).unwrap();
+        let (wake, _) = mpsc::channel();
+        {
+            let mut locked = s.lock().unwrap();
+            locked.acceptance_owners.insert(owner);
+            locked.acceptance_controls.insert(
+                claimed.id,
+                AcceptanceControl {
+                    owner,
+                    wake,
+                    cancel: Arc::new(AtomicBool::new(false)),
+                },
+            );
+        }
+        guard.retain();
+        // Preflight cancellation clears the placeholder assignment.
+        acceptance_block(&s, claimed.id, "cancelled", "Cancelled");
+        assert!(
+            s.lock().unwrap().tasks[&claimed.id]
+                .assigned_agent_id
+                .is_none()
+        );
+        assert!(claim_board_task(&s, &p).unwrap().is_none());
+        assert!(
+            WriterGuard::acquire(&s, AgentId::new(), &p, &AgentExecutionProfile::default()).is_ok()
+        );
+        {
+            let mut locked = s.lock().unwrap();
+            locked.acceptance_controls.remove(&claimed.id);
+            locked.acceptance_owners.remove(&owner);
+        }
+        assert!(
+            claim_board_task(&s, &p).unwrap().is_none(),
+            "retained lease owns cleanup"
+        );
+        s.lock().unwrap().release_writer(owner);
+        assert_eq!(claim_board_task(&s, &p).unwrap().unwrap().id, next.id);
+    }
+
+    #[test]
+    fn restarted_board_process_retains_slot_until_exit() {
+        use std::os::unix::process::CommandExt;
+        let (s, p) = fixture();
+        enqueue(&s, &task(&s, &p, "first"));
+        let next = enqueue(&s, &task(&s, &p, "next"));
+        let claimed = claim_board_task(&s, &p).unwrap().unwrap();
+        let owner = claimed.assigned_agent_id.unwrap();
+        let guard = WriterGuard::acquire(&s, owner, &p, &AgentExecutionProfile::default()).unwrap();
+        let mut child = Command::new("/bin/sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        guard.started(child.id() as i32).unwrap();
+        guard.retain();
+        let restored = Arc::new(Mutex::new(
+            RuntimeState::new(s.lock().unwrap().paths.clone(), false).unwrap(),
+        ));
+        let blocked = claim_board_task(&restored, &p).unwrap().is_none();
+        let manual = WriterGuard::acquire(
+            &restored,
+            AgentId::new(),
+            &p,
+            &AgentExecutionProfile::default(),
+        )
+        .is_ok();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(
+            blocked,
+            "reconciled task status must not release a surviving process"
+        );
+        assert!(manual);
+        assert_eq!(
+            claim_board_task(&restored, &p).unwrap().unwrap().id,
+            next.id
+        );
+        assert!(!restored.lock().unwrap().writer_leases.contains_key(&owner));
     }
 
     #[test]
@@ -672,7 +1098,9 @@ for line in sys.stdin:
  if m=='initialized':continue
  if m=='initialize':v={'userAgent':'fixture'}
  elif m=='skills/list':v={'data':[{'cwd':str(pathlib.Path.cwd()),'skills':[],'errors':[]}]}
- elif m=='thread/start':v={'thread':{'id':'board-queue-thread'}}
+ elif m in ['thread/start','thread/resume']:
+  if m=='thread/resume':assert p['threadId']=='board-queue-thread'
+  v={'thread':{'id':'board-queue-thread'}}
  elif m=='turn/start':
   send({'id':i,'result':{'turn':{'id':'turn'}}})
   send({'method':'turn/started','params':{'turn':{'id':'turn'}}})
@@ -738,20 +1166,29 @@ for line in sys.stdin:
             ),
         ));
         assert_eq!(accepted.column(), TaskColumn::Done);
-        // Active manual conversations also block the queue, even without a lease.
+        let history = s.lock().unwrap().agents[&owner].messages.clone();
+        assert_eq!(forward_or_prompt_agent(s.clone(), owner, "Follow up after acceptance".into(), AgentExecutionProfile::default()), ServerResponse::Accepted);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let locked = s.lock().unwrap();
+            if !locked.children.contains_key(&owner) && !locked.writer_leases.contains_key(&owner) {
+                assert_eq!(locked.tasks[&t.id], accepted);
+                assert!(locked.agents[&owner].messages.starts_with(&history));
+                assert_eq!(locked.agents[&owner].run.task_id, Some(t.id));
+                assert_eq!(locked.agents[&owner].run.native_session_id.as_deref(), Some("board-queue-thread"));
+                break;
+            }
+            drop(locked);
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(20));
+        }
+        // An unrelated manual approval wait does not delay the next board task.
+        let manual = stopped_agent(&s, &p);
         {
             let mut locked = s.lock().unwrap();
-            let agent = &mut locked.agents.get_mut(&owner).unwrap().run;
-            agent.task_id = None;
+            let agent = &mut locked.agents.get_mut(&manual).unwrap().run;
             agent.state = AgentState::AwaitingApproval;
             agent.can_stop = true;
-        }
-        assert!(claim_board_task(&s, &p).unwrap().is_none());
-        {
-            let mut locked = s.lock().unwrap();
-            let agent = &mut locked.agents.get_mut(&owner).unwrap().run;
-            agent.state = AgentState::Completed;
-            agent.can_stop = false;
         }
         assert_eq!(claim_board_task(&s, &p).unwrap().unwrap().id, next.id);
     }

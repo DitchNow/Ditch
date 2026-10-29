@@ -283,30 +283,22 @@ cp "$DITCH_CLI_SOURCE" "$MAIN_MACOS/ditch_cli"
 cp "$DITCHD_SOURCE" "$MAIN_MACOS/ditchd-remote-$HOST_REMOTE_TARGET"
 cp "$DITCHD_SOURCE" "$HELPER_MACOS/ditchd-remote-$HOST_REMOTE_TARGET"
 
-# Release automation may stage the cross-built Linux/macOS matrix produced by
-# scripts/build-remote-artifacts. Keep these as checksum-verified resources;
-# the host-native sibling above remains available for ordinary development.
+# Bundle only manifest-listed artifacts. Native development always gets a
+# verified resource too; signing refreshes Mac checksums before sealing.
 WORKSPACE_VERSION=$(sed -n 's/^version = "\([^"]*\)"/\1/p' "$WORKSPACE_ROOT/Cargo.toml" | head -n 1)
-REMOTE_ARTIFACT_SOURCE="${DITCH_REMOTE_ARTIFACT_DIR:-$WORKSPACE_ROOT/dist/remote/$DITCH_DEPLOYMENT_ENVIRONMENT/$WORKSPACE_VERSION}"
-if [ -f "$REMOTE_ARTIFACT_SOURCE/remote-artifacts.json" ]; then
-  ARTIFACT_ENVIRONMENT=$(/usr/bin/plutil -extract deployment_environment raw "$REMOTE_ARTIFACT_SOURCE/remote-artifacts.json" 2>/dev/null || printf production)
-  [ "$ARTIFACT_ENVIRONMENT" = "$DITCH_DEPLOYMENT_ENVIRONMENT" ] || {
-    echo "error: remote runtime artifacts belong to the other environment" >&2; exit 1;
-  }
-  ARTIFACT_BUILD_IDENTIFIER=$(sed -n 's/.*"build_identifier": "\([^"]*\)".*/\1/p' "$REMOTE_ARTIFACT_SOURCE/remote-artifacts.json" | head -n 1)
-  if [ "$ARTIFACT_BUILD_IDENTIFIER" != "$DITCH_BUILD_IDENTIFIER" ]; then
-    echo "error: remote runtime artifacts are stale for this source build." >&2
-    echo "Run scripts/build-remote-artifacts before building the macOS app." >&2
-    exit 1
+REMOTE_ARTIFACT_SOURCE="${DITCH_REMOTE_ARTIFACT_DIR:-/dev/null}"
+if [ "$DITCH_DEPLOYMENT_ENVIRONMENT" = production ] && [ -z "${DITCH_REMOTE_ARTIFACT_DIR:-}" ]; then
+  RELEASE_ARTIFACT_SOURCE="$WORKSPACE_ROOT/dist/remote/production/$WORKSPACE_VERSION"
+  if [ -f "$RELEASE_ARTIFACT_SOURCE/remote-artifacts.json" ]; then
+    REMOTE_ARTIFACT_SOURCE="$RELEASE_ARTIFACT_SOURCE"
   fi
-  mkdir -p "$HELPER_RESOURCES"
-  cp "$REMOTE_ARTIFACT_SOURCE/remote-artifacts.json" "$HELPER_RESOURCES/remote-artifacts.json"
-  for ARTIFACT in "$REMOTE_ARTIFACT_SOURCE"/ditchd-*; do
-    [ -f "$ARTIFACT" ] || continue
-    cp "$ARTIFACT" "$HELPER_RESOURCES/$(basename "$ARTIFACT")"
-    chmod 600 "$HELPER_RESOURCES/$(basename "$ARTIFACT")"
-  done
 fi
+REMOTE_PROTOCOL=$(sed -n 's/^pub const REMOTE_RUNTIME_PROTOCOL_VERSION: u16 = \([0-9][0-9]*\);/\1/p' "$WORKSPACE_ROOT/crates/ditch_protocol/src/lib.rs" | head -n 1)
+python3 "$WORKSPACE_ROOT/scripts/package-remote-artifacts.py" \
+  --source "$REMOTE_ARTIFACT_SOURCE" --destination "$HELPER_RESOURCES" \
+  --native "$DITCHD_SOURCE" --target "$HOST_REMOTE_TARGET" \
+  --environment "$DITCH_DEPLOYMENT_ENVIRONMENT" --edition "$DITCH_EDITION" \
+  --version "$WORKSPACE_VERSION" --build "$DITCH_BUILD_IDENTIFIER" --protocol "$REMOTE_PROTOCOL"
 
 # Verify the copies before signing (codesign changes Mach-O bytes). `cmp` is
 # killed by Xcode's script sandbox for Mach-O inputs, so verify executability

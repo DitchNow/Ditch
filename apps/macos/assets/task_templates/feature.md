@@ -20,8 +20,3 @@ Out of scope:
 ## Examples / screenshots
 
 ## Additional context
-
-## Before submitting
-- [ ] I searched for an existing issue.
-- [ ] I removed private information.
-- [ ] The feature is concrete enough to implement.

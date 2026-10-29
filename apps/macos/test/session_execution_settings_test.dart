@@ -155,7 +155,7 @@ void main() {
               initialText: '',
               hasSession: true,
               isWorking: true,
-              onSubmit: (_) {},
+              onSubmit: (_) async => true,
               onStop: () {},
             ),
           ),

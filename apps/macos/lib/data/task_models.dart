@@ -28,6 +28,7 @@ enum TaskColumn {
 @immutable
 class TaskDto {
   const TaskDto({
+    this.releaseId,
     this.issueKind = 'Custom',
     required this.id,
     required this.projectId,
@@ -75,6 +76,7 @@ class TaskDto {
       throw FormatException('Unsupported task state: $state');
     }
     return TaskDto(
+      releaseId: json['release_id'] as String?,
       executionQueue: json['execution_queue'] is Map
           ? Map<String, dynamic>.from(json['execution_queue'] as Map)
           : null,
@@ -109,6 +111,7 @@ class TaskDto {
       summary: json['review_summary'] as String?,
     );
   }
+  final String? releaseId;
   final String issueKind;
   final String id, projectId, title, description, state, condition, priority;
   final List<String> criteria;
@@ -181,4 +184,22 @@ class TaskRequestException implements Exception {
   final String code, message;
   @override
   String toString() => message;
+}
+
+@immutable
+class ProjectReleaseDto {
+  const ProjectReleaseDto({
+    required this.id,
+    required this.projectId,
+    required this.name,
+    required this.createdAt,
+  });
+  factory ProjectReleaseDto.fromJson(Map value) => ProjectReleaseDto(
+    id: value['id'] as String,
+    projectId: value['project_id'] as String,
+    name: value['name'] as String,
+    createdAt: DateTime.parse(value['created_at'] as String),
+  );
+  final String id, projectId, name;
+  final DateTime createdAt;
 }

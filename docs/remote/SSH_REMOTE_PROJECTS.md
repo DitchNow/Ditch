@@ -108,3 +108,28 @@ remote project from the desktop app.
 - Worktrees are not implemented in this repository. The execution-target
   boundary ensures a future worktree manager runs in the daemon that owns the
   project and Git repository.
+
+## Staging runtime development
+
+Staging uses `~/.ditch-staging`, `the-ditch-staging.service` on Linux and
+`dev.theditch.runtime.remote.staging` on macOS. Production retains `~/.ditch`
+and its existing service names. Runtime databases, sockets, logs and upgrade
+journals are separate; project files and each project's `.ditch` remain shared.
+
+An ordinary `./scripts/macos-app staging run` packages the native Mac runtime.
+For Linux SSH hosts, select the target explicitly (Docker is required on macOS):
+
+```sh
+DITCH_REMOTE_TARGETS="x86_64-unknown-linux-gnu" ./scripts/macos-app staging run
+# Use aarch64-unknown-linux-gnu for ARM Linux; multiple targets may be space-separated.
+```
+
+Use **Install / Repair Staging Runtime** in SSH setup. Compatible staging
+runtimes can connect without matching release numbers. An explicit replacement
+uses the current app's verified artifact and waits for active work to finish.
+Production's downgrade protection is unchanged. `DITCH_REMOTE_ARTIFACT_DIR=/dev/null`
+now retains a verified native fallback but supplies no cross-platform runtimes.
+
+The artifact manifest records environment, edition, source identity, protocol,
+target and checksum. Desktop and remote builders share the source identity;
+staging cannot install production artifacts or accept a production connection.

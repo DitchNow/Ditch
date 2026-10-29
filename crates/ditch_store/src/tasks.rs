@@ -21,7 +21,10 @@ impl DitchStore {
             "INTEGER NOT NULL DEFAULT 0",
         )?;
         self.connection.execute_batch(
-            "CREATE TABLE IF NOT EXISTS task_audit (
+            "CREATE TABLE IF NOT EXISTS project_releases (
+            id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id),
+            name TEXT NOT NULL, release_json TEXT NOT NULL, UNIQUE(project_id,name));
+            CREATE TABLE IF NOT EXISTS task_audit (
             sequence INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL UNIQUE,
             task_id TEXT NOT NULL REFERENCES tasks(id), audit_json TEXT NOT NULL);
             CREATE INDEX IF NOT EXISTS task_audit_task ON task_audit(task_id,sequence);
@@ -78,8 +81,80 @@ impl DitchStore {
         // Existing serialized links are authoritative only when their task exists.
         tx.execute("UPDATE agents SET task_id=json_extract(run_json,'$.task_id') WHERE json_valid(run_json) AND json_extract(run_json,'$.task_id') IN (SELECT id FROM tasks)", [])?;
         tx.execute(
-            "INSERT OR IGNORE INTO community_schema_migrations(version,applied_at) VALUES(4,?1),(5,?1)",
+            "INSERT OR IGNORE INTO community_schema_migrations(version,applied_at) VALUES(4,?1),(5,?1),(6,?1)",
             params![Utc::now().to_rfc3339()],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn load_releases(&self) -> Result<Vec<ditch_core::ProjectRelease>, StoreError> {
+        let mut stmt = self
+            .connection
+            .prepare("SELECT release_json FROM project_releases ORDER BY project_id,name,id")?;
+        Ok(stmt
+            .query_map([], |r| from_json(&r.get::<_, String>(0)?))?
+            .collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn save_release_batch(
+        &mut self,
+        release: Option<&ditch_core::ProjectRelease>,
+        changes: &[(Task, TaskAudit)],
+        request: &TaskRequest,
+        response: &TaskResponse,
+    ) -> Result<(), StoreError> {
+        let tx = self.connection.transaction()?;
+        if let Some(release) = release {
+            if release.name.trim() != release.name
+                || release.name.is_empty()
+                || release.name.len() > 128
+            {
+                return Err(StoreError::InvalidData("Invalid release name".into()));
+            }
+            tx.execute(
+                "INSERT INTO project_releases(id,project_id,name,release_json) VALUES(?1,?2,?3,?4)",
+                params![
+                    release.id.to_string(),
+                    release.project_id.0.to_string(),
+                    release.name,
+                    to_json(release)?
+                ],
+            )?;
+        }
+        for (task, audit) in changes {
+            let revision: i64 = tx.query_row(
+                "SELECT revision FROM tasks WHERE id=?1 AND project_id=?2",
+                params![task.id.0.to_string(), task.project_id.0.to_string()],
+                |r| r.get(0),
+            )?;
+            if revision as u64 + 1 != task.revision {
+                return Err(StoreError::InvalidData(
+                    "Task revision changed; refresh and retry".into(),
+                ));
+            }
+            if let Some(id) = task.release_id {
+                let belongs: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM project_releases WHERE id=?1 AND project_id=?2)",
+                    params![id.to_string(), task.project_id.0.to_string()],
+                    |r| r.get(0),
+                )?;
+                if !belongs {
+                    return Err(StoreError::InvalidData(
+                        "Release belongs to another project".into(),
+                    ));
+                }
+            }
+            write_task(&tx, task)?;
+            write_audit(&tx, audit)?;
+        }
+        tx.execute(
+            "INSERT INTO task_requests(id,request_json,response_json) VALUES(?1,?2,?3)",
+            params![
+                request.request_id.to_string(),
+                to_json(request)?,
+                to_json(response)?
+            ],
         )?;
         tx.commit()?;
         Ok(())
@@ -148,6 +223,17 @@ impl DitchStore {
                         .find(|current| current.id == task.id)
                         .map(TaskResponse::Changed)
                         .unwrap_or(TaskResponse::Deleted(task.id)),
+                    TaskResponse::ReleaseBatch { tasks, releases } => {
+                        let current: std::collections::HashMap<_, _> =
+                            self.load_tasks()?.into_iter().map(|t| (t.id, t)).collect();
+                        TaskResponse::ReleaseBatch {
+                            tasks: tasks
+                                .into_iter()
+                                .filter_map(|t| current.get(&t.id).cloned())
+                                .collect(),
+                            releases,
+                        }
+                    }
                     other => other,
                 };
                 Ok(Some(current))
@@ -415,6 +501,60 @@ fn write_audit(tx: &Transaction<'_>, audit: &TaskAudit) -> Result<(), StoreError
 mod tests {
     use super::*;
     use ditch_core::{TaskColumn, TaskDraft, TaskPriority, TaskState};
+
+    #[test]
+    fn release_transaction_rolls_back_and_names_are_project_scoped() {
+        use ditch_core::{ProjectRelease, ReleaseDestination, TaskOperation};
+        let connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch(SCHEMA).unwrap();
+        let mut store = DitchStore { connection };
+        store.initialize_tasks().unwrap();
+        let p = Project::new("P", "/tmp/p");
+        let q = Project::new("Q", "/tmp/q");
+        store.upsert_project(&p).unwrap();
+        store.upsert_project(&q).unwrap();
+        let release = ProjectRelease::new(p.id, " v1 ").unwrap();
+        let other = ProjectRelease::new(q.id, "v1").unwrap();
+        let request = TaskRequest {
+            project_id: Some(p.id),
+            request_id: uuid::Uuid::new_v4(),
+            operation: TaskOperation::AssignRelease {
+                tasks: vec![],
+                destination: ReleaseDestination::Other,
+            },
+        };
+        let response = TaskResponse::ReleaseBatch {
+            tasks: vec![],
+            releases: vec![release.clone()],
+        };
+        store
+            .save_release_batch(Some(&release), &[], &request, &response)
+            .unwrap();
+        let mut new_request = request.clone();
+        new_request.request_id = uuid::Uuid::new_v4();
+        let duplicate = ProjectRelease::new(p.id, "v1").unwrap();
+        assert!(
+            store
+                .save_release_batch(Some(&duplicate), &[], &new_request, &response)
+                .is_err()
+        );
+        assert!(store.task_replay(&new_request).unwrap().is_none());
+        store
+            .save_release_batch(Some(&other), &[], &new_request, &response)
+            .unwrap();
+        assert_eq!(store.load_releases().unwrap().len(), 2);
+        // Receipt failure occurs after insertion; the new release must roll back too.
+        let rollback = ProjectRelease::new(p.id, "rollback").unwrap();
+        assert!(
+            store
+                .save_release_batch(Some(&rollback), &[], &request, &response)
+                .is_err()
+        );
+        assert_eq!(store.load_releases().unwrap().len(), 2);
+        store.delete_project(p.id).unwrap();
+        assert_eq!(store.load_releases().unwrap(), vec![other]);
+    }
+
     #[test]
     fn legacy_rows_keep_serialized_states_and_unknown_commercial_tables() {
         let connection = Connection::open_in_memory().unwrap();

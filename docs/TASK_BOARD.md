@@ -53,7 +53,15 @@ remote task state.
 
 Both task-linked and ordinary agents reserve their process identity before launch.
 User-created agents may run concurrently in the same project, including Full Access
-and SSH sessions. Coordinator-owned workers share one slot per coordinator group
+and SSH sessions. Multiple manually started agents and resumed idle conversations
+may run alongside one Kanban execution in that project. Kanban tasks remain
+serialized, including while their workers and validators finish cleanup; the next
+task does not wait for unrelated manual agents. Opening a board-owned conversation
+does not bypass its queue ownership or allow overlapping turns on that agent.
+These agents share working files, so concurrent edits can invalidate acceptance
+evidence and require fresh validation.
+
+Coordinator-owned workers share one slot per coordinator group
 and canonical project folder; aliases of the same folder share that slot.
 Reservations survive uncertain stops and reconnects so the same agent cannot launch twice.
 Independent daemon installations are not a distributed lock service.
@@ -88,4 +96,63 @@ A project board can persist an explicit set of registered subprojects. Combined 
 
 The shared GitHub inbox supports linked-repository issue pages, selected import with stable issue identity, and source metadata refresh preserving local content, revision and review history. Closed GitHub issues remain Backlog with a closed source badge; they do not imply Ditch acceptance. Remote issue writes are absent. GitHub authentication has one Mac-only Connect GitHub action with inline shared-sign-in disclosure. It installs or repairs Ditch's managed CLI, runs browser authorization without terminal prompts, then connects after verifying the account. There is no separate account-confirmation or API-key path. Disconnect cancels integration work without logging other tools out. Live browser/Keychain and distributed-app verification remain required before release.
 
-Fresh SSH backlog tasks remain local until materialization and are retained through remote snapshots. Capability `board_workflow_v1` requires the matching remote runtime; it validates a fresh approved task snapshot, including its exact revision. Older SSH-host tasks continue to use the existing host task controls.
+### SSH board ownership and execution (2026-10-29)
+
+The board remains in the Mac UI. Fresh SSH Backlog tasks are stored on the Mac
+until an action needs the remote checkout. Backlog → Todo, Generate with AI,
+agent selection, and execution admission transfer the task to the registered
+project's SSH runtime first. The host then owns planning, queue execution, agent
+conversations and review evidence; its events and snapshots update the same board.
+Local project planning and execution keep their existing paths.
+
+Backlog → Todo runs the existing automatic planner on the host, using the title,
+description and source context. Saved plans are retained. An unavailable host
+leaves the draft in Backlog and reports Waiting for SSH; reconnect and retry the
+action. It does not create a failed local planning job. A legacy Todo task with
+the old connection error can recover through Generate with AI; conflicting or
+active remote copies require review and are never silently replaced.
+
+`board_handoff_v2` is checked before transfer. A transfer has its own durable
+request ID and frozen payload, separate from the task ID. The remote task and an
+immutable acknowledgment commit atomically. After a lost response, retry reuses
+that exact payload. If the user edited the pending local copy, Ditch first
+recovers the acknowledgment and then conditionally applies the newer snapshot.
+Execution-scope changes or active remote work block reconciliation. Metadata
+timestamps do not masquerade as a runtime-version error. Transfer alone never
+starts an execution agent.
+
+Remote events cannot replace a locally pending task before acknowledgment.
+Queue-created agents enter the Mac's agent registry on their first event, so
+their conversation is immediately navigable. Both editions share this code.
+Release the updated desktop and SSH runtime artifacts together; older hosts
+receive an explicit capability/update message rather than a partial transfer.
+GitHub refresh audit records remain stored but are omitted from the inspector's
+transition history. No GitHub polling behavior changes.
+
+
+### Project release groups
+
+Dropping In Review tasks into Done asks for a project release label and explicit
+**Accept and move** confirmation. Labels accept arbitrary non-empty names (up to
+128 UTF-8 bytes), are unique after trimming within their project, and are unrelated
+to Git tags. Choose **Other Tasks** to accept without a label. The inspector uses
+the same dialog. Cancelling before confirmation changes nothing.
+
+Click a Review or Done card to select it, Shift-click to extend selection across
+the visible range, or Cmd/Ctrl-click to toggle individual cards. Selection stays
+within one column; Escape clears it. Double-click a card (or use its Open task /
+review action) to open the inspector. Dragging a selected card moves the selected
+batch; dragging an unselected card moves only that card.
+
+Click a Done release header, including Other Tasks, to collapse or expand it.
+Collapsed headers still accept drops, and collapsing removes that group's tasks
+from selection. Expansion is retained while the board is mounted. Done groups retain empty labels;
+all-project and subproject boards nest labels under their owning project. Moving
+Done cards between groups changes membership and audit history, preserving completion
+timestamps and acceptance evidence. Reopening clears membership.
+
+Acceptance is atomic per project, including evidence validation, label creation,
+task updates, history, and retry receipts. A mixed-project dialog reports each
+project independently; successful batches are not resubmitted. Unconfirmed requests
+must be retried with their original request IDs before starting another mutation.
+SSH release operations require the owning host's `task_releases_v1` capability.

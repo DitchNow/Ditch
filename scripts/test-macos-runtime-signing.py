@@ -8,6 +8,7 @@ import plistlib
 import platform
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -108,6 +109,23 @@ class RuntimeSigningTests(unittest.TestCase):
         self.env.pop('EXPANDED_CODE_SIGN_IDENTITY')
         run('/bin/sh', str(SCRIPT), env=self.env)
         self.assert_hardened(self.helper)
+
+    def test_native_staging_package_has_valid_checksums_after_signing(self):
+        host = self.env['HOST_REMOTE_TARGET']
+        packager = SCRIPT.parents[3] / 'scripts/package-remote-artifacts.py'
+        run(sys.executable, str(packager), '--source', '/dev/null',
+            '--destination', str(self.resources), '--native', str(self.binaries[host]),
+            '--target', host, '--environment', 'staging', '--edition', 'community',
+            '--version', '0.1.1', '--build', 'fixture', '--protocol', '4')
+        run('/bin/sh', str(SCRIPT), env=self.env)
+        manifest = json.loads(self.manifest.read_text())
+        self.assertEqual(manifest['deployment_environment'], 'staging')
+        self.assertEqual(len(manifest['artifacts']), 1)
+        entry = manifest['artifacts'][0]
+        path = self.resources / entry['artifact']
+        self.assertEqual(entry['sha256'], digest(path))
+        self.assert_hardened(path)
+        run('/usr/bin/codesign', '--verify', '--deep', '--strict', str(self.helper))
 
     def test_stale_artifact_fails_before_signing(self):
         original = self.stage_matrix()

@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_markdown_plus/flutter_markdown_plus.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -34,6 +35,165 @@ void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
 
   for (final dark in [false, true]) {
+    for (final sample in [
+      (
+        name: 'mixed sentence',
+        markdown:
+            'Plain **bold** *italic* `inline code` #FF09648 and `#FF09648` end.',
+        plain: 'Plain bold italic inline code #FF09648 and #FF09648 end.',
+        width: 760.0,
+      ),
+      (
+        name: 'wrapped sentence',
+        markdown: 'Before `inline code` and #FF09648 after wrapping.',
+        plain: 'Before inline code and #FF09648 after wrapping.',
+        width: 180.0,
+      ),
+      (
+        name: 'table header',
+        markdown: '| Before `inline code` after |\n| --- |\n| Body |',
+        plain: 'Before inline code after',
+        width: 500.0,
+      ),
+      (
+        name: 'table body',
+        markdown: '| Header |\n| --- |\n| Before `inline code` after |',
+        plain: 'Before inline code after',
+        width: 500.0,
+      ),
+      (
+        name: 'list item',
+        markdown: '- Before `inline code` after',
+        plain: 'Before inline code after',
+        width: 500.0,
+      ),
+      (
+        name: 'task label',
+        markdown: '- [x] Before `inline code` after',
+        plain: 'Before inline code after',
+        width: 500.0,
+      ),
+      (
+        name: 'blockquote',
+        markdown: '> Before `inline code` after',
+        plain: 'Before inline code after',
+        width: 500.0,
+      ),
+      (
+        name: 'formatted link',
+        markdown: '[**Before** `inline code` *after*](https://example.com)',
+        plain: 'Before inline code after',
+        width: 500.0,
+      ),
+      (
+        name: 'fenced code',
+        markdown: '```text\nBefore inline code after\n```',
+        plain: 'Before inline code after',
+        width: 500.0,
+      ),
+    ]) {
+      for (final reverse in [false, true]) {
+        testWidgets('mouse selection paints and copies ${sample.name}, '
+            '${reverse ? 'backward' : 'forward'}, ${dark ? 'dark' : 'light'}', (
+          tester,
+        ) async {
+          String? copied;
+          tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+            SystemChannels.platform,
+            (call) async {
+              if (call.method == 'Clipboard.setData') {
+                copied = (call.arguments as Map)['text'] as String;
+              }
+              return null;
+            },
+          );
+          addTearDown(
+            () => tester.binding.defaultBinaryMessenger
+                .setMockMethodCallHandler(SystemChannels.platform, null),
+          );
+          final boundaryKey = GlobalKey();
+          var openedLinks = 0;
+          await tester.pumpWidget(
+            RepaintBoundary(
+              key: boundaryKey,
+              child: host(
+                AssistantMessageContent(
+                  text: sample.markdown,
+                  openLink: (_) async {
+                    openedLinks++;
+                    return true;
+                  },
+                ),
+                dark: dark,
+                width: sample.width,
+              ),
+            ),
+          );
+          await tester.pumpAndSettle();
+          final paragraph = tester.renderObject<RenderParagraph>(
+            find.byWidgetPredicate(
+              (widget) =>
+                  widget is RichText &&
+                  widget.text.toPlainText() == sample.plain,
+            ),
+          );
+          final boxes = paragraph.getBoxesForSelection(
+            TextSelection(baseOffset: 0, extentOffset: sample.plain.length),
+          );
+          if (sample.name == 'wrapped sentence') {
+            expect(boxes.map((box) => box.top).toSet().length, greaterThan(1));
+          }
+          final start = paragraph.localToGlobal(
+            Offset(boxes.first.left + 0.1, boxes.first.toRect().center.dy),
+          );
+          final end = paragraph.localToGlobal(
+            Offset(boxes.last.right - 0.1, boxes.last.toRect().center.dy),
+          );
+          final boundary =
+              boundaryKey.currentContext!.findRenderObject()!
+                  as RenderRepaintBoundary;
+          final before = await capturePixels(tester, boundary);
+          final mouse = await tester.startGesture(
+            reverse ? end : start,
+            kind: ui.PointerDeviceKind.mouse,
+          );
+          await mouse.moveTo(reverse ? start : end);
+          await mouse.up();
+          await tester.pumpAndSettle();
+          final after = await capturePixels(tester, boundary);
+
+          // Sample the space *inside* the code span, where an opaque span
+          // background used to cover the selection. No font/golden dependency.
+          final space = sample.plain.indexOf('inline code') + 'inline'.length;
+          final spaceBox = paragraph
+              .getBoxesForSelection(
+                TextSelection(baseOffset: space, extentOffset: space + 1),
+              )
+              .single
+              .toRect();
+          final origin = boundary.globalToLocal(
+            paragraph.localToGlobal(Offset.zero),
+          );
+          expectChangedPixels(before, after, spaceBox.shift(origin), 0.7);
+
+          // Also check every selected span/line, including literal hex text,
+          // bold and italic runs. This catches gaps across formatting boundaries.
+          // Ahem fills most glyph bounds, so only require some exposed background
+          // here; the whitespace probe above checks nearly the entire interior.
+          for (final box in boxes) {
+            expectChangedPixels(before, after, box.toRect().shift(origin), 0);
+          }
+          await tester.sendKeyDownEvent(LogicalKeyboardKey.metaLeft);
+          await tester.sendKeyEvent(LogicalKeyboardKey.keyC);
+          await tester.sendKeyUpEvent(LogicalKeyboardKey.metaLeft);
+          await tester.pump();
+          expect(copied, sample.plain);
+          expect(openedLinks, 0);
+          expect(tester.takeException(), isNull);
+        }, variant: TargetPlatformVariant.only(TargetPlatform.macOS));
+      }
+    }
+
     testWidgets(
       'formats GFM with selection in ${dark ? 'dark' : 'light'} theme',
       (tester) async {
@@ -80,6 +240,14 @@ void main() {
         final spans = tester
             .widgetList<RichText>(find.byType(RichText))
             .expand((text) => allSpans(text.text));
+        final code = spans.singleWhere((span) => span.text == 'a | **b**');
+        expect(code.style?.fontFamily, 'SF Mono');
+        expect(code.style?.fontSize, 12.5);
+        expect(code.style?.backgroundColor, Colors.transparent);
+        expect(
+          code.style?.color,
+          dark ? DitchTokens.dark.ink : DitchTokens.light.ink,
+        );
         expect(
           spans.any(
             (s) => s.text == 'Bold' && s.style?.fontWeight == FontWeight.bold,
@@ -455,4 +623,48 @@ Iterable<TextSpan> allSpans(InlineSpan span) sync* {
       yield* allSpans(child);
     }
   }
+}
+
+Future<({ByteData bytes, int width})> capturePixels(
+  WidgetTester tester,
+  RenderRepaintBoundary boundary,
+) async {
+  return (await tester.runAsync(() async {
+    final image = await boundary.toImage(pixelRatio: 1);
+    try {
+      return (
+        bytes: (await image.toByteData(format: ui.ImageByteFormat.rawRgba))!,
+        width: image.width,
+      );
+    } finally {
+      image.dispose();
+    }
+  }))!;
+}
+
+void expectChangedPixels(
+  ({ByteData bytes, int width}) before,
+  ({ByteData bytes, int width}) after,
+  Rect bounds,
+  double minimumFraction,
+) {
+  expect(after.width, before.width);
+  var changed = 0;
+  var total = 0;
+  // Exclude antialiased edges of the text/selection bounds.
+  for (var y = bounds.top.ceil() + 1; y < bounds.bottom.floor() - 1; y++) {
+    for (var x = bounds.left.ceil() + 1; x < bounds.right.floor() - 1; x++) {
+      final offset = (y * before.width + x) * 4;
+      if (before.bytes.getUint32(offset) != after.bytes.getUint32(offset)) {
+        changed++;
+      }
+      total++;
+    }
+  }
+  expect(total, greaterThan(0));
+  expect(
+    changed / total,
+    greaterThan(minimumFraction),
+    reason: 'Selection must visibly change the background inside $bounds',
+  );
 }
