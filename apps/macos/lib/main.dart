@@ -3818,67 +3818,65 @@ class _CommandCenterScreenState extends State<CommandCenterScreen>
       return;
     }
 
-    await _startCodexRuntime(prompt.trim());
-    _settingsForProject(_selectedProject.id).launchSkills = [];
+    final projectId = _selectedProject.id;
+    if (await _startCodexRuntime(prompt.trim())) {
+      _settingsForProject(projectId).launchSkills = [];
+    }
   }
 
-  Future<void> _startCodexRuntime(String prompt) async {
-    if (!await _prepareSelectedProjectForCodex()) {
-      return;
-    }
+  Future<bool> _startCodexRuntime(String prompt) async {
+    final project = _selectedProject;
+    final profile = _settingsForProject(project.id).protocolValue;
     try {
+      if (!await _prepareProjectForCodex(project) ||
+          !mounted || _selectedProject.id != project.id) {
+        return false;
+      }
       final response = await _runtimeClient.startCodexSession(
-        projectId: _selectedProject.id,
-        projectName: _selectedProject.name,
-        projectRoot: _selectedProject.path,
+        projectId: project.id,
+        projectName: project.name,
+        projectRoot: project.path,
         prompt: prompt,
-        executionProfile: _settingsForProject(
-          _selectedProject.id,
-        ).protocolValue,
+        executionProfile: profile,
       );
       final run = response['AgentStarted'];
       final session = _agentSessionFromRuntime(run, const []);
       if (session != null) {
+        if (!mounted) return true;
         final existing = _agentSessionByLocalId(session.localId);
         final target = existing ?? session;
         setState(() {
           if (existing == null) {
             _agentSessions.insert(0, session);
           }
-          _expandedAgentLocalId = session.localId;
+          if (_selectedProject.id == project.id) {
+            _expandedAgentLocalId = session.localId;
+          }
         });
-        _focusAgentComposerAfterLayout(session.localId);
+        if (_selectedProject.id == project.id) {
+          _focusAgentComposerAfterLayout(session.localId);
+        }
         if (target.messages.isEmpty) {
           unawaited(_loadAgentMessages(target));
         }
         _scheduleStatusBarUpdate();
       }
+      if (session == null) {
+        throw const FormatException('Runtime did not acknowledge the new agent.');
+      }
+      return true;
     } on Object catch (error) {
-      late final AgentSession session;
-      setState(() {
-        session = _createAgentSession(expand: true);
-        session.status = AgentStatus.failed;
-        session.currentPrompt = prompt;
-        session.updatedAt = DateTime.now();
-      });
-      _focusAgentComposerAfterLayout(session.localId);
-      _scheduleStatusBarUpdate();
-      _addChatMessage(
-        session,
-        ChatMessageRole.system,
-        'Failed to start Codex through Ditch Runtime: $error',
-      );
-      _addAttentionRequired(
-        kind: AttentionKind.failed,
-        sessionLocalId: session.localId,
-        icon: Icons.error_outline,
+      if (!mounted) return false;
+      _showProjectSetupResult(
         title: 'Codex failed to start',
-        body: '$error',
+        message: '$error',
+        isError: true,
       );
+      return false;
     }
   }
 
-  Future<bool> _prepareSelectedProjectForCodex() async {
+  Future<bool> _prepareProjectForCodex(DitchProject project) async {
     if (!_runtimeSupportsAppServerSessions) {
       _showProjectSetupResult(
         title: 'Runtime update required',
@@ -3888,9 +3886,9 @@ class _CommandCenterScreenState extends State<CommandCenterScreen>
       );
       return false;
     }
-    if (_selectedProject.isRemote) {
+    if (project.isRemote) {
       try {
-        final alias = _selectedProject.sshHostAlias;
+        final alias = project.sshHostAlias;
         if (alias == null) {
           throw const FormatException(
             'Remote project does not have an SSH host alias.',
@@ -3913,7 +3911,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen>
           if (repaired != true) return false;
         }
         await _runtimeClient.request({
-          'CheckRemoteProject': {'project_id': _selectedProject.id},
+          'CheckRemoteProject': {'project_id': project.id},
         });
         return true;
       } on Object catch (error) {
@@ -3958,7 +3956,6 @@ class _CommandCenterScreenState extends State<CommandCenterScreen>
       );
       return false;
     }
-    final project = _selectedProject;
     if (project.gitPolicy != ProjectGitPolicy.requireRepository ||
         isInsideGitWorkTree(project.path)) {
       return true;
@@ -4000,26 +3997,29 @@ class _CommandCenterScreenState extends State<CommandCenterScreen>
     final created = _projectFromRuntime(response['ProjectCreated']);
     if (created != null && mounted) {
       setState(() {
-        _projects[_selectedProjectIndex] = created;
-        _selectedProjectKey = _projectKey(created);
+        final index = _projects.indexWhere((p) => p.id == project.id);
+        if (index < 0) return;
+        _projects[index] = created;
+        if (_selectedProject.id == project.id) {
+          _selectedProjectKey = _projectKey(created);
+        }
       });
     }
     return true;
   }
 
-  Future<void> _submitComposer(AgentSession session, String prompt) async {
+  Future<bool> _submitComposer(AgentSession session, String prompt) async {
     if (session.isActive) {
-      return;
+      return false;
     }
 
     final cleanPrompt = prompt.trim();
     if (cleanPrompt.isEmpty) {
-      return;
+      return false;
     }
 
     if (session.codexThreadId == null && !session.isTerminal) {
-      await _startCodexRuntime(cleanPrompt);
-      return;
+      return _startCodexRuntime(cleanPrompt);
     }
 
     if (session.cannotResumeWithoutThread) {
@@ -4031,7 +4031,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen>
         body:
             'Codex never created a thread for this session. Its failure details remain available, but you must start a new agent to continue.',
       );
-      return;
+      return false;
     }
 
     final remoteSession = _projects.any(
@@ -4049,22 +4049,20 @@ class _CommandCenterScreenState extends State<CommandCenterScreen>
         body:
             'This session used ${session.originCodexHome}, while the runtime currently uses $_effectiveRuntimeCodexHome. Its history remains available; start a new agent to use the current Codex account.',
       );
-      return;
+      return false;
     }
 
-    setState(() {
-      session.status = AgentStatus.starting;
-      session.currentPrompt = cleanPrompt;
-      session.updatedAt = DateTime.now();
-    });
-    _scheduleStatusBarUpdate();
     final submittedProfile = session.executionSettings.protocolValue;
     try {
-      await _runtimeClient.promptAgent(
+      final response = await _runtimeClient.promptAgent(
         agentId: session.localId,
         prompt: cleanPrompt,
         executionProfile: submittedProfile,
       );
+      if (response['Accepted'] != true) {
+        throw const FormatException('Runtime did not acknowledge the prompt.');
+      }
+      if (!mounted) return true;
       if (mapEquals(
         session.executionSettings.protocolValue,
         submittedProfile,
@@ -4072,11 +4070,9 @@ class _CommandCenterScreenState extends State<CommandCenterScreen>
         session.executionSettings.edited = false;
       }
       _resolveAttentionForSession(session);
+      return true;
     } on Object catch (error) {
-      setState(() {
-        session.status = AgentStatus.failed;
-        session.updatedAt = DateTime.now();
-      });
+      if (!mounted) return false;
       _addChatMessage(
         session,
         ChatMessageRole.system,
@@ -4089,6 +4085,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen>
         title: 'Codex prompt failed',
         body: '$error',
       );
+      return false;
     }
   }
 
@@ -8182,8 +8179,8 @@ class AgentsSurface extends StatelessWidget {
   final String initialPrompt;
   final String? effectiveCodexHome;
   final VoidCallback onStartCodex;
-  final ValueChanged<String>? onStartPrompt;
-  final void Function(AgentSession session, String prompt) onSubmitPrompt;
+  final Future<bool> Function(String)? onStartPrompt;
+  final Future<bool> Function(AgentSession session, String prompt) onSubmitPrompt;
   final ValueChanged<AgentSession> onLoadMessages;
   final ValueChanged<AgentSession> onStopCodex;
   final ValueChanged<AgentSession> onDeleteAgent;
@@ -8245,7 +8242,7 @@ class AgentsSurface extends StatelessWidget {
                 headerKeyForAgent: headerKeyForAgent,
                 initialPrompt: initialPrompt,
                 effectiveCodexHome: effectiveCodexHome,
-                onStartPrompt: onStartPrompt ?? (_) {},
+                onStartPrompt: onStartPrompt ?? (_) async => false,
                 onToggleExpanded: onToggleExpanded,
                 onSubmitPrompt: onSubmitPrompt,
                 onLoadMessages: onLoadMessages,
@@ -8298,9 +8295,9 @@ class AgentSessionList extends StatelessWidget {
   final Key Function(String agentId) headerKeyForAgent;
   final String initialPrompt;
   final String? effectiveCodexHome;
-  final ValueChanged<String> onStartPrompt;
+  final Future<bool> Function(String) onStartPrompt;
   final ValueChanged<AgentSession> onToggleExpanded;
-  final void Function(AgentSession session, String prompt) onSubmitPrompt;
+  final Future<bool> Function(AgentSession session, String prompt) onSubmitPrompt;
   final ValueChanged<AgentSession> onLoadMessages;
   final ValueChanged<AgentSession> onStopCodex;
   final ValueChanged<AgentSession> onDeleteAgent;
@@ -8611,7 +8608,7 @@ class ExpandableAgentPanel extends StatelessWidget {
   final VoidCallback onEnlarge;
   final VoidCallback onDelete;
   final ValueChanged<String?> onRename;
-  final ValueChanged<String> onSubmitPrompt;
+  final Future<bool> Function(String) onSubmitPrompt;
   final VoidCallback onLoadMessages;
   final VoidCallback onStopCodex;
 
@@ -8939,7 +8936,7 @@ class AgentChatPanel extends StatelessWidget {
   final VoidCallback onLoadOlder;
   final bool enabled;
   final String? disabledMessage;
-  final ValueChanged<String> onSubmitPrompt;
+  final Future<bool> Function(String) onSubmitPrompt;
   final VoidCallback onStopCodex;
   final VoidCallback? onEnlarge;
   final bool autofocusAfterInitialPositioning;
@@ -9414,7 +9411,8 @@ class AgentComposer extends StatefulWidget {
   final bool isWorking;
   final bool canStop;
   final bool enabled;
-  final ValueChanged<String> onSubmit;
+  /// True only after runtime acceptance; false retains the editable draft.
+  final Future<bool> Function(String) onSubmit;
   final VoidCallback onStop;
   final VoidCallback? onEnlarge;
   final VoidCallback? onEscape;
@@ -9434,6 +9432,7 @@ class AgentComposerState extends State<AgentComposer> {
   String? _attachmentError;
   int _generation = 0;
   int _attachmentRevision = 0;
+  int _textRevision = 0;
   int? _submittingGeneration;
   Future<void> _dropQueue = Future.value();
   double _editorHeight = _minimumEditorHeight;
@@ -9452,12 +9451,40 @@ class AgentComposerState extends State<AgentComposer> {
   void initState() {
     super.initState();
     _draftText = widget.draft?.text ?? widget.initialText;
+    widget.draft?.addListener(_draftSubmissionChanged);
+  }
+
+  void _draftSubmissionChanged() {
+    if (!mounted) return;
+    final draft = widget.draft!;
+    final restoreFocus = _composerHasFocus && draft.text != _draftText;
+    setState(() {
+      final text = draft.text;
+      if (text != _draftText) {
+        _draftText = text;
+        _nativeComposerKey = GlobalKey<NativeComposerTextViewState>();
+        _editorHeight = _minimumEditorHeight;
+      }
+    });
+    if (restoreFocus) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted && identical(draft, widget.draft)) focus();
+      });
+    }
+  }
+
+  @override
+  void dispose() {
+    widget.draft?.removeListener(_draftSubmissionChanged);
+    super.dispose();
   }
 
   @override
   void didUpdateWidget(AgentComposer oldWidget) {
     super.didUpdateWidget(oldWidget);
     if (!identical(oldWidget.draft, widget.draft)) {
+      oldWidget.draft?.removeListener(_draftSubmissionChanged);
+      widget.draft?.addListener(_draftSubmissionChanged);
       _generation++;
       _dropQueue = Future.value();
       _attachmentRevision++;
@@ -9515,6 +9542,7 @@ class AgentComposerState extends State<AgentComposer> {
           if (existing.add(file.path)) _attachments.add(file);
         }
         _attachmentRevision++;
+        widget.draft?.revision++;
         _attachmentError = invalid.isEmpty
             ? null
             : 'Cannot include ${invalid.join(', ')}. Choose readable regular files.';
@@ -9526,13 +9554,18 @@ class AgentComposerState extends State<AgentComposer> {
     if (!widget.enabled ||
         widget.isWorking ||
         widget.canStop ||
-        _submittingGeneration == _generation) {
+        _submittingGeneration == _generation ||
+        widget.draft?.submitting == true) {
       return;
     }
     final generation = _generation;
-    _submittingGeneration = generation;
+    setState(() => _submittingGeneration = generation);
     final editor = _nativeComposerKey.currentState;
     final draft = widget.draft;
+    draft?.beginSubmission();
+    var accepted = false;
+    var submittedRevision = draft?.revision ?? 0;
+    var submittedAttachments = <PromptAttachment>[];
     bool current() =>
         mounted &&
         generation == _generation &&
@@ -9575,18 +9608,52 @@ class AgentComposerState extends State<AgentComposer> {
       }
       final prompt = serializeAttachedPrompt(nativeText, attachments);
       if (prompt.isEmpty) return;
-      final onSubmit = widget.onSubmit;
-      _handleChanged('');
-      setState(() {
-        _attachments.clear();
-        _attachmentRevision++;
-        _attachmentError = null;
-      });
-      await editor?.clearText();
-      onSubmit(prompt);
-      if (current()) focus();
+      _handleChanged(nativeText);
+      final textRevision = _textRevision;
+      submittedRevision = draft?.revision ?? 0;
+      submittedAttachments = attachments;
+      accepted = await widget.onSubmit(prompt);
+      bool sameComposer() => mounted && generation == _generation &&
+          identical(draft, widget.draft) &&
+          identical(editor, _nativeComposerKey.currentState);
+      if (accepted && sameComposer()) {
+        final beforeRead = _textRevision;
+        final latestText = await editor?.currentText() ?? _draftText;
+        if (sameComposer() && beforeRead == _textRevision) {
+          // Native text can be ahead of its textChanged notification.
+          _handleChanged(latestText);
+          if (draft == null && textRevision == _textRevision &&
+              revision == _attachmentRevision && latestText == nativeText) {
+            _handleChanged('');
+            setState(() {
+              _attachments.clear();
+              _attachmentRevision++;
+              _attachmentError = null;
+            });
+            await editor?.clearText();
+          }
+        }
+      }
+    } on Object catch (error) {
+      if (mounted && generation == _generation) {
+        if (accepted) draft?.revision++;
+        setState(() => _attachmentError = accepted
+            ? 'Prompt accepted, but the draft could not be cleared: $error'
+            : 'Prompt was not accepted: $error');
+      }
     } finally {
-      if (_submittingGeneration == generation) _submittingGeneration = null;
+      draft?.finishSubmission(
+        accepted: accepted,
+        submittedRevision: submittedRevision,
+        submittedAttachments: submittedAttachments,
+      );
+      if (_submittingGeneration == generation) {
+        if (mounted) {
+          setState(() => _submittingGeneration = null);
+        } else {
+          _submittingGeneration = null;
+        }
+      }
     }
   }
 
@@ -9595,6 +9662,7 @@ class AgentComposerState extends State<AgentComposer> {
     if (_draftText == text) {
       return;
     }
+    _textRevision++;
     setState(() => _draftText = text);
   }
 
@@ -9617,7 +9685,8 @@ class AgentComposerState extends State<AgentComposer> {
     final actionLabel = widget.hasSession ? 'Send' : 'Start';
     final actionIcon = widget.hasSession ? Icons.send : Icons.play_arrow;
     final editable = widget.enabled;
-    final canSubmit = widget.enabled && !widget.isWorking && !widget.canStop;
+    final canSubmit = widget.enabled && !widget.isWorking && !widget.canStop &&
+        _submittingGeneration != _generation && widget.draft?.submitting != true;
 
     return NativeFileDropRegion(
       key: ValueKey(_generation),
@@ -9654,6 +9723,7 @@ class AgentComposerState extends State<AgentComposer> {
                           ? (file) => setState(() {
                               _attachments.remove(file);
                               _attachmentRevision++;
+                              widget.draft?.revision++;
                               _attachmentError = null;
                             })
                           : null,
@@ -11932,11 +12002,20 @@ class _AddRemoteProjectDialogState extends State<AddRemoteProjectDialog> {
                               ),
                             ),
                           ),
-                    if (runtimeNeedsInstall)
+                    if (runtimeNeedsInstall ||
+                        remoteSetupCheckHasState(
+                          _setup ?? const <String, dynamic>{},
+                          key: 'runtime_update',
+                          state: 'install_available',
+                        ))
                       FilledButton.tonalIcon(
                         onPressed: _busy ? null : _installRuntime,
                         icon: const Icon(Icons.system_update_alt),
-                        label: const Text('Install / Repair Ditch Runtime'),
+                        label: const Text(
+                          ditchDeploymentEnvironment == 'staging'
+                              ? 'Install / Repair Staging Runtime'
+                              : 'Install / Repair Ditch Runtime',
+                        ),
                       ),
                     if (codexNeedsInstall)
                       FilledButton.tonalIcon(

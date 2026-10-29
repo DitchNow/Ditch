@@ -71,6 +71,7 @@ void main() {
     bool working = false,
     bool stopping = false,
     bool remote = false,
+    Future<bool> Function(String)? accept,
   }) async {
     await tester.pumpWidget(
       MaterialApp(
@@ -84,7 +85,10 @@ void main() {
             isWorking: working,
             canStop: stopping,
             isRemote: remote,
-            onSubmit: sent.add,
+            onSubmit: (prompt) async {
+              sent.add(prompt);
+              return accept == null ? true : await accept(prompt);
+            },
             onStop: () {},
           ),
         ),
@@ -109,6 +113,32 @@ void main() {
           tester.state<AgentComposerState>(find.byType(AgentComposer)).submit(),
     );
     await tester.pumpAndSettle();
+  }
+
+  for (final accepted in [false, true]) {
+    testWidgets('attachment-only prompt waits for acceptance $accepted', (
+      tester,
+    ) async {
+      final attachment = PromptAttachment(file('attached.md').path);
+      final draft = AgentPromptDraft('')..attachments.add(attachment);
+      final sent = <String>[];
+      final acknowledgement = Completer<bool>();
+      await mount(tester, draft, sent, accept: (_) => acknowledgement.future);
+      late Future<void> pending;
+      await tester.runAsync(() async {
+        pending = tester
+            .state<AgentComposerState>(find.byType(AgentComposer))
+            .submit();
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+      });
+      await tester.pumpAndSettle();
+      expect(sent, hasLength(1));
+      expect(draft.attachments.single, same(attachment));
+      acknowledgement.complete(accepted);
+      await tester.runAsync(() => pending);
+      await tester.pumpAndSettle();
+      expect(draft.attachments, accepted ? isEmpty : [attachment]);
+    });
   }
 
   testWidgets(

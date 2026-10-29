@@ -570,6 +570,8 @@ pub struct Snapshot {
     #[serde(default)]
     pub remote_hosts: Vec<RemoteHostPresence>,
     pub projects: Vec<Project>,
+    #[serde(default)]
+    pub releases: Vec<ditch_core::ProjectRelease>,
     pub tasks: Vec<Task>,
     pub agents: Vec<AgentRun>,
     pub attention: Vec<RuntimeAttention>,
@@ -690,6 +692,7 @@ pub enum ServerEvent {
     ProjectDeleted {
         project_id: ProjectId,
     },
+    ReleaseCreated(ditch_core::ProjectRelease),
     TaskChanged(Task),
     BoardExecutionChanged(ditch_core::BoardExecutionState),
     TaskDeleted {
@@ -887,6 +890,26 @@ mod project_rename_protocol_tests {
         assert_eq!(
             serde_json::from_value::<ServerResponse>(json).unwrap(),
             response
+        );
+    }
+}
+
+#[cfg(test)]
+mod release_protocol_tests {
+    use super::*;
+    #[test]
+    fn old_snapshot_defaults_releases_and_release_events_round_trip() {
+        let snapshot: Snapshot = serde_json::from_value(serde_json::json!({
+            "projects": [], "tasks": [], "agents": [], "attention": [], "messages": []
+        }))
+        .unwrap();
+        assert!(snapshot.releases.is_empty());
+        let release =
+            ditch_core::ProjectRelease::new(ditch_core::ProjectId::new(), "Preview").unwrap();
+        let event = ServerEvent::ReleaseCreated(release);
+        assert_eq!(
+            serde_json::from_slice::<ServerEvent>(&serde_json::to_vec(&event).unwrap()).unwrap(),
+            event
         );
     }
 }

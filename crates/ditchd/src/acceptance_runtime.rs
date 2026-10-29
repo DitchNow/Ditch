@@ -349,21 +349,10 @@ fn acceptance_request_inner(
                 action: TaskAction::Accept,
                 ..
             } => {
-                let submission=task.acceptance.current_submission.and_then(|id|task.acceptance.submissions.iter().find(|s|s.id==id)).ok_or("This review has no immutable workspace evidence. Revalidate before accepting.")?;
                 _review_guard = Some(WriterGuard::acquire(
-                    state,
-                    AgentId::new(),
-                    &project,
-                    &AgentExecutionProfile::default(),
+                    state, AgentId::new(), &project, &AgentExecutionProfile::default(),
                 )?);
-                let current = acceptance_workspace(&project.root, &task.acceptance.config)?;
-                if current.fingerprint != submission.workspace.fingerprint {
-                    return Err("Workspace changed after submission. Acceptance is blocked; revalidate the evidence.".into());
-                }
-                next = task
-                    .transition(&TaskAction::Accept, TaskActor::User, task.revision, false)
-                    .map_err(|e| e.to_string())?
-                    .0;
+                next = prepare_release_acceptance(&task, &project).map_err(|e| e.to_string())?;
                 "accept"
             }
             TaskOperation::Transition {
@@ -1258,4 +1247,222 @@ impl RuntimeState {
             self.release_writer(id);
         }
     }
+}
+
+/// Caller owns the project workspace guard and checks ownership/revision/liveness.
+fn prepare_release_acceptance(task: &Task, project: &Project) -> Result<Task, TaskError> {
+    let invalid = |message: &str| TaskError::new(TaskErrorCode::InvalidInput, message);
+    let submission = task
+        .acceptance
+        .current_submission
+        .and_then(|id| task.acceptance.submissions.iter().find(|s| s.id == id))
+        .ok_or_else(|| {
+            invalid("This review has no immutable workspace evidence. Revalidate before accepting.")
+        })?;
+    let current =
+        acceptance_workspace(&project.root, &task.acceptance.config).map_err(|e| invalid(&e))?;
+    if current.fingerprint != submission.workspace.fingerprint {
+        return Err(invalid(
+            "Workspace changed after submission. Acceptance is blocked; revalidate the evidence.",
+        ));
+    }
+    Ok(task
+        .transition(&TaskAction::Accept, TaskActor::User, task.revision, false)?
+        .0)
+}
+
+fn release_request(
+    state: &Arc<Mutex<RuntimeState>>,
+    request: &TaskRequest,
+) -> Option<ServerResponse> {
+    use ditch_core::ReleaseDestination;
+    if !matches!(
+        request.operation,
+        TaskOperation::ListReleases
+            | TaskOperation::AcceptRelease { .. }
+            | TaskOperation::AssignRelease { .. }
+    ) {
+        return None;
+    }
+    let result = (|| -> Result<TaskResponse, TaskError> {
+        let storage =
+            |e: ditch_store::StoreError| TaskError::new(TaskErrorCode::Storage, e.to_string());
+        let invalid = |message: &str| TaskError::new(TaskErrorCode::InvalidInput, message);
+        let project = request
+            .project_id
+            .and_then(|id| project_by_id(state, id))
+            .ok_or_else(|| invalid("Select a project"))?;
+        let accepting = matches!(request.operation, TaskOperation::AcceptRelease { .. });
+        let (tasks, destination) = match &request.operation {
+            TaskOperation::AcceptRelease { tasks, destination }
+            | TaskOperation::AssignRelease { tasks, destination } => (tasks, destination),
+            TaskOperation::ListReleases => {
+                return Ok(TaskResponse::Releases(
+                    state
+                        .lock()
+                        .unwrap()
+                        .releases
+                        .values()
+                        .filter(|r| r.project_id == project.id)
+                        .cloned()
+                        .collect(),
+                ));
+            }
+            _ => unreachable!(),
+        };
+        let originals = {
+            let locked = state.lock().unwrap();
+            if let Some(response) = locked.store.task_replay(request).map_err(storage)? {
+                return Ok(response);
+            }
+            let mut ids = HashSet::new();
+            if tasks.is_empty() || tasks.len() > 100 {
+                return Err(invalid("Choose 1–100 tasks per project"));
+            }
+            tasks
+                .iter()
+                .map(|reference| {
+                    if !ids.insert(reference.task_id) {
+                        return Err(invalid("A task can only appear once in a release batch"));
+                    }
+                    let task = locked
+                        .tasks
+                        .get(&reference.task_id)
+                        .filter(|t| t.project_id == project.id)
+                        .ok_or_else(|| {
+                            invalid("Task is unavailable or belongs to another project")
+                        })?;
+                    task.check_revision(reference.expected_revision)?;
+                    if locked.task_live(task) {
+                        return Err(TaskError::new(
+                            TaskErrorCode::AgentBusy,
+                            "Stop the task loop before changing its release",
+                        ));
+                    }
+                    if task.archived
+                        || task.column()
+                            != if accepting {
+                                TaskColumn::InReview
+                            } else {
+                                TaskColumn::Done
+                            }
+                    {
+                        return Err(TaskError::new(
+                            TaskErrorCode::IllegalTransition,
+                            "Acceptance requires In Review tasks; regrouping requires Done tasks",
+                        ));
+                    }
+                    Ok(task.clone())
+                })
+                .collect::<Result<Vec<_>, TaskError>>()?
+        };
+        let _guard = if accepting {
+            Some(
+                WriterGuard::acquire(
+                    state,
+                    AgentId::new(),
+                    &project,
+                    &AgentExecutionProfile::default(),
+                )
+                .map_err(|e| TaskError::new(TaskErrorCode::WorkspaceBusy, e))?,
+            )
+        } else {
+            None
+        };
+        let mut prepared = Vec::new();
+        for task in &originals {
+            prepared.push(if accepting {
+                prepare_release_acceptance(task, &project)?
+            } else {
+                let mut next = task.clone();
+                next.touch();
+                next
+            });
+        }
+        let mut locked = state.lock().unwrap();
+        // Another retry may have committed while this request captured evidence.
+        if let Some(response) = locked.store.task_replay(request).map_err(storage)? {
+            return Ok(response);
+        }
+        for task in &originals {
+            let current = locked
+                .tasks
+                .get(&task.id)
+                .ok_or_else(|| invalid("Task disappeared"))?;
+            current.check_revision(task.revision)?;
+            if locked.task_live(current) {
+                return Err(TaskError::new(
+                    TaskErrorCode::AgentBusy,
+                    "Task became active; refresh and retry",
+                ));
+            }
+        }
+        let created = if let ReleaseDestination::New(name) = destination {
+            let release = ditch_core::ProjectRelease::new(project.id, name)?;
+            if locked
+                .releases
+                .values()
+                .any(|r| r.project_id == project.id && r.name == release.name)
+            {
+                return Err(invalid(
+                    "That release already exists. Select it from the list.",
+                ));
+            }
+            Some(release)
+        } else {
+            None
+        };
+        let release_id = match destination {
+            ReleaseDestination::Other => None,
+            ReleaseDestination::New(_) => created.as_ref().map(|r| r.id),
+            ReleaseDestination::Existing(id) => {
+                if !locked
+                    .releases
+                    .get(id)
+                    .is_some_and(|r| r.project_id == project.id)
+                {
+                    return Err(invalid(
+                        "Release is unavailable or belongs to another project",
+                    ));
+                }
+                Some(*id)
+            }
+        };
+        let changes: Vec<_> = prepared
+            .into_iter()
+            .zip(&originals)
+            .map(|(mut next, old)| {
+                next.release_id = release_id;
+                let audit = next.audit(
+                    TaskActor::User,
+                    if accepting {
+                        "accept_release"
+                    } else {
+                        "assign_release"
+                    },
+                    Some(old.column()),
+                    Some(format!("Release: {:?} -> {:?}", old.release_id, release_id)),
+                );
+                (next, audit)
+            })
+            .collect();
+        let releases = created.iter().cloned().collect::<Vec<_>>();
+        let response = TaskResponse::ReleaseBatch {
+            tasks: changes.iter().map(|(t, _)| t.clone()).collect(),
+            releases,
+        };
+        locked
+            .store
+            .save_release_batch(created.as_ref(), &changes, request, &response)
+            .map_err(storage)?;
+        if let Some(release) = created {
+            locked.releases.insert(release.id, release.clone());
+            locked.broadcast(ServerEvent::ReleaseCreated(release));
+        }
+        locked.publish_tasks(changes);
+        Ok(response)
+    })();
+    Some(ServerResponse::TaskResponse(
+        result.unwrap_or_else(TaskResponse::Error),
+    ))
 }

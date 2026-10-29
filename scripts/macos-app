@@ -231,6 +231,20 @@ resolve_flutter() {
   return 1
 }
 
+# The native runtime is packaged by Xcode. Build only explicitly selected extra
+# targets, using the same source identity as the desktop.
+if [ "$environment" = staging ]; then
+  DITCH_BUILD_IDENTIFIER=$("$workspace/scripts/build-identifier")
+  export DITCH_BUILD_IDENTIFIER
+  if [ -n "${DITCH_REMOTE_TARGETS:-}" ]; then
+    version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' "$workspace/Cargo.toml" | head -n 1)
+    DITCH_REMOTE_ARTIFACT_OUTPUT="$workspace/dist/remote/staging/$version"
+    DITCH_REMOTE_ARTIFACT_DIR="$DITCH_REMOTE_ARTIFACT_OUTPUT"
+    export DITCH_REMOTE_ARTIFACT_OUTPUT DITCH_REMOTE_ARTIFACT_DIR
+    "$workspace/scripts/build-remote-artifacts"
+  fi
+fi
+
 flutter_command=$(resolve_flutter)
 
 cd "$workspace/apps/macos"

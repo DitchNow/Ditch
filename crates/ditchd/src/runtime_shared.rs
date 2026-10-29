@@ -68,6 +68,7 @@ fn main() {
                 "{}",
                 serde_json::json!({
                     "version": env!("CARGO_PKG_VERSION"),
+                    "deployment_environment": ditch_product::deployment::ENVIRONMENT,
                     "protocol_version": ditch_protocol::PROTOCOL_VERSION,
                     "remote_runtime_protocol_version": ditch_protocol::REMOTE_RUNTIME_PROTOCOL_VERSION,
                     "build_identifier": option_env!("DITCH_BUILD_IDENTIFIER").unwrap_or(env!("CARGO_PKG_VERSION")),
@@ -258,6 +259,7 @@ struct RuntimeState {
     projects: HashMap<String, Project>,
     project_clones: project_clone::Registry,
     agents: HashMap<AgentId, AgentRecord>,
+    releases: HashMap<uuid::Uuid, ditch_core::ProjectRelease>,
     tasks: HashMap<TaskId, Task>,
     app_server_streams: HashMap<AgentId, String>,
     acceptance_controls:HashMap<TaskId,AcceptanceControl>,
@@ -436,6 +438,7 @@ impl RuntimeState {
             validator_owners,
             acceptance_controls:HashMap::new(), acceptance_waiters:HashMap::new(), acceptance_owners:std::collections::HashSet::new(),
             skill_discovery: HashMap::new(),
+            releases: durable.releases.into_iter().map(|r|(r.id,r)).collect(),
             tasks: durable.tasks.into_iter().map(|t|(t.id,t)).collect(),
             writer_leases,
             remote_write_uncertain,
@@ -486,11 +489,13 @@ impl RuntimeState {
             "task_planning_v1".to_owned(),
             "github_task_metadata_v1".to_owned(),
             "board_queue_v1".to_owned(),
+            "task_releases_v1".to_owned(),
             "board_agent_resume_v1".to_owned(),
             "board_execution_v1".to_owned(),
             "acceptance_v1".to_owned(),
             "identified_tasks_v1".to_owned(),
             "board_workflow_v1".to_owned(),
+            "board_handoff_v2".to_owned(),
             "coordinator_concurrency_v1".to_owned(),
             "bounded_context_v1".to_owned(),
             "persistent_sessions_v1".to_owned(),
@@ -580,6 +585,7 @@ impl RuntimeState {
                 })
                 .collect(),
             projects: self.projects.values().cloned().collect(),
+            releases: self.releases.values().filter(|r| self.projects.values().any(|p| p.id == r.project_id)).cloned().collect(),
             tasks: self.tasks.values().cloned().collect(),
             agents: self
                 .agents
@@ -911,27 +917,35 @@ fn forward_remote_event_locked(state: &mut RuntimeState, alias: &str, event: Ser
         ServerEvent::SkillsChanged {project_id} => {
             if project_id.is_some_and(|id|state.projects.values().any(|p|p.id==id&&ssh_remote::remote_alias(p)==Some(alias))) {state.broadcast(ServerEvent::SkillsChanged{project_id});}
         }
+        ServerEvent::ReleaseCreated(release) => {
+            *state.remote_task_generation.entry(alias.into()).or_default() += 1;
+            if state.projects.values().any(|p| p.id == release.project_id && ssh_remote::remote_alias(p) == Some(alias)) {
+                state.releases.insert(release.id, release.clone());
+                state.broadcast(ServerEvent::ReleaseCreated(release));
+            }
+        }
         ServerEvent::TaskChanged(task) => {
             *state.remote_task_generation.entry(alias.into()).or_default() += 1;
             if state.projects.values().any(|p|p.id == task.project_id && ssh_remote::remote_alias(p) == Some(alias))
-                && state.tasks.get(&task.id).is_none_or(|old|old.revision <= task.revision) {
+                && state.tasks.get(&task.id).is_none_or(|old|!old.remote_pending && old.revision <= task.revision) {
                     state.update_remote_task(task.clone()); state.broadcast(ServerEvent::TaskChanged(task));
             }
         }
         ServerEvent::TaskDeleted {task_id,project_id} => {
             *state.remote_task_generation.entry(alias.into()).or_default() += 1;
-            if state.projects.values().any(|p|p.id == project_id && ssh_remote::remote_alias(p) == Some(alias)) {
+            if state.projects.values().any(|p|p.id == project_id && ssh_remote::remote_alias(p) == Some(alias))
+                && state.tasks.get(&task_id).is_none_or(|task| !task.remote_pending) {
                 state.tasks.remove(&task_id); state.broadcast(ServerEvent::TaskDeleted {task_id,project_id});
             }
         }
 
         ServerEvent::AgentChanged(run) => {
-            let owns_project = state.projects.values().any(|project| {
+            let project = state.projects.values().find(|project| {
                 project.id == run.project_id
                     && ssh_remote::remote_alias(project).is_some_and(|host| host == alias)
-            });
-            if !owns_project
-                || state
+            }).cloned();
+            let Some(project) = project else { return; };
+            if state
                     .agents
                     .get(&run.id)
                     .is_some_and(|existing| existing.run.project_id != run.project_id)
@@ -941,6 +955,13 @@ fn forward_remote_event_locked(state: &mut RuntimeState, alias: &str, event: Ser
             state.remote_agent_hosts.insert(run.id, alias.to_owned());
             if let Some(record) = state.agents.get_mut(&run.id) {
                 record.run = run.clone();
+            } else {
+                // Queue-created agents have no local launch response to insert them.
+                // Register on the first event so navigation/chat works immediately.
+                state.agents.insert(run.id, AgentRecord {
+                    run: run.clone(), project_root: project.root,
+                    messages: vec![], terminal_failure: None,
+                });
             }
             state.broadcast(ServerEvent::AgentChanged(run));
         }
@@ -1095,6 +1116,8 @@ fn reconcile_remote_snapshot_locked(
     }
 
     if *state.remote_task_generation.get(alias).unwrap_or(&0) == task_generation {
+        state.releases.retain(|_,r| !project_ids.contains(&r.project_id));
+        for release in snapshot.releases.into_iter().filter(|r| project_ids.contains(&r.project_id)) { state.releases.insert(release.id, release); }
         let remote_ids:HashSet<_>=snapshot.tasks.iter().map(|t|t.id).collect();
         state.tasks.retain(|id,t|t.remote_pending || !project_ids.contains(&t.project_id) || remote_ids.contains(id));
         for task in snapshot.tasks.into_iter().filter(|t|project_ids.contains(&t.project_id)) { state.update_remote_task(task); }
@@ -3136,6 +3159,7 @@ fn delete_project_for_target(
             .projects
             .retain(|_, candidate| candidate.id != project_id);
         state.tasks.retain(|_,t|t.project_id != project_id);
+        state.releases.retain(|_, r| r.project_id != project_id);
         state.broadcast(ServerEvent::ProjectDeleted { project_id });
         return ServerResponse::Accepted;
     }
@@ -3853,6 +3877,7 @@ fn discover_codex_models(
 }
 
 include!("task_runtime.rs");
+include!("remote_task_handoff.rs");
 include!("task_planning_runtime.rs");
 include!("task_queue_runtime.rs");
 #[cfg(test)]
@@ -4320,6 +4345,7 @@ fn delete_project(
                 .is_none_or(|agent_id| !agent_ids.contains(&agent_id))
     });
     state.projects.remove(&project_key);
+    state.releases.retain(|_, r| r.project_id != project_id);
     state.broadcast(ServerEvent::ProjectDeleted { project_id });
     ServerResponse::Accepted
 }
@@ -6796,6 +6822,8 @@ esac
 
 #[cfg(test)]
 include!("task_tests.rs");
+#[cfg(test)]
+include!("remote_task_handoff_tests.rs");
 
 #[cfg(test)]
 include!("skill_tests.rs");

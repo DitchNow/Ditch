@@ -30,6 +30,7 @@ pub struct DurableAgent {
 mod tasks;
 
 pub struct DurableState {
+    pub releases: Vec<ditch_core::ProjectRelease>,
     pub tasks: Vec<ditch_core::Task>,
     pub projects: Vec<Project>,
     pub agents: Vec<DurableAgent>,
@@ -292,6 +293,7 @@ impl DitchStore {
             .query_map([], |row| from_json(&row.get::<_, String>(0)?))?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(DurableState {
+            releases: self.load_releases()?,
             tasks: self.load_tasks()?,
             projects,
             agents,
@@ -384,6 +386,7 @@ impl DitchStore {
         )?;
         tx.execute("DELETE FROM agents WHERE project_id=?1", params![id])?;
         tx.execute("DELETE FROM tasks WHERE project_id=?1", params![id])?;
+        tx.execute("DELETE FROM project_releases WHERE project_id=?1", params![id])?;
         tx.execute("DELETE FROM projects WHERE id=?1", params![id])?;
         tx.commit()?;
         Ok(())

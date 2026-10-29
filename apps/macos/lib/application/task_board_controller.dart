@@ -11,6 +11,53 @@ class TaskBoardController extends ChangeNotifier {
   final TaskTransport request;
   late final skills = SkillsController(request: request);
   final Map<String, TaskDto> _tasks = {};
+  final Map<String, ProjectReleaseDto> releases = {};
+  final Set<String> _releaseProjects = {};
+  List<ProjectReleaseDto> projectReleases(String projectId) =>
+      releases.values.where((r) => r.projectId == projectId).toList()
+        ..sort((a, b) {
+          final order = b.createdAt.compareTo(a.createdAt);
+          return order == 0 ? a.id.compareTo(b.id) : order;
+        });
+
+  Future<void> loadReleases(String projectId) async {
+    final result = await _send({
+      'project_id': projectId,
+      'request_id': newRequestId(),
+      'operation': 'ListReleases',
+    });
+    if (result['Releases'] is! List) {
+      throw const FormatException(
+        'Update this project’s runtime to use releases.',
+      );
+    }
+    for (final value in result['Releases'] as List) {
+      final release = ProjectReleaseDto.fromJson(value as Map);
+      if (release.projectId == projectId) releases[release.id] = release;
+    }
+    _notify();
+  }
+
+  Future<Map<String, dynamic>?> releaseBatch(
+    List<TaskDto> tasks,
+    Object destination, {
+    required bool accept,
+  }) {
+    assert(
+      tasks.isNotEmpty &&
+          tasks.every((t) => t.projectId == tasks.first.projectId),
+    );
+    return mutate(tasks.first.projectId, {
+      accept ? 'AcceptRelease' : 'AssignRelease': {
+        'tasks': [
+          for (final task in tasks)
+            {'task_id': task.id, 'expected_revision': task.revision},
+        ],
+        'destination': destination,
+      },
+    });
+  }
+
   final Map<String, Map<String, dynamic>> agents = {};
   final Map<String, BoardExecutionDto> boardExecutions = {};
   final Map<String, String> boardExecutionErrors = {};
@@ -72,6 +119,13 @@ class TaskBoardController extends ChangeNotifier {
   int _generation = 0;
   final Set<String> _deleted = {};
   bool get canRetry => _retry != null;
+  bool get hasPendingRelease {
+    final operation = _retry?['operation'];
+    return operation is Map &&
+        (operation.containsKey('AcceptRelease') ||
+            operation.containsKey('AssignRelease'));
+  }
+
   Future<List<String>> boardProjects(
     String projectId, {
     List<String>? members,
@@ -98,10 +152,25 @@ class TaskBoardController extends ChangeNotifier {
 
   void replaceSnapshot(Map<String, dynamic> snapshot) {
     _generation++;
+    _releaseProjects
+      ..clear()
+      ..addAll([
+        for (final p in snapshot['projects'] as List? ?? [])
+          (p as Map)['id'] as String,
+      ]);
     final parsed = [
       for (final value in snapshot['tasks'] as List? ?? const [])
         TaskDto.fromJson(Map<String, dynamic>.from(value as Map)),
     ];
+    releases
+      ..clear()
+      ..addEntries([
+        for (final value in snapshot['releases'] as List? ?? [])
+          (() {
+            final r = ProjectReleaseDto.fromJson(value as Map);
+            return MapEntry(r.id, r);
+          })(),
+      ]);
     _tasks
       ..clear()
       ..addEntries(parsed.map((t) => MapEntry(t.id, t)));
@@ -123,6 +192,10 @@ class TaskBoardController extends ChangeNotifier {
 
   void applyEvent(Map<String, dynamic> event) {
     _generation++;
+    if (event['ReleaseCreated'] case final Map value) {
+      final release = ProjectReleaseDto.fromJson(value);
+      releases[release.id] = release;
+    }
     if (event.containsKey('SkillsChanged')) skills.invalidate();
     if (event['BoardExecutionChanged'] case final Map value) {
       _upsertExecution(BoardExecutionDto.fromJson(value));
@@ -142,6 +215,8 @@ class TaskBoardController extends ChangeNotifier {
     }
     if (event['ProjectDeleted'] case final Map value) {
       _tasks.removeWhere((_, t) => t.projectId == value['project_id']);
+      _releaseProjects.remove(value['project_id']);
+      releases.removeWhere((_, r) => r.projectId == value['project_id']);
       boardExecutions.remove(value['project_id']);
       boardExecutionErrors.remove(value['project_id']);
     }
@@ -214,6 +289,9 @@ class TaskBoardController extends ChangeNotifier {
           _upsert(task);
         }
       }
+      for (final project in _releaseProjects.toList()) {
+        await loadReleases(project);
+      }
       hydrated = true;
       if (!preserveError) error = null;
     } on Object catch (e) {
@@ -227,6 +305,15 @@ class TaskBoardController extends ChangeNotifier {
     Map<String, dynamic> operation,
   ) async {
     if (busy) return null;
+    final pending = _retry?['operation'];
+    if (pending is Map &&
+        (pending.containsKey('AcceptRelease') ||
+            pending.containsKey('AssignRelease'))) {
+      error =
+          'A release update is awaiting confirmation. Use Retry action before starting another change.';
+      _notify();
+      return null;
+    }
     return _perform({
       'project_id': projectId,
       'request_id': newRequestId(),
@@ -241,12 +328,30 @@ class TaskBoardController extends ChangeNotifier {
   }
 
   Future<Map<String, dynamic>?> _perform(Map<String, dynamic> payload) async {
+    final retrying = _retry != null;
     busy = true;
     error = null;
     _retry = null;
     _notify();
     try {
       final result = await _send(payload);
+      final operation = payload['operation'] as Map;
+      if ((operation.containsKey('AcceptRelease') ||
+              operation.containsKey('AssignRelease')) &&
+          result['ReleaseBatch'] is! Map) {
+        throw const FormatException(
+          'Update this project’s runtime to confirm release batches, then retry this request.',
+        );
+      }
+      if (result['ReleaseBatch'] case final Map batch) {
+        for (final value in batch['releases'] as List? ?? []) {
+          final release = ProjectReleaseDto.fromJson(value as Map);
+          releases[release.id] = release;
+        }
+        for (final value in batch['tasks'] as List) {
+          _upsert(TaskDto.fromJson(Map<String, dynamic>.from(value as Map)));
+        }
+      }
       if (result['BoardExecution'] case final Map value) {
         _upsertExecution(BoardExecutionDto.fromJson(value));
       }
@@ -260,6 +365,11 @@ class TaskBoardController extends ChangeNotifier {
       return result;
     } on TaskRequestException catch (e) {
       error = e.message;
+      if ((retrying && e.code == 'Unsupported') ||
+          e.code == 'operation_outcome_unknown' ||
+          (e.code == 'Unsupported' && e.message.contains('same request ID'))) {
+        _retry = payload;
+      }
       if (e.code == 'RevisionConflict') {
         if ((payload['operation'] as Map).containsKey('BoardExecution')) {
           await loadBoardExecution(payload['project_id'] as String);
@@ -290,7 +400,8 @@ class TaskBoardController extends ChangeNotifier {
     _upsert(TaskDto.fromJson(Map<String, dynamic>.from(detail['task'] as Map)));
     return [
       for (final v in detail['history'] as List)
-        TaskAuditDto.fromJson(Map<String, dynamic>.from(v as Map)),
+        if ((v as Map)['action'] != 'github_refresh')
+          TaskAuditDto.fromJson(Map<String, dynamic>.from(v)),
     ];
   }
 

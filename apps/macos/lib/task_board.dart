@@ -11,6 +11,7 @@ import 'data/task_models.dart';
 import 'data/session_title.dart';
 import 'data/task_templates.dart';
 import 'widgets/task_type_selector.dart';
+import 'widgets/task_release_dialog.dart';
 import 'widgets/github_mark.dart';
 import 'design_system/ditch_theme.dart';
 
@@ -44,7 +45,381 @@ class TaskBoard extends StatefulWidget {
   State<TaskBoard> createState() => _TaskBoardState();
 }
 
+class _ReleaseTaskDrag {
+  const _ReleaseTaskDrag(this.ids);
+  final List<String> ids;
+}
+
+class _DoneReleaseGroup {
+  const _DoneReleaseGroup(this.projectId, this.release, this.tasks);
+  final String projectId;
+  final ProjectReleaseDto? release;
+  final List<TaskDto> tasks;
+  (String, String?) get identity => (projectId, release?.id);
+}
+
 class _TaskBoardState extends State<TaskBoard> {
+  VoidCallback? openAgentFor(TaskDto task) {
+    if (!widget.controller.agents.containsKey(task.selectedAgentId)) {
+      return null;
+    }
+    return () {
+      final c = widget.controller;
+      final id = c.task(task.id)?.selectedAgentId;
+      if (id != null && c.agents.containsKey(id)) {
+        widget.onOpenAgent(id);
+      }
+    };
+  }
+
+  final releaseSelected = <String>{};
+  final collapsedReleaseGroups = <(String, String?)>{};
+  final releaseSelectionFocus = FocusNode();
+  String? releaseSelectionAnchor;
+  TaskColumn? releaseSelectionColumn;
+  List<TaskDto> releaseSelectionOrder = [];
+
+  void selectReleaseTask(
+    TaskDto task, {
+    required bool range,
+    required bool toggle,
+  }) {
+    if (!widget.connected || widget.controller.busy || !releaseEligible(task)) {
+      return;
+    }
+    releaseSelectionFocus.requestFocus();
+    setState(() {
+      if (releaseSelectionColumn != task.column) {
+        releaseSelected.clear();
+        releaseSelectionAnchor = null;
+      }
+      releaseSelectionColumn = task.column;
+      final ordered = releaseSelectionOrder
+          .where((t) => t.column == task.column)
+          .toList();
+      final start = ordered.indexWhere((t) => t.id == releaseSelectionAnchor);
+      final end = ordered.indexWhere((t) => t.id == task.id);
+      if (range && start >= 0 && end >= 0) {
+        releaseSelected.addAll(
+          ordered
+              .sublist(
+                start < end ? start : end,
+                (start > end ? start : end) + 1,
+              )
+              .map((t) => t.id),
+        );
+      } else if (toggle) {
+        if (!releaseSelected.remove(task.id)) releaseSelected.add(task.id);
+        releaseSelectionAnchor = task.id;
+      } else {
+        releaseSelected
+          ..clear()
+          ..add(task.id);
+        releaseSelectionAnchor = task.id;
+      }
+    });
+  }
+
+  List<TaskDto> draggedTasks(Object data) => data is _ReleaseTaskDrag
+      ? data.ids.map(widget.controller.task).whereType<TaskDto>().toList()
+      : data is TaskDto
+      ? [data]
+      : [];
+  bool releaseEligible(TaskDto t) =>
+      !t.running &&
+      !t.archived &&
+      (t.column == TaskColumn.inReview || t.column == TaskColumn.done);
+  Future<void> releaseTasks(List<TaskDto> tasks, {String? releaseId}) async {
+    await showTaskReleaseDialog(
+      context,
+      controller: widget.controller,
+      tasks: tasks,
+      projectNames: {for (final p in widget.projects) p.id: p.name},
+      preselectedRelease: releaseId,
+    );
+    if (mounted) {
+      setState(
+        () => releaseSelected.removeWhere(
+          (id) => widget.controller.task(id)?.column != TaskColumn.inReview,
+        ),
+      );
+    }
+  }
+
+  Widget releaseCard(TaskDto task) {
+    final c = widget.controller;
+    final selectedTasks = releaseSelected.contains(task.id)
+        ? c.tasks
+              .where(
+                (t) =>
+                    releaseSelected.contains(t.id) &&
+                    t.column == task.column &&
+                    releaseEligible(t),
+              )
+              .toList()
+        : [task];
+    Widget card() {
+      var range = false;
+      var toggle = false;
+      return Listener(
+        // Read modifiers on pointer down: even onTapDown can be delayed by
+        // the double-tap recognizer until after the modifier is released.
+        onPointerDown: (_) {
+          final keys = HardwareKeyboard.instance;
+          range = keys.isShiftPressed;
+          toggle = keys.isMetaPressed || keys.isControlPressed;
+        },
+        child: TaskCard(
+          task: task,
+          onOpenAgent: openAgentFor(task),
+          projectName:
+              widget.projects
+                  .where((p) => p.id == task.projectId)
+                  .firstOrNull
+                  ?.name ??
+              'Unavailable project',
+          onOpen: () => inspect(task),
+          onTap: releaseEligible(task)
+              ? () => selectReleaseTask(task, range: range, toggle: toggle)
+              : null,
+          onDoubleTap: releaseEligible(task) ? () => inspect(task) : null,
+          selected: releaseSelected.contains(task.id),
+          onMove: (column) => move(task, column, null),
+        ),
+      );
+    }
+
+    return Padding(
+      key: ValueKey('release-card-${task.id}'),
+      padding: const EdgeInsets.only(bottom: 8),
+      child: Column(
+        children: [
+          Draggable<Object>(
+            data: _ReleaseTaskDrag(selectedTasks.map((t) => t.id).toList()),
+            maxSimultaneousDrags:
+                releaseEligible(task) && widget.connected && !c.busy ? 1 : 0,
+            feedback: Material(
+              elevation: 14,
+              borderRadius: BorderRadius.circular(10),
+              child: SizedBox(
+                width: 260,
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    if (selectedTasks.length > 1)
+                      Padding(
+                        padding: const EdgeInsets.all(8),
+                        child: Text('${selectedTasks.length} selected tasks'),
+                      ),
+                    card(),
+                  ],
+                ),
+              ),
+            ),
+            childWhenDragging: Opacity(opacity: .25, child: card()),
+            child: card(),
+          ),
+        ],
+      ),
+    );
+  }
+
+  List<_DoneReleaseGroup> doneGroupData(List<TaskDto> cards) {
+    final c = widget.controller;
+    final projectIds = widget.projects
+        .where(
+          (p) =>
+              (projectId == null ||
+                  p.id == projectId ||
+                  subprojects.contains(p.id)) &&
+              (repositoryFilter == null || repositoryFilter == p.id),
+        )
+        .map((p) => p.id)
+        .toList();
+    for (final task in cards) {
+      if (!projectIds.contains(task.projectId)) projectIds.add(task.projectId);
+    }
+    return [
+      for (final id in projectIds)
+        for (final release in <ProjectReleaseDto?>[
+          ...c.projectReleases(id),
+          null,
+        ])
+          _DoneReleaseGroup(
+            id,
+            release,
+            cards
+                .where(
+                  (t) =>
+                      t.projectId == id &&
+                      (release == null
+                          ? t.releaseId == null ||
+                                c.releases[t.releaseId]?.projectId != id
+                          : t.releaseId == release.id),
+                )
+                .toList(),
+          ),
+    ];
+  }
+
+  Widget doneGroups(List<_DoneReleaseGroup> groups) {
+    final multiple = projectId == null || subprojects.isNotEmpty;
+    return ListView(
+      padding: const EdgeInsets.fromLTRB(8, 0, 8, 8),
+      children: [
+        for (final id in groups.map((g) => g.projectId).toSet())
+          Column(
+            key: ValueKey('done-project-$id'),
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              if (multiple)
+                Padding(
+                  padding: const EdgeInsets.symmetric(vertical: 8),
+                  child: Text(
+                    widget.projects
+                            .where((p) => p.id == id)
+                            .firstOrNull
+                            ?.name ??
+                        'Unavailable project',
+                    style: Theme.of(context).textTheme.titleSmall,
+                  ),
+                ),
+              for (final group in groups.where((g) => g.projectId == id))
+                releaseGroup(group),
+            ],
+          ),
+      ],
+    );
+  }
+
+  bool canDropRelease(
+    List<TaskDto> incoming,
+    String project,
+    ProjectReleaseDto? release,
+  ) =>
+      incoming.isNotEmpty &&
+      incoming.every(
+        (t) =>
+            t.projectId == project &&
+            releaseEligible(t) &&
+            t.column == incoming.first.column,
+      ) &&
+      (incoming.first.column == TaskColumn.inReview ||
+          incoming.any((t) => t.releaseId != release?.id));
+
+  Widget releaseGroup(_DoneReleaseGroup group) {
+    final id = group.projectId;
+    final release = group.release;
+    final tasks = group.tasks;
+    final expanded = !collapsedReleaseGroups.contains(group.identity);
+    return DragTarget<Object>(
+      key: ValueKey('release-group-$id-${release?.id ?? 'other'}'),
+      // Consume release drags at the group boundary so rejected cross-project
+      // and no-op drops cannot fall through to the column's acceptance dialog.
+      onWillAcceptWithDetails: (details) =>
+          widget.connected &&
+          !widget.controller.busy &&
+          draggedTasks(details.data).isNotEmpty &&
+          draggedTasks(details.data).every(releaseEligible),
+      onAcceptWithDetails: (details) async {
+        final incoming = draggedTasks(details.data);
+        if (!canDropRelease(incoming, id, release)) return;
+        if (incoming.first.column == TaskColumn.inReview) {
+          await releaseTasks(incoming, releaseId: release?.id);
+        } else {
+          await widget.controller.releaseBatch(
+            incoming,
+            release == null ? 'Other' : {'Existing': release.id},
+            accept: false,
+          );
+        }
+      },
+      builder: (context, incoming, _) => Container(
+        margin: const EdgeInsets.only(bottom: 10),
+        padding: const EdgeInsets.all(4),
+        decoration: BoxDecoration(
+          color:
+              !canDropRelease(
+                incoming.whereType<Object>().expand(draggedTasks).toList(),
+                id,
+                release,
+              )
+              ? Colors.transparent
+              : context.ditch.selection,
+          border: Border.all(
+            color:
+                !canDropRelease(
+                  incoming.whereType<Object>().expand(draggedTasks).toList(),
+                  id,
+                  release,
+                )
+                ? context.ditch.surfaceSoft
+                : context.ditch.accent,
+          ),
+          borderRadius: BorderRadius.circular(8),
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Semantics(
+              button: true,
+              expanded: expanded,
+              child: InkWell(
+                key: ValueKey(
+                  'release-group-toggle-$id-${release?.id ?? 'other'}',
+                ),
+                onTap: () => setState(() {
+                  if (expanded) {
+                    collapsedReleaseGroups.add(group.identity);
+                    final ids = tasks.map((t) => t.id).toSet();
+                    releaseSelected.removeAll(ids);
+                    if (ids.contains(releaseSelectionAnchor)) {
+                      releaseSelectionAnchor = null;
+                    }
+                  } else {
+                    collapsedReleaseGroups.remove(group.identity);
+                  }
+                }),
+                borderRadius: BorderRadius.circular(8),
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(
+                    vertical: 8,
+                    horizontal: 4,
+                  ),
+                  child: Row(
+                    children: [
+                      Icon(
+                        expanded
+                            ? Icons.keyboard_arrow_down
+                            : Icons.keyboard_arrow_right,
+                        size: 16,
+                        color: context.ditch.muted,
+                      ),
+                      const SizedBox(width: 4),
+                      Expanded(
+                        child: Text(
+                          '${release?.name ?? 'Other Tasks'} (${tasks.length})',
+                          style: Theme.of(context).textTheme.titleSmall,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+            if (expanded && tasks.isEmpty)
+              const Padding(
+                padding: EdgeInsets.all(8),
+                child: Text('Drop tasks here'),
+              ),
+            if (expanded)
+              for (final task in tasks) releaseCard(task),
+          ],
+        ),
+      ),
+    );
+  }
+
   late String? projectId = widget.initialProjectId;
   Set<String> subprojects = {};
   String? repositoryFilter;
@@ -215,6 +590,7 @@ class _TaskBoardState extends State<TaskBoard> {
   @override
   void dispose() {
     horizontal.dispose();
+    releaseSelectionFocus.dispose();
     super.dispose();
   }
 
@@ -228,6 +604,10 @@ class _TaskBoardState extends State<TaskBoard> {
   );
   Future<void> move(TaskDto task, TaskColumn column, String? before) async {
     if (before == task.id || !widget.connected || widget.controller.busy) {
+      return;
+    }
+    if (column == TaskColumn.done && task.column == TaskColumn.inReview) {
+      await releaseTasks([task]);
       return;
     }
     if (column == task.column) {
@@ -281,7 +661,25 @@ class _TaskBoardState extends State<TaskBoard> {
   }
 
   @override
-  Widget build(BuildContext context) => AnimatedBuilder(
+  Widget build(BuildContext context) => Focus(
+    focusNode: releaseSelectionFocus,
+    onKeyEvent: (_, event) {
+      if (event is KeyDownEvent &&
+          event.logicalKey == LogicalKeyboardKey.escape &&
+          releaseSelected.isNotEmpty) {
+        setState(() {
+          releaseSelected.clear();
+          releaseSelectionAnchor = null;
+          releaseSelectionColumn = null;
+        });
+        return KeyEventResult.handled;
+      }
+      return KeyEventResult.ignored;
+    },
+    child: buildBoard(context),
+  );
+
+  Widget buildBoard(BuildContext context) => AnimatedBuilder(
     animation: widget.controller,
     builder: (context, _) {
       final c = widget.controller;
@@ -307,6 +705,22 @@ class _TaskBoardState extends State<TaskBoard> {
                 (archived || !t.archived),
           )
           .toList();
+      final groups = doneGroupData(
+        tasks.where((t) => t.column == TaskColumn.done).toList(),
+      );
+      releaseSelectionOrder = [
+        ...tasks.where((t) => t.column == TaskColumn.inReview),
+        for (final group in groups)
+          if (!collapsedReleaseGroups.contains(group.identity)) ...group.tasks,
+      ].where(releaseEligible).toList();
+      final selectableIds = releaseSelectionOrder
+          .where((t) => t.column == releaseSelectionColumn)
+          .map((t) => t.id)
+          .toSet();
+      releaseSelected.removeWhere((id) => !selectableIds.contains(id));
+      if (!selectableIds.contains(releaseSelectionAnchor)) {
+        releaseSelectionAnchor = null;
+      }
       return Row(
         children: [
           if (showGitHubBoardControls)
@@ -679,6 +1093,21 @@ class _TaskBoardState extends State<TaskBoard> {
                                                   (d.data as GitHubIssueDrag)
                                                       .canDrop();
                                             }
+                                            if (d.data is _ReleaseTaskDrag) {
+                                              final incoming = draggedTasks(
+                                                d.data,
+                                              );
+                                              return incoming.isNotEmpty &&
+                                                  incoming.every(
+                                                    releaseEligible,
+                                                  ) &&
+                                                  (column == TaskColumn.done ||
+                                                      (incoming.length == 1 &&
+                                                          incoming
+                                                                  .first
+                                                                  .column !=
+                                                              column));
+                                            }
                                             if (d.data is! TaskDto) {
                                               return false;
                                             }
@@ -704,6 +1133,24 @@ class _TaskBoardState extends State<TaskBoard> {
                                                 (d.data as GitHubIssueDrag)
                                                     .importToBacklog(),
                                               );
+                                            } else if (d.data
+                                                is _ReleaseTaskDrag) {
+                                              final incoming = draggedTasks(
+                                                d.data,
+                                              );
+                                              if (column == TaskColumn.done) {
+                                                unawaited(
+                                                  releaseTasks(incoming),
+                                                );
+                                              } else if (incoming.length == 1) {
+                                                unawaited(
+                                                  move(
+                                                    incoming.first,
+                                                    column,
+                                                    null,
+                                                  ),
+                                                );
+                                              }
                                             } else if (d.data is TaskDto) {
                                               unawaited(
                                                 move(
@@ -789,6 +1236,12 @@ class _TaskBoardState extends State<TaskBoard> {
                                                               );
                                                         });
                                                       }
+                                                      if (column ==
+                                                          TaskColumn.done) {
+                                                        return doneGroups(
+                                                          groups,
+                                                        );
+                                                      }
                                                       if (cards.isEmpty) {
                                                         return Center(
                                                           child: Text(
@@ -813,6 +1266,13 @@ class _TaskBoardState extends State<TaskBoard> {
                                                         itemBuilder: (context, index) {
                                                           final task =
                                                               cards[index];
+                                                          if (column ==
+                                                              TaskColumn
+                                                                  .inReview) {
+                                                            return releaseCard(
+                                                              task,
+                                                            );
+                                                          }
                                                           final project = widget
                                                               .projects
                                                               .where(
@@ -830,9 +1290,9 @@ class _TaskBoardState extends State<TaskBoard> {
                                                                         .projectId]
                                                                     ?.paused ==
                                                                 true,
-                                                            hasAgent: c.agents
-                                                                .containsKey(
-                                                                  task.selectedAgentId,
+                                                            onOpenAgent:
+                                                                openAgentFor(
+                                                                  task,
                                                                 ),
                                                             showQueueOrder:
                                                                 projectId !=
@@ -1052,8 +1512,11 @@ class TaskCard extends StatelessWidget {
     required this.onMove,
     this.onMoveUp,
     this.showQueueOrder = false,
-    this.hasAgent = false,
+    this.onOpenAgent,
     this.queuePaused = false,
+    this.onTap,
+    this.onDoubleTap,
+    this.selected = false,
   });
   final TaskDto task;
   final String projectName;
@@ -1061,25 +1524,32 @@ class TaskCard extends StatelessWidget {
   final ValueChanged<TaskColumn> onMove;
   final VoidCallback? onMoveUp;
   final bool showQueueOrder;
-  final bool hasAgent;
+  final VoidCallback? onOpenAgent;
   final bool queuePaused;
+  final VoidCallback? onTap;
+  final VoidCallback? onDoubleTap;
+  final bool selected;
   @override
   Widget build(BuildContext context) => Semantics(
+    selected: onTap == null ? null : selected,
     label:
         '${task.title}, ${task.column.label}, ${task.condition}, $projectName',
     child: Card(
       margin: EdgeInsets.zero,
-      color: context.ditch.surface,
+      color: selected ? context.ditch.selection : context.ditch.surface,
       shape: RoundedRectangleBorder(
         borderRadius: BorderRadius.circular(10),
         side: BorderSide(
-          color: task.column == TaskColumn.inReview
+          color: selected
+              ? context.ditch.accent
+              : task.column == TaskColumn.inReview
               ? context.ditch.waiting
               : context.ditch.line,
         ),
       ),
       child: InkWell(
-        onTap: onOpen,
+        onTap: onTap ?? onOpen,
+        onDoubleTap: onDoubleTap,
         borderRadius: BorderRadius.circular(10),
         child: Padding(
           padding: const EdgeInsets.all(12),
@@ -1189,6 +1659,7 @@ class TaskCard extends StatelessWidget {
               Wrap(
                 spacing: 8,
                 runSpacing: 4,
+                crossAxisAlignment: WrapCrossAlignment.center,
                 children: [
                   if (task.planning['job'] != null ||
                       (task.planning['text'] as String? ?? '').isNotEmpty)
@@ -1207,11 +1678,22 @@ class TaskCard extends StatelessWidget {
                           : task.condition,
                       style: Theme.of(context).textTheme.labelSmall,
                     ),
-                  if (hasAgent)
-                    const Icon(
-                      Icons.smart_toy_outlined,
-                      size: 16,
-                      semanticLabel: 'Assigned agent',
+                  if (onOpenAgent != null)
+                    IconButton(
+                      key: ValueKey('task-open-agent-${task.id}'),
+                      tooltip: 'Go to agent',
+                      onPressed: onOpenAgent,
+                      icon: const Icon(
+                        Icons.smart_toy_outlined,
+                        semanticLabel: 'Go to agent',
+                      ),
+                      iconSize: 16,
+                      padding: const EdgeInsets.all(8),
+                      constraints: const BoxConstraints(
+                        minWidth: 40,
+                        minHeight: 40,
+                      ),
+                      visualDensity: VisualDensity.standard,
                     ),
                 ],
               ),
@@ -1968,26 +2450,13 @@ class _TaskInspectorState extends State<_TaskInspector> {
   }
 
   Future<void> accept(TaskDto task) async {
-    final confirmed = await showDialog<bool>(
-      context: context,
-      builder: (context) => AlertDialog(
-        title: const Text('Accept this work?'),
-        content: const Text(
-          'Confirm you reviewed the summary and acceptance criteria. Accept moves the task to Done.',
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context, false),
-            child: const Text('Keep in Review'),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.pop(context, true),
-            child: const Text('Accept'),
-          ),
-        ],
-      ),
+    await showTaskReleaseDialog(
+      context,
+      controller: widget.controller,
+      tasks: [task],
+      projectNames: {for (final p in widget.projects) p.id: p.name},
     );
-    if (confirmed == true) await transition(task, 'Accept');
+    if (mounted) setState(reload);
   }
 
   @override

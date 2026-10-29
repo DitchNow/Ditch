@@ -93,7 +93,9 @@ class _AssistantMessageContentState extends State<AssistantMessageContent> {
         code: bodyStyle?.copyWith(
           fontFamily: 'SF Mono',
           fontSize: 12.5,
-          backgroundColor: tokens.surfaceSoft,
+          // Span backgrounds paint over selection highlights. Explicitly clear
+          // the Markdown default so inline code remains visibly selectable.
+          backgroundColor: Colors.transparent,
         ),
         blockquote: bodyStyle,
         blockquoteDecoration: BoxDecoration(

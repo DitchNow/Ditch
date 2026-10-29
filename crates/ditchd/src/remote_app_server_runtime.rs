@@ -354,7 +354,7 @@ fn prompt_app_server_agent(
     let Some(project) = project_by_id(&state, project_id) else {
         return protocol_error("project_not_found", "Project not registered");
     };
-    let writer = match WriterGuard::acquire(&state, agent_id, &project, &execution_profile) {
+    let writer = match WriterGuard::acquire_direct_prompt(&state, agent_id, &project, &execution_profile) {
         Ok(w) => w,
         Err(e) => return protocol_error("workspace_busy", e),
     };

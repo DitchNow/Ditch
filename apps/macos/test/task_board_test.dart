@@ -1,10 +1,13 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:the_ditch/application/task_board_controller.dart';
 import 'package:the_ditch/data/task_models.dart';
 import 'package:the_ditch/task_board.dart';
 import 'package:the_ditch/design_system/ditch_theme.dart';
+import 'task_agent_attachment_test.dart' show agent;
+import 'task_queue_test.dart' as queue;
 
 Map<String, dynamic> taskJson({
   String id = 'one',
@@ -25,7 +28,302 @@ Map<String, dynamic> taskJson({
   'order_key': order,
   'archived': false,
 };
+Future<void> mountAgentBoard(
+  WidgetTester tester,
+  queue.QueueFixture fixture,
+  List<String> opened, {
+  bool dark = false,
+  String? projectId,
+  Size size = const Size(1700, 950),
+}) async {
+  tester.view.physicalSize = size;
+  tester.view.devicePixelRatio = 1;
+  addTearDown(tester.view.resetPhysicalSize);
+  addTearDown(tester.view.resetDevicePixelRatio);
+  addTearDown(fixture.controller.dispose);
+  fixture.controller.replaceSnapshot({
+    'tasks': fixture.rows,
+    'agents': fixture.agents,
+  });
+  await tester.pumpWidget(
+    MaterialApp(
+      theme: dark ? DitchTheme.dark() : DitchTheme.light(),
+      home: Scaffold(
+        body: TaskBoard(
+          controller: fixture.controller,
+          projects: const [
+            TaskProjectOption('project', 'First'),
+            TaskProjectOption('second', 'Second'),
+          ],
+          initialProjectId: projectId,
+          connected: true,
+          executionProfile: () => {},
+          onOpenAgent: opened.add,
+        ),
+      ),
+    ),
+  );
+  await tester.pumpAndSettle();
+}
+
 void main() {
+  for (final state in ['Running', 'InReview', 'Accepted', 'Ready']) {
+    for (final dark in [false, true]) {
+      testWidgets('robot opens agent directly in $state (dark: $dark)', (
+        tester,
+      ) async {
+        final f = queue.QueueFixture(
+          [
+            {
+              ...taskJson(state: state),
+              'condition': state == 'Running' ? 'Running' : 'Idle',
+              'assigned_agent_id': 'alpha',
+            },
+          ],
+          agents: [agent('alpha', taskId: 'one')],
+        );
+        final opened = <String>[];
+        await mountAgentBoard(tester, f, opened, dark: dark);
+        final before = f.controller.task('one');
+        final button = find.byKey(const ValueKey('task-open-agent-one'));
+        expect(button.hitTestable(), findsOneWidget);
+        expect(find.byTooltip('Go to agent'), findsOneWidget);
+        await tester.tap(button);
+        await tester.pump(const Duration(milliseconds: 350));
+        await tester.pumpAndSettle();
+        expect(opened, ['alpha']);
+        expect(find.byType(AlertDialog), findsNothing);
+        expect(f.calls, isEmpty);
+        expect(f.controller.task('one'), same(before));
+        await tester.tap(find.text('Task one'));
+        if (state == 'InReview' || state == 'Accepted') {
+          await tester.pump(const Duration(milliseconds: 50));
+          await tester.tap(find.text('Task one'));
+        }
+        await tester.pumpAndSettle();
+        expect(find.byType(AlertDialog), findsOneWidget);
+        expect(opened, ['alpha']);
+        expect(tester.takeException(), isNull);
+      });
+    }
+  }
+
+  for (final attachment in [
+    {
+      'continue_agent_id': 'continuation',
+      'assigned_agent_id': 'assigned',
+      'execution_queue': {'agent_id': 'queued'},
+    },
+    {
+      'assigned_agent_id': 'assigned',
+      'execution_queue': {'agent_id': 'queued'},
+    },
+    {
+      'execution_queue': {'agent_id': 'queued'},
+    },
+  ]) {
+    final expected =
+        attachment['continue_agent_id'] ??
+        attachment['assigned_agent_id'] ??
+        'queued';
+    testWidgets('robot resolves $expected with attachment precedence', (
+      tester,
+    ) async {
+      final f = queue.QueueFixture(
+        [
+          {...taskJson(), ...attachment},
+        ],
+        agents: [agent('continuation'), agent('assigned'), agent('queued')],
+      );
+      final opened = <String>[];
+      await mountAgentBoard(tester, f, opened);
+      await tester.tap(find.byKey(const ValueKey('task-open-agent-one')));
+      await tester.pumpAndSettle();
+      expect(opened, [expected]);
+      expect(f.calls, isEmpty);
+    });
+  }
+
+  testWidgets('robot is absent without a resolvable selected agent', (
+    tester,
+  ) async {
+    final f = queue.QueueFixture(
+      [
+        taskJson(id: 'unassigned'),
+        {...taskJson(id: 'missing'), 'assigned_agent_id': 'missing'},
+        {
+          ...taskJson(id: 'missing-continuation'),
+          'continue_agent_id': 'missing',
+          'assigned_agent_id': 'alpha',
+        },
+      ],
+      agents: [agent('alpha')],
+    );
+    await mountAgentBoard(tester, f, []);
+    expect(find.byType(TaskCard), findsNWidgets(3));
+    expect(find.byTooltip('Go to agent'), findsNothing);
+    expect(find.byIcon(Icons.smart_toy_outlined), findsNothing);
+  });
+
+  testWidgets('robot retains agent after dragging stopped work to Todo', (
+    tester,
+  ) async {
+    final f = queue.QueueFixture(
+      [
+        {
+          ...queue.task('a', position: 1),
+          'condition': 'Blocked',
+          'assigned_agent_id': 'alpha',
+        },
+      ],
+      agents: [agent('alpha', taskId: 'a')],
+    );
+    final opened = <String>[];
+    await mountAgentBoard(tester, f, opened, projectId: 'project');
+    await queue.drag(
+      tester,
+      find.text('Task a'),
+      find.byKey(const ValueKey('board-column-todo')),
+    );
+    expect(f.controller.task('a')!.column, TaskColumn.todo);
+    expect(f.calls.single['Move']['column'], 'Todo');
+    await tester.tap(find.byKey(const ValueKey('task-open-agent-a')));
+    await tester.pumpAndSettle();
+    expect(opened, ['alpha']);
+    expect(f.calls, hasLength(1));
+    expect(find.byType(AlertDialog), findsNothing);
+  });
+
+  testWidgets(
+    'combined board routes each project and rechecks changed attachments',
+    (tester) async {
+      final first = {...taskJson(), 'assigned_agent_id': 'alpha'};
+      final second = {
+        ...taskJson(id: 'two', project: 'second'),
+        'assigned_agent_id': 'beta',
+      };
+      final f = queue.QueueFixture(
+        [first, second],
+        agents: [
+          agent('alpha'),
+          {...agent('beta'), 'project_id': 'second'},
+        ],
+      );
+      final opened = <String>[];
+      await mountAgentBoard(tester, f, opened);
+      final firstButton = find.byKey(const ValueKey('task-open-agent-one'));
+      await tester.tap(firstButton);
+      await tester.tap(find.byKey(const ValueKey('task-open-agent-two')));
+      expect(opened, ['alpha', 'beta']);
+      final oldCallback = tester.widget<IconButton>(firstButton).onPressed!;
+      f.controller.applyEvent({
+        'TaskChanged': {...first, 'revision': 2, 'assigned_agent_id': 'beta'},
+      });
+      // Activate before a rebuild to exercise a stale card callback.
+      oldCallback();
+      expect(opened, ['alpha', 'beta', 'beta']);
+      await tester.pumpAndSettle();
+      await tester.tap(firstButton);
+      expect(opened.last, 'beta');
+      expect(opened, hasLength(4));
+      f.controller.replaceSnapshot({
+        'tasks': [
+          {...first, 'revision': 3, 'assigned_agent_id': 'beta'},
+          second,
+        ],
+        'agents': [agent('alpha')],
+      });
+      oldCallback();
+      expect(opened, hasLength(4));
+      await tester.pumpAndSettle();
+      expect(find.byTooltip('Go to agent'), findsNothing);
+      f.controller.applyEvent({
+        'TaskDeleted': {'task_id': 'one'},
+      });
+      oldCallback();
+      expect(opened, hasLength(4));
+      expect(f.calls, isEmpty);
+      expect(find.byType(AlertDialog), findsNothing);
+    },
+  );
+
+  testWidgets('robot is accessible and keyboard activated on a narrow board', (
+    tester,
+  ) async {
+    final semantics = tester.ensureSemantics();
+    final f = queue.QueueFixture(
+      [
+        {...taskJson(), 'assigned_agent_id': 'alpha'},
+      ],
+      agents: [agent('alpha')],
+    );
+    final opened = <String>[];
+    await mountAgentBoard(tester, f, opened, size: const Size(680, 600));
+    final button = find.byKey(const ValueKey('task-open-agent-one'));
+    await tester.ensureVisible(button);
+    await tester.pumpAndSettle();
+    expect(
+      tester.getSemantics(button),
+      matchesSemantics(
+        label: 'Go to agent',
+        isButton: true,
+        hasEnabledState: true,
+        isEnabled: true,
+        isFocusable: true,
+        hasTapAction: true,
+        hasFocusAction: true,
+      ),
+    );
+    expect(tester.getSize(button).width, greaterThanOrEqualTo(40));
+    expect(tester.getSize(button).height, greaterThanOrEqualTo(40));
+    Focus.of(
+      tester.element(find.byIcon(Icons.smart_toy_outlined)),
+    ).requestFocus();
+    await tester.pump();
+    await tester.sendKeyEvent(LogicalKeyboardKey.enter);
+    await tester.pumpAndSettle();
+    semantics.dispose();
+    expect(opened, ['alpha']);
+    expect(find.byType(AlertDialog), findsNothing);
+    expect(f.calls, isEmpty);
+    expect(tester.takeException(), isNull);
+  });
+
+  test(
+    'transition history excludes metadata refresh without removing workflow events',
+    () async {
+      final json = taskJson();
+      final c = TaskBoardController(
+        request: (_) async => {
+          'TaskResponse': {
+            'Detail': {
+              'task': json,
+              'history': [
+                for (final action in [
+                  'github_import',
+                  'github_refresh',
+                  'prioritize',
+                  'remote_materialized',
+                ])
+                  {
+                    'action': action,
+                    'actor': 'User',
+                    'created_at': '2026-10-29T12:00:00Z',
+                  },
+              ],
+            },
+          },
+        },
+      );
+      addTearDown(c.dispose);
+      final history = await c.history(TaskDto.fromJson(json));
+      expect(history.map((event) => event.action), [
+        'github_import',
+        'prioritize',
+        'remote_materialized',
+      ]);
+    },
+  );
   testWidgets('board keeps secondary controls in its menu', (tester) async {
     await tester.binding.setSurfaceSize(const Size(1400, 900));
     final c = TaskBoardController(
@@ -310,6 +608,11 @@ void main() {
         request: (request) async {
           final payload = (request as Map)['TaskRequest'] as Map;
           requests.add(payload);
+          if (payload['operation'] == 'ListReleases') {
+            return {
+              'TaskResponse': {'Releases': []},
+            };
+          }
           if ((payload['operation'] as Map).containsKey('Get')) {
             return {
               'TaskResponse': {
@@ -325,9 +628,14 @@ void main() {
           }
           return {
             'TaskResponse': {
-              'Changed': {
-                ...taskJson(state: 'Accepted', revision: 2),
-                'review_summary': 'Finished',
+              'ReleaseBatch': {
+                'tasks': [
+                  {
+                    ...taskJson(state: 'Accepted', revision: 2),
+                    'review_summary': 'Finished',
+                  },
+                ],
+                'releases': [],
               },
             },
           };
@@ -371,21 +679,25 @@ void main() {
       );
       await tester.tap(find.text('Accept…'));
       await tester.pumpAndSettle();
-      expect(find.text('Accept this work?'), findsOneWidget);
+      expect(find.text('Accept and release work'), findsOneWidget);
       expect(
         requests.where(
-          (r) => (r['operation'] as Map).containsKey('Transition'),
+          (r) =>
+              r['operation'] is Map &&
+              (r['operation'] as Map).containsKey('AcceptRelease'),
         ),
         isEmpty,
       );
-      await tester.tap(find.text('Accept'));
+      await tester.tap(find.text('Accept and move'));
       await tester.pumpAndSettle();
       expect(
         (requests.lastWhere(
-              (r) => (r['operation'] as Map).containsKey('Transition'),
+              (r) =>
+                  r['operation'] is Map &&
+                  (r['operation'] as Map).containsKey('AcceptRelease'),
             )['operation']
-            as Map)['Transition']['action'],
-        'Accept',
+            as Map)['AcceptRelease']['destination'],
+        'Other',
       );
       await tester.pumpWidget(const SizedBox());
       c.dispose();

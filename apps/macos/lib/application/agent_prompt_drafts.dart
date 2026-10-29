@@ -1,12 +1,46 @@
+import 'package:flutter/foundation.dart';
 import 'package:flutter/widgets.dart';
 import '../data/prompt_attachment.dart';
 
-/// Session-only prompt. It has no listeners, timers, or disk writes.
-class AgentPromptDraft {
-  AgentPromptDraft(this.text);
+/// Session-only prompt and pending submission, shared across composer remounts.
+class AgentPromptDraft extends ChangeNotifier {
+  AgentPromptDraft(this._text);
 
-  String text;
+  String _text;
+  int revision = 0;
+  bool submitting = false;
+  String get text => _text;
+  set text(String value) {
+    if (_text == value) return;
+    _text = value;
+    revision++;
+  }
+
   final attachments = <PromptAttachment>[];
+
+  bool beginSubmission() {
+    if (submitting) return false;
+    submitting = true;
+    notifyListeners();
+    return true;
+  }
+
+  void finishSubmission({
+    required bool accepted,
+    required int submittedRevision,
+    required List<PromptAttachment> submittedAttachments,
+  }) {
+    // An acknowledgement belongs to the captured draft, even after navigation.
+    // Keep all newer edits, including text edited and then restored to its old value.
+    if (accepted &&
+        revision == submittedRevision &&
+        listEquals(attachments, submittedAttachments)) {
+      text = '';
+      attachments.clear();
+    }
+    submitting = false;
+    notifyListeners();
+  }
 }
 
 class AgentPromptDrafts {

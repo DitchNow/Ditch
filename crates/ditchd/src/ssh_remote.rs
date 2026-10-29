@@ -42,6 +42,12 @@ fn preflight_script() -> String {
     PREFLIGHT_SCRIPT.replace("$HOME/.ditch/", &format!("$HOME/{}/", ditch_product::deployment::REMOTE_DIRECTORY))
 }
 
+fn runtime_identity_matches(status: &ditch_protocol::RuntimeStatus) -> bool {
+    (status.deployment_environment == ditch_product::deployment::ENVIRONMENT
+        || (status.deployment_environment.is_empty() && ditch_product::deployment::ENVIRONMENT == "production"))
+        && status.edition == super::RUNTIME_EDITION
+}
+
 const PREFLIGHT_SCRIPT: &str = r#"set -eu
 printf 'home\t%s\n' "$HOME"
 printf 'os\t%s\n' "$(uname -s 2>/dev/null || printf unknown)"
@@ -274,8 +280,12 @@ impl RemoteConnectionManager {
                     Err(_) => std::thread::sleep(Duration::from_millis(5)),
                 }
             };
-            if !read_only && (!bridge.verified || needs_session_controls) {
+            if (!read_only || ditch_product::deployment::ENVIRONMENT == "staging")
+                && (!bridge.verified || needs_session_controls) {
                 match bridge.exchange(ClientRequest::RuntimeStatus, deadline, true)? {
+                    ServerResponse::RuntimeStatus(status) if !runtime_identity_matches(&status) => {
+                        return Err(SshError::Failed("Remote runtime environment or edition does not match this app. No command was sent.".into()));
+                    }
                     ServerResponse::RuntimeStatus(status)
                         if status
                             .capabilities
@@ -389,13 +399,27 @@ impl RemoteConnectionManager {
         );
         let result = (|| {
             nonblocking(&stdin)?;
+            let mut stdout = stdout;
+            nonblocking(&stdout)?;
+            let mut buffered = Vec::new();
+            if ditch_product::deployment::ENVIRONMENT == "staging" {
+                let hello = Envelope::new(ClientRequest::RuntimeStatus);
+                let mut bytes = serde_json::to_vec(&hello).map_err(|e| SshError::Failed(e.to_string()))?;
+                bytes.push(b'\n');
+                let deadline = Instant::now() + Duration::from_secs(15);
+                write_frame(&mut stdin, &bytes, deadline)?;
+                let line = read_frame(&mut stdout, &mut buffered, deadline, Some(&cancel))?;
+                let reply: Envelope<ServerResponse> = serde_json::from_slice(&line)
+                    .map_err(|e| SshError::Failed(e.to_string()))?;
+                if reply.id != hello.id || reply.protocol_version != ditch_protocol::PROTOCOL_VERSION
+                    || !matches!(reply.body, ServerResponse::RuntimeStatus(ref status) if runtime_identity_matches(status)) {
+                    return Err(SshError::Failed("Remote event stream does not belong to this staging runtime.".into()));
+                }
+            }
             let mut bytes = serde_json::to_vec(&Envelope::new(request))
                 .map_err(|error| SshError::Failed(error.to_string()))?;
             bytes.push(b'\n');
             write_frame(&mut stdin, &bytes, Instant::now() + Duration::from_secs(15))?;
-            let mut stdout = stdout;
-            nonblocking(&stdout)?;
-            let mut buffered = Vec::new();
             let mut last = cursor;
             loop {
                 let line = read_frame(
@@ -687,11 +711,18 @@ pub fn check_setup(
     let exact = server_version.as_deref() == Some(env!("CARGO_PKG_VERSION"))
         && server_protocol == Some(ditch_protocol::REMOTE_RUNTIME_PROTOCOL_VERSION)
         && server_build == Some(local_build);
-    let compatible = server_protocol == Some(ditch_protocol::REMOTE_RUNTIME_PROTOCOL_VERSION);
+    // Older runtimes omit the environment in version-json. Validate those using
+    // RuntimeStatus before accepting the connection; never infer staging from a path.
+    let environment_matches = runtime_json.as_ref()
+        .and_then(|v| v.get("deployment_environment")).and_then(|v| v.as_str())
+        .is_none_or(|environment| environment == ditch_product::deployment::ENVIRONMENT);
+    let compatible = environment_matches
+        && server_protocol == Some(ditch_protocol::REMOTE_RUNTIME_PROTOCOL_VERSION);
+    let staging = ditch_product::deployment::ENVIRONMENT == "staging";
     let server_number = runtime_json.as_ref().and_then(|v| v.get("build_number"))
         .and_then(|v| v.as_str()).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
     let local_number = option_env!("DITCH_BUILD_NUMBER").and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
-    let newer = server_number > local_number && server_number > 0;
+    let newer = !staging && server_number > local_number && server_number > 0;
     let mut checks = vec![
         check(
             "ssh",
@@ -713,8 +744,10 @@ pub fn check_setup(
         ),
         check(
             "runtime",
-            "Ditch Runtime",
-            if exact || (compatible && newer) {
+            if staging { "Ditch Staging Runtime" } else { "Ditch Runtime" },
+            if !environment_matches {
+                RemoteCheckState::Failed
+            } else if exact || (compatible && (newer || staging)) {
                 RemoteCheckState::Ready
             } else if newer {
                 RemoteCheckState::Failed
@@ -723,7 +756,11 @@ pub fn check_setup(
             } else {
                 RemoteCheckState::InstallAvailable
             },
-            if exact {
+            if !environment_matches {
+                "Runtime belongs to another environment"
+            } else if staging && compatible {
+                "Compatible staging runtime installed"
+            } else if exact {
                 "Exact version installed"
             } else if newer && compatible {
                 "Compatible newer runtime installed"
@@ -737,6 +774,10 @@ pub fn check_setup(
             None,
         ),
     ];
+    if staging && compatible && !exact {
+        checks.push(check("runtime_update", "Staging runtime update", RemoteCheckState::InstallAvailable,
+            "Install / Repair to use this app's runtime build", None));
+    }
     let git = values.get("git").map(String::as_str).unwrap_or("missing");
     let package_manager = values
         .get("package_manager")
@@ -855,11 +896,11 @@ pub fn check_setup(
     let mut machine_id = None;
     let mut daemon_epoch = None;
     let mut daemon_ready = false;
+    let mut runtime_error = None;
     if compatible {
         connections.disconnect(alias);
-        if let Ok(ServerResponse::RuntimeStatus(status)) =
-            connections.request(alias, ClientRequest::RuntimeStatus)
-        {
+        match connections.request(alias, ClientRequest::RuntimeStatus) {
+          Ok(ServerResponse::RuntimeStatus(status)) => {
             daemon_ready = status
                 .capabilities
                 .iter()
@@ -868,13 +909,29 @@ pub fn check_setup(
                     .capabilities
                     .iter()
                     .any(|c| c == "app_server_sessions_v2")
-                && status.edition == super::RUNTIME_EDITION;
+                && runtime_identity_matches(&status);
             daemon_epoch = Some(status.instance_id);
+            if !daemon_ready {
+                runtime_error = Some(if !runtime_identity_matches(&status) {
+                    "Remote runtime environment or edition does not match this app".to_owned()
+                } else {
+                    "Remote runtime lacks required capabilities; use Install / Repair".to_owned()
+                });
+            }
+          }
+          Err(error) => runtime_error = Some(error.to_string()),
+          _ => runtime_error = Some("Remote runtime returned an unexpected setup response".into()),
         }
-        if let Ok(ServerResponse::HostIdentity(status)) =
+        if daemon_ready && let Ok(ServerResponse::HostIdentity(status)) =
             connections.request(alias, ClientRequest::HostIdentityStatus)
         {
             machine_id = Some(status.installation_id);
+        }
+    }
+    if let Some(error) = &runtime_error {
+        if let Some(runtime) = checks.iter_mut().find(|item| item.key == "runtime") {
+            runtime.state = RemoteCheckState::InstallAvailable;
+            runtime.detail = error.clone();
         }
     }
     let ready = desktop_project_setup_ready(
@@ -911,7 +968,7 @@ pub fn check_setup(
             architecture: Some(arch),
         },
         host_key_fingerprint: None,
-        last_error: None,
+        last_error: runtime_error,
     })
 }
 
@@ -1105,19 +1162,37 @@ fn locate_artifact(target: &str) -> Result<PathBuf, SshError> {
         .parent()
         .and_then(Path::parent)
         .expect("ditchd must be in a workspace");
-    candidates.push(workspace.join(format!("target/{target}/release/ditchd")));
-    if target == host_target() {
-        candidates.push(workspace.join("target/release/ditchd"));
-        candidates.push(workspace.join("target/debug/ditchd"));
+    candidates.push(workspace.join(format!("dist/remote/{}/{}/ditchd-{target}",
+        ditch_product::deployment::ENVIRONMENT, env!("CARGO_PKG_VERSION"))));
+    // Legacy unscoped outputs are production-only and still require a manifest.
+    if ditch_product::deployment::ENVIRONMENT == "production" {
+        candidates.push(workspace.join(format!("target/{target}/release/ditchd")));
+        if target == host_target() {
+            candidates.push(workspace.join("target/release/ditchd"));
+            candidates.push(workspace.join("target/debug/ditchd"));
+        }
     }
-    candidates
-        .into_iter()
-        .find(|path| path.is_file())
-        .ok_or_else(|| {
-            SshError::Failed(format!(
-                "No exact-version runtime artifact is available for {target}. Build it with scripts/build-remote-artifacts."
-            ))
-        })
+    select_artifact(candidates, target)
+}
+
+fn select_artifact(candidates: Vec<PathBuf>, target: &str) -> Result<PathBuf, SshError> {
+    for path in candidates {
+        if !path.is_file() || !path.parent().unwrap().join("remote-artifacts.json").is_file() {
+            continue;
+        }
+        let checksum = format!("{:x}", Sha256::digest(fs::read(&path)?));
+        verify_artifact_metadata(&path, target, &checksum)?;
+        return Ok(path);
+    }
+    let environment = ditch_product::deployment::ENVIRONMENT;
+    let instruction = if environment == "staging" {
+        format!("Rebuild using DITCH_REMOTE_TARGETS=\"{target}\" ./scripts/macos-app staging run.")
+    } else {
+        "Build matching artifacts with scripts/build-remote-artifacts and rebuild the app.".into()
+    };
+    Err(SshError::Failed(format!(
+        "No verified {environment} runtime artifact is available for {target}. {instruction}"
+    )))
 }
 
 fn verify_artifact_metadata(artifact: &Path, target: &str, checksum: &str) -> Result<(), SshError> {
@@ -1519,6 +1594,24 @@ mod tests {
     }
 
     #[test]
+    fn remote_identity_checks_environment_and_edition_without_build_number_gating() {
+        let mut status: ditch_protocol::RuntimeStatus = serde_json::from_value(serde_json::json!({
+            "identity": "fixture", "pid": 1, "socket_path": "fixture", "active_session_count": 0,
+            "edition": super::super::RUNTIME_EDITION,
+            "deployment_environment": ditch_product::deployment::ENVIRONMENT,
+            "build_number": "99999", "build_identifier": "different-source"
+        })).unwrap();
+        assert!(runtime_identity_matches(&status));
+        status.deployment_environment = if ditch_product::deployment::ENVIRONMENT == "staging" { "production" } else { "staging" }.into();
+        assert!(!runtime_identity_matches(&status));
+        status.deployment_environment.clear();
+        assert_eq!(runtime_identity_matches(&status), ditch_product::deployment::ENVIRONMENT == "production");
+        status.deployment_environment = ditch_product::deployment::ENVIRONMENT.into();
+        status.edition = "another-edition".into();
+        assert!(!runtime_identity_matches(&status));
+    }
+
+    #[test]
     fn artifact_manifest_must_match_the_exact_build_and_remote_protocol() {
         let root = std::env::temp_dir().join(format!("ditch-artifact-{}", Uuid::new_v4()));
         fs::create_dir_all(&root).unwrap();
@@ -1546,6 +1639,12 @@ mod tests {
         )
         .unwrap();
         assert!(verify_artifact_metadata(&artifact, "x86_64-unknown-linux-gnu", &checksum).is_ok());
+        let unverified = root.join("native-without-manifest/ditchd");
+        fs::create_dir_all(unverified.parent().unwrap()).unwrap();
+        fs::write(&unverified, b"unverified").unwrap();
+        assert_eq!(select_artifact(vec![unverified.clone(), artifact.clone()], "x86_64-unknown-linux-gnu").unwrap(), artifact);
+        assert!(select_artifact(vec![unverified], "x86_64-unknown-linux-gnu").is_err());
+        assert!(verify_artifact_metadata(&artifact, "x86_64-unknown-linux-gnu", "wrong-checksum").is_err());
 
         let manifest_path = root.join("remote-artifacts.json");
         let mut wrong_environment: serde_json::Value = serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();

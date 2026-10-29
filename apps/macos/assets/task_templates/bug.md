@@ -17,7 +17,6 @@ Relevant tools / versions:
 ## Affected area
 
 ## Logs or error output
-Remove credentials, tokens, and private information before publishing.
 
 ```text
 ```
@@ -25,8 +24,3 @@ Remove credentials, tokens, and private information before publishing.
 ## Screenshots / recordings
 
 ## Additional context
-
-## Before submitting
-- [ ] I searched for an existing issue.
-- [ ] I removed private information.
-- [ ] I described how to reproduce the problem.

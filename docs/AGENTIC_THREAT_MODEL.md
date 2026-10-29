@@ -22,6 +22,22 @@ The practical concurrency tests do not replace ThreadSanitizer or formal verific
 
 ## GitHub integration boundary (2026-09-29)
 
+### SSH task handoff (2026-10-29)
+
+The Mac checks `board_handoff_v2` before transferring an idle task. A persisted,
+immutable transfer request and atomic remote receipt separate transport retries
+from task execution authorization. Recovery verifies stable project/task/source
+identity and approved content; replacement requires an exact remote snapshot
+and cannot overwrite active work or review evidence. Initial transfer does not
+run an execution agent. Planning and queue admission are separate actions on
+the host; the existing execution, approval and human-acceptance rules apply.
+Late remote task events cannot overwrite a locally pending task. Agent events
+are accepted only for a registered project belonging to that SSH host.
+
+No GitHub tokens or Relay credentials are sent with the task. Existing SSH
+account permissions and sandbox limitations are unchanged. Local project
+planning and execution do not enter this handoff path.
+
 ### Staging GitHub App boundary (2026-10-21)
 
 For the exact staging Relay environment, the native runtime uses `github_app.rs`

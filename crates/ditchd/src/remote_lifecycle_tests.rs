@@ -5,7 +5,7 @@ use super::*;
 const DAEMON: &str = r#"#!/usr/bin/env python3
 import json, os, socket, sys, uuid
 from pathlib import Path
-root = Path(os.environ['HOME']) / '.ditch'
+root = Path(os.environ['HOME']) / '__REMOTE_DIRECTORY__'
 build = '__BUILD__'
 modern = __MODERN__
 identity = str(uuid.uuid4())
@@ -28,7 +28,7 @@ while True:
         if body == 'RuntimeStatus':
             response = {'RuntimeStatus': {'identity':'fixture', 'edition':'__EDITION__',
                 'pid':os.getpid(), 'socket_path':str(sock), 'active_session_count':active,
-                'build_identifier':build, 'instance_id':identity,
+                'build_identifier':build, 'instance_id':identity, 'deployment_environment':'__ENVIRONMENT__',
                 'capabilities':['remote_runtime_protocol_v4'] + (['remote_maintenance_v1','remote_terminal_maintenance_v1'] if modern else [])}}
         elif isinstance(body, dict) and 'RemoteRuntimeMaintenance' in body:
             operation = body['RemoteRuntimeMaintenance']
@@ -55,7 +55,7 @@ impl Fixture {
     fn new() -> Self {
         let root =
             std::env::temp_dir().join(format!("lc-{}", &Uuid::new_v4().simple().to_string()[..8]));
-        let data = root.join(".ditch");
+        let data = root.join(ditch_product::deployment::REMOTE_DIRECTORY);
         fs::create_dir_all(data.join("run")).unwrap();
         fs::create_dir_all(data.join("bin")).unwrap();
         fs::create_dir_all(data.join("state")).unwrap();
@@ -85,7 +85,9 @@ impl Fixture {
             DAEMON
                 .replace("__BUILD__", name)
                 .replace("__MODERN__", if modern { "True" } else { "False" })
-                .replace("__EDITION__", crate::RUNTIME_EDITION),
+                .replace("__EDITION__", crate::RUNTIME_EDITION)
+                .replace("__REMOTE_DIRECTORY__", ditch_product::deployment::REMOTE_DIRECTORY)
+                .replace("__ENVIRONMENT__", ditch_product::deployment::ENVIRONMENT),
         )
         .unwrap();
         fs::set_permissions(binary, fs::Permissions::from_mode(0o700)).unwrap();
@@ -117,6 +119,68 @@ impl Drop for Fixture {
         std::thread::sleep(Duration::from_millis(100));
         let _ = fs::remove_dir_all(&self.root);
     }
+}
+
+#[test]
+fn staging_replacements_ignore_release_order_but_production_does_not() {
+    assert!(!blocks_downgrade("staging", true, 999, 0));
+    assert!(!blocks_downgrade("staging", true, 999, 151));
+    assert!(blocks_downgrade("production", true, 999, 151));
+    assert!(!blocks_downgrade("production", true, 151, 999));
+    assert!(!blocks_downgrade("production", false, 999, 151));
+}
+
+#[test]
+fn wrong_environment_is_rejected_without_stopping_the_process() {
+    let f = Fixture::new();
+    let path = f.release("old", true);
+    let mut running = f.running(&path, "old");
+    running.deployment_environment = if ditch_product::deployment::ENVIRONMENT == "staging" { "production" } else { "staging" }.into();
+    assert!(validate_environment(&running).is_err());
+    assert_eq!(status(&f.paths).unwrap().unwrap().pid, running.pid);
+    running.deployment_environment.clear();
+    assert_eq!(validate_environment(&running).is_ok(), ditch_product::deployment::ENVIRONMENT == "production");
+}
+
+#[test]
+fn handoff_leaves_other_environment_daemon_and_state_untouched() {
+    let f = Fixture::new();
+    let (other_environment, other_directory) = if ditch_product::deployment::ENVIRONMENT == "staging" {
+        ("production", ".ditch")
+    } else { ("staging", ".ditch-staging") };
+    let other_root = f.root.join(other_directory);
+    fs::create_dir_all(other_root.join("state")).unwrap();
+    let saved = other_root.join("state/ditch.sqlite3");
+    fs::write(&saved, b"other environment data").unwrap();
+    let executable = f.root.join("other-daemon");
+    fs::write(&executable, DAEMON.replace("__BUILD__", "other")
+        .replace("__MODERN__", "True").replace("__EDITION__", crate::RUNTIME_EDITION)
+        .replace("__REMOTE_DIRECTORY__", other_directory).replace("__ENVIRONMENT__", other_environment)).unwrap();
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+    let mut other = Command::new(&executable).env("HOME", &f.root)
+        .stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+    let result = std::panic::catch_unwind(|| {
+        let socket = other_root.join("run/ditchd.sock");
+        let until = Instant::now() + Duration::from_secs(5);
+        while !socket.exists() {
+            assert!(Instant::now() < until);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let old_path = f.release("old", true);
+        let new_path = f.release("new", true);
+        let old = f.running(&old_path, "old");
+        let journal = f.journal(&old, old_path, new_path);
+        let _lock = lock(&f.paths, true).unwrap();
+        handoff(&f.paths, journal, Some(&old), false).unwrap();
+        assert_eq!(status(&f.paths).unwrap().unwrap().build_identifier, "new");
+        assert!(UnixStream::connect(&socket).is_ok());
+        assert_eq!(fs::read(saved).unwrap(), b"other environment data");
+    });
+    let alive = other.try_wait().unwrap().is_none();
+    let _ = other.kill();
+    let _ = other.wait();
+    assert!(alive);
+    result.unwrap();
 }
 
 #[test]

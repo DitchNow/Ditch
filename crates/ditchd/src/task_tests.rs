@@ -28,6 +28,262 @@ mod task_tests {
             operation,
         }
     }
+
+    fn release_review(state: &Arc<Mutex<RuntimeState>>, project: &Project, title: &str) -> Task {
+        let mut task = Task::new(project.id, draft(title), 1024).unwrap();
+        task.state = ditch_core::TaskState::InReview;
+        task.review_summary = Some("Reviewed implementation".into());
+        let submission = ditch_core::ReviewSubmission {
+            id: Uuid::new_v4(),
+            attempt_id: None,
+            agent_id: None,
+            summary: "Reviewed implementation".into(),
+            criteria: vec![],
+            workspace: acceptance_workspace(&project.root, &task.acceptance.config).unwrap(),
+            preexisting_dirty_paths: vec![],
+            approvals: vec![],
+            created_at: Utc::now(),
+        };
+        task.acceptance.current_submission = Some(submission.id);
+        task.acceptance.submissions.push(submission);
+        let mut locked = state.lock().unwrap();
+        locked
+            .store
+            .save_task_changes(
+                &[(
+                    task.clone(),
+                    task.audit(TaskActor::Daemon, "fixture", None, None),
+                )],
+                None,
+                None,
+            )
+            .unwrap();
+        locked.tasks.insert(task.id, task.clone());
+        task
+    }
+    fn references(tasks: &[Task]) -> Vec<ditch_core::TaskRevision> {
+        tasks
+            .iter()
+            .map(|t| ditch_core::TaskRevision {
+                task_id: t.id,
+                expected_revision: t.revision,
+            })
+            .collect()
+    }
+    #[test]
+    fn release_batch_atomic_accept_regroup_reopen_replay_and_restart() {
+        use ditch_core::ReleaseDestination;
+        let (state, project) = fixture();
+        let first = release_review(&state, &project, "One");
+        let second = release_review(&state, &project, "Two");
+        let request = req(
+            &project,
+            TaskOperation::AcceptRelease {
+                tasks: references(&[first.clone(), second.clone()]),
+                destination: ReleaseDestination::New("  Autumn preview  ".into()),
+            },
+        );
+        let response = handle_task_request(state.clone(), request.clone());
+        let ServerResponse::TaskResponse(TaskResponse::ReleaseBatch { tasks, releases }) = response
+        else {
+            panic!("{response:?}")
+        };
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(releases[0].name, "Autumn preview");
+        assert!(
+            tasks
+                .iter()
+                .all(|t| t.column() == TaskColumn::Done && t.release_id == Some(releases[0].id))
+        );
+        assert_eq!(tasks[0].acceptance, first.acceptance);
+        let move_request = req(
+            &project,
+            TaskOperation::AssignRelease {
+                tasks: references(&tasks),
+                destination: ReleaseDestination::Other,
+            },
+        );
+        let response = handle_task_request(state.clone(), move_request);
+        let ServerResponse::TaskResponse(TaskResponse::ReleaseBatch { tasks: moved, .. }) =
+            response
+        else {
+            panic!("{response:?}")
+        };
+        assert!(moved.iter().all(|t| t.release_id.is_none()));
+        assert_eq!(moved[0].completed_at, tasks[0].completed_at);
+        assert_eq!(moved[0].acceptance, tasks[0].acceptance);
+        let response = handle_task_request(state.clone(), request.clone());
+        let ServerResponse::TaskResponse(TaskResponse::ReleaseBatch { tasks: replay, .. }) =
+            response
+        else {
+            panic!("{response:?}")
+        };
+        assert_eq!(replay, moved); // Never resurrect the receipt's old membership.
+        let reopened = changed(handle_task_request(
+            state.clone(),
+            req(
+                &project,
+                TaskOperation::Transition {
+                    task_id: moved[0].id,
+                    expected_revision: moved[0].revision,
+                    action: TaskAction::Reopen,
+                },
+            ),
+        ));
+        assert!(reopened.release_id.is_none());
+        let locked = state.lock().unwrap();
+        let durable = locked.store.load().unwrap();
+        assert_eq!(durable.releases, releases);
+        assert_eq!(durable.tasks.len(), 2);
+        assert_eq!(locked.snapshot().releases, releases);
+        assert_eq!(
+            locked.store.task_detail(&reopened).unwrap().history.len(),
+            4
+        );
+        assert_eq!(locked.store.load_releases().unwrap().len(), 1);
+        let restarted = ditch_store::DitchStore::open(&locked.paths).unwrap();
+        assert_eq!(restarted.load_releases().unwrap(), releases);
+    }
+
+    #[test]
+    fn release_batches_reject_stale_missing_evidence_and_cross_project_without_partial_commit() {
+        use ditch_core::ReleaseDestination;
+        let (state, project) = fixture();
+        let first = release_review(&state, &project, "One");
+        let mut second = release_review(&state, &project, "Two");
+        second.acceptance.current_submission = None;
+        state
+            .lock()
+            .unwrap()
+            .tasks
+            .insert(second.id, second.clone());
+        let request = req(
+            &project,
+            TaskOperation::AcceptRelease {
+                tasks: references(&[first.clone(), second.clone()]),
+                destination: ReleaseDestination::New("v1".into()),
+            },
+        );
+        let result = handle_task_request(state.clone(), request.clone());
+        assert!(matches!(
+            result,
+            ServerResponse::TaskResponse(TaskResponse::Error(_))
+        ));
+        assert!(state.lock().unwrap().releases.is_empty());
+        assert_eq!(state.lock().unwrap().tasks[&first.id], first);
+        assert!(
+            state
+                .lock()
+                .unwrap()
+                .store
+                .task_replay(&request)
+                .unwrap()
+                .is_none()
+        );
+        let mut stale = references(std::slice::from_ref(&first));
+        stale[0].expected_revision += 1;
+        let result = handle_task_request(
+            state.clone(),
+            req(
+                &project,
+                TaskOperation::AcceptRelease {
+                    tasks: stale,
+                    destination: ReleaseDestination::Other,
+                },
+            ),
+        );
+        assert!(matches!(
+            result,
+            ServerResponse::TaskResponse(TaskResponse::Error(TaskError {
+                code: TaskErrorCode::RevisionConflict,
+                ..
+            }))
+        ));
+        let foreign = ditch_core::ProjectRelease::new(ProjectId::new(), "v1").unwrap();
+        state
+            .lock()
+            .unwrap()
+            .releases
+            .insert(foreign.id, foreign.clone());
+        let result = handle_task_request(
+            state.clone(),
+            req(
+                &project,
+                TaskOperation::AcceptRelease {
+                    tasks: references(std::slice::from_ref(&first)),
+                    destination: ReleaseDestination::Existing(foreign.id),
+                },
+            ),
+        );
+        assert!(matches!(
+            result,
+            ServerResponse::TaskResponse(TaskResponse::Error(_))
+        ));
+        fs::write(project.root.join("changed"), "workspace changed").unwrap();
+        let result = handle_task_request(
+            state.clone(),
+            req(
+                &project,
+                TaskOperation::AcceptRelease {
+                    tasks: references(std::slice::from_ref(&first)),
+                    destination: ReleaseDestination::Other,
+                },
+            ),
+        );
+        assert!(matches!(
+            result,
+            ServerResponse::TaskResponse(TaskResponse::Error(_))
+        ));
+        assert_eq!(state.lock().unwrap().tasks[&first.id], first);
+    }
+
+    #[test]
+    fn release_batch_rejects_live_tasks_and_duplicate_trimmed_names() {
+        use ditch_core::ReleaseDestination;
+        let (state, project) = fixture();
+        let first = release_review(&state, &project, "One");
+        let mut active = first.clone();
+        active.condition = TaskCondition::Queued;
+        state
+            .lock()
+            .unwrap()
+            .tasks
+            .insert(active.id, active.clone());
+        let request = req(
+            &project,
+            TaskOperation::AcceptRelease {
+                tasks: references(std::slice::from_ref(&first)),
+                destination: ReleaseDestination::New("v1".into()),
+            },
+        );
+        assert!(matches!(
+            handle_task_request(state.clone(), request.clone()),
+            ServerResponse::TaskResponse(TaskResponse::Error(_))
+        ));
+        state.lock().unwrap().tasks.insert(first.id, first.clone());
+        assert!(matches!(
+            handle_task_request(state.clone(), request),
+            ServerResponse::TaskResponse(TaskResponse::ReleaseBatch { .. })
+        ));
+        let second = release_review(&state, &project, "Two");
+        let request = req(
+            &project,
+            TaskOperation::AcceptRelease {
+                tasks: references(std::slice::from_ref(&second)),
+                destination: ReleaseDestination::New(" v1 ".into()),
+            },
+        );
+        assert!(matches!(
+            handle_task_request(state.clone(), request),
+            ServerResponse::TaskResponse(TaskResponse::Error(_))
+        ));
+        assert_eq!(state.lock().unwrap().tasks[&second.id], second);
+        assert_eq!(
+            state.lock().unwrap().store.load_releases().unwrap().len(),
+            1
+        );
+    }
+
     #[test]
     fn backlog_admission_and_board_membership_do_not_launch_work() {
         let (state, project) = fixture();
@@ -44,8 +300,10 @@ mod task_tests {
         assert_eq!(handle_task_request(state.clone(), req(&project, TaskOperation::BoardProjects { members: None })), ServerResponse::TaskResponse(TaskResponse::BoardProjects(vec![remote.id])));
         let remote_task = changed(handle_task_request(state.clone(), req(&remote, TaskOperation::CreateBacklog { draft: draft("SSH scope") })));
         assert!(remote_task.remote_pending);
-        let remote_task = changed(handle_task_request(state.clone(), req(&remote, TaskOperation::Move { task_id: remote_task.id, expected_revision: remote_task.revision, column: TaskColumn::Todo, before_id: None })));
-        assert_eq!(remote_task.column(), TaskColumn::Todo);
+        state.lock().unwrap().remote_connections.test_rpc = Some(Arc::new(|_, _, _| Err(ditch_ssh::SshError::Failed("offline".into()))));
+        let response = handle_task_request(state.clone(), req(&remote, TaskOperation::Move { task_id: remote_task.id, expected_revision: remote_task.revision, column: TaskColumn::Todo, before_id: None }));
+        assert!(matches!(response, ServerResponse::TaskResponse(TaskResponse::Error(_))));
+        assert_eq!(state.lock().unwrap().tasks[&remote_task.id].column(), TaskColumn::Backlog);
         let mut snapshot = state.lock().unwrap().snapshot();
         snapshot.tasks.clear();
         reconcile_remote_snapshot(&state, "child", std::slice::from_ref(&remote), Uuid::new_v4(), snapshot, 0);
@@ -353,6 +611,7 @@ for line in sys.stdin:
     if method=='initialized': continue
     if method=='config/read': result={'config':{}}
     elif method in ['thread/start','thread/resume']:
+        if method == 'thread/resume': assert p['threadId'] == 'test-thread'
         result={'thread':{'id':'test-thread'},'activePermissionProfile':{'id':p.get('config',{}).get('default_permissions')}}
     elif method=='turn/start':
         with open('runs.txt','a') as f: f.write('run\n')
@@ -439,6 +698,29 @@ for line in sys.stdin:
             before
         );
         drop(locked);
+        for prompt in ["Explain the implementation", "Explain the tests"] {
+            let history = state.lock().unwrap().agents[&agent_id].messages.clone();
+            assert_eq!(
+                forward_or_prompt_agent(state.clone(), agent_id, prompt.into(), AgentExecutionProfile::default()),
+                ServerResponse::Accepted
+            );
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let locked = state.lock().unwrap();
+                if !locked.children.contains_key(&agent_id) && !locked.writer_leases.contains_key(&agent_id) {
+                    let record = &locked.agents[&agent_id];
+                    assert_eq!(record.run.native_session_id.as_deref(), Some("test-thread"));
+                    assert_eq!(record.run.task_id, Some(task.id));
+                    assert!(record.messages.starts_with(&history));
+                    assert!(record.messages.iter().any(|m| m.role == AgentChatRole::User && m.text == prompt));
+                    assert_eq!(locked.tasks[&task.id], reviewed);
+                    break;
+                }
+                drop(locked);
+                assert!(Instant::now() < deadline, "follow-up did not finish");
+                thread::sleep(Duration::from_millis(20));
+            }
+        }
         let submission = reviewed.acceptance.submissions[0].clone();
         handle_task_request(
             Arc::clone(&state),
