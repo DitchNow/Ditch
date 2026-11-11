@@ -140,7 +140,8 @@ fn claim_session_name_job(state: &Arc<Mutex<RuntimeState>>) -> Option<SessionNam
         .values()
         .filter(|record| {
             let run = &record.run;
-            run.codex_title.is_none()
+            run.execution_profile.inference_endpoint_id.is_none()
+                && run.codex_title.is_none()
                 && run.user_title.is_none()
                 && !run.naming_failed
                 && run.native_session_id.is_some()

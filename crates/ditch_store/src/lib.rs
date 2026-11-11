@@ -28,6 +28,7 @@ pub struct DurableAgent {
 }
 
 mod tasks;
+mod ollama;
 
 pub struct DurableState {
     pub releases: Vec<ditch_core::ProjectRelease>,
@@ -76,6 +77,7 @@ impl DitchStore {
         )?;
         connection.pragma_update(None, "user_version", 3)?;
         let mut store = Self { connection };
+        store.initialize_ollama()?;
         store.initialize_tasks()?;
         store.cleanup_polluted_permission_alerts()?;
         store.import_legacy_registry_if_empty(paths)?;

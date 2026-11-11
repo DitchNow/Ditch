@@ -105,7 +105,11 @@ class PlanningFixture {
   }
 }
 
-Future<void> mount(WidgetTester tester, PlanningFixture f) async {
+Future<void> mount(
+  WidgetTester tester,
+  PlanningFixture f, {
+  String? endpointId,
+}) async {
   tester.view.physicalSize = const Size(1200, 1000);
   tester.view.devicePixelRatio = 1;
   addTearDown(tester.view.resetPhysicalSize);
@@ -125,7 +129,10 @@ Future<void> mount(WidgetTester tester, PlanningFixture f) async {
               f.controller,
               f.controller.task('task')!,
               const [TaskProjectOption('project', 'Project')],
-              () => {'model': 'chosen-model'},
+              () => {
+                'model': 'chosen-model',
+                'inference_endpoint_id': ?endpointId,
+              },
               (_) {},
             ),
             child: const Text('Open task'),
@@ -139,6 +146,21 @@ Future<void> mount(WidgetTester tester, PlanningFixture f) async {
 }
 
 void main() {
+  testWidgets('OSS selection cannot silently generate a plan through OpenAI', (
+    tester,
+  ) async {
+    final f = PlanningFixture();
+    await mount(tester, f, endpointId: 'server-a');
+    await tester.tap(find.text('Generate with AI'));
+    await tester.pumpAndSettle();
+    expect(f.calls.any((op) => op.containsKey('GeneratePlan')), isFalse);
+    expect(
+      find.textContaining(
+        'Automatic board planning with OSS models is not supported',
+      ),
+      findsOneWidget,
+    );
+  });
   testWidgets('card shows compact live planning and result states', (
     tester,
   ) async {

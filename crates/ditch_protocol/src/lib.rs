@@ -31,6 +31,7 @@ impl<T> Envelope<T> {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ClientRequest {
+    Ollama(ditch_core::ollama::OllamaRequest),
     SkillRequest(ditch_core::SkillRequest),
     TaskRequest(ditch_core::TaskRequest),
     GitHub(ditch_core::github::GitHubRequest),
@@ -344,6 +345,7 @@ pub enum ClientRequest {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum ServerResponse {
+    Ollama(ditch_core::ollama::OllamaResponse),
     PermissionDetails(ditch_core::PermissionRequest),
     SkillResponse(ditch_core::SkillResponse),
     TaskResponse(ditch_core::TaskResponse),

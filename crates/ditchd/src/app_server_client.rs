@@ -25,7 +25,19 @@ impl Client {
         home: Option<&Path>,
         on_spawn: Option<&dyn Fn(i32) -> io::Result<()>>,
     ) -> io::Result<Self> {
+        Self::open_with_provider(binary, cwd, home, on_spawn, None)
+    }
+    pub fn open_with_provider(
+        binary: &str,
+        cwd: &Path,
+        home: Option<&Path>,
+        on_spawn: Option<&dyn Fn(i32) -> io::Result<()>>,
+        provider: Option<&crate::ollama::ResolvedOllamaProvider>,
+    ) -> io::Result<Self> {
         let mut command = Command::new(binary);
+        if let Some(provider) = provider {
+            crate::ollama::configure(&mut command, provider);
+        }
         command
             .arg("app-server")
             .current_dir(cwd)

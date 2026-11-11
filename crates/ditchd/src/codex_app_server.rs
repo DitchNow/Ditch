@@ -85,6 +85,7 @@ pub struct SpawnedTurn {
 }
 
 pub struct Launch<'a> {
+    pub inference_provider: Option<&'a crate::ollama::ResolvedOllamaProvider>,
     pub restricted: bool,
     pub protected_roots: Vec<std::path::PathBuf>,
     pub remote: bool,
@@ -215,8 +216,13 @@ fn send_approval_response(
 
 pub fn spawn_turn(launch: Launch<'_>, events: Sender<Event>) -> io::Result<SpawnedTurn> {
     let home = launch.codex_home.as_ref().map(std::path::Path::new);
-    let mut client =
-        crate::app_server_client::Client::open(launch.binary, launch.cwd, home, launch.on_spawn)?;
+    let mut client = crate::app_server_client::Client::open_with_provider(
+        launch.binary,
+        launch.cwd,
+        home,
+        launch.on_spawn,
+        launch.inference_provider,
+    )?;
     client.set_roots(launch.extra_roots)?;
     // Discovery must happen in the same process that will load the thread.
     if !launch.execution_profile.skills.is_empty() {
@@ -312,6 +318,17 @@ pub fn spawn_turn(launch: Launch<'_>, events: Sender<Event>) -> io::Result<Spawn
     if let Some(model) = launch.execution_profile.model.as_deref() {
         thread_params["model"] = json!(model);
     }
+    let expected_provider = launch.inference_provider.map(|p| p.endpoint.provider_key());
+    let secret = launch
+        .inference_provider
+        .and_then(|p| p.token.as_ref())
+        .map(|t| t.0.clone());
+    if let Some(provider) = &expected_provider {
+        thread_params["modelProvider"] = json!(provider);
+        // Ollama does not provide OpenAI's hosted web-search tool.
+        thread_params["config"]["web_search"] = json!("disabled");
+        thread_params["config"]["tools"]["web_search"] = json!(false);
+    }
     let method = if let Some(thread_id) = launch.resume_thread {
         thread_params["threadId"] = json!(thread_id);
         "thread/resume"
@@ -383,6 +400,11 @@ pub fn spawn_turn(launch: Launch<'_>, events: Sender<Event>) -> io::Result<Spawn
                     continue;
                 }
             };
+            let line = if let Some(secret) = &secret {
+                line.replace(secret, "[redacted]")
+            } else {
+                line
+            };
             if let Ok(value) = serde_json::from_str::<Value>(&line) {
                 if !gate.accept(&value) {
                     continue;
@@ -390,6 +412,16 @@ pub fn spawn_turn(launch: Launch<'_>, events: Sender<Event>) -> io::Result<Spawn
                 if value.get("method").is_none()
                     && value.get("id").and_then(Value::as_str) == Some(THREAD_ID)
                 {
+                    if let Some(expected) = expected_provider.as_deref() {
+                        let mismatch = ["/result/thread/modelProvider", "/result/modelProvider"]
+                            .iter()
+                            .filter_map(|path| value.pointer(path).and_then(Value::as_str))
+                            .any(|actual| actual != expected);
+                        if mismatch {
+                            let _ = reader_events.send(Event::Failed("Codex returned a different inference provider; refusing to start the turn".into()));
+                            break;
+                        }
+                    }
                     thread_id = value
                         .pointer("/result/thread/id")
                         .and_then(Value::as_str)
@@ -1357,6 +1389,7 @@ printf '%s\n' '{{"method":"turn/completed","params":{{"turn":{{"id":"turn_remote
         let (tx, rx) = mpsc::channel();
         let spawned = spawn_turn(
             Launch {
+                inference_provider: None,
                 restricted: false,
                 protected_roots: vec![],
                 remote: true,
@@ -1444,24 +1477,34 @@ printf '%s' '{"id":"ditch:thread","result":'
         fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
         let (project_id, agent_id) = ids();
         let (tx, rx) = mpsc::channel();
-        let spawned = spawn_turn(Launch {
-            restricted: false,
-            protected_roots: vec![],
-            remote: false,
-            extra_roots: &[],
-            on_spawn: None,
-            binary: binary.to_str().unwrap(),
-            cwd: &root,
-            project_id,
-            agent_id,
-            prompt: "Continue",
-            resume_thread: Some("old-thread"),
-            execution_profile: &AgentExecutionProfile::default(),
-            codex_home: None,
-        }, tx).unwrap();
-        assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap(),
-            Event::Failed("Codex App Server output ended in the middle of a message".into()));
-        assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap(), Event::OutputClosed);
+        let spawned = spawn_turn(
+            Launch {
+                inference_provider: None,
+                restricted: false,
+                protected_roots: vec![],
+                remote: false,
+                extra_roots: &[],
+                on_spawn: None,
+                binary: binary.to_str().unwrap(),
+                cwd: &root,
+                project_id,
+                agent_id,
+                prompt: "Continue",
+                resume_thread: Some("old-thread"),
+                execution_profile: &AgentExecutionProfile::default(),
+                codex_home: None,
+            },
+            tx,
+        )
+        .unwrap();
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Event::Failed("Codex App Server output ended in the middle of a message".into())
+        );
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Event::OutputClosed
+        );
         spawned.child.lock().unwrap().wait().unwrap();
         fs::remove_dir_all(root).unwrap();
     }
@@ -1503,6 +1546,7 @@ printf '%s' '{"id":"ditch:thread","result":'
             let (tx, rx) = mpsc::channel();
             let spawned = spawn_turn(
                 Launch {
+                    inference_provider: None,
                     binary: &binary,
                     cwd: Path::new(&root),
                     project_id: ProjectId::new(),

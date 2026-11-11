@@ -145,6 +145,20 @@ fn prepare_task_plan(
     model: Option<String>,
 ) -> Result<TaskPlanLaunch, TaskError> {
     if task
+        .execution_queue
+        .as_ref()
+        .is_some_and(|q| q.profile.inference_endpoint_id.is_some())
+        || state.agents.values().any(|r| {
+            r.run.task_id == Some(task.id)
+                && r.run.execution_profile.inference_endpoint_id.is_some()
+        })
+    {
+        return Err(TaskError::new(
+            TaskErrorCode::InvalidInput,
+            "Automatic board planning for an OSS-backed task is not supported yet. Enter the plan manually.",
+        ));
+    }
+    if task
         .planning
         .job
         .as_ref()

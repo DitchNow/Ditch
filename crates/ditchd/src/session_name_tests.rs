@@ -111,6 +111,14 @@ fn session_naming_generates_and_saves_without_creating_an_agent_or_touching_work
 }
 
 #[test]
+fn oss_session_never_claims_an_openai_naming_job() {
+    let (state, id, root) = naming_fixture("success");
+    state.lock().unwrap().agents.get_mut(&id).unwrap().run.execution_profile.inference_endpoint_id = Some(Uuid::new_v4());
+    assert!(claim_session_name_job(&state).is_none());
+    assert_eq!(naming_calls(&root, "turn/start"), 0);
+}
+
+#[test]
 fn session_naming_failure_is_bounded_and_can_be_retried_from_rename() {
     let (state, id, root) = naming_fixture("fail");
     process_session_name_job(&state);

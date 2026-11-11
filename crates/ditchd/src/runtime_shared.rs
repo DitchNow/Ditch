@@ -482,6 +482,7 @@ impl RuntimeState {
 
     fn runtime_status(&self) -> RuntimeStatus {
         let mut capabilities = vec![
+            ollama::CAPABILITY.to_owned(),
             format!("edition_{RUNTIME_EDITION}"),
             "project_clone_v1".to_owned(),
             "project_rename_v1".to_owned(),
@@ -1333,7 +1334,12 @@ fn handle_operation(
     // so reusing an ID never executes a second copy of a possibly accepted command.
     let tracked = matches!(
         request,
-        ClientRequest::StartRemoteCodexAppServerSession { .. }
+        ClientRequest::Ollama(ditch_core::ollama::OllamaRequest {
+            operation: ditch_core::ollama::OllamaOperation::Add { .. }
+                | ditch_core::ollama::OllamaOperation::Disable { .. }
+                | ditch_core::ollama::OllamaOperation::Refresh { .. },
+            ..
+        }) | ClientRequest::StartRemoteCodexAppServerSession { .. }
             | ClientRequest::ResumeRemoteCodexAppServerSession { .. }
             | ClientRequest::PromptRemoteCodexAppServerAgent { .. }
             | ClientRequest::StartCodexSession { .. }
@@ -2146,6 +2152,7 @@ fn handle_request(request: ClientRequest, state: Arc<Mutex<RuntimeState>>) -> Se
                 list_agent_models(state, provider, project_id)
             }
         }
+        ClientRequest::Ollama(request) => ollama_request(state, request),
         ClientRequest::OpenProjectTerminal {
             project_id,
             columns,
@@ -3887,6 +3894,7 @@ include!("task_planning_tests.rs");
 include!("acceptance_runtime.rs");
 include!("skill_runtime.rs");
 include!("remote_app_server_runtime.rs");
+include!("ollama_runtime.rs");
 
 fn persist_launch_failure(
     state: &Arc<Mutex<RuntimeState>>,

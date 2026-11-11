@@ -70,6 +70,23 @@ fn start_remote_app_server_session_linked(
     {
         return protocol_error("codex_thread_project_mismatch", message);
     }
+    if let Some(thread_id) = resume_thread.as_deref() {
+        let guard = state.lock().unwrap();
+        let saved = guard
+            .agents
+            .values()
+            .find(|r| r.run.native_session_id.as_deref() == Some(thread_id));
+        let expected = saved.and_then(|r| r.run.execution_profile.inference_endpoint_id);
+        if let Err(message) =
+            validate_inference_binding(expected, execution_profile.inference_endpoint_id)
+        {
+            return protocol_error("inference_endpoint_mismatch", message);
+        }
+    }
+    let inference_provider = match resolve_ollama_profile(&state, &execution_profile) {
+        Ok(p) => p,
+        Err(message) => return protocol_error("inference_endpoint_unavailable", message),
+    };
     if let Err(error) = ensure_project_metadata(&project) {
         return protocol_error("project_metadata_failed", error.to_string());
     }
@@ -102,7 +119,15 @@ fn start_remote_app_server_session_linked(
         task_id: binding.map(|b| b.0),
         pane_id: None,
         native_session_id: resume_thread.clone(),
-        codex_title: None,
+        codex_title: execution_profile.inference_endpoint_id.and_then(|_| {
+            ditch_core::normalize_session_title(
+                &prompt
+                    .split_whitespace()
+                    .take(10)
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            )
+        }),
         naming_failed: false,
         user_title: None,
         origin_codex_home: state
@@ -166,6 +191,7 @@ fn start_remote_app_server_session_linked(
     let protected_roots = {let s=state.lock().unwrap();let mut roots=vec![s.paths.data_dir.clone()];if let Some(home)=s.codex_home.clone().or_else(||std::env::var_os("HOME").map(|h|PathBuf::from(h).join(".codex"))){roots.push(home);}roots};
     let spawned = match codex_app_server::spawn_turn(
         codex_app_server::Launch {
+            inference_provider: inference_provider.as_ref(),
             restricted,
             protected_roots,
             remote,
@@ -317,6 +343,12 @@ fn prompt_app_server_agent(
         let Some(record) = state.agents.get(&agent_id) else {
             return protocol_error("agent_not_found", "agent session was not found");
         };
+        if let Err(message) = validate_inference_binding(
+            record.run.execution_profile.inference_endpoint_id,
+            execution_profile.inference_endpoint_id,
+        ) {
+            return protocol_error("inference_endpoint_mismatch", message);
+        }
         if state.children.contains_key(&agent_id) || state.remote_launching.contains(&agent_id) {
             return protocol_error("agent_busy", "agent session is already working");
         }
@@ -348,6 +380,10 @@ fn prompt_app_server_agent(
     let _reservation = RemoteLaunchReservation {
         state: state.clone(),
         agent_id,
+    };
+    let inference_provider = match resolve_ollama_profile(&state, &execution_profile) {
+        Ok(p) => p,
+        Err(message) => return protocol_error("inference_endpoint_unavailable", message),
     };
     let remote = state.lock().unwrap().remote_runtime;
     execution_profile.transport = ditch_core::AgentTransport::AppServer;
@@ -384,6 +420,7 @@ fn prompt_app_server_agent(
     let protected_roots = {let s=state.lock().unwrap();let mut roots=vec![s.paths.data_dir.clone()];if let Some(home)=s.codex_home.clone().or_else(||std::env::var_os("HOME").map(|h|PathBuf::from(h).join(".codex"))){roots.push(home);}roots};
     let spawned = match codex_app_server::spawn_turn(
         codex_app_server::Launch {
+            inference_provider: inference_provider.as_ref(),
             restricted,
             protected_roots,
             remote,

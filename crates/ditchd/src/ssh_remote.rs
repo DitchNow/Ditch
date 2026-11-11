@@ -219,6 +219,7 @@ impl RemoteConnectionManager {
     }
 
     pub fn request(&self, alias: &str, request: ClientRequest) -> Result<ServerResponse, SshError> {
+        let needs_ollama = request_needs_ollama(&request);
         let read_only = matches!(
             request,
             ClientRequest::Health
@@ -231,6 +232,10 @@ impl RemoteConnectionManager {
                 | ClientRequest::GetOperationOutcome { .. }
                 | ClientRequest::GetPermissionRequest { .. }
                 | ClientRequest::ListFilesystemDirectory { .. }
+                | ClientRequest::Ollama(ditch_core::ollama::OllamaRequest {
+                    operation: ditch_core::ollama::OllamaOperation::List,
+                    ..
+                })
         );
         // Pause this Mac's schedulers too, including the legacy maintenance
         // window. Status/rejoin and explicit stop controls remain available.
@@ -280,8 +285,9 @@ impl RemoteConnectionManager {
                     Err(_) => std::thread::sleep(Duration::from_millis(5)),
                 }
             };
-            if (!read_only || ditch_product::deployment::ENVIRONMENT == "staging")
-                && (!bridge.verified || needs_session_controls) {
+            if (!read_only || needs_ollama || ditch_product::deployment::ENVIRONMENT == "staging")
+                && (!bridge.verified || needs_session_controls || needs_ollama)
+            {
                 match bridge.exchange(ClientRequest::RuntimeStatus, deadline, true)? {
                     ServerResponse::RuntimeStatus(status) if !runtime_identity_matches(&status) => {
                         return Err(SshError::Failed("Remote runtime environment or edition does not match this app. No command was sent.".into()));
@@ -291,6 +297,11 @@ impl RemoteConnectionManager {
                             .capabilities
                             .iter()
                             .any(|c| c == "remote_runtime_protocol_v4")
+                            && (!needs_ollama
+                                || status
+                                    .capabilities
+                                    .iter()
+                                    .any(|c| c == crate::ollama::CAPABILITY))
                             && (!needs_session_controls
                                 || status
                                     .capabilities
@@ -896,16 +907,13 @@ pub fn check_setup(
     let mut machine_id = None;
     let mut daemon_epoch = None;
     let mut daemon_ready = false;
+    let mut oss_capable = false;
     let mut runtime_error = None;
     if compatible {
         connections.disconnect(alias);
         match connections.request(alias, ClientRequest::RuntimeStatus) {
-          Ok(ServerResponse::RuntimeStatus(status)) => {
-            daemon_ready = status
-                .capabilities
-                .iter()
-                .any(|c| c == "remote_runtime_protocol_v4")
-                && status
+            Ok(ServerResponse::RuntimeStatus(status)) => {
+                oss_capable = status
                     .capabilities
                     .iter()
                     .any(|c| c == "app_server_sessions_v2")
@@ -942,6 +950,26 @@ pub fn check_setup(
         codex_auth == "ready",
         daemon_ready && machine_id.is_some(),
     );
+    checks.push(check(
+        "oss_execution",
+        "OSS execution",
+        if oss_capable
+            && desktop_project_setup_ready(
+                supported,
+                compatible,
+                git != "missing",
+                codex != "missing",
+                true,
+                daemon_ready && machine_id.is_some(),
+            )
+        {
+            RemoteCheckState::Ready
+        } else {
+            RemoteCheckState::ManualActionRequired
+        },
+        "Requires a compatible runtime and Codex; ChatGPT login is optional for OSS models",
+        None,
+    ));
     Ok(RemoteSetupStatus {
         ssh_host_alias: alias.to_owned(),
         remote_machine_id: machine_id,
@@ -970,6 +998,40 @@ pub fn check_setup(
         host_key_fingerprint: None,
         last_error: runtime_error,
     })
+}
+
+fn request_needs_ollama(request: &ClientRequest) -> bool {
+    match request {
+        ClientRequest::Ollama(_) => true,
+        ClientRequest::StartRemoteCodexAppServerSession {
+            execution_profile, ..
+        }
+        | ClientRequest::ResumeRemoteCodexAppServerSession {
+            execution_profile, ..
+        }
+        | ClientRequest::PromptRemoteCodexAppServerAgent {
+            execution_profile, ..
+        }
+        | ClientRequest::StartCodexSession {
+            execution_profile, ..
+        }
+        | ClientRequest::ResumeCodexSession {
+            execution_profile, ..
+        }
+        | ClientRequest::PromptAgent {
+            execution_profile, ..
+        } => execution_profile.inference_endpoint_id.is_some(),
+        ClientRequest::TaskRequest(request) => match &request.operation {
+            ditch_core::TaskOperation::Start {
+                execution_profile, ..
+            }
+            | ditch_core::TaskOperation::Enqueue {
+                execution_profile, ..
+            } => execution_profile.inference_endpoint_id.is_some(),
+            _ => false,
+        },
+        _ => false,
+    }
 }
 
 fn desktop_project_setup_ready(

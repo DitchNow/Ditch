@@ -43,6 +43,8 @@ export 'data/commercial_models.dart';
 export 'data/project_models.dart';
 export 'widgets/project_sidebar.dart';
 
+part 'ollama_ui.dart';
+
 const ditchDeploymentEnvironment = runtimeDeploymentEnvironment;
 const ditchRelayOrigin = String.fromEnvironment(
   'DITCH_RELAY_ORIGIN',
@@ -463,11 +465,21 @@ class AgentModelOption {
     required this.displayName,
     this.isDefault = false,
     this.contextWindowTokens,
+    this.endpointId,
+    this.endpointName,
+    this.availabilityError,
   });
   final String id;
   final String displayName;
   final bool isDefault;
   final int? contextWindowTokens;
+  final String? endpointId;
+  final String? endpointName;
+  final String? availabilityError;
+  String get selectionKey =>
+      endpointId == null ? 'openai:$id' : 'oss:$endpointId:$id';
+  String get selectionLabel =>
+      endpointName == null ? displayName : '$displayName · $endpointName';
 }
 
 class CodexInstallationOption {
@@ -524,6 +536,7 @@ class CodexReadinessReport {
   final String? diagnostics;
 
   bool get ready => path != null && compatible && authenticated;
+  bool get readyWithoutOpenAIAuth => path != null && compatible;
 }
 
 enum NotificationAuthorizationState {
@@ -582,12 +595,27 @@ class AgentExecutionSettings extends ChangeNotifier {
   bool edited = false;
   bool loadingModels = false;
   String? modelError;
+  String? ossError;
+  bool loadingOssModels = false;
+  String? inferenceEndpointId;
+  String? boundEndpointId;
+  bool providerBound = false;
+  List<AgentModelOption> ossModels = const [];
+  Iterable<AgentModelOption> get allModels => [...models, ...ossModels];
+  String? get selectionKey => model == null
+      ? null
+      : inferenceEndpointId == null
+      ? 'openai:$model'
+      : 'oss:$inferenceEndpointId:$model';
   List<Map<String, dynamic>> launchSkills = [];
   AgentApprovalPreset approval = AgentApprovalPreset.approveForMe;
 
   void syncProfile(Map? profile) {
     if (profile == null || edited) return;
     model = profile['model']?.toString();
+    inferenceEndpointId = profile['inference_endpoint_id']?.toString();
+    boundEndpointId = inferenceEndpointId;
+    providerBound = true;
     reasoningEffort = profile['reasoning_effort']?.toString();
     launchSkills = ((profile['skills'] as List?) ?? [])
         .map((s) => Map<String, dynamic>.from(s as Map))
@@ -621,6 +649,8 @@ class AgentExecutionSettings extends ChangeNotifier {
   List<AgentModelOption> models = const [];
 
   Map<String, dynamic> get protocolValue => {
+    if (inferenceEndpointId != null)
+      'inference_endpoint_id': inferenceEndpointId,
     'transport': 'AppServer',
     'skills': launchSkills,
     'model': model,
@@ -644,8 +674,48 @@ class AgentExecutionSettings extends ChangeNotifier {
     notifyListeners();
   }
 
+  bool canSelect(AgentModelOption option) =>
+      !providerBound || option.endpointId == boundEndpointId;
+
+  void selectOption(AgentModelOption? option) {
+    if (providerBound && option?.endpointId != boundEndpointId) return;
+    inferenceEndpointId = option?.endpointId;
+    setModel(option?.id);
+  }
+
+  Future<void> loadOssModels(
+    DitchRuntimeClient client,
+    String projectId,
+  ) async {
+    if (loadingOssModels) return;
+    loadingOssModels = true;
+    ossError = null;
+    notifyListeners();
+    try {
+      final response = await client.ollamaRequest(projectId, 'List');
+      final endpoints = (response['Endpoints'] as List?) ?? const [];
+      ossModels = [
+        for (final endpoint in endpoints.whereType<Map>())
+          if (endpoint['enabled'] == true)
+            for (final id in (endpoint['models'] as List? ?? const []))
+              AgentModelOption(
+                id: id.toString(),
+                displayName: id.toString(),
+                endpointId: endpoint['id'].toString(),
+                endpointName: endpoint['display_name'].toString(),
+                availabilityError: endpoint['error']?.toString(),
+              ),
+      ];
+    } on Object catch (error) {
+      ossError = 'OSS models unavailable: $error';
+    } finally {
+      loadingOssModels = false;
+      notifyListeners();
+    }
+  }
+
   AgentModelOption? get selectedModel =>
-      models.where((item) => item.id == model).firstOrNull;
+      allModels.where((item) => item.selectionKey == selectionKey).firstOrNull;
 
   void setModels(List<AgentModelOption> value) {
     models = value;
@@ -661,15 +731,21 @@ class AgentSettingsScope extends InheritedWidget {
     super.key,
     required this.settings,
     required this.loadModels,
+    this.runtimeClient,
+    this.projectId,
     required super.child,
   });
   final AgentExecutionSettings settings;
   final Future<List<AgentModelOption>> Function()? loadModels;
+  final DitchRuntimeClient? runtimeClient;
+  final String? projectId;
   static AgentSettingsScope? of(BuildContext context) =>
       context.dependOnInheritedWidgetOfExactType<AgentSettingsScope>();
   @override
   bool updateShouldNotify(AgentSettingsScope oldWidget) =>
       settings != oldWidget.settings ||
+      projectId != oldWidget.projectId ||
+      runtimeClient != oldWidget.runtimeClient ||
       (loadModels == null) != (oldWidget.loadModels == null);
 }
 
@@ -1286,7 +1362,26 @@ class DitchRuntimeClient implements ProjectCloneClient {
 
   String get socketPath => _transport.socketPath;
 
-  Future<Map<String, dynamic>> request(Object body) => _transport.request(body);
+  Future<Map<String, dynamic>> request(Object body) async {
+    bool usesOss(Object? value) => value is Map
+        ? value.containsKey('Ollama') ||
+              value['inference_endpoint_id'] != null ||
+              value.values.any(usesOss)
+        : value is List && value.any(usesOss);
+    if (usesOss(body)) {
+      final response = await _transport.request('RuntimeStatus');
+      final status = response['RuntimeStatus'];
+      if (status is! Map ||
+          !(status['capabilities'] as List? ?? const []).contains(
+            'ollama_inference_v1',
+          )) {
+        throw const FormatException(
+          'Upgrade the Ditch runtime before using OSS models.',
+        );
+      }
+    }
+    return _transport.request(body);
+  }
 
   Future<Stream<Map<String, dynamic>>> subscribeEvents() =>
       _transport.subscribeEvents();
@@ -1632,6 +1727,20 @@ class DitchRuntimeClient implements ProjectCloneClient {
             : int.tryParse(value['context_window_tokens']?.toString() ?? ''),
       );
     }).toList();
+  }
+
+  Future<Map<String, dynamic>> ollamaRequest(
+    String projectId,
+    Object operation,
+  ) async {
+    final response = await request({
+      'Ollama': {'project_id': projectId, 'operation': operation},
+    });
+    final value = response['Ollama'];
+    if (value is! Map) {
+      throw const FormatException('Unexpected OSS endpoint response');
+    }
+    return Map<String, dynamic>.from(value);
   }
 
   Future<List<CodexInstallationOption>> discoverCodexInstallations() async {
@@ -2083,6 +2192,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen>
   bool _runtimeHomeMismatchReported = false;
   bool _runtimeCodexHomeMatches = true;
   bool _runtimeSupportsAppServerSessions = true;
+  bool _runtimeSupportsOllama = false;
   bool _runtimeSupportsPersistence = true;
   bool _runtimeSupportsAlwaysOnWebAccess = true;
   bool _runtimeCompatibilityReported = false;
@@ -3021,6 +3131,9 @@ class _CommandCenterScreenState extends State<CommandCenterScreen>
   }
 
   void _checkRuntimeCapabilities(RuntimeStatusDto status) {
+    _runtimeSupportsOllama = status.capabilities.contains(
+      'ollama_inference_v1',
+    );
     _runtimeSupportsAppServerSessions = status.capabilities.contains(
       'app_server_sessions_v2',
     );
@@ -3799,6 +3912,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen>
     final prompt = await showDialog<String>(
       context: context,
       builder: (context) => StartCodexSessionDialog(
+        runtimeClient: _runtimeClient,
         initialPrompt: _defaultStartPrompt,
         settings: _settingsForProject(_selectedProject.id),
         loadModels:
@@ -3828,8 +3942,12 @@ class _CommandCenterScreenState extends State<CommandCenterScreen>
     final project = _selectedProject;
     final profile = _settingsForProject(project.id).protocolValue;
     try {
-      if (!await _prepareProjectForCodex(project) ||
-          !mounted || _selectedProject.id != project.id) {
+      if (!await _prepareProjectForCodex(
+            project,
+            oss: profile['inference_endpoint_id'] != null,
+          ) ||
+          !mounted ||
+          _selectedProject.id != project.id) {
         return false;
       }
       final response = await _runtimeClient.startCodexSession(
@@ -3876,7 +3994,19 @@ class _CommandCenterScreenState extends State<CommandCenterScreen>
     }
   }
 
-  Future<bool> _prepareProjectForCodex(DitchProject project) async {
+  Future<bool> _prepareProjectForCodex(
+    DitchProject project, {
+    bool oss = false,
+  }) async {
+    if (oss && !_runtimeSupportsOllama) {
+      _showProjectSetupResult(
+        title: 'Runtime update required',
+        message:
+            'Restart Ditch with an OSS-capable runtime before using this inference server.',
+        isError: true,
+      );
+      return false;
+    }
     if (!_runtimeSupportsAppServerSessions) {
       _showProjectSetupResult(
         title: 'Runtime update required',
@@ -3895,7 +4025,11 @@ class _CommandCenterScreenState extends State<CommandCenterScreen>
           );
         }
         final setup = await _runtimeClient.checkRemoteSetup(alias: alias);
-        if (!remoteSetupReadyForExecution(setup, requireCodexSandbox: false)) {
+        if (!remoteSetupReadyForExecution(
+          setup,
+          requireCodexSandbox: false,
+          requireOpenAIAuth: !oss,
+        )) {
           if (!mounted) return false;
           final repaired = await showDialog<bool>(
             context: context,
@@ -3906,6 +4040,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen>
               initialSetup: setup,
               repairOnly: true,
               requireCodexSandbox: false,
+              requireOpenAIAuth: !oss,
             ),
           );
           if (repaired != true) return false;
@@ -3923,9 +4058,12 @@ class _CommandCenterScreenState extends State<CommandCenterScreen>
         return false;
       }
     }
-    if (_codexReadiness?.ready != true) {
+    bool ready() => oss
+        ? _codexReadiness?.readyWithoutOpenAIAuth == true
+        : _codexReadiness?.ready == true;
+    if (!ready()) {
       await _refreshCodexReadiness();
-      if (_codexReadiness?.ready != true) {
+      if (!ready()) {
         _showProjectSetupResult(
           title: 'Codex setup required',
           message:
@@ -5454,6 +5592,8 @@ class _CommandCenterScreenState extends State<CommandCenterScreen>
                 projectKey: _projectKey(_selectedProject),
                 isRemote: _selectedProject.isRemote,
                 child: AgentSettingsScope(
+                  runtimeClient: _runtimeClient,
+                  projectId: modelProjectId,
                   settings: _settingsForProject(_selectedProject.id),
                   loadModels:
                       presentation.connection == RuntimeConnectionPhase.connected
@@ -6178,6 +6318,11 @@ class CodexOnboardingView extends StatelessWidget {
                 onPressed: onAddProject,
                 icon: const Icon(Icons.add),
                 label: const Text('Add Your First Project'),
+              ),
+            if (!ready && report?.readyWithoutOpenAIAuth == true)
+              FilledButton(
+                onPressed: busy ? null : onAddProject,
+                child: const Text('Continue with OSS models'),
               ),
           ],
         ),
@@ -9801,6 +9946,8 @@ class AgentComposerState extends State<AgentComposer> {
                   ),
                   const SizedBox(height: 8),
                   AgentExecutionControls(
+                    runtimeClient: _scope?.runtimeClient,
+                    projectId: _scope?.projectId,
                     settings: _settings,
                     loadModels: _scope?.loadModels,
                     appliesNextTurn: widget.isWorking || widget.canStop,
@@ -9819,12 +9966,16 @@ class AgentExecutionControls extends StatefulWidget {
   const AgentExecutionControls({
     required this.settings,
     this.loadModels,
+    this.runtimeClient,
+    this.projectId,
     this.appliesNextTurn = false,
     super.key,
   });
 
   final AgentExecutionSettings settings;
   final Future<List<AgentModelOption>> Function()? loadModels;
+  final DitchRuntimeClient? runtimeClient;
+  final String? projectId;
   final bool appliesNextTurn;
 
   @override
@@ -9847,15 +9998,21 @@ class _AgentExecutionControlsState extends State<AgentExecutionControls> {
   }
 
   void _loadModels() {
-    if (widget.loadModels == null) {
+    if (widget.loadModels == null &&
+        (widget.runtimeClient == null || widget.projectId == null)) {
       _loadedSettings = null;
       return;
     }
     if (identical(_loadedSettings, widget.settings)) return;
     final settings = _loadedSettings = widget.settings;
-    final load = widget.loadModels!;
+    final load = widget.loadModels;
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (mounted) unawaited(settings.loadModels(load));
+      if (mounted && load != null) unawaited(settings.loadModels(load));
+      if (mounted && widget.runtimeClient != null && widget.projectId != null) {
+        unawaited(
+          settings.loadOssModels(widget.runtimeClient!, widget.projectId!),
+        );
+      }
     });
   }
 
@@ -9884,6 +10041,28 @@ class _AgentExecutionControlsState extends State<AgentExecutionControls> {
       if (confirmed != true) return;
     }
     widget.settings.setApproval(value);
+  }
+
+  Future<void> _addOssModel() async {
+    if (widget.runtimeClient == null ||
+        widget.projectId == null ||
+        widget.settings.providerBound) {
+      return;
+    }
+    final option = await showDialog<AgentModelOption>(
+      context: context,
+      builder: (_) => AddOssModelDialog(
+        client: widget.runtimeClient!,
+        projectId: widget.projectId!,
+      ),
+    );
+    if (!mounted || option == null) return;
+    await widget.settings.loadOssModels(
+      widget.runtimeClient!,
+      widget.projectId!,
+    );
+    if (!mounted) return;
+    widget.settings.selectOption(option);
   }
 
   @override
@@ -9932,29 +10111,86 @@ class _AgentExecutionControlsState extends State<AgentExecutionControls> {
                 Expanded(
                   child: DropdownButtonHideUnderline(
                     child: DropdownButton<String?>(
-                      value: widget.settings.model,
+                      value: widget.settings.selectionKey,
                       hint: const Text('Default model'),
                       isDense: true,
                       isExpanded: true,
-                      onChanged: widget.settings.setModel,
+                      onChanged: (value) {
+                        if (value == '__add_oss__') {
+                          unawaited(_addOssModel());
+                          return;
+                        }
+                        if (value == null) {
+                          widget.settings.selectOption(null);
+                          return;
+                        }
+                        final option = widget.settings.allModels
+                            .where((m) => m.selectionKey == value)
+                            .firstOrNull;
+                        if (option != null) {
+                          widget.settings.selectOption(option);
+                        }
+                      },
                       items: [
-                        const DropdownMenuItem<String?>(
+                        DropdownMenuItem<String?>(
                           value: null,
-                          child: Text('Default model'),
+                          enabled:
+                              !widget.settings.providerBound ||
+                              widget.settings.boundEndpointId == null,
+                          child: const Text('Default model'),
                         ),
                         if (widget.settings.model != null &&
-                            !widget.settings.models.any(
-                              (m) => m.id == widget.settings.model,
+                            !widget.settings.allModels.any(
+                              (m) =>
+                                  m.selectionKey ==
+                                  widget.settings.selectionKey,
                             ))
                           DropdownMenuItem<String?>(
-                            value: widget.settings.model,
-                            child: Text(widget.settings.model!),
+                            value: widget.settings.selectionKey,
+                            enabled: false,
+                            child: Text(
+                              '${widget.settings.model!}${widget.settings.inferenceEndpointId == null ? '' : ' · Saved server'}',
+                            ),
                           ),
+                        const DropdownMenuItem<String?>(
+                          value: '__openai_label__',
+                          enabled: false,
+                          child: Text('OpenAI models'),
+                        ),
                         ...widget.settings.models.map(
                           (model) => DropdownMenuItem<String?>(
-                            value: model.id,
+                            value: model.selectionKey,
+                            enabled: widget.settings.canSelect(model),
                             child: Text(model.displayName),
                           ),
+                        ),
+                        const DropdownMenuItem<String?>(
+                          value: '__oss_label__',
+                          enabled: false,
+                          child: Text('OSS models'),
+                        ),
+                        ...widget.settings.ossModels.map(
+                          (model) => DropdownMenuItem<String?>(
+                            value: model.selectionKey,
+                            enabled: widget.settings.canSelect(model),
+                            child: Tooltip(
+                              message:
+                                  model.availabilityError ??
+                                  model.selectionLabel,
+                              child: Text(
+                                model.selectionLabel,
+                                overflow: TextOverflow.ellipsis,
+                              ),
+                            ),
+                          ),
+                        ),
+                        DropdownMenuItem<String?>(
+                          value: '__add_oss__',
+                          enabled:
+                              !widget.settings.providerBound &&
+                              widget.runtimeClient != null &&
+                              widget.projectId != null,
+                          child: const Text('+ Add OSS model…'),
                         ),
                       ],
                     ),
@@ -9966,6 +10202,23 @@ class _AgentExecutionControlsState extends State<AgentExecutionControls> {
             ),
           ),
           if (widget.settings.loadingModels) const Text('Loading models…'),
+          if (widget.settings.loadingOssModels)
+            const Text('Loading OSS models…'),
+          if (widget.settings.ossError != null)
+            TextButton(
+              onPressed:
+                  widget.runtimeClient == null || widget.projectId == null
+                  ? null
+                  : () => widget.settings.loadOssModels(
+                      widget.runtimeClient!,
+                      widget.projectId!,
+                    ),
+              child: Text(widget.settings.ossError!),
+            ),
+          if (widget.settings.selectedModel?.availabilityError != null)
+            Text(widget.settings.selectedModel!.availabilityError!),
+          if (widget.settings.providerBound)
+            const Text('Start a new agent to change inference server'),
           if (widget.settings.modelError != null)
             TextButton(
               onPressed: widget.loadModels == null
@@ -11453,8 +11706,15 @@ bool remoteSetupCheckHasState(
 bool remoteSetupReadyForExecution(
   Map<String, dynamic> setup, {
   required bool requireCodexSandbox,
+  bool requireOpenAIAuth = true,
 }) =>
-    setup['ready'] == true &&
+    (requireOpenAIAuth
+        ? setup['ready'] == true
+        : remoteSetupCheckHasState(
+            setup,
+            key: 'oss_execution',
+            state: 'ready',
+          )) &&
     (!requireCodexSandbox ||
         remoteSetupCheckHasState(setup, key: 'codex_sandbox', state: 'ready'));
 
@@ -11481,6 +11741,7 @@ class AddRemoteProjectDialog extends StatefulWidget {
     this.initialSetup,
     this.repairOnly = false,
     this.requireCodexSandbox = false,
+    this.requireOpenAIAuth = true,
     super.key,
   });
   final DitchRuntimeClient client;
@@ -11488,6 +11749,7 @@ class AddRemoteProjectDialog extends StatefulWidget {
   final Map<String, dynamic>? initialSetup;
   final bool repairOnly;
   final bool requireCodexSandbox;
+  final bool requireOpenAIAuth;
 
   @override
   State<AddRemoteProjectDialog> createState() => _AddRemoteProjectDialogState();
@@ -11608,6 +11870,7 @@ class _AddRemoteProjectDialogState extends State<AddRemoteProjectDialog> {
     final ready = remoteSetupReadyForExecution(
       setup,
       requireCodexSandbox: widget.requireCodexSandbox,
+      requireOpenAIAuth: widget.requireOpenAIAuth,
     );
     final home = setup['home_directory']?.toString().trim();
     final offerSandboxSetup = remoteSetupShouldConfigureSandbox(
@@ -11864,6 +12127,7 @@ class _AddRemoteProjectDialogState extends State<AddRemoteProjectDialog> {
         remoteSetupReadyForExecution(
           _setup!,
           requireCodexSandbox: widget.requireCodexSandbox,
+          requireOpenAIAuth: widget.requireOpenAIAuth,
         );
     final selectingDirectory = effectiveReady && _selectingDirectory;
     final runtimeNeedsInstall =
@@ -12608,6 +12872,7 @@ class StartCodexSessionDialog extends StatefulWidget {
     this.onTask,
     this.settings,
     this.loadModels,
+    this.runtimeClient,
     this.skillsController,
     this.projectId,
     super.key,
@@ -12616,6 +12881,7 @@ class StartCodexSessionDialog extends StatefulWidget {
   final String initialPrompt;
   final AgentExecutionSettings? settings;
   final Future<List<AgentModelOption>> Function()? loadModels;
+  final DitchRuntimeClient? runtimeClient;
   final VoidCallback? onTask;
   final SkillsController? skillsController;
   final String? projectId;
@@ -12687,6 +12953,8 @@ class _StartCodexSessionDialogState extends State<StartCodexSessionDialog> {
             AgentExecutionControls(
               settings: settings,
               loadModels: widget.loadModels,
+              runtimeClient: widget.runtimeClient,
+              projectId: widget.projectId,
             ),
             if (showUnfinishedFeatureControls &&
                 widget.skillsController != null &&

@@ -284,6 +284,7 @@ impl RuntimeState {
                     && a.revision == b.revision
             });
         if original.model != profile.model
+            || original.inference_endpoint_id != profile.inference_endpoint_id
             || original.reasoning_effort != profile.reasoning_effort
             || original.approval != profile.approval
             || !same_skills

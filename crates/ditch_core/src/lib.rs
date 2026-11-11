@@ -131,6 +131,9 @@ pub enum AgentApprovalPreset {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Default)]
 pub struct AgentExecutionProfile {
+    /// Inference identity; execution still belongs to Codex on the project host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inference_endpoint_id: Option<Uuid>,
     #[serde(default)]
     pub transport: AgentTransport,
     #[serde(default)]
@@ -140,6 +143,8 @@ pub struct AgentExecutionProfile {
     #[serde(default)]
     pub approval: AgentApprovalPreset,
 }
+
+pub mod ollama;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Default)]
 pub enum ProjectGitPolicy {

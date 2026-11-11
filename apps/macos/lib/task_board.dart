@@ -2204,6 +2204,16 @@ class _TaskInspectorState extends State<_TaskInspector> {
   }
 
   Future<void> generatePlan() async {
+    if (widget.profile()['inference_endpoint_id'] != null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            'Automatic board planning with OSS models is not supported yet. Enter the plan manually.',
+          ),
+        ),
+      );
+      return;
+    }
     if (!await saveDescription() || !mounted) return;
     final task = widget.controller.task(widget.taskId)!;
     await widget.controller.mutate(task.projectId, {
