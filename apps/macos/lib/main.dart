@@ -44,6 +44,7 @@ export 'data/project_models.dart';
 export 'widgets/project_sidebar.dart';
 
 part 'ollama_ui.dart';
+part 'agent_model_picker.dart';
 
 const ditchDeploymentEnvironment = runtimeDeploymentEnvironment;
 const ditchRelayOrigin = String.fromEnvironment(
@@ -10105,95 +10106,30 @@ class _AgentExecutionControlsState extends State<AgentExecutionControls> {
             ),
           ),
           SizedBox(
-            width: controlWidth,
+            width: 280,
             child: Row(
               children: [
                 Expanded(
-                  child: DropdownButtonHideUnderline(
-                    child: DropdownButton<String?>(
-                      value: widget.settings.selectionKey,
-                      hint: const Text('Default model'),
-                      isDense: true,
-                      isExpanded: true,
-                      onChanged: (value) {
-                        if (value == '__add_oss__') {
-                          unawaited(_addOssModel());
-                          return;
-                        }
-                        if (value == null) {
-                          widget.settings.selectOption(null);
-                          return;
-                        }
-                        final option = widget.settings.allModels
-                            .where((m) => m.selectionKey == value)
-                            .firstOrNull;
-                        if (option != null) {
-                          widget.settings.selectOption(option);
-                        }
-                      },
-                      items: [
-                        DropdownMenuItem<String?>(
-                          value: null,
-                          enabled:
-                              !widget.settings.providerBound ||
-                              widget.settings.boundEndpointId == null,
-                          child: const Text('Default model'),
-                        ),
-                        if (widget.settings.model != null &&
-                            !widget.settings.allModels.any(
-                              (m) =>
-                                  m.selectionKey ==
-                                  widget.settings.selectionKey,
-                            ))
-                          DropdownMenuItem<String?>(
-                            value: widget.settings.selectionKey,
-                            enabled: false,
-                            child: Text(
-                              '${widget.settings.model!}${widget.settings.inferenceEndpointId == null ? '' : ' · Saved server'}',
+                  child: AgentModelPicker(
+                    settings: widget.settings,
+                    onAdd:
+                        widget.runtimeClient != null && widget.projectId != null
+                        ? () => unawaited(_addOssModel())
+                        : null,
+                    onRetryOpenAI: widget.loadModels == null
+                        ? null
+                        : () => unawaited(
+                            widget.settings.loadModels(widget.loadModels!),
+                          ),
+                    onRetryOss:
+                        widget.runtimeClient == null || widget.projectId == null
+                        ? null
+                        : () => unawaited(
+                            widget.settings.loadOssModels(
+                              widget.runtimeClient!,
+                              widget.projectId!,
                             ),
                           ),
-                        const DropdownMenuItem<String?>(
-                          value: '__openai_label__',
-                          enabled: false,
-                          child: Text('OpenAI models'),
-                        ),
-                        ...widget.settings.models.map(
-                          (model) => DropdownMenuItem<String?>(
-                            value: model.selectionKey,
-                            enabled: widget.settings.canSelect(model),
-                            child: Text(model.displayName),
-                          ),
-                        ),
-                        const DropdownMenuItem<String?>(
-                          value: '__oss_label__',
-                          enabled: false,
-                          child: Text('OSS models'),
-                        ),
-                        ...widget.settings.ossModels.map(
-                          (model) => DropdownMenuItem<String?>(
-                            value: model.selectionKey,
-                            enabled: widget.settings.canSelect(model),
-                            child: Tooltip(
-                              message:
-                                  model.availabilityError ??
-                                  model.selectionLabel,
-                              child: Text(
-                                model.selectionLabel,
-                                overflow: TextOverflow.ellipsis,
-                              ),
-                            ),
-                          ),
-                        ),
-                        DropdownMenuItem<String?>(
-                          value: '__add_oss__',
-                          enabled:
-                              !widget.settings.providerBound &&
-                              widget.runtimeClient != null &&
-                              widget.projectId != null,
-                          child: const Text('+ Add OSS model…'),
-                        ),
-                      ],
-                    ),
                   ),
                 ),
                 const SizedBox(width: 6),
@@ -10201,31 +10137,6 @@ class _AgentExecutionControlsState extends State<AgentExecutionControls> {
               ],
             ),
           ),
-          if (widget.settings.loadingModels) const Text('Loading models…'),
-          if (widget.settings.loadingOssModels)
-            const Text('Loading OSS models…'),
-          if (widget.settings.ossError != null)
-            TextButton(
-              onPressed:
-                  widget.runtimeClient == null || widget.projectId == null
-                  ? null
-                  : () => widget.settings.loadOssModels(
-                      widget.runtimeClient!,
-                      widget.projectId!,
-                    ),
-              child: Text(widget.settings.ossError!),
-            ),
-          if (widget.settings.selectedModel?.availabilityError != null)
-            Text(widget.settings.selectedModel!.availabilityError!),
-          if (widget.settings.providerBound)
-            const Text('Start a new agent to change inference server'),
-          if (widget.settings.modelError != null)
-            TextButton(
-              onPressed: widget.loadModels == null
-                  ? null
-                  : () => widget.settings.loadModels(widget.loadModels!),
-              child: Text(widget.settings.modelError!),
-            ),
           if (widget.appliesNextTurn) const Text('Applies next turn'),
         ],
       );

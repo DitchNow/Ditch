@@ -63,7 +63,7 @@ void main() {
     await tester.pumpAndSettle();
     await tester.tap(find.text('Ask for approval').last);
     await tester.pumpAndSettle();
-    await tester.tap(find.byType(DropdownButton<String?>));
+    await tester.tap(find.byType(AgentModelPicker));
     await tester.pumpAndSettle();
     await tester.tap(find.text('Project model').last);
     await tester.pumpAndSettle();

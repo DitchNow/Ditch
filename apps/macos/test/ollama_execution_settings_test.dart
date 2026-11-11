@@ -208,13 +208,15 @@ void main() {
         ),
       );
       await tester.pumpAndSettle();
-      await tester.tap(find.byType(DropdownButton<String?>));
+      await tester.tap(find.byType(AgentModelPicker));
       await tester.pumpAndSettle();
       expect(find.text('OpenAI models'), findsOneWidget);
       expect(find.text('OSS models'), findsOneWidget);
-      expect(find.text('qwen:9b · GPU A'), findsOneWidget);
-      expect(find.text('qwen:9b · GPU B'), findsOneWidget);
-      await tester.tap(find.text('+ Add OSS model…').last);
+      await tester.tap(find.text('OSS models'));
+      await tester.pumpAndSettle();
+      expect(find.text('GPU A'), findsOneWidget);
+      expect(find.text('GPU B'), findsOneWidget);
+      await tester.tap(find.text('Add OSS model…').last);
       await tester.pumpAndSettle();
       expect(find.byType(AddOssModelDialog), findsOneWidget);
       await tester.tap(find.text('Cancel'));
