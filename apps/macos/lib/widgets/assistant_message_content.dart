@@ -4,7 +4,10 @@ import 'package:flutter_markdown_plus/flutter_markdown_plus.dart';
 import 'package:markdown/markdown.dart' as md;
 
 import '../design_system/ditch_theme.dart';
+import '../application/chat_links.dart';
 import 'assistant_message_image.dart';
+import 'chat_code_source.dart';
+import 'chat_mermaid_block.dart';
 import 'chat_visual_block.dart';
 
 typedef ChatLinkOpener = Future<bool> Function(Uri uri);
@@ -22,11 +25,19 @@ class AssistantMessageContent extends StatefulWidget {
     required this.text,
     this.openLink = openChatLink,
     this.fetchImage = fetchChatImage,
+    this.revealFile = revealChatFile,
+    this.projectPath,
+    this.isRemote = false,
+    this.remoteHost,
     super.key,
   });
   final String text;
   final ChatLinkOpener openLink;
   final ChatImageFetcher fetchImage;
+  final ChatFileRevealer revealFile;
+  final String? projectPath;
+  final bool isRemote;
+  final String? remoteHost;
 
   @override
   State<AssistantMessageContent> createState() =>
@@ -43,25 +54,64 @@ class _AssistantMessageContentState extends State<AssistantMessageContent> {
     super.didUpdateWidget(oldWidget);
     if (oldWidget.text != widget.text ||
         oldWidget.openLink != widget.openLink ||
-        oldWidget.fetchImage != widget.fetchImage) {
+        oldWidget.fetchImage != widget.fetchImage ||
+        oldWidget.revealFile != widget.revealFile ||
+        oldWidget.projectPath != widget.projectPath ||
+        oldWidget.isRemote != widget.isRemote ||
+        oldWidget.remoteHost != widget.remoteHost) {
       _body = null;
       _linkError = null;
     }
   }
 
+  ChatLinkTarget _resolve(String destination) => resolveChatLink(
+    destination,
+    projectPath: widget.projectPath,
+    isRemote: widget.isRemote,
+    remoteHost: widget.remoteHost,
+  );
+
+  String _tooltip(String destination) => switch (_resolve(destination)) {
+    ChatFileLink(:final path, :final withoutLineSuffix) =>
+      'Show file in Finder\n${withoutLineSuffix ?? path}',
+    _ => destination,
+  };
+
   Future<void> _open(String destination) async {
-    final uri = chatHttpsUri(destination);
+    final target = _resolve(destination);
+    final originalText = widget.text;
+    final originalProject = (
+      widget.projectPath,
+      widget.isRemote,
+      widget.remoteHost,
+    );
     String? error;
-    if (uri == null) {
-      error = 'Only HTTPS links can be opened.';
-    } else {
-      try {
-        if (!await widget.openLink(uri)) error = 'Could not open this link.';
-      } catch (_) {
-        error = 'Could not open this link.';
+    try {
+      switch (target) {
+        case ChatWebLink(:final uri):
+          if (!await widget.openLink(uri)) error = 'Could not open this link.';
+        case ChatFileLink():
+          await widget.revealFile(target);
+        case UnsupportedChatLink(:final message):
+          error = message;
       }
+    } on ChatLinkFailure catch (failure) {
+      error = failure.message;
+    } on MissingPluginException {
+      error = target is ChatFileLink
+          ? 'Finder integration is unavailable.'
+          : 'Could not open this link.';
+    } catch (_) {
+      error = target is ChatFileLink
+          ? 'Could not show this file in Finder.'
+          : 'Could not open this link.';
     }
-    if (mounted) setState(() => _linkError = error);
+    if (mounted &&
+        widget.text == originalText &&
+        (widget.projectPath, widget.isRemote, widget.remoteHost) ==
+            originalProject) {
+      setState(() => _linkError = error);
+    }
   }
 
   @override
@@ -80,6 +130,9 @@ class _AssistantMessageContentState extends State<AssistantMessageContent> {
     // Retain the Markdown widget and stylesheet on unrelated transcript rebuilds.
     // MarkdownBody also retains its parsed children when data/styles are equal.
     _body ??= MarkdownBody(
+      // MarkdownBody reparses only on data/style changes. Context also changes
+      // relative destinations and their tooltips, even with identical Markdown.
+      key: ValueKey((widget.projectPath, widget.isRemote, widget.remoteHost)),
       data: widget.text,
       fitContent: false,
       extensionSet: md.ExtensionSet.gitHubFlavored,
@@ -121,7 +174,7 @@ class _AssistantMessageContentState extends State<AssistantMessageContent> {
       ),
       builders: {
         'pre': _CodeBuilder(),
-        'a': _LinkBuilder(_open, widget.fetchImage),
+        'a': _LinkBuilder(_open, _tooltip, widget.fetchImage),
       },
       checkboxBuilder: (checked) => Semantics(
         checked: checked,
@@ -161,8 +214,9 @@ class _AssistantMessageContentState extends State<AssistantMessageContent> {
 }
 
 class _LinkBuilder extends MarkdownElementBuilder {
-  _LinkBuilder(this.open, this.fetchImage);
+  _LinkBuilder(this.open, this.tooltip, this.fetchImage);
   final Future<void> Function(String) open;
+  final String Function(String) tooltip;
   final ChatImageFetcher fetchImage;
 
   InlineSpan _span(md.Node node) {
@@ -199,7 +253,7 @@ class _LinkBuilder extends MarkdownElementBuilder {
   ) {
     final destination = element.attributes['href'] ?? '';
     return Tooltip(
-      message: destination,
+      message: tooltip(destination),
       child: Semantics(
         link: true,
         child: InkWell(
@@ -280,32 +334,22 @@ class _CodeBuilder extends MarkdownElementBuilder {
                 ),
               ),
               IconButton(
-                tooltip: 'Copy code',
+                tooltip: language == 'mermaid' ? 'Copy as Markdown' : 'Copy code',
                 visualDensity: VisualDensity.compact,
                 icon: const Icon(Icons.copy_outlined, size: 16),
-                onPressed: () => Clipboard.setData(ClipboardData(text: source)),
+                onPressed: () => Clipboard.setData(ClipboardData(
+                  text: language == 'mermaid' ? mermaidMarkdown(source) : source,
+                )),
               ),
             ],
           ),
         ),
-        if (visual != null)
+        if (language == 'mermaid' && element.attributes['data-closed'] == 'true')
+          ChatMermaidBlock(source: source)
+        else if (visual != null)
           ChatVisualBlock(data: visual)
         else
-          SingleChildScrollView(
-            scrollDirection: Axis.horizontal,
-            primary: false,
-            padding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
-            child: Text(
-              source.endsWith('\n')
-                  ? source.substring(0, source.length - 1)
-                  : source,
-              style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                fontFamily: 'SF Mono',
-                fontSize: 12.5,
-                height: 1.45,
-              ),
-            ),
-          ),
+          ChatCodeSource(source: source),
       ],
     );
   }

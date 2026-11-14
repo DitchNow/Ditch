@@ -439,7 +439,7 @@ void main() {
       host(
         AssistantMessageContent(
           text:
-              '[Good](https://example.com/path) [Bad](file:///etc/passwd) [Script](javascript:alert) [Command](command:run)',
+              '[Good](https://example.com/path) [Bad](http://example.com) [Script](javascript:alert) [Command](command:run)',
           openLink: (uri) async {
             opened.add(uri);
             return false;
@@ -451,7 +451,10 @@ void main() {
     for (final name in ['Bad', 'Script', 'Command']) {
       await tester.tap(find.text(name));
       await tester.pump();
-      expect(find.text('Only HTTPS links can be opened.'), findsOneWidget);
+      expect(
+        find.text('Only HTTPS links and local file paths are supported.'),
+        findsOneWidget,
+      );
     }
     expect(opened, isEmpty);
     await tester.tap(find.text('Good'));

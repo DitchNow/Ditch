@@ -3,6 +3,7 @@ import 'data/project_clone_models.dart';
 import 'widgets/clone_project_dialog.dart';
 import 'widgets/github_mark.dart';
 import 'widgets/assistant_message_content.dart';
+import 'widgets/chat_link_scope.dart';
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
@@ -5666,62 +5667,68 @@ class _CommandCenterScreenState extends State<CommandCenterScreen>
                 _maximumInspectorWidth(constraints.maxWidth, showSidebar),
               );
               final modelProjectId = _selectedProject.id;
-              final agentsSurface = AgentPromptDraftScope(
-                drafts: _promptDrafts,
-                projectKey: _projectKey(_selectedProject),
+              final agentsSurface = ChatLinkScope(
+                projectPath: _selectedProject.path,
                 isRemote: _selectedProject.isRemote,
-                child: AgentSettingsScope(
-                  runtimeClient: _runtimeClient,
-                  projectId: modelProjectId,
-                  settings: _settingsForProject(_selectedProject.id),
-                  loadModels:
-                      presentation.connection ==
-                          RuntimeConnectionPhase.connected
-                      ? () => _runtimeClient.listCodexModels(
-                          projectId: modelProjectId,
-                        )
-                      : null,
-                  child: AgentsSurface(
-                    onOpenBoard: () => _openBoard(_selectedProject.id),
-                    sessions: _visibleSessions,
-                    expandedAgentLocalId: _expandedAgentLocalId,
-                    focusedAgentLocalId: _focusedAgentLocalId,
-                    chatViewport: _chatViewport,
-                    agentListController: _agentListController,
-                    composerKey: _idleComposerKey,
-                    composerKeyForAgent: _composerKeyForAgent,
-                    headerKeyForAgent: _agentHeaderKey,
-                    initialPrompt: _defaultStartPrompt,
-                    effectiveCodexHome: _selectedProject.isRemote
-                        ? null
-                        : _effectiveRuntimeCodexHome,
-                    onStartCodex: _startCodex,
-                    onStartPrompt: _startCodexRuntime,
-                    onSubmitPrompt: _submitComposer,
-                    onLoadMessages: _loadAgentMessages,
-                    onStopCodex: _stopCodex,
-                    onDeleteAgent: _deleteAgent,
-                    onRenameAgent: _renameAgent,
-                    hasUnreadResult: (session) =>
-                        unreadResultAttentionIdsForAgent(
-                          attention: _attention,
-                          agentId: session.localId,
-                          readAttentionIds: _readAttentionIds,
-                        ).isNotEmpty,
-                    onFocusAgent: (session) {
-                      if (session != null) _markAgentResultsRead(session);
-                      setState(() {
-                        _focusedAgentLocalId = session?.localId;
-                        if (session != null) {
-                          _expandedAgentLocalId = session.localId;
+                remoteHost: _selectedProject.sshHostAlias,
+                child: AgentPromptDraftScope(
+                  drafts: _promptDrafts,
+                  projectKey: _projectKey(_selectedProject),
+                  isRemote: _selectedProject.isRemote,
+                  child: AgentSettingsScope(
+                    runtimeClient: _runtimeClient,
+                    projectId: modelProjectId,
+                    settings: _settingsForProject(_selectedProject.id),
+                    loadModels:
+                        presentation.connection ==
+                            RuntimeConnectionPhase.connected
+                        ? () => _runtimeClient.listCodexModels(
+                            projectId: modelProjectId,
+                          )
+                        : null,
+                    child: AgentsSurface(
+                      onOpenBoard: () => _openBoard(_selectedProject.id),
+                      sessions: _visibleSessions,
+                      expandedAgentLocalId: _expandedAgentLocalId,
+                      focusedAgentLocalId: _focusedAgentLocalId,
+                      chatViewport: _chatViewport,
+                      agentListController: _agentListController,
+                      composerKey: _idleComposerKey,
+                      composerKeyForAgent: _composerKeyForAgent,
+                      headerKeyForAgent: _agentHeaderKey,
+                      initialPrompt: _defaultStartPrompt,
+                      effectiveCodexHome: _selectedProject.isRemote
+                          ? null
+                          : _effectiveRuntimeCodexHome,
+                      onStartCodex: _startCodex,
+                      onStartPrompt: _startCodexRuntime,
+                      onSubmitPrompt: _submitComposer,
+                      onLoadMessages: _loadAgentMessages,
+                      onStopCodex: _stopCodex,
+                      onDeleteAgent: _deleteAgent,
+                      onRenameAgent: _renameAgent,
+                      hasUnreadResult: (session) =>
+                          unreadResultAttentionIdsForAgent(
+                            attention: _attention,
+                            agentId: session.localId,
+                            readAttentionIds: _readAttentionIds,
+                          ).isNotEmpty,
+                      onFocusAgent: (session) {
+                        if (session != null) _markAgentResultsRead(session);
+                        setState(() {
+                          _focusedAgentLocalId = session?.localId;
+                          if (session != null) {
+                            _expandedAgentLocalId = session.localId;
+                          }
+                        });
+                        final agentId =
+                            session?.localId ?? _expandedAgentLocalId;
+                        if (agentId != null) {
+                          _focusAgentComposerAfterLayout(agentId);
                         }
-                      });
-                      final agentId = session?.localId ?? _expandedAgentLocalId;
-                      if (agentId != null) {
-                        _focusAgentComposerAfterLayout(agentId);
-                      }
-                    },
-                    onToggleExpanded: _toggleExpandedAgent,
+                      },
+                      onToggleExpanded: _toggleExpandedAgent,
+                    ),
                   ),
                 ),
               );
@@ -6089,7 +6096,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen>
                 );
               }
 
-              return ColoredBox(
+              return Material(
                 color: context.ditch.workspace,
                 child: Column(
                   children: [
@@ -9800,6 +9807,7 @@ class AgentChatBubble extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final linkContext = ChatLinkScope.maybeOf(context);
     final colors = Theme.of(context).colorScheme;
     final (
       label,
@@ -9884,7 +9892,12 @@ class AgentChatBubble extends StatelessWidget {
                     ),
                     const SizedBox(height: 8),
                     if (message.role == ChatMessageRole.assistant)
-                      AssistantMessageContent(text: message.text)
+                      AssistantMessageContent(
+                        text: message.text,
+                        projectPath: linkContext?.projectPath,
+                        isRemote: linkContext?.isRemote ?? false,
+                        remoteHost: linkContext?.remoteHost,
+                      )
                     else if (message.role == ChatMessageRole.tool)
                       SelectionArea(
                         child: Text(

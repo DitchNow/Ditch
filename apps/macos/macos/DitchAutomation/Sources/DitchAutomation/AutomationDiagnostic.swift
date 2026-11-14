@@ -1,0 +1,84 @@
+import Foundation
+import PeekabooAutomationKit
+import PeekabooFoundation
+
+/// Only fixed categories cross the ABI. Upstream messages/context can contain
+/// captured text, file paths, typed values, or account information.
+struct AutomationDiagnostic: Encodable {
+    let ok = false
+    let error: String
+    let message: String
+    let captureStage: String?
+    let captureReason: String?
+
+    init(_ failure: any Error) {
+        var stage: String?
+        var reason: String?
+        let code: String
+        if let action = failure as? DesktopActionFailure {
+            code = action.outcome.dispatchState.mutationDispatched ? "outcome_unknown" : "actionRefused"
+        } else if let native = failure as? AutomationFailure {
+            code = native.rawValue
+        } else if failure is CancellationError {
+            code = "cancelled"
+        } else if let ownership = failure as? ScreenCaptureKitOwnershipDiagnostic {
+            code = "captureCoordinationFailed"
+            stage = ownership.stage.rawValue
+            reason = ownership.kind.rawValue
+        } else if let observation = failure as? DesktopObservationError {
+            switch observation {
+            case .unsupportedTarget: code = "unsupportedTarget"
+            case .targetNotFound: code = "targetNotFound"
+            case .targetChanged: code = "staleSnapshot"
+            case .ambiguousWindowTitle: code = "ambiguousTarget"
+            }
+        } else if let capture = failure as? CaptureError {
+            switch capture {
+            case .screenRecordingPermissionDenied, .permissionDeniedScreenRecording,
+                 .accessibilityPermissionDenied, .appleScriptPermissionDenied:
+                code = "permissionRequired"
+            case .windowNotFound, .windowTitleNotFound, .appNotFound, .noWindowsFound,
+                 .noFrontmostApplication: code = "targetNotFound"
+            case .detectionTimedOut: code = "observationTimedOut"
+            case .fileWriteError, .fileIOError: code = "captureStorageFailed"
+            default: code = "captureFailed"
+            }
+        } else if let standard = failure as? any StandardizedError {
+            switch standard.code {
+            case .screenRecordingPermissionDenied, .accessibilityPermissionDenied,
+                 .eventSynthesizingPermissionDenied: code = "permissionRequired"
+            case .applicationNotFound, .windowNotFound, .elementNotFound, .menuNotFound:
+                code = "targetNotFound"
+            case .snapshotNotFound, .snapshotStale, .sessionNotFound: code = "staleSnapshot"
+            case .captureFailed: code = "captureFailed"
+            case .accessibilityIncomplete: code = "accessibilityIncomplete"
+            case .timeout: code = "observationTimedOut"
+            case .cancelled: code = "cancelled"
+            case .fileIOError: code = "captureStorageFailed"
+            default: code = "operationFailed"
+            }
+        } else {
+            code = "operationFailed"
+        }
+        self.error = code
+        self.captureStage = stage
+        self.captureReason = reason
+        self.message = switch code {
+        case "protectedTarget": "Ditch blocks this target. This is not a missing macOS permission."
+        case "permissionRequired": "The native operation requires a macOS permission. Check Ditch computer-use status."
+        case "invalidArguments": "Invalid desktop arguments. Use IDs returned by the desktop tools."
+        case "unsupportedTarget": "This target is not supported by the desktop adapter."
+        case "targetNotFound", "ambiguousTarget": "List targets again and select an exact returned target."
+        case "staleSnapshot": "No valid snapshot is available. Observe the target before requesting another action."
+        case "captureCoordinationFailed": "Capture coordination failed. No new observation is available."
+        case "captureFailed": "Screen capture failed. No new observation is available."
+        case "captureStorageFailed": "The native host could not store the observation."
+        case "accessibilityIncomplete": "The target did not return a usable accessibility observation."
+        case "observationTimedOut": "The native operation timed out. Its result is not verified."
+        case "outcome_unknown": "Input may have been dispatched. Observe the target; do not automatically repeat the action."
+        case "actionRefused": "Native input was refused. No successful action is confirmed."
+        case "cancelled": "The operation was cancelled."
+        default: "The native operation failed. Do not claim that it succeeded."
+        }
+    }
+}

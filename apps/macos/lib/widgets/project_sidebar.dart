@@ -451,7 +451,7 @@ class _ProjectSidebarState extends State<ProjectSidebar> {
       }
     }
 
-    return ColoredBox(
+    return Material(
       color: context.ditch.sidebar,
       child: SizedBox(
         width: widget.width,

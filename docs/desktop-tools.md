@@ -168,6 +168,42 @@ dependencies and the exact MCP/async Cargo dependency graph for that edition.
 
 ## Validation status and remaining release checks
 
+### November 14 independent-review follow-up
+
+The affected live Qwen session invoked two independent `codex exec` children
+through its Full Access shell. Their traces reported an OpenAI provider. The
+managed thread's CUA exclusion did not constrain those child processes. The
+current host execution path therefore does **not** satisfy whole-run Qwen-only
+inference isolation. Do not interpret catalogue verification as containment.
+
+The follow-up source changes reject missing, null, conflicting, or mismatched
+provider/model metadata in OSS thread creation/resumption before tool discovery
+or `turn/start`. New/resumed launch regressions pass in both editions. This
+hardens the managed thread; it does not close the descendant-process escape.
+
+Native errors now return fixed diagnostic categories and recovery text instead
+of flattening every upstream failure to `operationFailed`. Capture coordination
+includes only typed stage/reason values. Captured text, file paths, and arbitrary
+upstream messages are not serialized. Three focused native diagnostic tests pass;
+the production Swift module type-checks against the existing built dependencies.
+The package test runner could not write an existing build output, so the diagnostic
+tests were compiled separately against those dependencies and run through XCTest.
+Zero PID/window IDs are rejected before attempting an observation.
+
+No new signed application was deployed by this follow-up. The original Terminal
+observation failure has not been reproduced with the new diagnostics. No desktop
+action, menu-bar operation, or animated cursor has been qualified by these tests.
+
+Whole-run isolation remains gated on an execution-environment decision and proof.
+The implementation session cannot apply even a minimal macOS sandbox profile
+(`sandbox_apply: Operation not permitted`); this limits local validation and does
+not prove that sandboxing cannot work on the target machine. The user was asked
+to choose an isolated local environment or a separate execution host. Either
+still requires a controlled host desktop bridge: unrestricted control of an
+authenticated host terminal/application would defeat the boundary.
+
+The historical validation notes below retain their original scope.
+
 Earlier staging debug bundles built. Native cancellation/ownership tests, runtime
 policy/dedup tests, focused Flutter regressions, Codex session/approval regressions
 and nested signing tests pass. The isolated live Qwen3.5:9b probe passed tool

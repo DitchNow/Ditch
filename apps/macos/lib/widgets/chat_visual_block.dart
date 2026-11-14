@@ -1,7 +1,9 @@
 import 'dart:convert';
 import 'dart:math' as math;
 
+import 'package:fl_chart/fl_chart.dart';
 import 'package:flutter/material.dart';
+import 'package:intl/intl.dart';
 
 import '../design_system/ditch_theme.dart';
 
@@ -160,42 +162,23 @@ class ChatVisualBlock extends StatelessWidget {
             )
           else ...[
             // Values remain accessible without interpreting the plot or colors.
-            SingleChildScrollView(
-              scrollDirection: Axis.horizontal,
-              primary: false,
-              child: SizedBox(
-                width: math.max(300, data.labels.length * 80).toDouble(),
-                child: Column(
-                  children: [
-                    ExcludeSemantics(
-                      child: SizedBox(
-                        height: 180,
-                        width: double.infinity,
-                        child: CustomPaint(
-                          painter: _ChartPainter(
-                            data,
-                            seriesColors,
-                            tokens.line,
-                          ),
-                        ),
-                      ),
-                    ),
-                    Row(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        for (var i = 0; i < data.labels.length; i++)
-                          Expanded(
-                            child: Padding(
-                              padding: const EdgeInsets.all(4),
-                              child: Text(
-                                data.labels[i],
-                                textAlign: TextAlign.center,
-                              ),
-                            ),
-                          ),
-                      ],
-                    ),
-                  ],
+            LayoutBuilder(
+              builder: (context, constraints) => SingleChildScrollView(
+                scrollDirection: Axis.horizontal,
+                primary: false,
+                child: SizedBox(
+                  width: math
+                      .max(
+                        constraints.maxWidth.isFinite
+                            ? constraints.maxWidth
+                            : 300,
+                        math.max(300, data.labels.length * 80),
+                      )
+                      .toDouble(),
+                  height: 240,
+                  child: ExcludeSemantics(
+                    child: _NativeChart(data: data, colors: seriesColors),
+                  ),
                 ),
               ),
             ),
@@ -222,63 +205,171 @@ class ChatVisualBlock extends StatelessWidget {
   }
 }
 
-class _ChartPainter extends CustomPainter {
-  _ChartPainter(this.data, this.colors, this.gridColor);
+/// The same bounded data contract rendered by fl_chart, with Ditch colors.
+class _NativeChart extends StatelessWidget {
+  const _NativeChart({required this.data, required this.colors});
+
   final ChatVisualData data;
   final List<Color> colors;
-  final Color gridColor;
 
   @override
-  void paint(Canvas canvas, Size size) {
-    final values = data.series.expand((s) => s.values);
-    final min = math.min(0.0, values.reduce(math.min));
-    final max = math.max(0.0, values.reduce(math.max));
-    final range = max == min ? 1.0 : max - min;
-    double y(double value) => 8 + (max - value) / range * (size.height - 16);
-    final step = size.width / data.labels.length;
-    canvas.drawLine(
-      Offset(0, y(0)),
-      Offset(size.width, y(0)),
-      Paint()..color = gridColor,
+  Widget build(BuildContext context) {
+    final tokens = context.ditch;
+    final originalValues = data.series.expand((series) => series.values);
+    final magnitude = originalValues
+        .map((value) => value.abs())
+        .reduce(math.max);
+    // Avoid a zero grid interval when a finite subnormal value is divided by
+    // the tick count. Labels and tooltips still show the original units.
+    final scale = magnitude > 0 && magnitude < 1e-6 ? magnitude : 1.0;
+    final values = originalValues.map((value) => value / scale);
+    final low = math.min(0.0, values.reduce(math.min));
+    final high = math.max(0.0, values.reduce(math.max));
+    final range = high == low ? 1.0 : high - low;
+    final minY = low < 0 ? low - range * 0.1 : 0.0;
+    final maxY = high > 0 ? high + range * 0.1 : (low == 0 ? 1.0 : 0.0);
+    final labelStyle = TextStyle(color: tokens.muted, fontSize: 11);
+    final tooltipStyle = TextStyle(color: tokens.ink, fontSize: 12);
+    final titles = FlTitlesData(
+      topTitles: const AxisTitles(),
+      rightTitles: const AxisTitles(),
+      leftTitles: AxisTitles(
+        sideTitles: SideTitles(
+          showTitles: true,
+          reservedSize: 44,
+          minIncluded: false,
+          maxIncluded: false,
+          getTitlesWidget: (value, meta) {
+            final actual = value * scale;
+            return Text(
+              actual != 0 && actual.abs() < 0.001
+                  ? actual.toStringAsExponential(0)
+                  : NumberFormat.compact().format(actual),
+              style: labelStyle,
+            );
+          },
+        ),
+      ),
+      bottomTitles: AxisTitles(
+        sideTitles: SideTitles(
+          showTitles: true,
+          reservedSize: 52,
+          interval: 1,
+          minIncluded: false,
+          maxIncluded: false,
+          getTitlesWidget: (value, meta) {
+            final index = value.round();
+            if (value != index || index < 0 || index >= data.labels.length) {
+              return const SizedBox.shrink();
+            }
+            return Padding(
+              padding: const EdgeInsets.only(top: 8),
+              child: SizedBox(
+                width: 68,
+                child: Text(
+                  data.labels[index],
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                  textAlign: TextAlign.center,
+                  style: labelStyle,
+                ),
+              ),
+            );
+          },
+        ),
+      ),
     );
-    for (var s = 0; s < data.series.length; s++) {
-      final paint = Paint()
-        ..color = colors[s]
-        ..strokeWidth = 2;
-      final path = Path();
-      for (var i = 0; i < data.labels.length; i++) {
-        final value = data.series[s].values[i];
-        final x = (i + 0.5) * step;
-        if (data.kind == 'bar') {
-          final width = step * 0.7 / data.series.length;
-          final left = i * step + step * 0.15 + s * width;
-          canvas.drawRect(
-            Rect.fromLTRB(
-              left,
-              math.min(y(0), y(value)),
-              left + width - 2,
-              math.max(y(0), y(value)),
+    final grid = FlGridData(
+      drawVerticalLine: false,
+      getDrawingHorizontalLine: (_) =>
+          FlLine(color: tokens.line, strokeWidth: 1, dashArray: [4, 4]),
+    );
+    final border = FlBorderData(show: false);
+    if (data.kind == 'bar') {
+      return BarChart(
+        BarChartData(
+          minY: minY,
+          maxY: maxY,
+          titlesData: titles,
+          gridData: grid,
+          borderData: border,
+          barTouchData: BarTouchData(
+            touchTooltipData: BarTouchTooltipData(
+              getTooltipColor: (_) => tokens.surface,
+              fitInsideHorizontally: true,
+              fitInsideVertically: true,
+              getTooltipItem: (group, groupIndex, rod, rodIndex) => BarTooltipItem(
+                '${data.series[rodIndex].name}\n'
+                '${data.labels[groupIndex]}: ${data.series[rodIndex].values[groupIndex]}',
+                tooltipStyle,
+              ),
             ),
-            paint,
-          );
-        } else {
-          if (i == 0) {
-            path.moveTo(x, y(value));
-          } else {
-            path.lineTo(x, y(value));
-          }
-          canvas.drawCircle(Offset(x, y(value)), 3, paint);
-        }
-      }
-      if (data.kind == 'line') {
-        canvas.drawPath(path, paint..style = PaintingStyle.stroke);
-      }
+          ),
+          barGroups: [
+            for (var i = 0; i < data.labels.length; i++)
+              BarChartGroupData(
+                x: i,
+                barsSpace: 3,
+                barRods: [
+                  for (var s = 0; s < data.series.length; s++)
+                    BarChartRodData(
+                      toY: data.series[s].values[i] / scale,
+                      color: colors[s],
+                      width: 40 / data.series.length,
+                      borderRadius: BorderRadius.circular(3),
+                    ),
+                ],
+              ),
+          ],
+        ),
+        duration: Duration.zero,
+      );
     }
+    return LineChart(
+      LineChartData(
+        minX: -0.5,
+        maxX: data.labels.length - 0.5,
+        minY: minY,
+        maxY: maxY,
+        titlesData: titles,
+        gridData: grid,
+        borderData: border,
+        lineTouchData: LineTouchData(
+          touchTooltipData: LineTouchTooltipData(
+            getTooltipColor: (_) => tokens.surface,
+            fitInsideHorizontally: true,
+            fitInsideVertically: true,
+            getTooltipItems: (spots) => [
+              for (final spot in spots)
+                LineTooltipItem(
+                  '${data.series[spot.barIndex].name}\n'
+                  '${data.labels[spot.x.toInt()]}: ${data.series[spot.barIndex].values[spot.x.toInt()]}',
+                  tooltipStyle,
+                ),
+            ],
+          ),
+        ),
+        lineBarsData: [
+          for (var s = 0; s < data.series.length; s++)
+            LineChartBarData(
+              color: colors[s],
+              barWidth: 2.5,
+              spots: [
+                for (var i = 0; i < data.labels.length; i++)
+                  FlSpot(i.toDouble(), data.series[s].values[i] / scale),
+              ],
+              dotData: FlDotData(
+                getDotPainter: (_, _, _, _) => FlDotCirclePainter(
+                  radius: 3.5,
+                  color: colors[s],
+                  strokeWidth: 1.5,
+                  strokeColor: tokens.surfaceSoft,
+                ),
+              ),
+            ),
+        ],
+      ),
+      duration: Duration.zero,
+    );
   }
-
-  @override
-  bool shouldRepaint(_ChartPainter oldDelegate) =>
-      data != oldDelegate.data ||
-      colors != oldDelegate.colors ||
-      gridColor != oldDelegate.gridColor;
 }

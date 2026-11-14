@@ -182,7 +182,7 @@ for line in sys.stdin:
  elif m=='config/read':r={'config':{'model_context_window':8192,'model_auto_compact_token_limit':6144,'plugins':{'unified-computer-use@openai-bundled':{'enabled':True}},'mcp_servers':{'external':{}}}}
  elif m=='plugin/list':r={'marketplaces':[]}
  elif m=='skills/list':r={'data':[]}
- elif m in ['thread/start','thread/resume']:r={'thread':{'id':'existing-thread'}}
+ elif m in ['thread/start','thread/resume']:r={'thread':{'id':'existing-thread','modelProvider':p['modelProvider']},'model':p['model']}
  elif m=='mcpServerStatus/list':r={'data':LEAK,'nextCursor':None}
  elif m=='turn/start':
   print(json.dumps({'id':v['id'],'result':{'turn':{'id':'t'}}}),flush=True)

@@ -214,6 +214,38 @@ fn send_approval_response(
     write_message(writer, &json!({"id":pending.rpc_id,"result":result}))
 }
 
+// Check the actual thread response before tool discovery or turn/start. Missing
+// metadata is not confirmation. Never reflect returned values into diagnostics:
+// a remote server can put credentials or conversation content in those fields.
+fn verify_oss_thread_binding(result: &Value, provider: &str, model: &str) -> io::Result<()> {
+    for (paths, expected, label) in [
+        (
+            ["/thread/modelProvider", "/modelProvider"],
+            provider,
+            "provider",
+        ),
+        (["/model", "/thread/model"], model, "model"),
+    ] {
+        let mut confirmed = false;
+        for path in paths {
+            if let Some(actual) = result.pointer(path) {
+                if actual.as_str() != Some(expected) {
+                    return Err(io::Error::other(format!(
+                        "OSS inference binding: Codex returned a different or invalid {label}; no model turn was started"
+                    )));
+                }
+                confirmed = true;
+            }
+        }
+        if !confirmed {
+            return Err(io::Error::other(format!(
+                "OSS inference binding: Codex did not confirm the selected {label}; no model turn was started"
+            )));
+        }
+    }
+    Ok(())
+}
+
 pub fn spawn_turn(launch: Launch<'_>, events: Sender<Event>) -> io::Result<SpawnedTurn> {
     let desktop = if launch.inference_provider.is_some()
         && launch.execution_profile.approval == ditch_core::AgentApprovalPreset::FullAccess
@@ -396,6 +428,10 @@ pub fn spawn_turn(launch: Launch<'_>, events: Sender<Event>) -> io::Result<Spawn
     // can launch a separate helper even when threadId is supplied.
     let mut initial_response = if let Some(policy) = &oss_policy {
         let result = client.call(method, thread_params)?;
+        let provider = launch
+            .inference_provider
+            .expect("OSS policy requires a provider");
+        verify_oss_thread_binding(&result, &provider.endpoint.provider_key(), &provider.model)?;
         let thread = result["thread"]["id"]
             .as_str()
             .ok_or_else(|| io::Error::other("Codex did not return an OSS thread ID"))?;
@@ -519,16 +555,6 @@ pub fn spawn_turn(launch: Launch<'_>, events: Sender<Event>) -> io::Result<Spawn
                 if value.get("method").is_none()
                     && value.get("id").and_then(Value::as_str) == Some(THREAD_ID)
                 {
-                    if let Some(expected) = expected_provider.as_deref() {
-                        let mismatch = ["/result/thread/modelProvider", "/result/modelProvider"]
-                            .iter()
-                            .filter_map(|path| value.pointer(path).and_then(Value::as_str))
-                            .any(|actual| actual != expected);
-                        if mismatch {
-                            let _ = reader_events.send(Event::Failed("Codex returned a different inference provider; refusing to start the turn".into()));
-                            break;
-                        }
-                    }
                     thread_id = value
                         .pointer("/result/thread/id")
                         .and_then(Value::as_str)

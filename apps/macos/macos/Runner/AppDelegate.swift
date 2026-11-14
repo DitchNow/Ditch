@@ -643,6 +643,19 @@ class AppDelegate: FlutterAppDelegate, SPUUpdaterDelegate {
           UserDefaults.standard.set(inspector.doubleValue, forKey: "inspectorWidth")
         }
         result(true)
+      case "revealFileInFinder":
+        guard let path = call.arguments as? String,
+          path.hasPrefix("/"), !path.hasPrefix("//"),
+          !path.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }),
+          FileManager.default.fileExists(atPath: path)
+        else {
+          result(false)
+          return
+        }
+        let fileURL = URL(fileURLWithPath: path)
+        NSWorkspace.shared.activateFileViewerSelecting([fileURL])
+        // AppKit does not report completion; acknowledge the reveal request.
+        result(true)
       case "revealInFinder":
         guard let path = call.arguments as? String,
           FileManager.default.fileExists(atPath: path)

@@ -151,15 +151,8 @@ public func automationInvoke(_ id: UInt64, _ bytes: UnsafePointer<UInt8>?, _ len
             let value = try JSONSerialization.jsonObject(with: payload)
             result = try JSONSerialization.data(withJSONObject: ["ok": true, "result": value])
         } catch {
-            let code: String
-            if let failure = error as? DesktopActionFailure {
-                code = failure.outcome.dispatchState.mutationDispatched ? "outcome_unknown" : "actionRefused"
-            } else {
-                code = (error as? AutomationFailure)?.rawValue ?? (error is CancellationError ? "cancelled" : "operationFailed")
-            }
-            // Never copy an upstream error string (which can include observed or
-            // typed content) into generic runtime diagnostics.
-            result = Data("{\"ok\":false,\"error\":\"\(code)\"}".utf8)
+            result = (try? JSONEncoder().encode(AutomationDiagnostic(error)))
+                ?? Data("{\"ok\":false,\"error\":\"operationFailed\"}".utf8)
         }
         OperationTable.shared.finish(id)
         result.withUnsafeBytes { buffer in completion(id, buffer.bindMemory(to: UInt8.self).baseAddress, buffer.count) }

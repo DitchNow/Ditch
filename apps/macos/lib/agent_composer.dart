@@ -617,11 +617,31 @@ class _AgentExecutionControlsState extends State<AgentExecutionControls> {
         final confirmed = await showDialog<bool>(
           context: context,
           builder: (context) => AlertDialog(
-            icon: const Icon(Icons.warning_amber_rounded),
-            title: const Text('Enable Full Access?'),
-            content: Text(
-              'Codex will run without approval prompts or sandbox restrictions and can access the internet and files on the computer running this project.'
-              '${widget.settings.inferenceEndpointId != null && !widget.isRemote ? ' Computer use can also observe and control applications on this Mac when macOS permissions are granted to Ditch. Observations are sent to your selected model.' : ''}',
+            constraints: const BoxConstraints(maxWidth: 480),
+            insetPadding: const EdgeInsets.all(24),
+            scrollable: true,
+            title: const Row(
+              children: [
+                Icon(Icons.warning_amber_rounded, size: 22),
+                SizedBox(width: 12),
+                Expanded(child: Text('Enable Full Access?')),
+              ],
+            ),
+            content: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text(
+                  'Codex can access files and the internet on the computer running this project, without approval prompts or sandbox restrictions.',
+                ),
+                if (widget.settings.inferenceEndpointId != null &&
+                    !widget.isRemote) ...[
+                  const SizedBox(height: 16),
+                  const Text(
+                    'Computer use can also observe and control apps on this Mac once you grant macOS permissions to Ditch. Observations are sent to your selected model.',
+                  ),
+                ],
+              ],
             ),
             actions: [
               TextButton(

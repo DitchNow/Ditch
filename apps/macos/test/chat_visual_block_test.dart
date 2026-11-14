@@ -1,7 +1,9 @@
 import 'dart:convert';
 
+import 'package:fl_chart/fl_chart.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:the_ditch/design_system/ditch_theme.dart';
 import 'package:the_ditch/widgets/chat_visual_block.dart';
 
 Map<String, Object> chart() => {
@@ -17,6 +19,65 @@ Map<String, Object> chart() => {
 };
 
 void main() {
+  for (final dark in [false, true]) {
+    for (final type in ['bar', 'line']) {
+      testWidgets(
+        '$type uses theme colors and handles sparse/zero/negative data ($dark)',
+        (tester) async {
+          for (final values in <List<double>>[
+            [0],
+            [-3, 0, 5],
+            [0, 5e-324],
+            [-1e-300, 1e-300],
+            List.filled(ChatVisualData.maxPoints, 1e12),
+          ]) {
+            final input = {
+              'title': 'Trend',
+              'type': type,
+              'labels': [for (var i = 0; i < values.length; i++) 'Day $i'],
+              'series': [
+                for (var i = 0; i < ChatVisualData.maxSeries; i++)
+                  {'name': 'Series $i', 'values': values},
+              ],
+            };
+            await tester.pumpWidget(
+              MaterialApp(
+                theme: dark ? DitchTheme.dark() : DitchTheme.light(),
+                home: Scaffold(
+                  body: SingleChildScrollView(
+                    child: SizedBox(
+                      width: 220,
+                      child: ChatVisualBlock(
+                        data: ChatVisualData.parse(
+                          'ditch-chart',
+                          jsonEncode(input),
+                        )!,
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            );
+            final tokens = dark ? DitchTokens.dark : DitchTokens.light;
+            if (type == 'bar') {
+              final plot = tester.widget<BarChart>(find.byType(BarChart)).data;
+              expect(plot.barGroups.first.barRods.first.color, tokens.running);
+              expect(plot.maxY, greaterThan(plot.minY));
+            } else {
+              final plot = tester
+                  .widget<LineChart>(find.byType(LineChart))
+                  .data;
+              expect(plot.lineBarsData.first.color, tokens.running);
+              expect(plot.maxY, greaterThan(plot.minY));
+            }
+            expect(find.text('Series 0'), findsOneWidget);
+            expect(tester.takeException(), isNull);
+          }
+        },
+      );
+    }
+  }
+
   test(
     'validates chart schema, bounded counts, numeric values, and block size',
     () {

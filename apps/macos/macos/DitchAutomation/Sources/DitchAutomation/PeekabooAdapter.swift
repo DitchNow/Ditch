@@ -123,7 +123,8 @@ final class PeekabooAdapter {
     }
 
     private func observe(_ request: NativeRequest) async throws -> Data {
-        guard let pid = request.arguments.pid, let window = request.arguments.window_id else {
+        guard let pid = request.arguments.pid, pid > 0,
+              let window = request.arguments.window_id, window > 0 else {
             throw AutomationFailure.invalidArguments
         }
         try self.validateTarget(pid)

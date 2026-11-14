@@ -679,6 +679,8 @@ for line in sys.stdin:
  if method=='initialized': continue
  if method=='initialize': result={}
  elif method=='config/read': result={'config':{'model_context_window':65536,'model_auto_compact_token_limit':49152,'skills':{'config':[{'name':'already-disabled','enabled':False}]},'mcp_servers':{'large_catalog':{'enabled':True}}}}
+ elif method=='plugin/list': result={'marketplaces':[]}
+ elif method=='mcpServerStatus/list': result={'data':[],'nextCursor':None}
  elif method=='skills/list': result={'data':[{'skills':[{'path':'/outside/SKILL.md'},{'path':str(root/'SKILL.md')}]}]}
  elif method in ('thread/start','thread/resume'):
   p=r['params']; assert p['model']=='qwen:9b'; assert p['modelProvider'].startswith('ditch_ollama_')
@@ -687,7 +689,14 @@ for line in sys.stdin:
   assert p['config']['skills']['config'] == [{'name':'already-disabled','enabled':False},{'path':'/outside/SKILL.md','enabled':False}]
   assert p['config']['mcp_servers']['large_catalog']['enabled'] is False
   (root/'method').write_text(method)
-  result={'thread':{'id':'saved-thread','modelProvider':'openai' if (root/'mismatch').exists() else p['modelProvider']}}
+  result={'thread':{'id':'saved-thread','modelProvider':p['modelProvider']},'model':p['model']}
+  failure=(root/'failure').read_text()
+  if failure=='wrong-provider': result['thread']['modelProvider']='openai'
+  if failure=='missing-provider': del result['thread']['modelProvider']
+  if failure=='wrong-model': result['model']='unexpected-model'
+  if failure=='missing-model': del result['model']
+  if failure=='conflicting-provider': result['modelProvider']='openai'
+  if failure=='null-provider': result['thread']['modelProvider']=None
  elif method=='turn/start':
   (root/'turn').write_text('started'); result={'turn':{'id':'turn'}}
  else: raise Exception(method)
@@ -707,15 +716,20 @@ for line in sys.stdin:
             model: "qwen:9b".into(),
             context_window: 65536,
         };
-        for (resume, mismatch) in [
-            (None, false),
-            (Some("saved-thread"), false),
-            (Some("saved-thread"), true),
-        ] {
+        for (resume, failure) in [None, Some("saved-thread")].into_iter().flat_map(|resume| {
+            [
+                "none",
+                "wrong-provider",
+                "missing-provider",
+                "wrong-model",
+                "missing-model",
+                "conflicting-provider",
+                "null-provider",
+            ]
+            .map(|failure| (resume, failure))
+        }) {
             let _ = std::fs::remove_file(root.join("turn"));
-            if mismatch {
-                std::fs::write(root.join("mismatch"), "yes").unwrap();
-            }
+            std::fs::write(root.join("failure"), failure).unwrap();
             let (tx, rx) = std::sync::mpsc::channel();
             let spawned = codex_app_server::spawn_turn(
                 Launch {
@@ -735,8 +749,19 @@ for line in sys.stdin:
                     codex_home: Some(root.join("home").into_os_string()),
                 },
                 tx,
-            )
-            .unwrap();
+            );
+            if failure != "none" {
+                let error = spawned
+                    .err()
+                    .expect("unverified binding must fail during startup");
+                assert!(error.to_string().contains("OSS inference binding"), "{error}");
+                assert!(
+                    !root.join("turn").exists(),
+                    "{failure} must never start inference"
+                );
+                continue;
+            }
+            let spawned = spawned.unwrap();
             let mut failed = false;
             let mut completed = false;
             while let Ok(event) = rx.recv_timeout(Duration::from_secs(5)) {
@@ -756,9 +781,9 @@ for line in sys.stdin:
             let mut child = spawned.child.lock().unwrap();
             let _ = child.kill();
             let _ = child.wait();
-            assert_eq!(failed, mismatch);
-            assert_eq!(completed, !mismatch);
-            assert_eq!(root.join("turn").exists(), !mismatch);
+            assert!(!failed);
+            assert!(completed);
+            assert!(root.join("turn").exists());
             assert_eq!(
                 std::fs::read_to_string(root.join("method")).unwrap(),
                 if resume.is_some() {
