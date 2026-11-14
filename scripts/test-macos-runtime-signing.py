@@ -58,7 +58,21 @@ class RuntimeSigningTests(unittest.TestCase):
             'CFBundleExecutable': 'ditchd', 'CFBundlePackageType': 'APPL',
             'CFBundleVersion': '1', 'CFBundleShortVersionString': '1.0',
         }))
-        self.env = dict(os.environ, MAIN_MACOS=str(main), HELPER_APP=str(self.helper),
+        framework = self.helper / 'Contents/Frameworks/DitchAutomation.framework'
+        version = framework / 'Versions/A'
+        (version / 'Resources').mkdir(parents=True)
+        source = self.root / 'automation.c'
+        source.write_text('int ditch_automation_abi_version(void) { return 1; }\n')
+        run('xcrun', 'clang', '-dynamiclib', str(source), '-o', str(version / 'DitchAutomation'))
+        (version / 'Resources/Info.plist').write_bytes(plistlib.dumps({
+            'CFBundleIdentifier': 'ai.theditch.automation', 'CFBundleExecutable': 'DitchAutomation',
+            'CFBundlePackageType': 'FMWK', 'CFBundleVersion': '1',
+        }))
+        (framework / 'Versions/Current').symlink_to('A')
+        (framework / 'DitchAutomation').symlink_to('Versions/Current/DitchAutomation')
+        (framework / 'Resources').symlink_to('Versions/Current/Resources')
+        self.framework = framework
+        self.env = dict(os.environ, HELPER_CONTENTS=str(self.helper / 'Contents'), MAIN_MACOS=str(main), HELPER_APP=str(self.helper),
                         HELPER_MACOS=str(helper_macos), HELPER_RESOURCES=str(self.resources),
                         HOST_REMOTE_TARGET=host, EXPANDED_CODE_SIGN_IDENTITY='-')
 
@@ -88,6 +102,7 @@ class RuntimeSigningTests(unittest.TestCase):
         original = self.stage_matrix()
         linux_bytes = {p.name: p.read_bytes() for p in self.resources.glob('*-linux-gnu')}
         run('/bin/sh', str(SCRIPT), env=self.env)
+        self.assert_hardened(self.framework)
         updated = json.loads(self.manifest.read_text())
         self.assertEqual({k: v for k, v in original.items() if k != 'artifacts'},
                          {k: v for k, v in updated.items() if k != 'artifacts'})

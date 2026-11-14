@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+rmcp.workspace = true
+tokio.workspace = true
+libc.workspace = true
 chrono.workspace = true
 ditch_core.workspace = true
 ditch_protocol.workspace = true

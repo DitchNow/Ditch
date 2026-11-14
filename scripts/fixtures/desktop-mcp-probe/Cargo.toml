@@ -1,0 +1,13 @@
+[package]
+name = "ditch-desktop-mcp-probe"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Isolated feasibility fixture; never linked into or bundled with Ditch.
+[workspace]
+
+[dependencies]
+rmcp = { version = "=3.10.0", default-features = false, features = ["server", "transport-io"] }
+serde_json = "1.0"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std"] }

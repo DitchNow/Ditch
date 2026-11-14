@@ -83,6 +83,7 @@ final class StatusHost: NSObject, NSApplicationDelegate, UNUserNotificationCente
     writePidFile()
     configureNotifications()
     configureStatusItem()
+    log("desktop automation module available=\(AutomationModuleLoader.load())")
     ensureRuntimeAvailable()
     timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
       self?.refreshRuntimeStatus()

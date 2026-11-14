@@ -68,6 +68,8 @@ sign_code "$MAIN_MACOS/ditch_cli"
 sign_code "$MAIN_MACOS/ditchd-remote-$HOST_REMOTE_TARGET"
 sign_code "$HELPER_MACOS/ditchd-remote-$HOST_REMOTE_TARGET"
 sign_code "$HELPER_MACOS/ditch_cli"
+sign_code "$HELPER_CONTENTS/Frameworks/DitchAutomation.framework"
+/usr/bin/codesign --verify --strict "$HELPER_CONTENTS/Frameworks/DitchAutomation.framework"
 sign_code "$HELPER_APP"
 for SIGNED_CODE in \
   "$MAIN_MACOS/ditch_cli" \

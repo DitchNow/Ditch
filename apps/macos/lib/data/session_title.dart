@@ -20,7 +20,9 @@ String sessionDisplayName(
   String? userTitle,
   String? codexName, {
   bool namingFailed = false,
+  String? provisionalTitle,
 }) =>
     normalizeSessionTitle(userTitle) ??
     normalizeSessionTitle(codexName) ??
+    normalizeSessionTitle(provisionalTitle) ??
     (namingFailed ? sessionTitleFailed : sessionTitlePending);

@@ -26,6 +26,26 @@ pub struct OllamaEndpoint {
     pub models: Vec<String>,
     pub reachable: Option<bool>,
     pub error: Option<String>,
+    /// Verified per-model serving budgets, never the model's theoretical maximum.
+    #[serde(default)]
+    pub model_status: std::collections::BTreeMap<String, OllamaModelStatus>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct OllamaModelStatus {
+    /// Declared by /api/show for the exact fingerprint. Vision declaration is
+    /// capability evidence, not a claim of successful visual task execution.
+    #[serde(default)]
+    pub tools_declared: bool,
+    #[serde(default)]
+    pub vision_declared: bool,
+    pub context_window: u32,
+    pub model_fingerprint: String,
+    pub server_version: String,
+    pub verified_at: DateTime<Utc>,
+    pub developer_instructions: bool,
+    pub conversation_recall: bool,
+    pub rejects_overflow: bool,
 }
 impl OllamaEndpoint {
     pub fn provider_key(&self) -> String {
@@ -70,6 +90,8 @@ pub struct OllamaProbe {
     pub error: Option<String>,
     /// A bounded Responses/tool probe, not a claim of end-to-end coding quality.
     pub responses_tool_check: bool,
+    #[serde(default)]
+    pub model_status: Option<OllamaModelStatus>,
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum OllamaResponse {

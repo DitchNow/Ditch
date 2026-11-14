@@ -29,6 +29,7 @@ pub struct DurableAgent {
 
 mod tasks;
 mod ollama;
+mod tool_integrations;
 
 pub struct DurableState {
     pub releases: Vec<ditch_core::ProjectRelease>,
@@ -78,6 +79,7 @@ impl DitchStore {
         connection.pragma_update(None, "user_version", 3)?;
         let mut store = Self { connection };
         store.initialize_ollama()?;
+        store.initialize_tool_integrations()?;
         store.initialize_tasks()?;
         store.cleanup_polluted_permission_alerts()?;
         store.import_legacy_registry_if_empty(paths)?;
@@ -1009,6 +1011,7 @@ mod tests {
             pane_id: None,
             native_session_id: Some("thread-1".into()),
             codex_title: Some("Codex title".into()),
+            provisional_title: None,
             naming_failed: false,
             user_title: None,
             origin_codex_home: Some("/tmp/codex-home".into()),

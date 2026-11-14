@@ -161,6 +161,7 @@ pub(super) fn recovery_agent(runtime: &mut RuntimeState) -> AgentId {
         pane_id: None,
         native_session_id: Some("saved-thread".into()),
         codex_title: None,
+        provisional_title: None,
         naming_failed: false,
         user_title: None,
         origin_codex_home: None,

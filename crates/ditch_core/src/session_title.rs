@@ -13,6 +13,11 @@ impl crate::AgentRun {
                     .as_deref()
                     .and_then(normalize_session_title)
             })
+            .or_else(|| {
+                self.provisional_title
+                    .as_deref()
+                    .and_then(normalize_session_title)
+            })
             .unwrap_or_else(|| {
                 if self.naming_failed {
                     SESSION_TITLE_FAILED

@@ -87,6 +87,7 @@ mod task_queue_tests {
             pane_id: None,
             native_session_id: Some("existing-thread".into()),
             codex_title: Some("Original title".into()),
+            provisional_title: None,
             naming_failed: false,
             user_title: Some("My agent".into()),
             origin_codex_home: s

@@ -10,11 +10,16 @@ use std::{
 };
 use uuid::Uuid;
 
-pub const CAPABILITY: &str = "ollama_inference_v1";
+#[path = "ollama_context.rs"]
+mod context;
+pub use context::verify_model;
+
+pub const CAPABILITY: &str = "ollama_inference_v2";
 pub struct ResolvedOllamaProvider {
     pub endpoint: OllamaEndpoint,
     pub token: Option<EndpointToken>,
     pub model: String,
+    pub context_window: u32,
 }
 fn invalid(message: &str) -> io::Error {
     io::Error::other(message)
@@ -139,6 +144,15 @@ pub fn configure(command: &mut Command, provider: &ResolvedOllamaProvider) {
     let quote = |v: &str| serde_json::to_string(v).unwrap();
     let prefix = format!("model_providers.{key}");
     for config in [
+        format!("model_context_window={}", provider.context_window),
+        format!(
+            "model_auto_compact_token_limit={}",
+            provider.context_window * 3 / 4
+        ),
+        "model_auto_compact_token_limit_scope=\"total\"".into(),
+        "features.apps=false".into(),
+        "skills.max_context_tokens=1024".into(),
+        "tool_output_token_limit=4096".into(),
         format!("model_provider={}", quote(&key)),
         format!("model={}", quote(&provider.model)),
         format!("{prefix}.name={}", quote(&provider.endpoint.display_name)),
@@ -296,6 +310,7 @@ pub fn probe(
         reachable: false,
         error: None,
         responses_tool_check: false,
+        model_status: None,
     };
     for path in ["/api/tags", "/v1/models"] {
         if let Ok(response) = request("GET", path).call() {
@@ -370,6 +385,167 @@ pub fn probe(
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// Exercises Ditch's real launch/resume path, not a parallel mock client.
+    #[test]
+    #[ignore = "Set DITCH_OLLAMA_TEST_URL and DITCH_OLLAMA_TEST_MODEL for a live endpoint"]
+    fn live_ollama_recall_resume_and_compaction() {
+        use crate::codex_app_server::{self, Event, Launch};
+        let root = std::env::temp_dir().join(format!("ditch-ollama-live-{}", Uuid::new_v4()));
+        let home = root.join("codex-home");
+        std::fs::create_dir_all(&home).unwrap();
+        let mut endpoint = endpoint();
+        endpoint.api_root_url = std::env::var("DITCH_OLLAMA_TEST_URL").unwrap();
+        endpoint.auth_mode = "none".into();
+        endpoint.has_credentials = false;
+        let token = std::env::var("DITCH_OLLAMA_SMOKE_TOKEN")
+            .ok()
+            .map(EndpointToken);
+        let model = std::env::var("DITCH_OLLAMA_TEST_MODEL").unwrap();
+        let mut thread: Option<String> = None;
+        // Optional recovery regression: operate on a copy, never the user's rollout.
+        if let Ok(path) = std::env::var("DITCH_OLLAMA_TEST_ROLLOUT") {
+            let source = std::path::Path::new(&path);
+            let data = std::fs::read_to_string(source).unwrap();
+            let meta: serde_json::Value =
+                serde_json::from_str(data.lines().next().unwrap()).unwrap();
+            thread = Some(meta["payload"]["id"].as_str().unwrap().to_owned());
+            let key = meta["payload"]["model_provider"].as_str().unwrap();
+            endpoint.id = Uuid::parse_str(key.strip_prefix("ditch_ollama_").unwrap()).unwrap();
+            let sessions = home.join("sessions/2026/11/11");
+            std::fs::create_dir_all(&sessions).unwrap();
+            std::fs::copy(source, sessions.join(source.file_name().unwrap())).unwrap();
+        }
+        let status = verify_model(&endpoint, token.as_ref(), &model).unwrap();
+        println!(
+            "Verified context={}, version={}",
+            status.context_window, status.server_version
+        );
+        let provider = ResolvedOllamaProvider {
+            endpoint,
+            token,
+            model: model.clone(),
+            context_window: status.context_window,
+        };
+        let profile = ditch_core::AgentExecutionProfile {
+            model: Some(model),
+            reasoning_effort: Some("none".into()),
+            inference_endpoint_id: Some(provider.endpoint.id),
+            ..Default::default()
+        };
+        let binary = std::env::var("DITCH_OLLAMA_TEST_CODEX").unwrap_or_else(|_| "codex".into());
+        let marker = format!("CEDAR-{}", Uuid::new_v4().simple());
+        let project_id = ditch_core::ProjectId::new();
+        let agent_id = ditch_core::AgentId::new();
+        for index in 0..3 {
+            let prompt = if index == 0 {
+                format!(
+                    "Remember this exact marker throughout our conversation: {marker}. Do not use tools or write it to any file. Reply only OK."
+                )
+            } else {
+                "What exact marker did I ask you to remember earlier? Do not use tools. Reply only with that marker.".into()
+            };
+            let (tx, rx) = std::sync::mpsc::channel();
+            let spawned = codex_app_server::spawn_turn(
+                Launch {
+                    inference_provider: Some(&provider),
+                    restricted: false,
+                    protected_roots: vec![],
+                    remote: false,
+                    extra_roots: &[],
+                    on_spawn: None,
+                    binary: &binary,
+                    cwd: &root,
+                    project_id,
+                    agent_id,
+                    prompt: &prompt,
+                    resume_thread: thread.as_deref(),
+                    execution_profile: &profile,
+                    codex_home: Some(home.clone().into_os_string()),
+                },
+                tx,
+            )
+            .unwrap();
+            let mut text = String::new();
+            let mut failure = None;
+            let mut completed = false;
+            let deadline = std::time::Instant::now() + Duration::from_secs(180);
+            while std::time::Instant::now() < deadline {
+                let Ok(event) = rx.recv_timeout(Duration::from_secs(10)) else {
+                    continue;
+                };
+                match event {
+                    Event::ThreadReady(id) => {
+                        if let Some(saved) = &thread {
+                            assert_eq!(saved, &id);
+                        }
+                        thread = Some(id);
+                    }
+                    Event::AssistantMessage(message) => text = message,
+                    Event::ProviderUsage(usage) => println!("turn {index} usage: {usage}"),
+                    Event::Failed(error) => {
+                        failure = Some(error);
+                        break;
+                    }
+                    Event::TurnCompleted { status, error } => {
+                        completed = status == "completed";
+                        failure = error;
+                        break;
+                    }
+                    Event::OutputClosed => break,
+                    _ => (),
+                }
+            }
+            {
+                let mut child = spawned.child.lock().unwrap();
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            assert!(completed && failure.is_none(), "turn {index}: {failure:?}");
+            if index > 0 {
+                assert_eq!(text.trim(), marker);
+            }
+            println!("turn {index}: recall passed");
+            if index == 1 {
+                let mut client = crate::app_server_client::Client::open_with_provider(
+                    &binary,
+                    &root,
+                    Some(&home),
+                    None,
+                    Some(&provider),
+                )
+                .unwrap();
+                client.graceful = true;
+                client.call("thread/resume",serde_json::json!({"threadId":thread,"model":provider.model,"modelProvider":provider.endpoint.provider_key(),"config":{"web_search":"disabled","features":{"apps":false}}})).unwrap();
+                client
+                    .call(
+                        "thread/compact/start",
+                        serde_json::json!({"threadId":thread}),
+                    )
+                    .unwrap();
+                let deadline = std::time::Instant::now() + Duration::from_secs(180);
+                let mut compacted = false;
+                while std::time::Instant::now() < deadline {
+                    let Ok(Ok(line)) = client
+                        .incoming
+                        .as_ref()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(10))
+                    else {
+                        continue;
+                    };
+                    let value: serde_json::Value = serde_json::from_str(&line).unwrap();
+                    if value["method"] == "turn/completed" {
+                        assert_eq!(value["params"]["turn"]["status"], "completed", "{value}");
+                        compacted = true;
+                        break;
+                    }
+                }
+                assert!(compacted, "compaction did not complete");
+                println!("compaction completed");
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
     fn endpoint() -> OllamaEndpoint {
         OllamaEndpoint {
             id: Uuid::new_v4(),
@@ -380,6 +556,7 @@ mod tests {
             allow_private_http: true,
             enabled: true,
             created_at: chrono::Utc::now(),
+            model_status: Default::default(),
             models: vec!["qwen:9b".into()],
             reachable: None,
             error: None,
@@ -501,9 +678,14 @@ for line in sys.stdin:
  r=json.loads(line); method=r['method']
  if method=='initialized': continue
  if method=='initialize': result={}
+ elif method=='config/read': result={'config':{'model_context_window':65536,'model_auto_compact_token_limit':49152,'skills':{'config':[{'name':'already-disabled','enabled':False}]},'mcp_servers':{'large_catalog':{'enabled':True}}}}
+ elif method=='skills/list': result={'data':[{'skills':[{'path':'/outside/SKILL.md'},{'path':str(root/'SKILL.md')}]}]}
  elif method in ('thread/start','thread/resume'):
   p=r['params']; assert p['model']=='qwen:9b'; assert p['modelProvider'].startswith('ditch_ollama_')
   assert p['config']['web_search']=='disabled'
+  assert p['config']['features']['apps'] is False
+  assert p['config']['skills']['config'] == [{'name':'already-disabled','enabled':False},{'path':'/outside/SKILL.md','enabled':False}]
+  assert p['config']['mcp_servers']['large_catalog']['enabled'] is False
   (root/'method').write_text(method)
   result={'thread':{'id':'saved-thread','modelProvider':'openai' if (root/'mismatch').exists() else p['modelProvider']}}
  elif method=='turn/start':
@@ -523,6 +705,7 @@ for line in sys.stdin:
             endpoint,
             token: Some(EndpointToken("private-launch-token".into())),
             model: "qwen:9b".into(),
+            context_window: 65536,
         };
         for (resume, mismatch) in [
             (None, false),
@@ -629,6 +812,7 @@ for line in sys.stdin:
             allow_private_http: false,
             enabled: true,
             created_at: chrono::Utc::now(),
+            model_status: Default::default(),
             models: vec![],
             reachable: None,
             error: None,
@@ -640,11 +824,20 @@ for line in sys.stdin:
                 endpoint,
                 token: Some(EndpointToken("private-token".into())),
                 model: "qwen:9b".into(),
+                context_window: 65536,
             },
         );
         let args = format!("{:?}", command.get_args().collect::<Vec<_>>());
         assert!(!args.contains("private-token"));
         assert!(args.contains("requires_openai_auth=false"));
+        for expected in [
+            "model_context_window=65536",
+            "model_auto_compact_token_limit=49152",
+            "model_auto_compact_token_limit_scope=\"total\"",
+            "features.apps=false",
+        ] {
+            assert!(command.get_args().any(|argument| argument == expected));
+        }
         assert!(
             command
                 .get_envs()

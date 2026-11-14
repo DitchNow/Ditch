@@ -4,6 +4,49 @@ import 'package:the_ditch/data/session_title.dart';
 import 'package:the_ditch/main.dart';
 
 void main() {
+  test('OSS provisional titles remain available until generation succeeds', () {
+    final session = AgentSession(
+      localId: 'oss',
+      provider: AgentProvider.codex,
+      status: AgentStatus.working,
+      messages: [],
+      provisionalTitle: 'Fix login',
+    );
+    expect(session.displayName, 'Fix login');
+    session.namingFailed = true;
+    expect(session.displayName, 'Fix login');
+    session.codexTitle = 'Validate empty passwords';
+    expect(session.displayName, 'Validate empty passwords');
+    session.userTitle = 'My title';
+    expect(session.displayName, 'My title');
+  });
+
+  testWidgets('OSS rename explains and requests selected-model regeneration', (
+    tester,
+  ) async {
+    String? renamed = 'unset';
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: EditableAgentTitle(
+            title: 'Legacy prompt title',
+            hasOverride: false,
+            usesOssModel: true,
+            onRename: (value) => renamed = value,
+          ),
+        ),
+      ),
+    );
+    expect(
+      tester.widget<Tooltip>(find.byType(Tooltip)).message,
+      contains('selected model'),
+    );
+    await tester.tap(find.text('Legacy prompt title'));
+    await tester.pump();
+    await tester.enterText(find.byKey(const Key('agent-title-editor')), '');
+    await tester.testTextInput.receiveAction(TextInputAction.done);
+    expect(renamed, isNull);
+  });
   test('session name waits for Codex and respects manual edits', () {
     final session = AgentSession(
       localId: 'naming',

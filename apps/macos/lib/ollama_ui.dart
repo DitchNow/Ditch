@@ -75,7 +75,10 @@ class _AddOssModelDialogState extends State<AddOssModelDialog> {
           _manual = false;
           _model = _models.first;
         }
-        _status = probe['responses_tool_check'] == true
+        final modelStatus = probe['model_status'] as Map?;
+        _status = modelStatus != null && probe['responses_tool_check'] == true
+            ? 'Verified ${modelStatus['context_window']} token context, conversation recall, instructions and overflow protection.'
+            : probe['responses_tool_check'] == true
             ? 'Responses streaming and tool check passed. Full coding compatibility still requires verification.'
             : probe['reachable'] == true
             ? 'Server reachable. Select a model and test again to check Responses and tools.'

@@ -48,7 +48,29 @@ fn ollama_request(
                 auth.as_ref(),
                 model.as_deref(),
             )
-            .map(OllamaResponse::Probe)
+            .map(|mut probe| {
+                if let Some(model) = model.as_deref() {
+                    let endpoint = OllamaEndpoint {
+                        id: Uuid::nil(),
+                        display_name: String::new(),
+                        api_root_url: api_url,
+                        auth_mode: "none".into(),
+                        has_credentials: auth.is_some(),
+                        allow_private_http,
+                        enabled: true,
+                        created_at: Utc::now(),
+                        models: vec![],
+                        reachable: None,
+                        error: None,
+                        model_status: Default::default(),
+                    };
+                    match ollama::verify_model(&endpoint, auth.as_ref(), model) {
+                        Ok(status) => probe.model_status = Some(status),
+                        Err(error) => probe.error = Some(error.to_string()),
+                    }
+                }
+                OllamaResponse::Probe(probe)
+            })
             .map_err(|e| e.to_string()),
             OllamaOperation::Add {
                 display_name,
@@ -87,6 +109,7 @@ fn ollama_request(
                     allow_private_http,
                     enabled: true,
                     created_at: Utc::now(),
+                    model_status: Default::default(),
                     models,
                     reachable: Some(probe.reachable),
                     error: probe.error,
@@ -195,10 +218,19 @@ fn resolve_ollama_profile(
     ollama::validate_destination(&url).map_err(|e| e.to_string())?;
     let token = ollama::load_token(&paths, remote, &endpoint)
         .map_err(|_| "Inference endpoint credential is unavailable".to_owned())?;
+    let status = ollama::verify_model(&endpoint, token.as_ref(), model)
+        .map_err(|error| error.to_string())?;
+    state
+        .lock()
+        .unwrap()
+        .store
+        .update_ollama_model_status(id, model, status.clone())
+        .map_err(|error| error.to_string())?;
     Ok(Some(ollama::ResolvedOllamaProvider {
         endpoint,
         token,
         model: model.into(),
+        context_window: status.context_window,
     }))
 }
 
@@ -231,6 +263,7 @@ mod ollama_runtime_tests {
             allow_private_http: false,
             enabled: true,
             created_at: Utc::now(),
+            model_status: Default::default(),
             models: vec!["qwen:9b".into()],
             reachable: None,
             error: None,

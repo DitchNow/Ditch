@@ -5,6 +5,7 @@ class AgentModelPicker extends StatefulWidget {
   const AgentModelPicker({
     required this.settings,
     this.onAdd,
+    this.onSelect,
     this.onRetryOpenAI,
     this.onRetryOss,
     super.key,
@@ -12,6 +13,7 @@ class AgentModelPicker extends StatefulWidget {
 
   final AgentExecutionSettings settings;
   final VoidCallback? onAdd;
+  final Future<void> Function(AgentModelOption?)? onSelect;
   final VoidCallback? onRetryOpenAI;
   final VoidCallback? onRetryOss;
 
@@ -97,7 +99,11 @@ class _AgentModelPickerState extends State<AgentModelPicker> {
     if (choice.add) {
       widget.onAdd?.call();
     } else {
-      settings.selectOption(choice.option);
+      if (widget.onSelect != null) {
+        await widget.onSelect!(choice.option);
+      } else {
+        settings.selectOption(choice.option);
+      }
     }
   }
 

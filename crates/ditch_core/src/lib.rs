@@ -145,6 +145,7 @@ pub struct AgentExecutionProfile {
 }
 
 pub mod ollama;
+pub mod tool_integrations;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Default)]
 pub enum ProjectGitPolicy {
@@ -309,6 +310,9 @@ pub struct AgentRun {
     pub native_session_id: Option<String>,
     #[serde(default)]
     pub codex_title: Option<String>,
+    /// Local prompt-derived label while automatic naming is pending or unavailable.
+    #[serde(default)]
+    pub provisional_title: Option<String>,
     #[serde(default)]
     pub naming_failed: bool,
     #[serde(default)]

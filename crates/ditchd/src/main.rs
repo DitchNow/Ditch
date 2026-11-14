@@ -9,6 +9,8 @@ mod project_clone;
 mod app_server_client;
 mod ollama;
 mod codex_app_server;
+mod tool_integrations;
+mod native_tools_ffi;
 mod session_namer;
 mod task_planner;
 mod edition;

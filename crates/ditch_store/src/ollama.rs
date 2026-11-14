@@ -38,6 +38,26 @@ impl DitchStore {
         )?;
         Ok(())
     }
+    pub fn update_ollama_model_status(
+        &self,
+        id: Uuid,
+        model: &str,
+        status: ditch_core::ollama::OllamaModelStatus,
+    ) -> Result<(), StoreError> {
+        let mut endpoint = self
+            .ollama_endpoint(id)?
+            .ok_or_else(|| StoreError::InvalidData("Endpoint not found".into()))?;
+        endpoint.model_status.insert(model.to_owned(), status);
+        self.connection.execute(
+            "UPDATE ollama_endpoints SET endpoint_json=?2 WHERE id=?1",
+            params![
+                id.to_string(),
+                serde_json::to_string(&endpoint)
+                    .map_err(|e| StoreError::InvalidData(e.to_string()))?
+            ],
+        )?;
+        Ok(())
+    }
     /// Destinations are immutable even before first use; replace by registering a new ID.
     pub fn update_ollama_status(
         &self,
@@ -90,6 +110,7 @@ mod tests {
             allow_private_http: false,
             enabled: true,
             created_at: Utc::now(),
+            model_status: Default::default(),
             models: vec!["model:tag".into()],
             reachable: Some(true),
             error: None,
@@ -100,6 +121,44 @@ mod tests {
         store.insert_ollama_endpoint(&duplicate).unwrap();
         assert_eq!(store.ollama_endpoints().unwrap().len(), 2);
         assert!(store.insert_ollama_endpoint(&endpoint).is_err());
+        let status = ditch_core::ollama::OllamaModelStatus {
+            tools_declared: true,
+            vision_declared: false,
+            context_window: 65536,
+            model_fingerprint: "model-hash".into(),
+            server_version: "test".into(),
+            verified_at: Utc::now(),
+            developer_instructions: true,
+            conversation_recall: true,
+            rejects_overflow: true,
+        };
+        store
+            .update_ollama_model_status(endpoint.id, "model:tag", status.clone())
+            .unwrap();
+        assert_eq!(
+            store
+                .ollama_endpoint(endpoint.id)
+                .unwrap()
+                .unwrap()
+                .model_status["model:tag"],
+            status
+        );
+        assert!(
+            store
+                .ollama_endpoint(duplicate.id)
+                .unwrap()
+                .unwrap()
+                .model_status
+                .is_empty()
+        );
+        let mut old_json = serde_json::to_value(&endpoint).unwrap();
+        old_json.as_object_mut().unwrap().remove("model_status");
+        assert!(
+            serde_json::from_value::<OllamaEndpoint>(old_json)
+                .unwrap()
+                .model_status
+                .is_empty()
+        );
         let disabled = store
             .update_ollama_status(
                 endpoint.id,

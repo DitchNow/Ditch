@@ -45,3 +45,5 @@ rand_core = { version = "0.6.4", features = ["getrandom"] }
 sha2 = "0.10.9"
 semver = "1.0.27"
 url = "2.5.7"
+rmcp = { version = "=3.10.0", default-features = false, features = ["server", "transport-io"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "io-std", "time", "macros"] }

@@ -226,10 +226,18 @@ mkdir -p "$SWIFT_CACHE"
 export SWIFT_MODULECACHE_PATH="$SWIFT_CACHE"
 export CLANG_MODULE_CACHE_PATH="$SWIFT_CACHE"
 
+AUTOMATION_SOURCE="$PROJECT_DIR"
+AUTOMATION_CONFIGURATION=release
+[ "${CONFIGURATION:-Release}" != Debug ] || AUTOMATION_CONFIGURATION=debug
+/bin/sh "$AUTOMATION_SOURCE/build_automation_module.sh" "$HELPER_CONTENTS" \
+  "$CARGO_TARGET_DIR/automation-$BUILD_ARCH" "$BUILD_ARCH" "$AUTOMATION_CONFIGURATION" "$WORKSPACE_ROOT/Cargo.toml"
+cp "$HELPER_CONTENTS/Frameworks/DitchAutomation.framework/Resources/OpenSourceLicenses.txt" "$MAIN_RESOURCES/DitchComputerUseLicenses.txt"
+
 /usr/bin/swiftc -parse-as-library $DITCH_SWIFT_IDENTITY_FLAGS \
   -target "$BUILD_ARCH-apple-macos$DEPLOYMENT_TARGET" \
   "$PROJECT_DIR/Runner/DeploymentIdentity.swift" \
   "$PROJECT_DIR/StatusHost/StatusHost.swift" \
+  "$AUTOMATION_SOURCE/StatusHost/AutomationModuleLoader.swift" \
   "$OFFICIAL_BUILD_SWIFT" \
   "$DITCHD_LIBRARY" \
   -framework Cocoa \
@@ -253,7 +261,9 @@ cat > "$HELPER_CONTENTS/Info.plist" <<PLIST
   <key>CFBundleInfoDictionaryVersion</key>
   <string>6.0</string>
   <key>CFBundleName</key>
-  <string>Ditch Runtime</string>
+  <string>$DITCH_HELPER_NAME</string>
+  <key>CFBundleDisplayName</key>
+  <string>$DITCH_HELPER_NAME</string>
   <key>CFBundlePackageType</key>
   <string>APPL</string>
   <key>CFBundleShortVersionString</key>

@@ -45,6 +45,7 @@ export 'widgets/project_sidebar.dart';
 
 part 'ollama_ui.dart';
 part 'agent_model_picker.dart';
+part 'tool_integration_ui.dart';
 
 const ditchDeploymentEnvironment = runtimeDeploymentEnvironment;
 const ditchRelayOrigin = String.fromEnvironment(
@@ -469,6 +470,7 @@ class AgentModelOption {
     this.endpointId,
     this.endpointName,
     this.availabilityError,
+    this.toolsDeclared,
   });
   final String id;
   final String displayName;
@@ -477,6 +479,7 @@ class AgentModelOption {
   final String? endpointId;
   final String? endpointName;
   final String? availabilityError;
+  final bool? toolsDeclared;
   String get selectionKey =>
       endpointId == null ? 'openai:$id' : 'oss:$endpointId:$id';
   String get selectionLabel =>
@@ -705,6 +708,7 @@ class AgentExecutionSettings extends ChangeNotifier {
                 endpointId: endpoint['id'].toString(),
                 endpointName: endpoint['display_name'].toString(),
                 availabilityError: endpoint['error']?.toString(),
+                toolsDeclared: (endpoint['model_status'] as Map?)?[id]?['tools_declared'] as bool?,
               ),
       ];
     } on Object catch (error) {
@@ -777,6 +781,7 @@ class AgentSession {
     AgentExecutionSettings? executionSettings,
     this.codexThreadId,
     this.codexTitle,
+    this.provisionalTitle,
     this.namingFailed = false,
     this.userTitle,
     this.originCodexHome,
@@ -807,6 +812,7 @@ class AgentSession {
   AgentStatus status;
   String? codexThreadId;
   String? codexTitle;
+  String? provisionalTitle;
   bool namingFailed;
   String? userTitle;
   final String? originCodexHome;
@@ -828,8 +834,12 @@ class AgentSession {
   String streamingText = '';
   List<Map<String, dynamic>> attachedSkills;
 
-  String get displayName =>
-      sessionDisplayName(userTitle, codexTitle, namingFailed: namingFailed);
+  String get displayName => sessionDisplayName(
+    userTitle,
+    codexTitle,
+    namingFailed: namingFailed,
+    provisionalTitle: provisionalTitle,
+  );
 
   bool get hasCodexThread => codexThreadId != null;
 
@@ -864,6 +874,7 @@ void reconcileAgentSession(List<AgentSession> sessions, AgentSession incoming) {
   existing.codexThreadId = incoming.codexThreadId;
   existing.codexTitle = incoming.codexTitle;
   existing.namingFailed = incoming.namingFailed;
+  existing.provisionalTitle = incoming.provisionalTitle;
   existing.userTitle = incoming.userTitle;
   existing.currentPrompt = incoming.currentPrompt;
   existing.lastVisibleAction = incoming.lastVisibleAction;
@@ -1374,7 +1385,7 @@ class DitchRuntimeClient implements ProjectCloneClient {
       final status = response['RuntimeStatus'];
       if (status is! Map ||
           !(status['capabilities'] as List? ?? const []).contains(
-            'ollama_inference_v1',
+            'ollama_inference_v2',
           )) {
         throw const FormatException(
           'Upgrade the Ditch runtime before using OSS models.',
@@ -1386,6 +1397,8 @@ class DitchRuntimeClient implements ProjectCloneClient {
 
   Future<Stream<Map<String, dynamic>>> subscribeEvents() =>
       _transport.subscribeEvents();
+
+  Stream<Map<String, dynamic>> subscribeToolEvents() => _transport.subscribeToolEvents();
 
   Future<RuntimeStatusDto> runtimeStatus() async {
     return RuntimeStatusDto.fromResponse(await request('RuntimeStatus'));
@@ -3014,6 +3027,11 @@ class _CommandCenterScreenState extends State<CommandCenterScreen>
         (section) => showUnfinishedFeatureControls || showGitHubBoardControls || section.id != 'github',
       ),
       EditionSettingsSection(
+        id: 'desktop-open-source', icon: Icons.description_outlined,
+        title: 'Computer Use Licenses', subtitle: 'Peekaboo and its bundled dependencies',
+        dialogBuilder: (_) => const DesktopLicensesDialog(),
+      ),
+      EditionSettingsSection(
         id: 'license-plans',
         icon: Icons.verified_outlined,
         title: 'License & Plans',
@@ -3133,7 +3151,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen>
 
   void _checkRuntimeCapabilities(RuntimeStatusDto status) {
     _runtimeSupportsOllama = status.capabilities.contains(
-      'ollama_inference_v1',
+      'ollama_inference_v2',
     );
     _runtimeSupportsAppServerSessions = status.capabilities.contains(
       'app_server_sessions_v2',
@@ -4931,6 +4949,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen>
       codexThreadId: agentJson['native_session_id']?.toString(),
       codexTitle: agentJson['codex_title']?.toString(),
       namingFailed: agentJson['naming_failed'] == true,
+      provisionalTitle: agentJson['provisional_title']?.toString(),
       userTitle: agentJson['user_title']?.toString(),
       originCodexHome: agentJson['origin_codex_home']?.toString(),
       currentPrompt: agentJson['current_prompt']?.toString(),
@@ -8605,12 +8624,14 @@ class EditableAgentTitle extends StatefulWidget {
     required this.title,
     required this.hasOverride,
     required this.onRename,
+    this.usesOssModel = false,
     super.key,
   });
 
   final String title;
   final bool hasOverride;
   final ValueChanged<String?> onRename;
+  final bool usesOssModel;
 
   @override
   State<EditableAgentTitle> createState() => _EditableAgentTitleState();
@@ -8667,7 +8688,9 @@ class _EditableAgentTitleState extends State<EditableAgentTitle> {
       );
     }
     return Tooltip(
-      message: widget.hasOverride
+      message: widget.usesOssModel
+          ? 'Click to rename. Save an empty name to generate a title with the selected model.'
+          : widget.hasOverride
           ? 'Click to rename. Clear to restore the Codex title.'
           : widget.title == sessionTitleFailed
           ? 'Automatic naming failed. Click to rename, or save an empty name to retry.'
@@ -8785,6 +8808,8 @@ class ExpandableAgentPanel extends StatelessWidget {
                           hasOverride:
                               session.userTitle?.trim().isNotEmpty ?? false,
                           onRename: onRename,
+                          usesOssModel:
+                              session.executionSettings.inferenceEndpointId != null,
                         ),
                       ),
                       if (hasUnreadResult) ...[
@@ -9123,6 +9148,7 @@ class AgentChatPanel extends StatelessWidget {
         ),
       AgentComposer(
         key: composerKey,
+        agentId: hasSession ? conversationId : null,
         isRemote: AgentPromptDraftScope.maybeOf(context)?.isRemote ?? false,
         draft: AgentPromptDraftScope.maybeOf(context)?.forConversation(
           conversationId,
@@ -9536,6 +9562,7 @@ class AgentComposer extends StatefulWidget {
   const AgentComposer({
     required this.initialText,
     this.draft,
+    this.agentId,
     this.isRemote = false,
     required this.hasSession,
     required this.isWorking,
@@ -9551,6 +9578,7 @@ class AgentComposer extends StatefulWidget {
 
   final String initialText;
   final AgentPromptDraft? draft;
+  final String? agentId;
   final bool isRemote;
   final AgentExecutionSettings? executionSettings;
   final bool hasSession;
@@ -9950,6 +9978,8 @@ class AgentComposerState extends State<AgentComposer> {
                     runtimeClient: _scope?.runtimeClient,
                     projectId: _scope?.projectId,
                     settings: _settings,
+                    agentId: widget.agentId,
+                    isRemote: widget.isRemote,
                     loadModels: _scope?.loadModels,
                     appliesNextTurn: widget.isWorking || widget.canStop,
                   ),
@@ -9969,6 +9999,8 @@ class AgentExecutionControls extends StatefulWidget {
     this.loadModels,
     this.runtimeClient,
     this.projectId,
+    this.agentId,
+    this.isRemote = false,
     this.appliesNextTurn = false,
     super.key,
   });
@@ -9977,6 +10009,8 @@ class AgentExecutionControls extends StatefulWidget {
   final Future<List<AgentModelOption>> Function()? loadModels;
   final DitchRuntimeClient? runtimeClient;
   final String? projectId;
+  final String? agentId;
+  final bool isRemote;
   final bool appliesNextTurn;
 
   @override
@@ -9985,6 +10019,49 @@ class AgentExecutionControls extends StatefulWidget {
 
 class _AgentExecutionControlsState extends State<AgentExecutionControls> {
   AgentExecutionSettings? _loadedSettings;
+  bool _changing = false;
+
+  Future<bool> _revokeDesktop() async {
+    if (widget.agentId == null ||
+        widget.runtimeClient == null ||
+        widget.settings.inferenceEndpointId == null ||
+        widget.isRemote) {
+      return true;
+    }
+    try {
+      final status = await widget.runtimeClient!.runtimeStatus();
+      if (!status.capabilities.contains('tool_integrations_v1')) return true;
+      await widget.runtimeClient!.request({
+        'ToolIntegration': {
+          'Revoke': {'agent_id': widget.agentId},
+        },
+      });
+      return true;
+    } catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Could not finish stopping computer use: $error'),
+          ),
+        );
+      }
+      return false;
+    }
+  }
+
+  Future<void> _selectModel(AgentModelOption? option) async {
+    if (_changing || option?.selectionKey == widget.settings.selectionKey) {
+      return;
+    }
+    setState(() => _changing = true);
+    try {
+      if (await _revokeDesktop() && mounted) {
+        widget.settings.selectOption(option);
+      }
+    } finally {
+      if (mounted) setState(() => _changing = false);
+    }
+  }
 
   @override
   void initState() {
@@ -10018,30 +10095,41 @@ class _AgentExecutionControlsState extends State<AgentExecutionControls> {
   }
 
   Future<void> _selectApproval(AgentApprovalPreset value) async {
-    if (value == AgentApprovalPreset.fullAccess) {
-      final confirmed = await showDialog<bool>(
-        context: context,
-        builder: (context) => AlertDialog(
-          icon: const Icon(Icons.warning_amber_rounded),
-          title: const Text('Enable Full Access?'),
-          content: const Text(
-            'Codex will run without approval prompts or sandbox restrictions and can access the internet and files on the computer running this project.',
+    if (_changing || value == widget.settings.approval) return;
+    setState(() => _changing = true);
+    try {
+      if (value == AgentApprovalPreset.fullAccess) {
+        final confirmed = await showDialog<bool>(
+          context: context,
+          builder: (context) => AlertDialog(
+            icon: const Icon(Icons.warning_amber_rounded),
+            title: const Text('Enable Full Access?'),
+            content: Text(
+              'Codex will run without approval prompts or sandbox restrictions and can access the internet and files on the computer running this project.'
+              '${widget.settings.inferenceEndpointId != null && !widget.isRemote ? ' Computer use can also observe and control applications on this Mac when macOS permissions are granted to Ditch. Observations are sent to your selected model.' : ''}',
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.of(context).pop(false),
+                child: const Text('Cancel'),
+              ),
+              FilledButton(
+                onPressed: () => Navigator.of(context).pop(true),
+                child: const Text('Enable Full Access'),
+              ),
+            ],
           ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.of(context).pop(false),
-              child: const Text('Cancel'),
-            ),
-            FilledButton(
-              onPressed: () => Navigator.of(context).pop(true),
-              child: const Text('Enable Full Access'),
-            ),
-          ],
-        ),
-      );
-      if (confirmed != true) return;
+        );
+        if (confirmed != true) return;
+      }
+      if (!mounted) return;
+      if (value != AgentApprovalPreset.fullAccess && !await _revokeDesktop()) {
+        return;
+      }
+      if (mounted) widget.settings.setApproval(value);
+    } finally {
+      if (mounted) setState(() => _changing = false);
     }
-    widget.settings.setApproval(value);
   }
 
   Future<void> _addOssModel() async {
@@ -10063,7 +10151,7 @@ class _AgentExecutionControlsState extends State<AgentExecutionControls> {
       widget.projectId!,
     );
     if (!mounted) return;
-    widget.settings.selectOption(option);
+    await _selectModel(option);
   }
 
   @override
@@ -10083,11 +10171,13 @@ class _AgentExecutionControlsState extends State<AgentExecutionControls> {
                 value: widget.settings.approval,
                 isDense: true,
                 isExpanded: true,
-                onChanged: (value) {
-                  if (value != null) {
-                    unawaited(_selectApproval(value));
-                  }
-                },
+                onChanged: _changing
+                    ? null
+                    : (value) {
+                        if (value != null) {
+                          unawaited(_selectApproval(value));
+                        }
+                      },
                 items: const [
                   DropdownMenuItem(
                     value: AgentApprovalPreset.ask,
@@ -10112,6 +10202,7 @@ class _AgentExecutionControlsState extends State<AgentExecutionControls> {
                 Expanded(
                   child: AgentModelPicker(
                     settings: widget.settings,
+                    onSelect: _selectModel,
                     onAdd:
                         widget.runtimeClient != null && widget.projectId != null
                         ? () => unawaited(_addOssModel())
@@ -10137,7 +10228,24 @@ class _AgentExecutionControlsState extends State<AgentExecutionControls> {
               ],
             ),
           ),
-          if (widget.appliesNextTurn) const Text('Applies next turn'),
+          if (widget.settings.inferenceEndpointId != null &&
+              widget.runtimeClient != null)
+            DesktopIntegrationStatus(
+              client: widget.runtimeClient!,
+              agentId: widget.agentId,
+              fullAccess:
+                  widget.settings.approval == AgentApprovalPreset.fullAccess,
+              isRemote: widget.isRemote,
+              toolsDeclared: widget.settings.selectedModel?.toolsDeclared,
+            ),
+          if (_changing)
+            const Text('Stopping computer use…')
+          else if (widget.appliesNextTurn)
+            Text(
+              widget.settings.inferenceEndpointId == null
+                  ? 'Applies next turn'
+                  : 'Model changes apply next turn',
+            ),
         ],
       );
     },

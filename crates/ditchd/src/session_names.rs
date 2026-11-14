@@ -99,7 +99,9 @@ fn start_session_name_watcher(state: &Arc<Mutex<RuntimeState>>) {
         loop {
             thread::sleep(std::time::Duration::from_secs(3));
             let Some(state) = weak.upgrade() else { break };
-            let Ok(_admission) = RemoteMutationGuard::background_work(&state) else { continue };
+            let Ok(_admission) = RemoteMutationGuard::background_work(&state) else {
+                continue;
+            };
             refresh_session_names(&state);
             process_session_name_job(&state);
         }
@@ -113,6 +115,10 @@ struct SessionNameReceipt {
     attempts: u8,
     retry_at: i64,
     generated_name: Option<String>,
+    model: Option<String>,
+    endpoint_id: Option<Uuid>,
+    generation: Uuid,
+    force_generation: bool,
 }
 
 struct SessionNameJob {
@@ -122,12 +128,23 @@ struct SessionNameJob {
     binary: String,
     workspace: PathBuf,
     model: Option<String>,
+    endpoint_id: Option<Uuid>,
     prompt: String,
     receipt: SessionNameReceipt,
 }
 
 fn name_receipt_key(agent_id: AgentId) -> String {
     format!("session-naming:{}", agent_id.0)
+}
+
+fn name_regeneration_pending(state: &RuntimeState, id: AgentId) -> bool {
+    state
+        .store
+        .setting(&name_receipt_key(id))
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str::<SessionNameReceipt>(&s).ok())
+        .is_some_and(|receipt| receipt.force_generation)
 }
 
 // A single background worker claims these jobs. The durable attempt reservation
@@ -140,11 +157,15 @@ fn claim_session_name_job(state: &Arc<Mutex<RuntimeState>>) -> Option<SessionNam
         .values()
         .filter(|record| {
             let run = &record.run;
-            run.execution_profile.inference_endpoint_id.is_none()
-                && run.codex_title.is_none()
+            (run.codex_title.is_none() || name_regeneration_pending(&locked, run.id))
                 && run.user_title.is_none()
                 && !run.naming_failed
                 && run.native_session_id.is_some()
+                && (run.execution_profile.inference_endpoint_id.is_none()
+                    || (run.finished_at.is_some()
+                        && !run.can_stop
+                        && !locked.children.contains_key(&run.id)
+                        && !locked.app_server_turns.contains_key(&run.id)))
                 && locked.projects.values().any(|p| {
                     p.id == run.project_id
                         && p.archived_at.is_none()
@@ -165,9 +186,14 @@ fn claim_session_name_job(state: &Arc<Mutex<RuntimeState>>) -> Option<SessionNam
             Ok(None) => SessionNameReceipt::default(),
             Err(_) => continue,
         };
-        if receipt.thread_id != *thread_id {
+        if receipt.thread_id != *thread_id
+            || receipt.model != run.execution_profile.model
+            || receipt.endpoint_id != run.execution_profile.inference_endpoint_id
+        {
             receipt = SessionNameReceipt {
                 thread_id: thread_id.clone(),
+                model: run.execution_profile.model.clone(),
+                endpoint_id: run.execution_profile.inference_endpoint_id,
                 ..Default::default()
             };
         }
@@ -204,6 +230,7 @@ fn claim_session_name_job(state: &Arc<Mutex<RuntimeState>>) -> Option<SessionNam
             binary,
             workspace: locked.paths.data_dir.join("session-naming"),
             model: run.execution_profile.model,
+            endpoint_id: run.execution_profile.inference_endpoint_id,
             prompt,
             receipt,
         });
@@ -215,15 +242,26 @@ fn session_name_job_matches(locked: &RuntimeState, job: &SessionNameJob) -> bool
     locked.agents.get(&job.agent_id).is_some_and(|record| {
         record.run.native_session_id.as_deref() == Some(&job.thread_id)
             && session_name_home(record.run.origin_codex_home.as_deref()) == job.home
+            && record.run.execution_profile.model == job.model
+            && record.run.execution_profile.inference_endpoint_id == job.endpoint_id
+            && record.run.user_title.is_none()
+            && locked
+                .store
+                .setting(&name_receipt_key(job.agent_id))
+                .ok()
+                .flatten()
+                .and_then(|s| serde_json::from_str::<SessionNameReceipt>(&s).ok())
+                .is_some_and(|r| r.generation == job.receipt.generation)
     })
 }
 
 fn set_session_naming_failed(locked: &mut RuntimeState, agent_id: AgentId, thread_id: &str) {
+    let regenerating = name_regeneration_pending(locked, agent_id);
     let Some(record) = locked.agents.get_mut(&agent_id) else {
         return;
     };
     if record.run.native_session_id.as_deref() != Some(thread_id)
-        || record.run.codex_title.is_some()
+        || (record.run.codex_title.is_some() && !regenerating)
         || record.run.naming_failed
     {
         return;
@@ -252,17 +290,65 @@ fn generate_session_name(
     state: &Arc<Mutex<RuntimeState>>,
     job: &mut SessionNameJob,
 ) -> io::Result<()> {
-    let mut client = session_namer::open(&job.binary, &job.workspace, job.home.as_deref())?;
-    let existing = session_namer::existing_name(&mut client, &job.thread_id)?;
+    if !session_name_job_matches(&state.lock().unwrap(), job) {
+        return Ok(());
+    }
+    let profile = AgentExecutionProfile {
+        model: job.model.clone(),
+        inference_endpoint_id: job.endpoint_id,
+        ..Default::default()
+    };
+    let provider = resolve_ollama_profile(state, &profile).map_err(io::Error::other)?;
+    generate_session_name_with_provider(state, job, provider.as_ref())
+}
+
+fn generate_session_name_with_provider(
+    state: &Arc<Mutex<RuntimeState>>,
+    job: &mut SessionNameJob,
+    provider: Option<&ollama::ResolvedOllamaProvider>,
+) -> io::Result<()> {
+    if !session_name_job_matches(&state.lock().unwrap(), job) {
+        return Ok(());
+    }
+    if job.endpoint_id != provider.map(|p| p.endpoint.id)
+        || provider.is_some_and(|p| job.model.as_deref() != Some(p.model.as_str()))
+    {
+        return Err(io::Error::other("Naming provider binding changed"));
+    }
+    let mut client = if let Some(provider) = provider.as_ref() {
+        session_namer::open_with_provider(
+            &job.binary,
+            &job.workspace,
+            job.home.as_deref(),
+            Some(provider),
+        )?
+    } else {
+        session_namer::open(&job.binary, &job.workspace, job.home.as_deref())?
+    };
+    let existing = if job.receipt.force_generation {
+        None
+    } else {
+        session_namer::existing_name(&mut client, &job.thread_id)?
+    };
     let name = if let Some(name) = existing.clone().or(job.receipt.generated_name.clone()) {
         name
     } else {
-        let name = session_namer::generate(
-            &mut client,
-            &job.workspace,
-            job.model.as_deref(),
-            &job.prompt,
-        )?;
+        let name = if let Some(provider) = provider.as_ref() {
+            session_namer::generate_with_provider(
+                &mut client,
+                &job.workspace,
+                job.model.as_deref(),
+                &job.prompt,
+                Some(provider),
+            )?
+        } else {
+            session_namer::generate(
+                &mut client,
+                &job.workspace,
+                job.model.as_deref(),
+                &job.prompt,
+            )?
+        };
         job.receipt.generated_name = Some(name.clone());
         let mut locked = state.lock().unwrap();
         if !session_name_job_matches(&locked, job) {
@@ -283,7 +369,8 @@ fn generate_session_name(
             return Ok(());
         }
         let run = &locked.agents[&job.agent_id].run;
-        if run.user_title.is_some() || run.codex_title.is_some() {
+        if run.user_title.is_some() || (run.codex_title.is_some() && !job.receipt.force_generation)
+        {
             return Ok(());
         }
     }
@@ -294,12 +381,21 @@ fn generate_session_name(
     if !session_name_job_matches(&locked, job) {
         return Ok(());
     }
-    let record = locked.agents.get_mut(&job.agent_id).unwrap();
-    if record.run.codex_title.is_some() {
+    if locked.agents[&job.agent_id].run.codex_title.is_some() && !job.receipt.force_generation {
         return Ok(());
     }
+    job.receipt.force_generation = false;
+    locked
+        .store
+        .set_setting(
+            &name_receipt_key(job.agent_id),
+            &serde_json::to_string(&job.receipt)?,
+        )
+        .map_err(io::Error::other)?;
+    let record = locked.agents.get_mut(&job.agent_id).unwrap();
     // Never mutate user_title; a manual edit made during either RPC wins.
     record.run.codex_title = Some(name);
+    record.run.provisional_title = None;
     record.run.naming_failed = false;
     let run = record.run.clone();
     locked.persist_agent(job.agent_id);

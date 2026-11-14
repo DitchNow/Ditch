@@ -2272,6 +2272,7 @@ class _TaskInspectorState extends State<_TaskInspector> {
           agent['user_title'] as String?,
           agent['codex_title'] as String?,
           namingFailed: agent['naming_failed'] == true,
+          provisionalTitle: agent['provisional_title']?.toString(),
         );
 
   Future<void> selectAgent(TaskDto task, String? id) async {
@@ -2821,6 +2822,8 @@ class _TaskInspectorState extends State<_TaskInspector> {
                               agent['user_title'] as String?,
                               agent['codex_title'] as String?,
                               namingFailed: agent['naming_failed'] == true,
+                              provisionalTitle:
+                                  agent['provisional_title']?.toString(),
                             ),
                           ),
                         ),

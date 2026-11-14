@@ -31,6 +31,7 @@ impl<T> Envelope<T> {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ClientRequest {
+    ToolIntegration(ditch_core::tool_integrations::ToolIntegrationRequest),
     Ollama(ditch_core::ollama::OllamaRequest),
     SkillRequest(ditch_core::SkillRequest),
     TaskRequest(ditch_core::TaskRequest),
@@ -345,6 +346,7 @@ pub enum ClientRequest {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum ServerResponse {
+    ToolIntegration(ditch_core::tool_integrations::ToolIntegrationResponse),
     Ollama(ditch_core::ollama::OllamaResponse),
     PermissionDetails(ditch_core::PermissionRequest),
     SkillResponse(ditch_core::SkillResponse),
@@ -674,6 +676,8 @@ pub struct RuntimeAttention {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum ServerEvent {
+    /// Sent only on the explicit ToolIntegration Subscribe stream.
+    ToolIntegration(ditch_core::tool_integrations::ToolIntegrationEvent),
     Heartbeat,
     PermissionResolved {
         request_id: Uuid,

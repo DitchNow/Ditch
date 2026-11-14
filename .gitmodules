@@ -1,0 +1,3 @@
+[submodule "vendor/peekaboo"]
+	path = vendor/peekaboo
+	url = https://github.com/openclaw/Peekaboo.git

@@ -215,6 +215,11 @@ fn send_approval_response(
 }
 
 pub fn spawn_turn(launch: Launch<'_>, events: Sender<Event>) -> io::Result<SpawnedTurn> {
+    let desktop = if launch.inference_provider.is_some()
+        && launch.execution_profile.approval == ditch_core::AgentApprovalPreset::FullAccess
+        && !launch.remote && !launch.restricted {
+        crate::tool_integrations::lease_for(launch.agent_id)
+    } else { None };
     let home = launch.codex_home.as_ref().map(std::path::Path::new);
     let mut client = crate::app_server_client::Client::open_with_provider(
         launch.binary,
@@ -254,6 +259,57 @@ pub fn spawn_turn(launch: Launch<'_>, events: Sender<Event>) -> io::Result<Spawn
         "sandbox":sandbox, "serviceName":"the_ditch",
         "config":{"features":{"multi_agent":false,"collab":false},"web_search":"live","tools":{"web_search":true},"sandbox_workspace_write":{"writable_roots":[launch.cwd],"exclude_slash_tmp":true,"exclude_tmpdir_env_var":true,"network_access":true}}
     });
+    if let Some(provider) = launch.inference_provider {
+        // Scope the OSS tool catalog to this child/thread; keep the original home
+        // and native thread identity so existing history remains resumable.
+        let config = client.call("config/read", json!({"includeLayers":false}))?;
+        if config["config"]["model_context_window"].as_u64()
+            != Some(u64::from(provider.context_window))
+            || config["config"]["model_auto_compact_token_limit"].as_u64()
+                != Some(u64::from(provider.context_window * 3 / 4))
+        {
+            return Err(io::Error::other(
+                "Codex did not accept the verified OSS context budget. Update Codex on this execution host before continuing.",
+            ));
+        }
+        let disabled: serde_json::Map<String, Value> = config["config"]["mcp_servers"]
+            .as_object()
+            .into_iter()
+            .flatten()
+            .map(|(name, _)| (name.clone(), json!({"enabled":false})))
+            .collect();
+        thread_params["config"]["mcp_servers"] = json!(disabled);
+        if let Some(desktop) = &desktop {
+            thread_params["config"]["mcp_servers"]["ditch_tools"] = desktop.config();
+        }
+        thread_params["config"]["features"]["apps"] = json!(false);
+        let catalog = client.call(
+            "skills/list",
+            json!({"cwds":[launch.cwd],"forceReload":true}),
+        )?;
+        let mut disabled_skills = config["config"]["skills"]["config"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        disabled_skills.extend(
+            catalog["data"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .flat_map(|entry| entry["skills"].as_array().into_iter().flatten())
+                .filter_map(|skill| skill["path"].as_str())
+                .filter(|path| {
+                    !Path::new(path).starts_with(launch.cwd)
+                        && !launch
+                            .execution_profile
+                            .skills
+                            .iter()
+                            .any(|s| s.path == Path::new(path))
+                })
+                .map(|path| json!({"path":path,"enabled":false})),
+        );
+        thread_params["config"]["skills"]["config"] = json!(disabled_skills);
+    }
     if launch.restricted {
         let config = client.call("config/read", json!({"includeLayers":false}))?;
         let mut disabled = serde_json::Map::new();
@@ -426,6 +482,9 @@ pub fn spawn_turn(launch: Launch<'_>, events: Sender<Event>) -> io::Result<Spawn
                         .pointer("/result/thread/id")
                         .and_then(Value::as_str)
                         .map(str::to_owned);
+                    if let (Some(desktop), Some(thread)) = (&desktop, &thread_id) {
+                        desktop.bind_thread(thread);
+                    }
                 }
                 if let (Some(thread), Some(turn)) = (
                     thread_id.as_ref(),
@@ -435,6 +494,7 @@ pub fn spawn_turn(launch: Launch<'_>, events: Sender<Event>) -> io::Result<Spawn
                         .and_then(Value::as_str),
                 ) {
                     *reader_ids.lock().unwrap() = Some((thread.clone(), turn.to_owned()));
+                    if let Some(desktop) = &desktop { desktop.bind_turn(turn); }
                 }
                 if value.get("method").is_none()
                     && value.get("id").and_then(Value::as_str) == Some("ditch:interrupt")
@@ -480,6 +540,7 @@ pub fn spawn_turn(launch: Launch<'_>, events: Sender<Event>) -> io::Result<Spawn
                 &skills,
             );
         }
+        if let Some(desktop) = &desktop { desktop.drain(); }
         let _ = reader_events.send(Event::OutputClosed);
     });
 

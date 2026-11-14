@@ -4,6 +4,7 @@ use ditch_protocol::{ClientRequest, Envelope, ServerResponse};
 use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use uuid::Uuid;
+mod tool_server;
 
 fn main() {
     if std::env::var_os("DITCH_SSH_ASKPASS_SOCKET").is_some() {
@@ -14,6 +15,7 @@ fn main() {
     }
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     let result = match args.as_slice() {
+        [group, command, transport] if group == "tools" && command == "serve" && transport == "--stdio" => tool_server::serve(),
         [] => print_help(),
         [command] if command == "health" => print_response(ClientRequest::Health),
         [command] if command == "paths" => print_paths(),

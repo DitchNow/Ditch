@@ -119,7 +119,8 @@ fn start_remote_app_server_session_linked(
         task_id: binding.map(|b| b.0),
         pane_id: None,
         native_session_id: resume_thread.clone(),
-        codex_title: execution_profile.inference_endpoint_id.and_then(|_| {
+        codex_title: None,
+        provisional_title: execution_profile.inference_endpoint_id.and_then(|_| {
             ditch_core::normalize_session_title(
                 &prompt
                     .split_whitespace()
@@ -153,6 +154,7 @@ fn start_remote_app_server_session_linked(
     if let Some(previous) = &previous {
         run.started_at = previous.run.started_at;
         run.codex_title = previous.run.codex_title.clone();
+        run.provisional_title = previous.run.provisional_title.clone();
         run.naming_failed = previous.run.naming_failed;
         run.user_title = previous.run.user_title.clone();
     }
@@ -189,6 +191,9 @@ fn start_remote_app_server_session_linked(
     let (event_tx, event_rx) = mpsc::channel();
     let restricted = edition::restricted_agent(&state.lock().unwrap(), run.id);
     let protected_roots = {let s=state.lock().unwrap();let mut roots=vec![s.paths.data_dir.clone()];if let Some(home)=s.codex_home.clone().or_else(||std::env::var_os("HOME").map(|h|PathBuf::from(h).join(".codex"))){roots.push(home);}roots};
+    let run_id = uuid::Uuid::new_v4();
+    let desktop = tool_integrations::prepare(&state, run.id, run_id, &execution_profile,
+        if binding.is_some() || restricted { ditch_core::tool_integrations::InvocationPurpose::Worker } else { ditch_core::tool_integrations::InvocationPurpose::User });
     let spawned = match codex_app_server::spawn_turn(
         codex_app_server::Launch {
             inference_provider: inference_provider.as_ref(),
@@ -210,6 +215,7 @@ fn start_remote_app_server_session_linked(
     ) {
         Ok(spawned) => spawned,
         Err(error) => {
+            if let Some(desktop) = &desktop { desktop.drain(); }
             return persist_launch_failure(
                 &state,
                 project,
@@ -224,7 +230,6 @@ fn start_remote_app_server_session_linked(
         .lock()
         .expect("child lock should not be poisoned")
         .id() as i32;
-    let run_id = uuid::Uuid::new_v4();
     run.state = AgentState::Working;
     run.can_stop = true;
     run.updated_at = Utc::now();
@@ -418,6 +423,10 @@ fn prompt_app_server_agent(
     let (event_tx, event_rx) = mpsc::channel();
     let restricted = edition::restricted_agent(&state.lock().unwrap(), agent_id);
     let protected_roots = {let s=state.lock().unwrap();let mut roots=vec![s.paths.data_dir.clone()];if let Some(home)=s.codex_home.clone().or_else(||std::env::var_os("HOME").map(|h|PathBuf::from(h).join(".codex"))){roots.push(home);}roots};
+    let run_id = uuid::Uuid::new_v4();
+    let is_worker = state.lock().unwrap().agents.get(&agent_id).is_some_and(|a| a.run.task_id.is_some());
+    let desktop = tool_integrations::prepare(&state, agent_id, run_id, &execution_profile,
+        if is_worker || restricted { ditch_core::tool_integrations::InvocationPurpose::Worker } else { ditch_core::tool_integrations::InvocationPurpose::User });
     let spawned = match codex_app_server::spawn_turn(
         codex_app_server::Launch {
             inference_provider: inference_provider.as_ref(),
@@ -439,6 +448,7 @@ fn prompt_app_server_agent(
     ) {
         Ok(spawned) => spawned,
         Err(error) => {
+            if let Some(desktop) = &desktop { desktop.drain(); }
             let message = format!("Failed to start Codex App Server: {error}");
             record_terminal_failure(&state, agent_id, message.clone(), None);
             return protocol_error("codex_start_failed", message);
@@ -455,7 +465,6 @@ fn prompt_app_server_agent(
         .lock()
         .expect("child lock should not be poisoned")
         .id() as i32;
-    let run_id = uuid::Uuid::new_v4();
     {
         let mut state = state
             .lock()
@@ -570,6 +579,7 @@ fn attach_remote_app_server_turn(
                 break;
             }
         }
+        tool_integrations::revoke_run(agent_id, run_id);
     });
 }
 
@@ -762,6 +772,7 @@ fn handle_remote_app_server_event(
             state.broadcast(ServerEvent::PermissionRequested(request));
         }
         codex_app_server::Event::TurnCompleted { status, error } => {
+            tool_integrations::revoke_run(agent_id, run_id);
             if let Some(error) = error {
                 record_terminal_failure(state, agent_id, error, Some(run_id));
             }

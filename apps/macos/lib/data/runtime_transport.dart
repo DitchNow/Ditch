@@ -77,7 +77,13 @@ class RuntimeTransport {
     int sinceSequence = 0,
   }) async => _readEvents(sinceSequence);
 
-  Stream<Map<String, dynamic>> _readEvents(int sinceSequence) async* {
+  Stream<Map<String, dynamic>> subscribeToolEvents() =>
+      _readEvents(0, body: const {'ToolIntegration': 'Subscribe'});
+
+  Stream<Map<String, dynamic>> _readEvents(
+    int sinceSequence, {
+    Object? body,
+  }) async* {
     Socket? socket;
     try {
       // Open lazily so cancelling before listening cannot orphan a socket.
@@ -91,9 +97,11 @@ class RuntimeTransport {
           'protocol_version': 1,
           'id': _newRequestUuid(),
           'sent_at': DateTime.now().toUtc().toIso8601String(),
-          'body': {
-            'SubscribeEvents': {'since_sequence': sinceSequence},
-          },
+          'body':
+              body ??
+              {
+                'SubscribeEvents': {'since_sequence': sinceSequence},
+              },
         }),
       );
       await socket.flush();

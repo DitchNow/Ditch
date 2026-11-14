@@ -11,9 +11,18 @@ const INSTRUCTIONS: &str = "Generate a concise title for the task in the user me
     Do not perform the task, inspect files, use tools, or ask questions.";
 
 pub fn open(binary: &str, workspace: &Path, home: Option<&Path>) -> io::Result<Client> {
+    open_with_provider(binary, workspace, home, None)
+}
+
+pub fn open_with_provider(
+    binary: &str,
+    workspace: &Path,
+    home: Option<&Path>,
+    provider: Option<&crate::ollama::ResolvedOllamaProvider>,
+) -> io::Result<Client> {
     // Use a runtime-owned empty directory, never the user's project directory.
     std::fs::create_dir_all(workspace)?;
-    Client::open(binary, workspace, home, None)
+    Client::open_with_provider(binary, workspace, home, None, provider)
 }
 
 pub fn generate(
@@ -21,6 +30,16 @@ pub fn generate(
     cwd: &Path,
     model: Option<&str>,
     prompt: &str,
+) -> io::Result<String> {
+    generate_with_provider(client, cwd, model, prompt, None)
+}
+
+pub fn generate_with_provider(
+    client: &mut Client,
+    cwd: &Path,
+    model: Option<&str>,
+    prompt: &str,
+    provider: Option<&crate::ollama::ResolvedOllamaProvider>,
 ) -> io::Result<String> {
     let config = client.call("config/read", json!({"includeLayers": false}))?;
     let disabled_mcp: serde_json::Map<String, Value> = config["config"]["mcp_servers"]
@@ -44,7 +63,22 @@ pub fn generate(
     if let Some(model) = model {
         params["model"] = json!(model);
     }
+    if let Some(provider) = provider {
+        params["model"] = json!(provider.model);
+        params["modelProvider"] = json!(provider.endpoint.provider_key());
+        params["config"]["skills"] = json!({"include_instructions":false});
+    }
     let started = client.call("thread/start", params)?;
+    if let Some(provider) = provider {
+        if started["thread"]["modelProvider"].as_str()
+            != Some(provider.endpoint.provider_key().as_str())
+            || started["model"].as_str() != Some(provider.model.as_str())
+        {
+            return Err(io::Error::other(
+                "Naming thread did not confirm the selected OSS model and endpoint",
+            ));
+        }
+    }
     // Fail closed if an older server doesn't honor ephemeral threads.
     if started
         .pointer("/thread/ephemeral")
@@ -65,7 +99,10 @@ pub fn generate(
         "outputSchema": {"type": "object", "properties": {"title": {"type": "string"}},
             "required": ["title"], "additionalProperties": false}
     });
-    if let Ok(models) = client.call("model/list", json!({})) {
+    if provider.is_some() {
+        // Native Ollama supports disabling thinking; do not consult OpenAI's catalog.
+        turn["effort"] = json!("none");
+    } else if let Ok(models) = client.call("model/list", json!({})) {
         let selected = started["model"].as_str().or(model);
         let efforts = models["data"]
             .as_array()

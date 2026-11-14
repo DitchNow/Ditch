@@ -78,7 +78,10 @@ void main() {
                 jsonEncode({
                   'body': {
                     'RuntimeStatus': {
-                      'capabilities': ['app_server_sessions_v2'],
+                      'capabilities': [
+                        'app_server_sessions_v2',
+                        'ollama_inference_v1',
+                      ],
                     },
                   },
                 }),

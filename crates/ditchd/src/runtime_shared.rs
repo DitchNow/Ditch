@@ -343,6 +343,7 @@ impl RuntimeState {
     fn new(paths: AppPaths, remote_runtime: bool) -> Result<Self, io::Error> {
         let mut store = DitchStore::open(&paths).map_err(io::Error::other)?;
         edition::initialize_store(&mut store)?;
+        store.recover_tool_operations().map_err(io::Error::other)?;
         store.reconcile_active_agents().map_err(io::Error::other)?;
         store.reconcile_tasks().map_err(io::Error::other)?;
         let mut durable = store.load().map_err(io::Error::other)?;
@@ -482,7 +483,9 @@ impl RuntimeState {
 
     fn runtime_status(&self) -> RuntimeStatus {
         let mut capabilities = vec![
+            ditch_core::tool_integrations::CAPABILITY.to_owned(),
             ollama::CAPABILITY.to_owned(),
+            "ollama_inference_v1".to_owned(),
             format!("edition_{RUNTIME_EDITION}"),
             "project_clone_v1".to_owned(),
             "project_rename_v1".to_owned(),
@@ -520,6 +523,9 @@ impl RuntimeState {
             capabilities.push("remote_terminal_maintenance_v1".to_owned());
         }
         edition::extend_runtime_capabilities(&self.edition, &mut capabilities);
+        if tool_integrations::native::available() {
+            capabilities.push(ditch_core::tool_integrations::DESKTOP_CAPABILITY.to_owned());
+        }
         RuntimeStatus {
             identity: RUNTIME_IDENTITY.to_owned(),
             edition: RUNTIME_EDITION.to_owned(),
@@ -1312,6 +1318,48 @@ fn handle_client(mut stream: UnixStream, state: Arc<Mutex<RuntimeState>>) -> io:
     if let ClientRequest::SubscribeAttention = request {
         return subscribe_attention(stream, state);
     }
+    if let ClientRequest::ToolIntegration(operation) = &request {
+        use ditch_core::tool_integrations::ToolIntegrationRequest;
+        if matches!(operation, ToolIntegrationRequest::Subscribe) {
+            stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+            let events = tool_integrations::subscribe();
+            loop {
+                match events.recv_timeout(Duration::from_secs(1)) {
+                    Ok(event) => {
+                        serde_json::to_writer(&mut stream, &Envelope::new(ServerEvent::ToolIntegration(event)))?;
+                        stream.write_all(b"\n")?;
+                        stream.flush()?;
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        use std::os::fd::AsRawFd;
+                        let mut byte = 0u8;
+                        let count = unsafe { libc::recv(stream.as_raw_fd(), (&mut byte as *mut u8).cast(), 1, libc::MSG_PEEK | libc::MSG_DONTWAIT) };
+                        if count == 0 { break; }
+                    }
+                }
+            }
+            return Ok(());
+        }
+        if let ToolIntegrationRequest::RequestSystemPermission { permission } = operation {
+            let expected = std::env::current_exe().ok().and_then(|p| p.ancestors()
+                .filter(|p| p.extension().is_some_and(|e| e == "app")).last().map(Path::to_path_buf));
+            let authorized = expected.as_ref().is_some_and(|path| tool_integrations::local_transport::peer_pid(&stream)
+                .is_some_and(|pid| tool_integrations::native::verify_peer(pid, 2, path)));
+            let body = if authorized {
+                use ditch_core::tool_integrations::{SystemPermission,ToolIntegrationResponse};
+                tool_integrations::native::request_permission(match permission {
+                    SystemPermission::Accessibility => 1, SystemPermission::ScreenRecording => 2, SystemPermission::PostEvent => 3,
+                });
+                ServerResponse::ToolIntegration(ToolIntegrationResponse::SetupRequested)
+            } else { protocol_error("client_not_authorized", "System permission setup requires the signed Ditch UI") };
+            let mut response = Envelope::new(body);
+            response.id = request_id;
+            serde_json::to_writer(&mut stream, &response)?;
+            stream.write_all(b"\n")?;
+            return Ok(());
+        }
+    }
 
     let response = handle_operation(request_id, request, state);
     let mut envelope = Envelope::new(response);
@@ -1500,6 +1548,21 @@ fn subscribe_attention(mut stream: UnixStream, state: Arc<Mutex<RuntimeState>>) 
 #[allow(unreachable_patterns)]
 fn handle_request(request: ClientRequest, state: Arc<Mutex<RuntimeState>>) -> ServerResponse {
     match request {
+        ClientRequest::ToolIntegration(operation) => {
+            use ditch_core::tool_integrations::{ToolIntegrationRequest,ToolIntegrationResponse};
+            match operation {
+                ToolIntegrationRequest::Status { agent_id } =>
+                    ServerResponse::ToolIntegration(ToolIntegrationResponse::Status(tool_integrations::status(agent_id))),
+                ToolIntegrationRequest::Revoke { agent_id } => {
+                    if tool_integrations::has_lease(agent_id) {
+                        let response = stop_agent(state, agent_id);
+                        if !matches!(response, ServerResponse::Accepted) { return response; }
+                    }
+                    ServerResponse::ToolIntegration(ToolIntegrationResponse::Revoked)
+                }
+                _ => protocol_error("client_not_authorized", "This operation requires a native client connection"),
+            }
+        }
         ClientRequest::Health => {
             let state = state
                 .lock()
@@ -3531,6 +3594,8 @@ fn list_filesystem_directory(absolute_path: &str) -> ServerResponse {
 }
 
 fn shutdown_runtime(state: Arc<Mutex<RuntimeState>>) -> ServerResponse {
+    tool_integrations::revoke_all();
+    tool_integrations::native::revoke_and_drain();
     let socket_path = {
         let mut state = state
             .lock()
@@ -4045,6 +4110,11 @@ fn prompt_agent(
 }
 
 fn stop_agent(state: Arc<Mutex<RuntimeState>>, agent_id: AgentId) -> ServerResponse {
+    if !tool_integrations::revoke(agent_id) {
+        let control = state.lock().unwrap().app_server_turns.get(&agent_id).cloned();
+        if let Some(control) = control { let _ = control.interrupt(); }
+        return protocol_error("desktop_still_stopping", "Desktop input is still stopping. Access remains revoked; wait for native cleanup before continuing.");
+    }
     let active = {
         let mut state = state
             .lock()
@@ -4135,6 +4205,9 @@ fn stop_agent(state: Arc<Mutex<RuntimeState>>, agent_id: AgentId) -> ServerRespo
 }
 
 fn force_kill_agent(state: Arc<Mutex<RuntimeState>>, agent_id: AgentId) -> ServerResponse {
+    if !tool_integrations::revoke(agent_id) {
+        return protocol_error("desktop_still_stopping", "Desktop input is still stopping; access remains revoked.");
+    }
     {let locked=state.lock().unwrap();if let Some(control)=locked.acceptance_controls.values().find(|c|c.owner==agent_id){control.cancel.store(true,Ordering::Release);let _=control.wake.send(());}}
     let active = {
         let state = state
@@ -4267,6 +4340,9 @@ fn finalize_stopped_run(state: &Arc<Mutex<RuntimeState>>, agent_id: AgentId, run
 }
 
 fn delete_agent(state: Arc<Mutex<RuntimeState>>, agent_id: AgentId) -> ServerResponse {
+    if !tool_integrations::revoke(agent_id) {
+        return protocol_error("desktop_still_stopping", "Wait for desktop input to stop before deleting this session.");
+    }
     let mut state = state
         .lock()
         .expect("runtime state lock should not be poisoned");
@@ -4364,22 +4440,40 @@ fn rename_agent(
     title: Option<String>,
 ) -> ServerResponse {
     let title = title.as_deref().and_then(ditch_core::normalize_session_title);
-    let mut state = state
-        .lock()
-        .expect("runtime state lock should not be poisoned");
-    let Some(record) = state.agents.get_mut(&agent_id) else {
+    let mut state = state.lock().expect("runtime state lock should not be poisoned");
+    let Some(record) = state.agents.get(&agent_id) else {
         return protocol_error("agent_not_found", "agent session was not found");
     };
+    // An empty OSS name is an explicit request to regenerate, including legacy
+    // titles whose origin was not recorded. Never infer origin from title text.
+    let regenerate =
+        title.is_none() && record.run.execution_profile.inference_endpoint_id.is_some();
+    let retry = title.is_none() && record.run.naming_failed;
+    if regenerate || retry {
+        let receipt = SessionNameReceipt {
+            thread_id: record.run.native_session_id.clone().unwrap_or_default(),
+            model: record.run.execution_profile.model.clone(),
+            endpoint_id: record.run.execution_profile.inference_endpoint_id,
+            generation: Uuid::new_v4(),
+            force_generation: regenerate,
+            ..Default::default()
+        };
+        let value = serde_json::to_string(&receipt).expect("serialize naming receipt");
+        if state
+            .store
+            .set_setting(&name_receipt_key(agent_id), &value)
+            .is_err()
+        {
+            return protocol_error("session_naming_unavailable", "Could not queue session naming");
+        }
+    }
+    let record = state.agents.get_mut(&agent_id).unwrap();
     record.run.user_title = title;
-    let retry_naming = record.run.user_title.is_none() && record.run.naming_failed;
-    if retry_naming {
+    if regenerate || retry {
         record.run.naming_failed = false;
     }
     record.run.updated_at = Utc::now();
     let run = record.run.clone();
-    if retry_naming {
-        let _ = state.store.set_setting(&name_receipt_key(agent_id), "{}");
-    }
     state.persist_agent(agent_id);
     state.broadcast(ServerEvent::AgentChanged(run));
     ServerResponse::Accepted
@@ -6249,6 +6343,7 @@ esac
                     pane_id: None,
                     native_session_id: None,
                     codex_title: None,
+                    provisional_title: None,
                     naming_failed: false,
                     user_title: None,
                     origin_codex_home: None,
@@ -6332,6 +6427,7 @@ esac
                     pane_id: None,
                     native_session_id: Some("thread-stop".to_owned()),
                     codex_title: Some("Stop test".to_owned()),
+                    provisional_title: None,
                     naming_failed: false,
                     user_title: None,
                     origin_codex_home: None,
@@ -6437,6 +6533,7 @@ esac
                     pane_id: None,
                     native_session_id: None,
                     codex_title: None,
+                    provisional_title: None,
                     naming_failed: false,
                     user_title: None,
                     origin_codex_home: None,
@@ -6520,6 +6617,7 @@ esac
                     pane_id: None,
                     native_session_id: Some("thread-completed".to_owned()),
                     codex_title: Some("Notification test".to_owned()),
+                    provisional_title: None,
                     naming_failed: false,
                     user_title: None,
                     origin_codex_home: None,
@@ -6582,6 +6680,7 @@ esac
                     pane_id: None,
                     native_session_id: Some("thread-safe".to_owned()),
                     codex_title: Some("Safety test".to_owned()),
+                    provisional_title: None,
                     naming_failed: false,
                     user_title: None,
                     origin_codex_home: None,
@@ -6659,6 +6758,7 @@ esac
                     pane_id: None,
                     native_session_id: Some("thread-quota".to_owned()),
                     codex_title: None,
+                    provisional_title: None,
                     naming_failed: false,
                     user_title: None,
                     origin_codex_home: None,
@@ -6723,6 +6823,7 @@ esac
                     pane_id: None,
                     native_session_id: Some("thread-123".to_owned()),
                     codex_title: None,
+                    provisional_title: None,
                     naming_failed: false,
                     user_title: None,
                     origin_codex_home: None,

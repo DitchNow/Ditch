@@ -1,0 +1,62 @@
+diff --git a/model/renderers/qwen35.go b/model/renderers/qwen35.go
+index f55e190..5c205ba 100644
+--- a/model/renderers/qwen35.go
++++ b/model/renderers/qwen35.go
+@@ -201,12 +201,12 @@ func (r *Qwen35Renderer) validateMessages(messages []api.Message) error {
+ }
+ 
+ func (r *Qwen35Renderer) Render(messages []api.Message, tools []api.Tool, think *api.ThinkValue) (string, error) {
+-	if r.variant == qwen35Renderer38 {
+-		var err error
+-		messages, err = normalizeQwen38Messages(messages)
+-		if err != nil {
+-			return "", err
+-		}
++	// Both Qwen3.5 and Qwen3.8 need all instruction messages in the
++	// leading system turn. Otherwise developer messages are silently dropped.
++	var err error
++	messages, err = normalizeQwen38Messages(messages)
++	if err != nil {
++		return "", err
+ 	}
+ 	if err := r.validateMessages(messages); err != nil {
+ 		return "", err
+diff --git a/model/renderers/qwen35_developer_test.go b/model/renderers/qwen35_developer_test.go
+new file mode 100644
+index 0000000..dade1d4
+--- /dev/null
++++ b/model/renderers/qwen35_developer_test.go
+@@ -0,0 +1,33 @@
++package renderers
++
++import (
++	"github.com/ollama/ollama/api"
++	"strings"
++	"testing"
++)
++
++func TestQwen35PreservesDeveloperInstructions(t *testing.T) {
++	r := &Qwen35Renderer{}
++	messages := []api.Message{
++		{Role: "system", Content: "SYSTEM-FIRST"},
++		{Role: "developer", Content: "DEVELOPER-SECOND"},
++		{Role: "user", Content: "USER-MARKER"},
++		{Role: "assistant", Content: "ASSISTANT-MARKER"},
++		{Role: "developer", Content: "DEVELOPER-THIRD"},
++		{Role: "user", Content: "FINAL-USER"},
++	}
++	for _, tools := range [][]api.Tool{nil, {{Type: "function", Function: api.ToolFunction{Name: "probe"}}}} {
++		got, err := r.Render(messages, tools, nil)
++		if err != nil {
++			t.Fatal(err)
++		}
++		previous := -1
++		for _, marker := range []string{"SYSTEM-FIRST", "DEVELOPER-SECOND", "DEVELOPER-THIRD", "USER-MARKER", "ASSISTANT-MARKER", "FINAL-USER"} {
++			index := strings.Index(got, marker)
++			if index <= previous {
++				t.Fatalf("missing or reordered %s", marker)
++			}
++			previous = index
++		}
++	}
++}
