@@ -6,6 +6,7 @@ import PeekabooBridge
 /// host is invoked; Peekaboo does not own a model or a separate agent loop.
 @MainActor
 public final class AutomationHost {
+    let visualizer = AutomationVisualizer()
     let services: PeekabooEmbeddedBridgeServices
 
     public init(coordinationDirectory: URL) {

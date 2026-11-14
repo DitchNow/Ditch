@@ -689,6 +689,7 @@ fn acceptance_cycle(
                 prompt,
                 profile.clone(),
                 Some((id, owner)),
+                Default::default(),
             );
             if let ServerResponse::Error(error) = launched {
                 return Err(("launch_failed".into(), error.message));

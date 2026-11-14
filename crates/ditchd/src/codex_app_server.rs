@@ -259,6 +259,7 @@ pub fn spawn_turn(launch: Launch<'_>, events: Sender<Event>) -> io::Result<Spawn
         "sandbox":sandbox, "serviceName":"the_ditch",
         "config":{"features":{"multi_agent":false,"collab":false},"web_search":"live","tools":{"web_search":true},"sandbox_workspace_write":{"writable_roots":[launch.cwd],"exclude_slash_tmp":true,"exclude_tmpdir_env_var":true,"network_access":true}}
     });
+    let mut oss_policy = None;
     if let Some(provider) = launch.inference_provider {
         // Scope the OSS tool catalog to this child/thread; keep the original home
         // and native thread identity so existing history remains resumable.
@@ -272,17 +273,17 @@ pub fn spawn_turn(launch: Launch<'_>, events: Sender<Event>) -> io::Result<Spawn
                 "Codex did not accept the verified OSS context budget. Update Codex on this execution host before continuing.",
             ));
         }
-        let disabled: serde_json::Map<String, Value> = config["config"]["mcp_servers"]
-            .as_object()
-            .into_iter()
-            .flatten()
-            .map(|(name, _)| (name.clone(), json!({"enabled":false})))
-            .collect();
-        thread_params["config"]["mcp_servers"] = json!(disabled);
-        if let Some(desktop) = &desktop {
-            thread_params["config"]["mcp_servers"]["ditch_tools"] = desktop.config();
-        }
-        thread_params["config"]["features"]["apps"] = json!(false);
+        let plugins = client.call(
+            "plugin/list",
+            json!({"cwds":[launch.cwd],"forceRefetch":false,"marketplaceKinds":["local"]}),
+        )?;
+        let policy = crate::oss_tool_policy::OssToolPolicy::discover(
+            &config["config"],
+            &plugins,
+            desktop.as_ref().map(|d| d.config()),
+        );
+        policy.apply_thread(&mut thread_params);
+        oss_policy = Some(policy);
         let catalog = client.call(
             "skills/list",
             json!({"cwds":[launch.cwd],"forceReload":true}),
@@ -391,7 +392,57 @@ pub fn spawn_turn(launch: Launch<'_>, events: Sender<Event>) -> io::Result<Spawn
     } else {
         "thread/start"
     };
-    client.send(&json!({"id":THREAD_ID,"method":method,"params":thread_params}))?;
+    // Verify the named thread connection first. Codex's broad inventory query
+    // can launch a separate helper even when threadId is supplied.
+    let mut initial_response = if let Some(policy) = &oss_policy {
+        let result = client.call(method, thread_params)?;
+        let thread = result["thread"]["id"]
+            .as_str()
+            .ok_or_else(|| io::Error::other("Codex did not return an OSS thread ID"))?;
+        if let Some(desktop) = &desktop {
+            desktop.bind_thread(thread);
+        }
+        let discovery_deadline = Instant::now() + STARTUP_TIMEOUT;
+        let execution_adapter = if let Some(desktop) = &desktop {
+            policy.verify_thread_adapter(
+                &mut client,
+                thread,
+                discovery_deadline.saturating_duration_since(Instant::now()),
+            )?;
+            Some(desktop.authenticated_adapter()?)
+        } else { None };
+        let mut servers = Vec::new();
+        let mut cursor = Value::Null;
+        for page in 0..100 {
+            let inventory = client.call_timeout(
+                "mcpServerStatus/list",
+                json!({"threadId":thread,"cursor":cursor,"limit":100}),
+                discovery_deadline.saturating_duration_since(Instant::now()),
+            )?;
+            servers.extend(
+                inventory["data"]
+                    .as_array()
+                    .ok_or_else(|| io::Error::other("Codex did not return a thread tool inventory"))?
+                    .iter()
+                    .cloned(),
+            );
+            cursor = inventory["nextCursor"].clone();
+            if cursor.is_null() {
+                break;
+            }
+            if page == 99 {
+                return Err(io::Error::other("Codex tool inventory pagination did not finish"));
+            }
+        }
+        policy.verify_inventory(&servers)?;
+        if let (Some(desktop), Some(pid)) = (&desktop, execution_adapter) {
+            desktop.confirm_registered(pid)?;
+        }
+        Some(json!({"id":THREAD_ID,"result":result}).to_string())
+    } else {
+        client.send(&json!({"id":THREAD_ID,"method":method,"params":thread_params}))?;
+        None
+    };
     let child = client.child.take().unwrap();
     let writer = client.writer.take().expect("App Server input");
     let incoming = client.incoming.take().unwrap();
@@ -436,7 +487,7 @@ pub fn spawn_turn(launch: Launch<'_>, events: Sender<Event>) -> io::Result<Spawn
                 )));
                 break;
             }
-            let line = match incoming.recv_timeout(Duration::from_millis(100)) {
+            let line = match initial_response.take().map(|line| Ok(Ok(line))).unwrap_or_else(|| incoming.recv_timeout(Duration::from_millis(100))) {
                 Ok(Ok(line)) => line,
                 Ok(Err(error)) => {
                     let _ = reader_events.send(Event::Failed(error.to_string()));
@@ -524,7 +575,7 @@ pub fn spawn_turn(launch: Launch<'_>, events: Sender<Event>) -> io::Result<Spawn
                     deadline = Instant::now() + STARTUP_TIMEOUT;
                 }
             }
-            handle_line(
+            handle_line_with_policy(
                 &line,
                 &reader_writer,
                 &reader_pending,
@@ -538,6 +589,7 @@ pub fn spawn_turn(launch: Launch<'_>, events: Sender<Event>) -> io::Result<Spawn
                 approval_policy,
                 &sandbox_policy,
                 &skills,
+                oss_policy.as_ref(),
             );
         }
         if let Some(desktop) = &desktop { desktop.drain(); }
@@ -636,6 +688,7 @@ pub fn execution_policy(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn handle_line(
     line: &str,
     writer: &Weak<Mutex<ChildStdin>>,
@@ -650,6 +703,27 @@ fn handle_line(
     approval_policy: &str,
     sandbox_policy: &Value,
     skills: &[ditch_core::SkillBinding],
+) {
+    handle_line_with_policy(line, writer, pending, events, project_id, agent_id,
+        cwd, prompt, model, effort, approval_policy, sandbox_policy, skills, None);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_line_with_policy(
+    line: &str,
+    writer: &Weak<Mutex<ChildStdin>>,
+    pending: &Arc<Mutex<HashMap<Uuid, PendingApproval>>>,
+    events: &Sender<Event>,
+    project_id: ProjectId,
+    agent_id: AgentId,
+    cwd: &Path,
+    prompt: &str,
+    model: Option<&str>,
+    effort: Option<&str>,
+    approval_policy: &str,
+    sandbox_policy: &Value,
+    skills: &[ditch_core::SkillBinding],
+    oss_policy: Option<&crate::oss_tool_policy::OssToolPolicy>,
 ) {
     let Ok(value) = serde_json::from_str::<Value>(line) else {
         let text = line.trim();
@@ -730,6 +804,7 @@ fn handle_line(
         if let Some(effort) = effort {
             params["effort"] = Value::String(effort.to_owned());
         }
+        if let Some(policy) = oss_policy { policy.apply_turn(&mut params); }
         if let Err(error) = write_message(
             &writer,
             &json!({"id": TURN_ID, "method": "turn/start", "params": params}),

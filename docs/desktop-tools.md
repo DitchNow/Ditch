@@ -19,6 +19,51 @@ and `desktop_act`. Actions support one click, text entry, key combination, scrol
 or window focus against a fresh exact-window snapshot. Other Peekaboo features
 are outside this initial tool surface.
 
+## OSS tool routing
+
+`oss_tool_policy.rs` scopes inherited MCP servers and installed/configured plugins
+out of each OSS thread. `features.apps=false` alone does not disable plugin MCP
+servers. The policy sets per-thread `config.plugins.<id>.enabled=false` and sends
+`disabledPluginIds` on every `turn/start`, including follow-ups and resumes.
+It leaves OpenAI launches and the user's Codex home configuration unchanged.
+Codex 0.166.0 explicitly describes `disabledPluginIds` as saved metadata that does
+not yet filter capabilities. Ditch therefore relies on the configuration override
+and effective inventory verification, not on that field alone.
+
+Before inference, Ditch first queries `mcpServerStatus/list` with both `threadId`
+and `serverName: "ditch_tools"` (`detail: "toolsAndAuthOnly"`). Codex 0.166.0
+reuses the thread's execution adapter only for this named query. Ditch verifies
+its catalogue and captures its authenticated process ID, then audits the broader
+inventory and confirms that the original execution process is still alive and
+unchanged. A single deadline bounds these discovery steps.
+Only disabled inherited servers and, when eligible, the connected `ditch_tools`
+server with exactly the four expected tools are accepted. An unknown/active server,
+missing adapter, failed discovery, or incompatible Codex produces a startup error;
+no model turn is sent. A turn without an eligible native integration can still chat
+and code with desktop tools omitted and explicit unavailable instructions.
+
+During `tools/list`, the bundled adapter authenticates to its private runtime socket
+with a non-tool handshake. The broad inventory query can start a separate CLI
+process even when `threadId` is supplied. Such a helper may authenticate and inspect
+schemas; it cannot replace the execution owner or invoke any desktop tool, including
+`desktop_status`. Both discovery and execution still require the exact signed CLI,
+the run credential and an unrevoked lease. Discovery does not call Peekaboo. An
+exited execution adapter requires a fresh turn; authority is never transferred to
+the discovery helper.
+
+Registration is not considered complete merely because
+the CLI advertises schemas. Status reports `native_available`, `eligible`,
+`adapter_connected`, and `tools_registered` separately. The UI shows **Connecting**
+until registration succeeds, then **Peekaboo**. Activity still comes from actual
+runtime operations, never assistant prose. Handshakes contain no observation data
+and do not create action receipts.
+
+Turn instructions require list–observe–act–observe and truthful errors. Ditch's own
+apps and status/menu-bar controls remain unsupported; use an ordinary disposable
+window for acceptance testing. The instructions discourage shell/AppleScript
+substitutes; Full Access shell execution is still available for coding, so this is
+tool routing rather than a security boundary against arbitrary shell programs.
+
 ## Permissions and Stop
 
 Full Access is the sole Ditch authorization. There is no extra desktop grant or
@@ -37,6 +82,31 @@ before updating the selection. If cancellation cannot finish within its deadline
 Ditch reports that input is still stopping and prevents further desktop dispatch.
 Physical actions already delivered cannot be undone. Wake/unlock does not resume
 revoked input; submit a new turn.
+
+## Per-turn visualizer
+
+The prompt box shows a **Visualizer** switch only for custom Ollama/OSS models.
+It starts off and remembers the choice per agent for the current app session.
+Full Access, a local desktop, native visualizer support, and macOS permissions
+are required to enable it. OpenAI model controls never show this switch.
+
+Send captures the choice for that turn. While submitting or running, the switch
+is labelled **Visualizer · next turn**; changing it does not alter the active
+turn. Failed submissions retain the choice. Turning it off hides feedback only;
+it does not disable computer use or change permissions.
+
+Native feedback briefly outlines an observed target, pulses a click location, or
+shows a fixed typing/shortcut/scroll icon. It never displays typed text and never
+means an action was verified successful. Fresh observations still verify results.
+The current tools use background delivery: there is no travelling physical cursor.
+Hidden, moved, minimized, or partly covered windows receive no overlay.
+
+`turn_options.computer_use_visualizer` is optional request metadata, defaulting
+to false. The runtime captures it on the eligible run's lease and supplies it to
+the native adapter independently of model tool arguments. The native host owns
+non-interactive overlays; it clears them before observation/input, on expiry,
+cancel/revocation, desktop lock/sleep, and app/Space changes. Capture starts only
+after overlay removal. No overlay data is persisted or relayed.
 
 ## Architecture and data
 
@@ -98,10 +168,62 @@ dependencies and the exact MCP/async Cargo dependency graph for that edition.
 
 ## Validation status and remaining release checks
 
-The staging debug bundle builds. Native cancellation/ownership tests, runtime
+Earlier staging debug bundles built. Native cancellation/ownership tests, runtime
 policy/dedup tests, focused Flutter regressions, Codex session/approval regressions
 and nested signing tests pass. The isolated live Qwen3.5:9b probe passed tool
 discovery, thread resumption, recall and synthetic image interpretation.
+
+The November 14 routing repair additionally passes a real Codex 0.166.0 regression
+with a harmless local CUA fixture plugin: the old apps-only configuration exposes
+the plugin, while the new policy excludes it on both new and persisted/resumed
+threads. This test uses a disposable Codex home and an offline inference provider;
+it also checks the exact four-tool Ditch catalogue with a harmless MCP fixture,
+both when enabled and omitted.
+It does not establish real Qwen desktop-action or visualizer success. Run it with:
+
+```sh
+DITCH_TEST_CODEX_BINARY=/absolute/path/to/codex \
+  cargo test -p ditchd --lib oss_tool_policy -- --include-ignored --nocapture
+```
+
+The current repair has **not** been deployed or visually qualified in signed staging.
+The implementation session's filesystem restrictions blocked Xcode package-cache
+access before a new signed bundle could be produced. Rebuild/run signed staging in
+the normal developer terminal, then perform the checks below on both a new OSS
+conversation and a follow-up in an existing one. Confirm native receipts and visible
+target feedback with Visualizer on; repeat with it off and verify actions still work.
+
+The follow-up adapter-ownership regression uses real Codex and the production CLI
+with the **production Rust authorization function**, on new and disk-resumed
+threads. It verifies that broad discovery can use a second helper without moving
+execution authority, and that secondary tool calls remain rejected. The transport
+test also sends a tool call through the real thread after broad discovery and
+confirms that it still reaches the original execution process. The transport
+fixture has no native provider and bypasses native signature verification; signed
+host/OS permission and real desktop-action acceptance remain separate checks.
+
+```sh
+cargo build -p ditch_cli
+DITCH_TEST_CODEX_BINARY=/absolute/path/to/codex \
+DITCH_TEST_DESKTOP_CLI="$PWD/target/debug/ditch_cli" \
+  cargo test -p ditchd --lib live_codex_discovery_preserves_production_execution_owner \
+  -- --ignored --nocapture
+```
+
+The companion Python probe reproduces the old strict discovery rejection, then
+verifies the corrected contract, including real secondary-CLI tool-call rejection
+and revocation. It makes no desktop calls or external inference requests:
+
+```sh
+python3 scripts/check-peekaboo-codex.py --adapter-startup \
+  --server /absolute/path/to/ditch_cli --codex /absolute/path/to/codex \
+  --build-root target/adapter-probe
+```
+
+In a Commercial checkout, prefix the script path with `community/`. Use a short
+build-root path because macOS bounds the length of Unix socket paths. The probe
+writes only disposable homes and diagnostic evidence below that directory and
+removes its per-run socket credentials when it finishes.
 
 Physical keyboard/mouse input from the signed Ditch host has **not** yet been
 qualified with macOS permissions. Before release, use a disposable text document:

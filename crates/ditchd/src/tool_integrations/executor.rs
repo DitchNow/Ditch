@@ -56,7 +56,8 @@ mod tests {
                 "desktop_observe".into(),
             ]
         }
-        fn invoke(&self, _: &Value, _: &Arc<AtomicBool>, _: Option<File>) -> Value {
+        fn invoke(&self, request: &Value, _: &Arc<AtomicBool>, _: Option<File>) -> Value {
+            assert_eq!(request["visualizer"], false, "model arguments cannot enable feedback");
             self.0.fetch_add(1, Ordering::SeqCst);
             json!({"ok":true,"result":{"test":"private-observation"}})
         }
@@ -77,16 +78,24 @@ mod tests {
             credential_path: PathBuf::new(),
             cli: PathBuf::new(),
             adapter_pid: AtomicI32::new(0),
+            tools_registered: AtomicBool::new(false),
             binding: Mutex::new((None, None)),
             completed: Mutex::new(HashMap::new()),
             vision: false,
+            visualizer: false,
         };
         let request = |id, tool: &str| AdapterRequest {
             credential: String::new(),
             operation_id: id,
             tool: tool.into(),
-            arguments: json!({}),
+            arguments: json!({"visualizer":true}),
         };
+        assert!(lease.confirm_registered(std::process::id() as i32).is_err(), "catalogue alone is not an authenticated connection");
+        lease.adapter_pid.store(std::process::id() as i32, Ordering::Release);
+        assert!(lease.confirm_registered((std::process::id() as i32) + 1).is_err());
+        assert!(!lease.tools_registered.load(Ordering::Acquire));
+        lease.confirm_registered(std::process::id() as i32).unwrap();
+        assert!(lease.tools_registered.load(Ordering::Acquire));
         assert_eq!(
             execute(&lease, request(Uuid::new_v4(), "desktop_act"))["error"],
             "turnNotReady"
@@ -112,7 +121,13 @@ mod tests {
             assert!(!serialized.contains("private-observation"));
             assert!(!serialized.contains("arguments"));
         }
+        let mut exited = std::process::Command::new("/usr/bin/true").spawn().unwrap();
+        let exited_pid = exited.id() as i32;
+        exited.wait().unwrap();
+        lease.adapter_pid.store(exited_pid, Ordering::Release);
+        assert!(lease.confirm_registered(exited_pid).is_err(), "an exited execution owner requires a fresh turn");
         lease.revoke();
+        assert!(lease.confirm_registered(std::process::id() as i32).is_err());
         assert_eq!(
             execute(&lease, request(Uuid::new_v4(), "desktop_status"))["error"],
             "revoked"
@@ -191,7 +206,7 @@ pub fn execute(lease: &Lease, request: AdapterRequest) -> Value {
     lease.event(request.operation_id, &request.tool, "running");
     let result = lease.provider.invoke(
         &json!({"sessionId":lease.run_id,"operationId":request.operation_id,
-        "tool":request.tool,"arguments":request.arguments}),
+        "tool":request.tool,"arguments":request.arguments,"visualizer":lease.visualizer}),
         &lease.cancelled,
         lock,
     );

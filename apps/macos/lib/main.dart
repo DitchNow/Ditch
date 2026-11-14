@@ -45,6 +45,7 @@ export 'widgets/project_sidebar.dart';
 
 part 'ollama_ui.dart';
 part 'agent_model_picker.dart';
+part 'agent_composer.dart';
 part 'tool_integration_ui.dart';
 
 const ditchDeploymentEnvironment = runtimeDeploymentEnvironment;
@@ -248,14 +249,22 @@ abstract interface class EditionWorkspaceProvider {
 }
 
 abstract interface class EditionBoardProvider {
-  Future<void> runBoardTasks(DitchRuntimeClient client, String requestId, List<Map<String, dynamic>> tasks);
+  Future<void> runBoardTasks(
+    DitchRuntimeClient client,
+    String requestId,
+    List<Map<String, dynamic>> tasks,
+  );
   Future<void> pauseBoardWork(DitchRuntimeClient client);
 }
 
-EditionSettingsSection githubIntegrationSettingsSection() => EditionSettingsSection(
-  id: 'github', icon: Icons.code, title: 'GitHub', subtitle: 'Repository issues and task imports',
-  dialogBuilder: (client) => GitHubSettingsDialog(request: client.request),
-);
+EditionSettingsSection githubIntegrationSettingsSection() =>
+    EditionSettingsSection(
+      id: 'github',
+      icon: Icons.code,
+      title: 'GitHub',
+      subtitle: 'Repository issues and task imports',
+      dialogBuilder: (client) => GitHubSettingsDialog(request: client.request),
+    );
 
 abstract interface class EditionSurface {
   const EditionSurface();
@@ -708,7 +717,9 @@ class AgentExecutionSettings extends ChangeNotifier {
                 endpointId: endpoint['id'].toString(),
                 endpointName: endpoint['display_name'].toString(),
                 availabilityError: endpoint['error']?.toString(),
-                toolsDeclared: (endpoint['model_status'] as Map?)?[id]?['tools_declared'] as bool?,
+                toolsDeclared:
+                    (endpoint['model_status'] as Map?)?[id]?['tools_declared']
+                        as bool?,
               ),
       ];
     } on Object catch (error) {
@@ -1398,7 +1409,8 @@ class DitchRuntimeClient implements ProjectCloneClient {
   Future<Stream<Map<String, dynamic>>> subscribeEvents() =>
       _transport.subscribeEvents();
 
-  Stream<Map<String, dynamic>> subscribeToolEvents() => _transport.subscribeToolEvents();
+  Stream<Map<String, dynamic>> subscribeToolEvents() =>
+      _transport.subscribeToolEvents();
 
   Future<RuntimeStatusDto> runtimeStatus() async {
     return RuntimeStatusDto.fromResponse(await request('RuntimeStatus'));
@@ -1676,6 +1688,7 @@ class DitchRuntimeClient implements ProjectCloneClient {
     required String projectRoot,
     required String prompt,
     Map<String, dynamic>? executionProfile,
+    Map<String, dynamic>? turnOptions,
   }) {
     return request({
       'StartCodexSession': {
@@ -1683,6 +1696,7 @@ class DitchRuntimeClient implements ProjectCloneClient {
         'project_name': projectName,
         'project_root': projectRoot,
         'prompt': prompt,
+        'turn_options': ?turnOptions,
         'mode': 'Exec',
         'execution_profile':
             executionProfile ?? AgentExecutionSettings().protocolValue,
@@ -1696,6 +1710,7 @@ class DitchRuntimeClient implements ProjectCloneClient {
     required String threadId,
     required String prompt,
     Map<String, dynamic>? executionProfile,
+    Map<String, dynamic>? turnOptions,
   }) {
     return request({
       'ResumeCodexSession': {
@@ -1703,6 +1718,7 @@ class DitchRuntimeClient implements ProjectCloneClient {
         'project_root': projectRoot,
         'thread_id': threadId,
         'prompt': prompt,
+        'turn_options': ?turnOptions,
         'execution_profile':
             executionProfile ?? AgentExecutionSettings().protocolValue,
       },
@@ -1713,11 +1729,13 @@ class DitchRuntimeClient implements ProjectCloneClient {
     required String agentId,
     required String prompt,
     Map<String, dynamic>? executionProfile,
+    Map<String, dynamic>? turnOptions,
   }) {
     return request({
       'PromptAgent': {
         'agent_id': agentId,
         'prompt': prompt,
+        'turn_options': ?turnOptions,
         'execution_profile':
             executionProfile ?? AgentExecutionSettings().protocolValue,
       },
@@ -2074,7 +2092,8 @@ class _CommandCenterScreenState extends State<CommandCenterScreen>
   final _composerKeys = <String, GlobalKey<AgentComposerState>>{};
   final _promptDrafts = AgentPromptDrafts();
   int _composerFocusGeneration = 0;
-  late final _runtimeClient = widget.runtimeClient ??
+  late final _runtimeClient =
+      widget.runtimeClient ??
       DitchRuntimeClient(deploymentEnvironment: widget.deploymentEnvironment);
   late final _tasks = TaskBoardController(request: _runtimeClient.request);
   EditionWorkspace? _editionWorkspace;
@@ -2466,10 +2485,14 @@ class _CommandCenterScreenState extends State<CommandCenterScreen>
 
   final Set<String> _remoteTerminalAutoOpenSuppressed = {};
 
-  Future<void> _ensureSelectedProjectTerminal({bool userRequested = false}) async {
+  Future<void> _ensureSelectedProjectTerminal({
+    bool userRequested = false,
+  }) async {
     final project = _selectedProjectOrNull;
     if (project == null) return;
-    if (!userRequested && _remoteTerminalAutoOpenSuppressed.contains(project.sshHostAlias)) return;
+    if (!userRequested &&
+        _remoteTerminalAutoOpenSuppressed.contains(project.sshHostAlias))
+      return;
     final projectId = project.id;
     if (projectId == null || _projectTerminals.containsKey(projectId)) return;
     try {
@@ -2723,7 +2746,8 @@ class _CommandCenterScreenState extends State<CommandCenterScreen>
     _runtimeEvents = null;
     if (events != null) unawaited(events.cancel());
     _runtimeSnapshotHydrated = false;
-    final terminal = error is DitchRuntimeException &&
+    final terminal =
+        error is DitchRuntimeException &&
         const {
           'runtime_startup_failed',
           'runtime_identity_mismatch',
@@ -3024,11 +3048,16 @@ class _CommandCenterScreenState extends State<CommandCenterScreen>
     );
     final settingsSections = [
       ...editionSections.where(
-        (section) => showUnfinishedFeatureControls || showGitHubBoardControls || section.id != 'github',
+        (section) =>
+            showUnfinishedFeatureControls ||
+            showGitHubBoardControls ||
+            section.id != 'github',
       ),
       EditionSettingsSection(
-        id: 'desktop-open-source', icon: Icons.description_outlined,
-        title: 'Computer Use Licenses', subtitle: 'Peekaboo and its bundled dependencies',
+        id: 'desktop-open-source',
+        icon: Icons.description_outlined,
+        title: 'Computer Use Licenses',
+        subtitle: 'Peekaboo and its bundled dependencies',
         dialogBuilder: (_) => const DesktopLicensesDialog(),
       ),
       EditionSettingsSection(
@@ -3429,7 +3458,10 @@ class _CommandCenterScreenState extends State<CommandCenterScreen>
     if (id == null || !_projects.any((candidate) => candidate.id == id)) {
       throw StateError('Project is no longer registered');
     }
-    final response = await _runtimeClient.renameProject(projectId: id, name: name);
+    final response = await _runtimeClient.renameProject(
+      projectId: id,
+      name: name,
+    );
     final renamed = _projectFromRuntime(response['ProjectRenamed']);
     if (renamed == null || renamed.id != id) {
       throw StateError('Runtime returned an invalid project rename response');
@@ -3921,44 +3953,54 @@ class _CommandCenterScreenState extends State<CommandCenterScreen>
     );
   }
 
+  bool _newAgentDialogOpen = false;
+
   Future<void> _startCodex() async {
-    FocusManager.instance.primaryFocus?.unfocus();
-    await _activeComposerKey.currentState?.blur();
-    if (!mounted) {
-      return;
-    }
-
-    final prompt = await showDialog<String>(
-      context: context,
-      builder: (context) => StartCodexSessionDialog(
-        runtimeClient: _runtimeClient,
-        initialPrompt: _defaultStartPrompt,
-        settings: _settingsForProject(_selectedProject.id),
-        loadModels:
-            _presentation.value.connection == RuntimeConnectionPhase.connected
-            ? () =>
-                  _runtimeClient.listCodexModels(projectId: _selectedProject.id)
-            : null,
-        skillsController: _tasks.skills,
-        projectId: _selectedProject.id,
-        onTask: () {
-          Navigator.pop(context);
-          unawaited(_chooseTaskForAgent());
-        },
-      ),
-    );
-    if (prompt == null || prompt.trim().isEmpty) {
-      return;
-    }
-
-    final projectId = _selectedProject.id;
-    if (await _startCodexRuntime(prompt.trim())) {
-      _settingsForProject(projectId).launchSkills = [];
+    if (_newAgentDialogOpen) return;
+    _newAgentDialogOpen = true;
+    try {
+      FocusManager.instance.primaryFocus?.unfocus();
+      await _activeComposerKey.currentState?.blur();
+      if (!mounted) return;
+      final project = _selectedProject;
+      final draft = _promptDrafts.forNewAgent(
+        _projectKey(project),
+        _defaultStartPrompt,
+      );
+      await showDialog<String>(
+        context: context,
+        barrierDismissible: false,
+        builder: (context) => StartCodexSessionDialog(
+          runtimeClient: _runtimeClient,
+          initialPrompt: _defaultStartPrompt,
+          settings: _settingsForProject(project.id),
+          loadModels:
+              _presentation.value.connection == RuntimeConnectionPhase.connected
+              ? () => _runtimeClient.listCodexModels(projectId: project.id)
+              : null,
+          skillsController: _tasks.skills,
+          projectId: project.id,
+          promptDraft: draft,
+          isRemote: project.isRemote,
+          onSubmit: (prompt) =>
+              _startCodexRuntime(prompt, visualizer: draft.submittedVisualizer),
+          onTask: () {
+            Navigator.pop(context);
+            unawaited(_chooseTaskForAgent());
+          },
+        ),
+      );
+    } finally {
+      _newAgentDialogOpen = false;
     }
   }
 
-  Future<bool> _startCodexRuntime(String prompt) async {
+  Future<bool> _startCodexRuntime(String prompt, {bool? visualizer}) async {
     final project = _selectedProject;
+    final draft = _promptDrafts.forNewAgent(_projectKey(project), '');
+    final turnOptions = visualizer == null
+        ? draft.submittedTurnOptions
+        : {'computer_use_visualizer': visualizer};
     final profile = _settingsForProject(project.id).protocolValue;
     try {
       if (!await _prepareProjectForCodex(
@@ -3975,6 +4017,9 @@ class _CommandCenterScreenState extends State<CommandCenterScreen>
         projectRoot: project.path,
         prompt: prompt,
         executionProfile: profile,
+        turnOptions: profile['inference_endpoint_id'] != null
+            ? turnOptions
+            : null,
       );
       final run = response['AgentStarted'];
       final session = _agentSessionFromRuntime(run, const []);
@@ -3982,6 +4027,8 @@ class _CommandCenterScreenState extends State<CommandCenterScreen>
         if (!mounted) return true;
         final existing = _agentSessionByLocalId(session.localId);
         final target = existing ?? session;
+        _promptDrafts.forAgent(session.localId, '').visualizer =
+            draft.visualizer;
         setState(() {
           if (existing == null) {
             _agentSessions.insert(0, session);
@@ -3999,7 +4046,9 @@ class _CommandCenterScreenState extends State<CommandCenterScreen>
         _scheduleStatusBarUpdate();
       }
       if (session == null) {
-        throw const FormatException('Runtime did not acknowledge the new agent.');
+        throw const FormatException(
+          'Runtime did not acknowledge the new agent.',
+        );
       }
       return true;
     } on Object catch (error) {
@@ -4209,12 +4258,18 @@ class _CommandCenterScreenState extends State<CommandCenterScreen>
       return false;
     }
 
+    final turnOptions = _promptDrafts
+        .forAgent(session.localId, '')
+        .submittedTurnOptions;
     final submittedProfile = session.executionSettings.protocolValue;
     try {
       final response = await _runtimeClient.promptAgent(
         agentId: session.localId,
         prompt: cleanPrompt,
         executionProfile: submittedProfile,
+        turnOptions: submittedProfile['inference_endpoint_id'] != null
+            ? turnOptions
+            : null,
       );
       if (response['Accepted'] != true) {
         throw const FormatException('Runtime did not acknowledge the prompt.');
@@ -4542,7 +4597,9 @@ class _CommandCenterScreenState extends State<CommandCenterScreen>
       if (alias != null) {
         setState(() {
           _remoteTerminalAutoOpenSuppressed.add(alias);
-          for (final project in _projects.where((project) => project.sshHostAlias == alias)) {
+          for (final project in _projects.where(
+            (project) => project.sshHostAlias == alias,
+          )) {
             _projectTerminals.remove(project.id);
           }
         });
@@ -4558,7 +4615,9 @@ class _CommandCenterScreenState extends State<CommandCenterScreen>
             .toList();
         if (keys.isNotEmpty) {
           setState(() {
-            for (final project in _projects.where((project) => keys.contains(project.id))) {
+            for (final project in _projects.where(
+              (project) => keys.contains(project.id),
+            )) {
               final alias = project.sshHostAlias;
               if (alias != null) _remoteTerminalAutoOpenSuppressed.add(alias);
             }
@@ -5616,7 +5675,8 @@ class _CommandCenterScreenState extends State<CommandCenterScreen>
                   projectId: modelProjectId,
                   settings: _settingsForProject(_selectedProject.id),
                   loadModels:
-                      presentation.connection == RuntimeConnectionPhase.connected
+                      presentation.connection ==
+                          RuntimeConnectionPhase.connected
                       ? () => _runtimeClient.listCodexModels(
                           projectId: modelProjectId,
                         )
@@ -5668,9 +5728,14 @@ class _CommandCenterScreenState extends State<CommandCenterScreen>
               final selectedTerminal = _selectedProject.id == null
                   ? null
                   : _projectTerminals[_selectedProject.id];
-              final VoidCallback? openClosedTerminal = selectedTerminal == null &&
-                      _remoteTerminalAutoOpenSuppressed.contains(_selectedProject.sshHostAlias)
-                  ? () => unawaited(_ensureSelectedProjectTerminal(userRequested: true))
+              final VoidCallback? openClosedTerminal =
+                  selectedTerminal == null &&
+                      _remoteTerminalAutoOpenSuppressed.contains(
+                        _selectedProject.sshHostAlias,
+                      )
+                  ? () => unawaited(
+                      _ensureSelectedProjectTerminal(userRequested: true),
+                    )
                   : null;
               final selectedFiles = _selectedProject.id == null
                   ? null
@@ -8345,7 +8410,8 @@ class AgentsSurface extends StatelessWidget {
   final String? effectiveCodexHome;
   final VoidCallback onStartCodex;
   final Future<bool> Function(String)? onStartPrompt;
-  final Future<bool> Function(AgentSession session, String prompt) onSubmitPrompt;
+  final Future<bool> Function(AgentSession session, String prompt)
+  onSubmitPrompt;
   final ValueChanged<AgentSession> onLoadMessages;
   final ValueChanged<AgentSession> onStopCodex;
   final ValueChanged<AgentSession> onDeleteAgent;
@@ -8372,7 +8438,9 @@ class AgentsSurface extends StatelessWidget {
                       style: Theme.of(context).textTheme.headlineSmall,
                     ),
                   ),
-                  if ((showUnfinishedFeatureControls || showGitHubBoardControls) && onOpenBoard != null)
+                  if ((showUnfinishedFeatureControls ||
+                          showGitHubBoardControls) &&
+                      onOpenBoard != null)
                     Tooltip(
                       message: 'Open project board',
                       constraints: const BoxConstraints(maxWidth: 180),
@@ -8462,7 +8530,8 @@ class AgentSessionList extends StatelessWidget {
   final String? effectiveCodexHome;
   final Future<bool> Function(String) onStartPrompt;
   final ValueChanged<AgentSession> onToggleExpanded;
-  final Future<bool> Function(AgentSession session, String prompt) onSubmitPrompt;
+  final Future<bool> Function(AgentSession session, String prompt)
+  onSubmitPrompt;
   final ValueChanged<AgentSession> onLoadMessages;
   final ValueChanged<AgentSession> onStopCodex;
   final ValueChanged<AgentSession> onDeleteAgent;
@@ -8809,7 +8878,8 @@ class ExpandableAgentPanel extends StatelessWidget {
                               session.userTitle?.trim().isNotEmpty ?? false,
                           onRename: onRename,
                           usesOssModel:
-                              session.executionSettings.inferenceEndpointId != null,
+                              session.executionSettings.inferenceEndpointId !=
+                              null,
                         ),
                       ),
                       if (hasUnreadResult) ...[
@@ -9150,10 +9220,9 @@ class AgentChatPanel extends StatelessWidget {
         key: composerKey,
         agentId: hasSession ? conversationId : null,
         isRemote: AgentPromptDraftScope.maybeOf(context)?.isRemote ?? false,
-        draft: AgentPromptDraftScope.maybeOf(context)?.forConversation(
-          conversationId,
-          initialPrompt,
-        ),
+        draft: AgentPromptDraftScope.maybeOf(
+          context,
+        )?.forConversation(conversationId, initialPrompt),
         executionSettings: executionSettings,
         initialText: initialPrompt,
         hasSession: hasSession,
@@ -9558,1002 +9627,6 @@ class _ThinkingStatusStripState extends State<ThinkingStatusStrip>
   }
 }
 
-class AgentComposer extends StatefulWidget {
-  const AgentComposer({
-    required this.initialText,
-    this.draft,
-    this.agentId,
-    this.isRemote = false,
-    required this.hasSession,
-    required this.isWorking,
-    this.canStop = false,
-    this.enabled = true,
-    required this.onSubmit,
-    required this.onStop,
-    this.onEnlarge,
-    this.onEscape,
-    this.executionSettings,
-    super.key,
-  });
-
-  final String initialText;
-  final AgentPromptDraft? draft;
-  final String? agentId;
-  final bool isRemote;
-  final AgentExecutionSettings? executionSettings;
-  final bool hasSession;
-  final bool isWorking;
-  final bool canStop;
-  final bool enabled;
-  /// True only after runtime acceptance; false retains the editable draft.
-  final Future<bool> Function(String) onSubmit;
-  final VoidCallback onStop;
-  final VoidCallback? onEnlarge;
-  final VoidCallback? onEscape;
-
-  @override
-  State<AgentComposer> createState() => AgentComposerState();
-}
-
-class AgentComposerState extends State<AgentComposer> {
-  var _nativeComposerKey = GlobalKey<NativeComposerTextViewState>();
-  static const _minimumEditorHeight = 48.0;
-  static const _maximumEditorHeight = 160.0;
-  late String _draftText;
-  final _localAttachments = <PromptAttachment>[];
-  List<PromptAttachment> get _attachments =>
-      widget.draft?.attachments ?? _localAttachments;
-  String? _attachmentError;
-  int _generation = 0;
-  int _attachmentRevision = 0;
-  int _textRevision = 0;
-  int? _submittingGeneration;
-  Future<void> _dropQueue = Future.value();
-  double _editorHeight = _minimumEditorHeight;
-  bool _composerHasFocus = false;
-  AgentSettingsScope? _scope;
-  AgentExecutionSettings get _settings =>
-      widget.executionSettings ?? _scope?.settings ?? agentExecutionSettings;
-
-  @override
-  void didChangeDependencies() {
-    super.didChangeDependencies();
-    _scope = AgentSettingsScope.of(context);
-  }
-
-  @override
-  void initState() {
-    super.initState();
-    _draftText = widget.draft?.text ?? widget.initialText;
-    widget.draft?.addListener(_draftSubmissionChanged);
-  }
-
-  void _draftSubmissionChanged() {
-    if (!mounted) return;
-    final draft = widget.draft!;
-    final restoreFocus = _composerHasFocus && draft.text != _draftText;
-    setState(() {
-      final text = draft.text;
-      if (text != _draftText) {
-        _draftText = text;
-        _nativeComposerKey = GlobalKey<NativeComposerTextViewState>();
-        _editorHeight = _minimumEditorHeight;
-      }
-    });
-    if (restoreFocus) {
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (mounted && identical(draft, widget.draft)) focus();
-      });
-    }
-  }
-
-  @override
-  void dispose() {
-    widget.draft?.removeListener(_draftSubmissionChanged);
-    super.dispose();
-  }
-
-  @override
-  void didUpdateWidget(AgentComposer oldWidget) {
-    super.didUpdateWidget(oldWidget);
-    if (!identical(oldWidget.draft, widget.draft)) {
-      oldWidget.draft?.removeListener(_draftSubmissionChanged);
-      widget.draft?.addListener(_draftSubmissionChanged);
-      _generation++;
-      _dropQueue = Future.value();
-      _attachmentRevision++;
-      _localAttachments.clear();
-      _attachmentError = null;
-      _draftText = widget.draft?.text ?? widget.initialText;
-      _nativeComposerKey = GlobalKey<NativeComposerTextViewState>();
-      _editorHeight = _minimumEditorHeight;
-    } else if (widget.draft == null &&
-        oldWidget.initialText != widget.initialText &&
-        _draftText.trim().isEmpty) {
-      _draftText = widget.initialText;
-    }
-  }
-
-  void focus() {
-    _nativeComposerKey.currentState?.focus();
-  }
-
-  Future<void> blur() async {
-    await _nativeComposerKey.currentState?.blur();
-  }
-
-  void _includeFiles(List<String> paths) {
-    final generation = _generation;
-    // Serial validation preserves the order of consecutive multi-file drops.
-    _dropQueue = _dropQueue.then((_) async {
-      if (!mounted || generation != _generation || !widget.enabled) return;
-      if (widget.isRemote) {
-        setState(
-          () => _attachmentError =
-              'Local file inclusion is unavailable for SSH projects. Use a path on the remote machine.',
-        );
-        return;
-      }
-      final valid = <PromptAttachment>[];
-      final invalid = <String>[];
-      for (final path in paths) {
-        final attachment = PromptAttachment(path);
-        if (path.startsWith('/') && await attachment.isReadable) {
-          valid.add(attachment);
-        } else {
-          invalid.add(attachment.filename);
-        }
-      }
-      if (!mounted ||
-          generation != _generation ||
-          !widget.enabled ||
-          widget.isRemote) {
-        return;
-      }
-      setState(() {
-        final existing = _attachments.map((file) => file.path).toSet();
-        for (final file in valid) {
-          if (existing.add(file.path)) _attachments.add(file);
-        }
-        _attachmentRevision++;
-        widget.draft?.revision++;
-        _attachmentError = invalid.isEmpty
-            ? null
-            : 'Cannot include ${invalid.join(', ')}. Choose readable regular files.';
-      });
-    });
-  }
-
-  Future<void> submit() async {
-    if (!widget.enabled ||
-        widget.isWorking ||
-        widget.canStop ||
-        _submittingGeneration == _generation ||
-        widget.draft?.submitting == true) {
-      return;
-    }
-    final generation = _generation;
-    setState(() => _submittingGeneration = generation);
-    final editor = _nativeComposerKey.currentState;
-    final draft = widget.draft;
-    draft?.beginSubmission();
-    var accepted = false;
-    var submittedRevision = draft?.revision ?? 0;
-    var submittedAttachments = <PromptAttachment>[];
-    bool current() =>
-        mounted &&
-        generation == _generation &&
-        identical(editor, _nativeComposerKey.currentState) &&
-        identical(draft, widget.draft) &&
-        widget.enabled &&
-        !widget.isWorking &&
-        !widget.canStop;
-    try {
-      await _dropQueue;
-      if (!current()) return;
-      final revision = _attachmentRevision;
-      final nativeText = await editor?.currentText() ?? _draftText;
-      if (!current()) return;
-      final attachments = List<PromptAttachment>.of(_attachments);
-      if (attachments.isNotEmpty && widget.isRemote) {
-        setState(
-          () => _attachmentError =
-              'Local file inclusion is unavailable for SSH projects. Remove these files to send.',
-        );
-        return;
-      }
-      for (final attachment in attachments) {
-        if (!await attachment.isReadable) {
-          if (current()) {
-            setState(
-              () => _attachmentError =
-                  'Cannot read ${attachment.filename}. Restore the file or remove it to send.',
-            );
-          }
-          return;
-        }
-      }
-      if (!current() || revision != _attachmentRevision) return;
-      // Do not clear edits made while file availability was being checked.
-      if ((await editor?.currentText() ?? _draftText) != nativeText ||
-          !current() ||
-          revision != _attachmentRevision) {
-        return;
-      }
-      final prompt = serializeAttachedPrompt(nativeText, attachments);
-      if (prompt.isEmpty) return;
-      _handleChanged(nativeText);
-      final textRevision = _textRevision;
-      submittedRevision = draft?.revision ?? 0;
-      submittedAttachments = attachments;
-      accepted = await widget.onSubmit(prompt);
-      bool sameComposer() => mounted && generation == _generation &&
-          identical(draft, widget.draft) &&
-          identical(editor, _nativeComposerKey.currentState);
-      if (accepted && sameComposer()) {
-        final beforeRead = _textRevision;
-        final latestText = await editor?.currentText() ?? _draftText;
-        if (sameComposer() && beforeRead == _textRevision) {
-          // Native text can be ahead of its textChanged notification.
-          _handleChanged(latestText);
-          if (draft == null && textRevision == _textRevision &&
-              revision == _attachmentRevision && latestText == nativeText) {
-            _handleChanged('');
-            setState(() {
-              _attachments.clear();
-              _attachmentRevision++;
-              _attachmentError = null;
-            });
-            await editor?.clearText();
-          }
-        }
-      }
-    } on Object catch (error) {
-      if (mounted && generation == _generation) {
-        if (accepted) draft?.revision++;
-        setState(() => _attachmentError = accepted
-            ? 'Prompt accepted, but the draft could not be cleared: $error'
-            : 'Prompt was not accepted: $error');
-      }
-    } finally {
-      draft?.finishSubmission(
-        accepted: accepted,
-        submittedRevision: submittedRevision,
-        submittedAttachments: submittedAttachments,
-      );
-      if (_submittingGeneration == generation) {
-        if (mounted) {
-          setState(() => _submittingGeneration = null);
-        } else {
-          _submittingGeneration = null;
-        }
-      }
-    }
-  }
-
-  void _handleChanged(String text) {
-    widget.draft?.text = text;
-    if (_draftText == text) {
-      return;
-    }
-    _textRevision++;
-    setState(() => _draftText = text);
-  }
-
-  void _handleFocusChanged(bool focused) {
-    if (_composerHasFocus == focused) return;
-    setState(() => _composerHasFocus = focused);
-  }
-
-  void _handleContentHeightChanged(double height) {
-    final nextHeight = height
-        .clamp(_minimumEditorHeight, _maximumEditorHeight)
-        .toDouble();
-    if ((_editorHeight - nextHeight).abs() < 1) return;
-    setState(() => _editorHeight = nextHeight);
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final hasText = _draftText.trim().isNotEmpty || _attachments.isNotEmpty;
-    final actionLabel = widget.hasSession ? 'Send' : 'Start';
-    final actionIcon = widget.hasSession ? Icons.send : Icons.play_arrow;
-    final editable = widget.enabled;
-    final canSubmit = widget.enabled && !widget.isWorking && !widget.canStop &&
-        _submittingGeneration != _generation && widget.draft?.submitting != true;
-
-    return NativeFileDropRegion(
-      key: ValueKey(_generation),
-      enabled: widget.enabled,
-      remote: widget.isRemote,
-      onDrop: _includeFiles,
-      child: Padding(
-        padding: const EdgeInsets.all(12),
-        child: GestureDetector(
-          key: const Key('composer-focus-surface'),
-          behavior: HitTestBehavior.opaque,
-          excludeFromSemantics: true,
-          onTap: editable ? focus : null,
-          child: Container(
-            decoration: BoxDecoration(
-              color: context.ditch.surfaceHover,
-              borderRadius: BorderRadius.circular(context.ditch.radiusMedium),
-              border: Border.all(
-                color: _composerHasFocus
-                    ? context.ditch.accent.withValues(alpha: 0.72)
-                    : context.ditch.separator.withValues(alpha: 0.72),
-              ),
-            ),
-            padding: const EdgeInsets.all(10),
-            child: ListenableBuilder(
-              listenable: _settings,
-              builder: (context, _) => Column(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  if (_attachments.isNotEmpty) ...[
-                    PromptAttachments(
-                      attachments: _attachments,
-                      onRemove: widget.enabled
-                          ? (file) => setState(() {
-                              _attachments.remove(file);
-                              _attachmentRevision++;
-                              widget.draft?.revision++;
-                              _attachmentError = null;
-                            })
-                          : null,
-                    ),
-                    const SizedBox(height: 8),
-                  ],
-                  if (_attachmentError != null)
-                    Padding(
-                      padding: const EdgeInsets.only(bottom: 8),
-                      child: Semantics(
-                        liveRegion: true,
-                        child: Text(
-                          _attachmentError!,
-                          style: TextStyle(
-                            color: Theme.of(context).colorScheme.error,
-                          ),
-                        ),
-                      ),
-                    ),
-                  LayoutBuilder(
-                    builder: (context, constraints) => Row(
-                      crossAxisAlignment: CrossAxisAlignment.end,
-                      children: [
-                        Expanded(
-                          child: AnimatedContainer(
-                            key: const Key('composer-editor-shell'),
-                            duration: MediaQuery.disableAnimationsOf(context)
-                                ? const Duration(milliseconds: 1)
-                                : const Duration(milliseconds: 120),
-                            curve: Curves.easeOut,
-                            height: _editorHeight,
-                            child: NativeComposerTextView(
-                              key: _nativeComposerKey,
-                              initialText: _draftText,
-                              enabled: editable,
-                              placeholder: widget.hasSession
-                                  ? 'Send a follow-up to Codex'
-                                  : 'Tell Codex what to do',
-                              onChanged: _handleChanged,
-                              onFocusChanged: _handleFocusChanged,
-                              onContentHeightChanged:
-                                  _handleContentHeightChanged,
-                              onSubmitRequested: submit,
-                              onEnlarge: widget.onEnlarge,
-                              onEscape: widget.onEscape,
-                            ),
-                          ),
-                        ),
-                        const SizedBox(width: 6),
-                        if (widget.canStop)
-                          IconButton.filledTonal(
-                            onPressed: widget.onStop,
-                            tooltip: 'Stop Codex',
-                            icon: const Icon(Icons.stop_circle_outlined),
-                          )
-                        else if (constraints.maxWidth < 190)
-                          FilledButton.icon(
-                            onPressed: hasText && canSubmit ? submit : null,
-                            icon: Icon(actionIcon),
-                            label: Text(actionLabel),
-                            style: FilledButton.styleFrom(
-                              padding: const EdgeInsets.symmetric(
-                                horizontal: 10,
-                              ),
-                            ),
-                          )
-                        else
-                          FilledButton.icon(
-                            onPressed: hasText && canSubmit ? submit : null,
-                            icon: Icon(actionIcon),
-                            label: Text(actionLabel),
-                          ),
-                      ],
-                    ),
-                  ),
-                  const SizedBox(height: 8),
-                  AgentExecutionControls(
-                    runtimeClient: _scope?.runtimeClient,
-                    projectId: _scope?.projectId,
-                    settings: _settings,
-                    agentId: widget.agentId,
-                    isRemote: widget.isRemote,
-                    loadModels: _scope?.loadModels,
-                    appliesNextTurn: widget.isWorking || widget.canStop,
-                  ),
-                ],
-              ),
-            ),
-          ),
-        ),
-      ),
-    );
-  }
-}
-
-class AgentExecutionControls extends StatefulWidget {
-  const AgentExecutionControls({
-    required this.settings,
-    this.loadModels,
-    this.runtimeClient,
-    this.projectId,
-    this.agentId,
-    this.isRemote = false,
-    this.appliesNextTurn = false,
-    super.key,
-  });
-
-  final AgentExecutionSettings settings;
-  final Future<List<AgentModelOption>> Function()? loadModels;
-  final DitchRuntimeClient? runtimeClient;
-  final String? projectId;
-  final String? agentId;
-  final bool isRemote;
-  final bool appliesNextTurn;
-
-  @override
-  State<AgentExecutionControls> createState() => _AgentExecutionControlsState();
-}
-
-class _AgentExecutionControlsState extends State<AgentExecutionControls> {
-  AgentExecutionSettings? _loadedSettings;
-  bool _changing = false;
-
-  Future<bool> _revokeDesktop() async {
-    if (widget.agentId == null ||
-        widget.runtimeClient == null ||
-        widget.settings.inferenceEndpointId == null ||
-        widget.isRemote) {
-      return true;
-    }
-    try {
-      final status = await widget.runtimeClient!.runtimeStatus();
-      if (!status.capabilities.contains('tool_integrations_v1')) return true;
-      await widget.runtimeClient!.request({
-        'ToolIntegration': {
-          'Revoke': {'agent_id': widget.agentId},
-        },
-      });
-      return true;
-    } catch (error) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text('Could not finish stopping computer use: $error'),
-          ),
-        );
-      }
-      return false;
-    }
-  }
-
-  Future<void> _selectModel(AgentModelOption? option) async {
-    if (_changing || option?.selectionKey == widget.settings.selectionKey) {
-      return;
-    }
-    setState(() => _changing = true);
-    try {
-      if (await _revokeDesktop() && mounted) {
-        widget.settings.selectOption(option);
-      }
-    } finally {
-      if (mounted) setState(() => _changing = false);
-    }
-  }
-
-  @override
-  void initState() {
-    super.initState();
-    _loadModels();
-  }
-
-  @override
-  void didUpdateWidget(AgentExecutionControls oldWidget) {
-    super.didUpdateWidget(oldWidget);
-    _loadModels();
-  }
-
-  void _loadModels() {
-    if (widget.loadModels == null &&
-        (widget.runtimeClient == null || widget.projectId == null)) {
-      _loadedSettings = null;
-      return;
-    }
-    if (identical(_loadedSettings, widget.settings)) return;
-    final settings = _loadedSettings = widget.settings;
-    final load = widget.loadModels;
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (mounted && load != null) unawaited(settings.loadModels(load));
-      if (mounted && widget.runtimeClient != null && widget.projectId != null) {
-        unawaited(
-          settings.loadOssModels(widget.runtimeClient!, widget.projectId!),
-        );
-      }
-    });
-  }
-
-  Future<void> _selectApproval(AgentApprovalPreset value) async {
-    if (_changing || value == widget.settings.approval) return;
-    setState(() => _changing = true);
-    try {
-      if (value == AgentApprovalPreset.fullAccess) {
-        final confirmed = await showDialog<bool>(
-          context: context,
-          builder: (context) => AlertDialog(
-            icon: const Icon(Icons.warning_amber_rounded),
-            title: const Text('Enable Full Access?'),
-            content: Text(
-              'Codex will run without approval prompts or sandbox restrictions and can access the internet and files on the computer running this project.'
-              '${widget.settings.inferenceEndpointId != null && !widget.isRemote ? ' Computer use can also observe and control applications on this Mac when macOS permissions are granted to Ditch. Observations are sent to your selected model.' : ''}',
-            ),
-            actions: [
-              TextButton(
-                onPressed: () => Navigator.of(context).pop(false),
-                child: const Text('Cancel'),
-              ),
-              FilledButton(
-                onPressed: () => Navigator.of(context).pop(true),
-                child: const Text('Enable Full Access'),
-              ),
-            ],
-          ),
-        );
-        if (confirmed != true) return;
-      }
-      if (!mounted) return;
-      if (value != AgentApprovalPreset.fullAccess && !await _revokeDesktop()) {
-        return;
-      }
-      if (mounted) widget.settings.setApproval(value);
-    } finally {
-      if (mounted) setState(() => _changing = false);
-    }
-  }
-
-  Future<void> _addOssModel() async {
-    if (widget.runtimeClient == null ||
-        widget.projectId == null ||
-        widget.settings.providerBound) {
-      return;
-    }
-    final option = await showDialog<AgentModelOption>(
-      context: context,
-      builder: (_) => AddOssModelDialog(
-        client: widget.runtimeClient!,
-        projectId: widget.projectId!,
-      ),
-    );
-    if (!mounted || option == null) return;
-    await widget.settings.loadOssModels(
-      widget.runtimeClient!,
-      widget.projectId!,
-    );
-    if (!mounted) return;
-    await _selectModel(option);
-  }
-
-  @override
-  Widget build(BuildContext context) => ListenableBuilder(
-    listenable: widget.settings,
-    builder: (context, _) {
-      const controlWidth = 220.0;
-      return Wrap(
-        spacing: 16,
-        runSpacing: 8,
-        crossAxisAlignment: WrapCrossAlignment.center,
-        children: [
-          SizedBox(
-            width: controlWidth,
-            child: DropdownButtonHideUnderline(
-              child: DropdownButton<AgentApprovalPreset>(
-                value: widget.settings.approval,
-                isDense: true,
-                isExpanded: true,
-                onChanged: _changing
-                    ? null
-                    : (value) {
-                        if (value != null) {
-                          unawaited(_selectApproval(value));
-                        }
-                      },
-                items: const [
-                  DropdownMenuItem(
-                    value: AgentApprovalPreset.ask,
-                    child: Text('Ask for approval'),
-                  ),
-                  DropdownMenuItem(
-                    value: AgentApprovalPreset.approveForMe,
-                    child: Text('Approve for me'),
-                  ),
-                  DropdownMenuItem(
-                    value: AgentApprovalPreset.fullAccess,
-                    child: Text('Full Access'),
-                  ),
-                ],
-              ),
-            ),
-          ),
-          SizedBox(
-            width: 280,
-            child: Row(
-              children: [
-                Expanded(
-                  child: AgentModelPicker(
-                    settings: widget.settings,
-                    onSelect: _selectModel,
-                    onAdd:
-                        widget.runtimeClient != null && widget.projectId != null
-                        ? () => unawaited(_addOssModel())
-                        : null,
-                    onRetryOpenAI: widget.loadModels == null
-                        ? null
-                        : () => unawaited(
-                            widget.settings.loadModels(widget.loadModels!),
-                          ),
-                    onRetryOss:
-                        widget.runtimeClient == null || widget.projectId == null
-                        ? null
-                        : () => unawaited(
-                            widget.settings.loadOssModels(
-                              widget.runtimeClient!,
-                              widget.projectId!,
-                            ),
-                          ),
-                  ),
-                ),
-                const SizedBox(width: 6),
-                ContextWindowIndicator(model: widget.settings.selectedModel),
-              ],
-            ),
-          ),
-          if (widget.settings.inferenceEndpointId != null &&
-              widget.runtimeClient != null)
-            DesktopIntegrationStatus(
-              client: widget.runtimeClient!,
-              agentId: widget.agentId,
-              fullAccess:
-                  widget.settings.approval == AgentApprovalPreset.fullAccess,
-              isRemote: widget.isRemote,
-              toolsDeclared: widget.settings.selectedModel?.toolsDeclared,
-            ),
-          if (_changing)
-            const Text('Stopping computer use…')
-          else if (widget.appliesNextTurn)
-            Text(
-              widget.settings.inferenceEndpointId == null
-                  ? 'Applies next turn'
-                  : 'Model changes apply next turn',
-            ),
-        ],
-      );
-    },
-  );
-}
-
-class ContextWindowIndicator extends StatelessWidget {
-  const ContextWindowIndicator({required this.model, super.key});
-
-  final AgentModelOption? model;
-
-  @override
-  Widget build(BuildContext context) {
-    final limit = model?.contextWindowTokens;
-    final label = limit == null
-        ? 'Context size unavailable'
-        : '${_formatTokens(limit)} context window; live usage is unavailable';
-    return Tooltip(
-      message: label,
-      child: Semantics(
-        label: label,
-        child: DecoratedBox(
-          decoration: BoxDecoration(
-            color: context.ditch.surface,
-            borderRadius: BorderRadius.circular(8),
-          ),
-          child: Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
-            child: Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Icon(
-                  Icons.data_usage_outlined,
-                  size: 14,
-                  color: limit == null ? Theme.of(context).disabledColor : null,
-                ),
-                if (limit != null) ...[
-                  const SizedBox(width: 3),
-                  Text(
-                    _formatTokens(limit),
-                    style: Theme.of(context).textTheme.labelSmall,
-                  ),
-                ],
-              ],
-            ),
-          ),
-        ),
-      ),
-    );
-  }
-
-  static String _formatTokens(int tokens) =>
-      tokens >= 1000 ? '${(tokens / 1000).round()}k' : '$tokens';
-}
-
-class NativeComposerTextView extends StatefulWidget {
-  const NativeComposerTextView({
-    required this.initialText,
-    required this.enabled,
-    required this.placeholder,
-    required this.onChanged,
-    required this.onFocusChanged,
-    required this.onContentHeightChanged,
-    required this.onSubmitRequested,
-    this.onEnlarge,
-    this.onEscape,
-    super.key,
-  });
-
-  final String initialText;
-  final bool enabled;
-  final String placeholder;
-  final ValueChanged<String> onChanged;
-  final ValueChanged<bool> onFocusChanged;
-  final ValueChanged<double> onContentHeightChanged;
-  final VoidCallback onSubmitRequested;
-  final VoidCallback? onEnlarge;
-  final VoidCallback? onEscape;
-
-  @override
-  State<NativeComposerTextView> createState() => NativeComposerTextViewState();
-}
-
-class NativeComposerTextViewState extends State<NativeComposerTextView> {
-  MethodChannel? _channel;
-  bool? _lastSentEnabled;
-  bool _focusRequested = false;
-  int? _lastAppearanceHash;
-  late final TextEditingController _fallbackController;
-  late final FocusNode _fallbackFocusNode;
-
-  @override
-  void initState() {
-    super.initState();
-    _fallbackController = TextEditingController(text: widget.initialText);
-    _fallbackFocusNode = FocusNode();
-    _fallbackFocusNode.addListener(_handleFallbackFocusChanged);
-  }
-
-  @override
-  void didUpdateWidget(NativeComposerTextView oldWidget) {
-    super.didUpdateWidget(oldWidget);
-    if (oldWidget.initialText != widget.initialText &&
-        _fallbackController.text.trim().isEmpty) {
-      _fallbackController.text = widget.initialText;
-      final channel = _channel;
-      if (channel != null &&
-          !kIsWeb &&
-          defaultTargetPlatform == TargetPlatform.macOS) {
-        unawaited(channel.invokeMethod<void>('setText', widget.initialText));
-      }
-    }
-    _syncNativeEnabled();
-  }
-
-  @override
-  void dispose() {
-    _fallbackFocusNode.removeListener(_handleFallbackFocusChanged);
-    _channel?.setMethodCallHandler(null);
-    _channel = null;
-    _fallbackController.dispose();
-    _fallbackFocusNode.dispose();
-    super.dispose();
-  }
-
-  void _handleFallbackFocusChanged() {
-    widget.onFocusChanged(_fallbackFocusNode.hasFocus);
-  }
-
-  Future<void> focus() async {
-    _focusRequested = true;
-    final channel = _channel;
-    if (kIsWeb || defaultTargetPlatform != TargetPlatform.macOS) {
-      _fallbackFocusNode.requestFocus();
-      return;
-    }
-    if (channel == null) return;
-
-    try {
-      final focused = await channel.invokeMethod<bool>('focus') ?? false;
-      if (!focused && mounted && _focusRequested) {
-        WidgetsBinding.instance.addPostFrameCallback((_) {
-          if (mounted && _focusRequested && identical(_channel, channel)) {
-            unawaited(channel.invokeMethod<bool>('focus'));
-          }
-        });
-      }
-    } on MissingPluginException {
-      return;
-    }
-  }
-
-  Future<void> blur() async {
-    _focusRequested = false;
-    _fallbackFocusNode.unfocus();
-    final channel = _channel;
-    if (channel == null ||
-        kIsWeb ||
-        defaultTargetPlatform != TargetPlatform.macOS) {
-      return;
-    }
-
-    try {
-      await channel.invokeMethod<void>('blur');
-    } on MissingPluginException {
-      return;
-    }
-  }
-
-  Future<String> currentText() async {
-    final channel = _channel;
-    if (channel == null ||
-        kIsWeb ||
-        defaultTargetPlatform != TargetPlatform.macOS) {
-      return _fallbackController.text;
-    }
-
-    return await channel.invokeMethod<String>('getText') ?? '';
-  }
-
-  Future<void> clearText() async {
-    _fallbackController.clear();
-    widget.onChanged('');
-
-    final channel = _channel;
-    if (channel == null ||
-        kIsWeb ||
-        defaultTargetPlatform != TargetPlatform.macOS) {
-      return;
-    }
-
-    await channel.invokeMethod<void>('clearText');
-  }
-
-  Future<void> _syncNativeEnabled() async {
-    final channel = _channel;
-    if (channel == null ||
-        kIsWeb ||
-        defaultTargetPlatform != TargetPlatform.macOS) {
-      return;
-    }
-
-    if (_lastSentEnabled != widget.enabled) {
-      _lastSentEnabled = widget.enabled;
-      await channel.invokeMethod<void>('setEnabled', widget.enabled);
-    }
-  }
-
-  Map<String, Object> _appearance(BuildContext context) {
-    final tokens = context.ditch;
-    return {
-      'textColor': tokens.ink.toARGB32(),
-      'placeholderColor': tokens.muted.toARGB32(),
-      'caretColor': tokens.accent.toARGB32(),
-      'fontName': 'Avenir Next',
-    };
-  }
-
-  Future<void> _syncNativeAppearance(BuildContext context) async {
-    final channel = _channel;
-    if (channel == null || !mounted) return;
-    final appearance = _appearance(context);
-    final hash = Object.hashAll(appearance.values);
-    if (_lastAppearanceHash == hash) return;
-    _lastAppearanceHash = hash;
-    await channel.invokeMethod<void>('setAppearance', appearance);
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    if (_channel != null) {
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (mounted) unawaited(_syncNativeAppearance(context));
-      });
-    }
-    if (kIsWeb || defaultTargetPlatform != TargetPlatform.macOS) {
-      return CallbackShortcuts(
-        bindings: {
-          const SingleActivator(LogicalKeyboardKey.enter):
-              widget.onSubmitRequested,
-          const SingleActivator(LogicalKeyboardKey.numpadEnter):
-              widget.onSubmitRequested,
-        },
-        child: TextField(
-          controller: _fallbackController,
-          focusNode: _fallbackFocusNode,
-          enabled: widget.enabled,
-          minLines: 1,
-          maxLines: 5,
-          onChanged: widget.onChanged,
-          decoration: InputDecoration(
-            hintText: widget.placeholder,
-            border: InputBorder.none,
-            isDense: true,
-          ),
-        ),
-      );
-    }
-
-    return AppKitView(
-      viewType: 'the_ditch/composer_text_view',
-      creationParams: {
-        'text': _fallbackController.text,
-        'enabled': widget.enabled,
-        'placeholder': widget.placeholder,
-        'fontSize': 14.0,
-        'escapeEnabled': widget.onEscape != null,
-        ..._appearance(context),
-      },
-      creationParamsCodec: const StandardMessageCodec(),
-      onPlatformViewCreated: (id) {
-        final channel = MethodChannel('the_ditch/composer_text_view/$id');
-        _channel = channel;
-        _lastSentEnabled = widget.enabled;
-        unawaited(_syncNativeAppearance(context));
-        channel.setMethodCallHandler((call) async {
-          if (call.method == 'textChanged') {
-            final text = call.arguments as String? ?? '';
-            if (_fallbackController.text != text) {
-              _fallbackController.value = TextEditingValue(
-                text: text,
-                selection: TextSelection.collapsed(offset: text.length),
-              );
-            }
-            widget.onChanged(text);
-          } else if (call.method == 'focusChanged') {
-            final focused = call.arguments as bool? ?? false;
-            _focusRequested = focused;
-            widget.onFocusChanged(focused);
-          } else if (call.method == 'contentHeightChanged') {
-            final height = (call.arguments as num?)?.toDouble();
-            if (height != null) widget.onContentHeightChanged(height);
-          } else if (call.method == 'enlargeRequested') {
-            widget.onEnlarge?.call();
-          } else if (call.method == 'escapePressed') {
-            widget.onEscape?.call();
-          } else if (call.method == 'submitRequested') {
-            widget.onSubmitRequested();
-          }
-        });
-        if (_focusRequested) {
-          channel.invokeMethod<void>('focus');
-        }
-      },
-    );
-  }
-}
-
 class ToolActivityGroup extends StatefulWidget {
   const ToolActivityGroup({
     required this.messages,
@@ -10924,7 +9997,8 @@ class _ProjectToolsPanelState extends State<ProjectToolsPanel> {
   @override
   void didUpdateWidget(ProjectToolsPanel oldWidget) {
     super.didUpdateWidget(oldWidget);
-    if (widget.terminal == null && widget.onStartTerminal == null &&
+    if (widget.terminal == null &&
+        widget.onStartTerminal == null &&
         oldWidget.terminal?.projectId != widget.terminal?.projectId) {
       WidgetsBinding.instance.addPostFrameCallback(
         (_) => widget.onEnsureTerminal(),
@@ -10978,7 +10052,12 @@ class _ProjectToolsPanelState extends State<ProjectToolsPanel> {
             onPresentationChanged: widget.onPresentationChanged,
           ),
           if (widget.dockedTerminalExpanded)
-            Expanded(child: ProjectTerminalBody(terminal: terminal, onStartTerminal: widget.onStartTerminal)),
+            Expanded(
+              child: ProjectTerminalBody(
+                terminal: terminal,
+                onStartTerminal: widget.onStartTerminal,
+              ),
+            ),
           if (widget.showFiles) ...[
             ProjectFilesHeader(
               expanded: widget.dockedFilesExpanded,
@@ -11488,7 +10567,12 @@ class ProjectTerminalSurface extends StatelessWidget {
 }
 
 class ProjectTerminalBody extends StatelessWidget {
-  const ProjectTerminalBody({required this.terminal, this.onEscape, this.onStartTerminal, super.key});
+  const ProjectTerminalBody({
+    required this.terminal,
+    this.onEscape,
+    this.onStartTerminal,
+    super.key,
+  });
 
   final ProjectTerminalSession? terminal;
   final VoidCallback? onEscape;
@@ -11497,13 +10581,15 @@ class ProjectTerminalBody extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return terminal == null
-        ? Center(child: onStartTerminal == null
-            ? const Text('Starting project shell…')
-            : TextButton.icon(
-                onPressed: onStartTerminal,
-                icon: const Icon(Icons.terminal, size: 16),
-                label: const Text('Open terminal'),
-              ))
+        ? Center(
+            child: onStartTerminal == null
+                ? const Text('Starting project shell…')
+                : TextButton.icon(
+                    onPressed: onStartTerminal,
+                    icon: const Icon(Icons.terminal, size: 16),
+                    label: const Text('Open terminal'),
+                  ),
+          )
         : TerminalView(
             terminal!.terminal,
             autofocus: false,
@@ -11930,17 +11016,26 @@ class _AddRemoteProjectDialogState extends State<AddRemoteProjectDialog> {
       _error = null;
     });
     try {
-      await _followRuntimeUpdate(await widget.client.installRemoteRuntime(alias));
+      await _followRuntimeUpdate(
+        await widget.client.installRemoteRuntime(alias),
+      );
     } on Object catch (error) {
       if (!mounted) return;
-      setState(() { _busy = false; _error = '$error'; });
+      setState(() {
+        _busy = false;
+        _error = '$error';
+      });
     }
   }
 
   Future<void> _followRuntimeUpdate(Map<String, dynamic> setup) async {
     var pollFailures = 0;
     while (mounted && setup['connection_state'] == 'updating') {
-      setState(() { _setup = setup; _busy = true; _error = null; });
+      setState(() {
+        _setup = setup;
+        _busy = true;
+        _error = null;
+      });
       await Future<void>.delayed(const Duration(seconds: 1));
       if (!mounted) return;
       try {
@@ -11951,13 +11046,20 @@ class _AddRemoteProjectDialogState extends State<AddRemoteProjectDialog> {
         // or require another Install / Repair click.
         if (++pollFailures < 5) continue;
         if (!mounted) return;
-        setState(() { _busy = false; _error = '$error'; });
+        setState(() {
+          _busy = false;
+          _error = '$error';
+        });
         return;
       }
     }
     if (!mounted) return;
     if (setup['connection_state'] == 'update_failed') {
-      setState(() { _setup = setup; _busy = false; _error = setup['last_error']?.toString(); });
+      setState(() {
+        _setup = setup;
+        _busy = false;
+        _error = setup['last_error']?.toString();
+      });
       return;
     }
     await _acceptSetup(setup);
@@ -12152,8 +11254,13 @@ class _AddRemoteProjectDialogState extends State<AddRemoteProjectDialog> {
     final runtimeNeedsInstall =
         checks is List &&
         checks.whereType<Map>().any(
-          (item) => item['key'] == 'runtime' &&
-              ['missing', 'install_available', 'checking'].contains(item['state']),
+          (item) =>
+              item['key'] == 'runtime' &&
+              [
+                'missing',
+                'install_available',
+                'checking',
+              ].contains(item['state']),
         );
     final codexNeedsInstall =
         checks is List &&
@@ -12213,7 +11320,8 @@ class _AddRemoteProjectDialogState extends State<AddRemoteProjectDialog> {
       content: SizedBox(
         width: 600,
         height: 520,
-        child: _busy && _hosts.isEmpty && _setup?['connection_state'] != 'updating'
+        child:
+            _busy && _hosts.isEmpty && _setup?['connection_state'] != 'updating'
             ? const Center(child: CircularProgressIndicator())
             : ListView(
                 children: [
@@ -12889,11 +11997,14 @@ class StartCodexSessionDialog extends StatefulWidget {
   const StartCodexSessionDialog({
     required this.initialPrompt,
     this.onTask,
+    this.onSubmit,
     this.settings,
     this.loadModels,
     this.runtimeClient,
     this.skillsController,
     this.projectId,
+    this.promptDraft,
+    this.isRemote = false,
     super.key,
   });
 
@@ -12902,8 +12013,11 @@ class StartCodexSessionDialog extends StatefulWidget {
   final Future<List<AgentModelOption>> Function()? loadModels;
   final DitchRuntimeClient? runtimeClient;
   final VoidCallback? onTask;
+  final Future<bool> Function(String)? onSubmit;
   final SkillsController? skillsController;
   final String? projectId;
+  final AgentPromptDraft? promptDraft;
+  final bool isRemote;
 
   @override
   State<StartCodexSessionDialog> createState() =>
@@ -12911,108 +12025,156 @@ class StartCodexSessionDialog extends StatefulWidget {
 }
 
 class _StartCodexSessionDialogState extends State<StartCodexSessionDialog> {
-  late final TextEditingController _prompt;
+  final _composerKey = GlobalKey<AgentComposerState>();
+  late final AgentPromptDraft _draft;
+  bool _expanded = false;
   AgentExecutionSettings get settings =>
       widget.settings ?? agentExecutionSettings;
   List<Map<String, dynamic>> selectedSkills = [];
-  late final FocusNode _promptFocusNode;
 
   @override
   void initState() {
     super.initState();
-    _prompt = TextEditingController(text: widget.initialPrompt);
-    _promptFocusNode = FocusNode();
+    _draft = widget.promptDraft ?? AgentPromptDraft(widget.initialPrompt);
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) {
         return;
       }
-      _promptFocusNode.requestFocus();
+      _composerKey.currentState?.focus();
     });
   }
 
   @override
   void dispose() {
-    _prompt.dispose();
-    _promptFocusNode.dispose();
+    if (widget.promptDraft == null) _draft.dispose();
     super.dispose();
   }
 
-  void _submit() {
-    final prompt = _prompt.text.trim();
-    if (prompt.isEmpty) {
-      return;
-    }
+  Future<bool> _submit(String prompt) async {
     settings.launchSkills = selectedSkills;
-    Navigator.of(context).pop(prompt);
+    final accepted =
+        await (widget.onSubmit?.call(prompt) ?? Future.value(true));
+    if (accepted) {
+      settings.launchSkills = [];
+      if (mounted) Navigator.of(context).pop(prompt);
+    }
+    return accepted;
   }
 
   @override
-  Widget build(BuildContext context) {
-    return AlertDialog(
-      title: const Text('Start Codex Session'),
-      scrollable: true,
-      content: SizedBox(
-        width: 640,
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            TextField(
-              controller: _prompt,
-              focusNode: _promptFocusNode,
-              autofocus: true,
-              minLines: 4,
-              maxLines: 8,
-              textInputAction: TextInputAction.newline,
-              decoration: const InputDecoration(
-                labelText: 'Initial prompt',
-                alignLabelWithHint: true,
+  Widget build(BuildContext context) => ListenableBuilder(
+    listenable: _draft,
+    builder: (context, _) => PopScope(
+      canPop: !_draft.submitting,
+      child: Dialog(
+        insetPadding: const EdgeInsets.all(24),
+        child: SizedBox(
+          width: 688,
+          child: SingleChildScrollView(
+            child: Padding(
+              padding: const EdgeInsets.all(24),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Row(
+                    children: [
+                      const Expanded(child: Text('Start Codex Session')),
+                      IconButton(
+                        tooltip: _expanded
+                            ? 'Collapse prompt (⌘⇧F)'
+                            : 'Expand prompt (⌘⇧F)',
+                        onPressed: () => setState(() => _expanded = !_expanded),
+                        icon: Icon(
+                          _expanded
+                              ? Icons.close_fullscreen
+                              : Icons.open_in_full,
+                          size: 16,
+                        ),
+                        style: IconButton.styleFrom(
+                          minimumSize: const Size(28, 28),
+                          maximumSize: const Size(28, 28),
+                          padding: EdgeInsets.zero,
+                          tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 12),
+                  SizedBox(
+                    width: 640,
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        AgentComposer(
+                          key: _composerKey,
+                          initialText: widget.initialPrompt,
+                          draft: _draft,
+                          executionSettings: settings,
+                          runtimeClient: widget.runtimeClient,
+                          projectId: widget.projectId,
+                          loadModels: widget.loadModels,
+                          isRemote: widget.isRemote,
+                          hasSession: false,
+                          isWorking: false,
+                          expanded: _expanded,
+                          onSubmit: _submit,
+                          onStop: () {},
+                          onEnlarge: () =>
+                              setState(() => _expanded = !_expanded),
+                          onEscape: () {
+                            if (_expanded) {
+                              setState(() => _expanded = false);
+                              return;
+                            }
+                            if (!_draft.submitting) Navigator.of(context).pop();
+                          },
+                        ),
+                        if (showUnfinishedFeatureControls &&
+                            widget.skillsController != null &&
+                            widget.projectId != null)
+                          SkillChips(
+                            skills: selectedSkills,
+                            onEdit: () async {
+                              final result = await showSkillPicker(
+                                context,
+                                widget.skillsController!,
+                                widget.projectId!,
+                                selectedSkills,
+                              );
+                              if (result != null && mounted) {
+                                setState(() {
+                                  selectedSkills = result;
+                                });
+                              }
+                            },
+                          ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.end,
+                    children: [
+                      if (showUnfinishedFeatureControls &&
+                          widget.onTask != null)
+                        TextButton(
+                          onPressed: _draft.submitting ? null : widget.onTask,
+                          child: const Text("Create / select task…"),
+                        ),
+                      TextButton(
+                        onPressed: _draft.submitting
+                            ? null
+                            : () => Navigator.of(context).pop(),
+                        child: const Text('Cancel'),
+                      ),
+                    ],
+                  ),
+                ],
               ),
             ),
-            const SizedBox(height: 12),
-            AgentExecutionControls(
-              settings: settings,
-              loadModels: widget.loadModels,
-              runtimeClient: widget.runtimeClient,
-              projectId: widget.projectId,
-            ),
-            if (showUnfinishedFeatureControls &&
-                widget.skillsController != null &&
-                widget.projectId != null)
-              SkillChips(
-                skills: selectedSkills,
-                onEdit: () async {
-                  final result = await showSkillPicker(
-                    context,
-                    widget.skillsController!,
-                    widget.projectId!,
-                    selectedSkills,
-                  );
-                  if (result != null && mounted) {
-                    setState(() {
-                      selectedSkills = result;
-                    });
-                  }
-                },
-              ),
-          ],
+          ),
         ),
       ),
-      actions: [
-        if (showUnfinishedFeatureControls && widget.onTask != null)
-          TextButton(
-            onPressed: widget.onTask,
-            child: const Text("Create / select task…"),
-          ),
-        TextButton(
-          onPressed: () => Navigator.of(context).pop(),
-          child: const Text('Cancel'),
-        ),
-        FilledButton.icon(
-          onPressed: _submit,
-          icon: const Icon(Icons.play_arrow),
-          label: const Text('Start'),
-        ),
-      ],
-    );
-  }
+    ),
+  );
 }

@@ -54,9 +54,11 @@ pub struct Lease {
     credential_path: PathBuf,
     cli: PathBuf,
     adapter_pid: AtomicI32,
+    tools_registered: AtomicBool,
     binding: Mutex<(Option<String>, Option<String>)>,
     completed: Mutex<HashMap<Uuid, Value>>,
     vision: bool,
+    visualizer: bool,
 }
 static LEASES: OnceLock<Mutex<HashMap<AgentId, Arc<Lease>>>> = OnceLock::new();
 static SUBSCRIBERS: OnceLock<Mutex<Vec<mpsc::SyncSender<ToolIntegrationEvent>>>> = OnceLock::new();
@@ -65,6 +67,27 @@ fn leases() -> &'static Mutex<HashMap<AgentId, Arc<Lease>>> {
 }
 
 impl Lease {
+    pub fn authenticated_adapter(&self) -> std::io::Result<i32> {
+        let pid = self.adapter_pid.load(Ordering::Acquire);
+        if self.cancelled.load(Ordering::Acquire) {
+            return Err(std::io::Error::other("Ditch desktop turn was revoked during startup; no model turn was started"));
+        }
+        if pid == 0 {
+            return Err(std::io::Error::other("Ditch adapter did not authenticate with the runtime; no model turn was started"));
+        }
+        // Signal zero checks existence without signalling or changing the peer.
+        if unsafe { libc::kill(pid, 0) } != 0 {
+            return Err(std::io::Error::other("Ditch execution adapter exited during startup; start a fresh turn"));
+        }
+        Ok(pid)
+    }
+    pub fn confirm_registered(&self, expected_pid: i32) -> std::io::Result<()> {
+        if self.authenticated_adapter()? != expected_pid {
+            return Err(std::io::Error::other("Ditch execution adapter changed during discovery; no model turn was started"));
+        }
+        self.tools_registered.store(true, Ordering::Release);
+        Ok(())
+    }
     pub fn config(&self) -> Value {
         json!({"command":self.cli,"args":["tools","serve","--stdio"],
             "env":{"DITCH_TOOL_SOCKET":self.socket,"DITCH_TOOL_CREDENTIAL_FILE":self.credential_path},
@@ -124,6 +147,7 @@ pub fn prepare(
     agent_id: AgentId,
     run_id: Uuid,
     profile: &AgentExecutionProfile,
+    turn_options: TurnOptions,
     purpose: InvocationPurpose,
 ) -> Option<Arc<Lease>> {
     if !revoke(agent_id) {
@@ -184,9 +208,11 @@ pub fn prepare(
         credential: format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple()),
         cancelled: Arc::new(AtomicBool::new(false)),
         adapter_pid: AtomicI32::new(0),
+        tools_registered: AtomicBool::new(false),
         binding: Mutex::new((None, None)),
         completed: Mutex::new(HashMap::new()),
         vision: model_status.vision_declared,
+        visualizer: turn_options.computer_use_visualizer,
     });
     if local_transport::start(lease.clone()).is_err() {
         return None;
@@ -254,6 +280,8 @@ pub fn status(agent: Option<AgentId>) -> ToolIntegrationStatus {
         integration: "peekaboo".into(),
         native_available: native::available(),
         eligible: lease.is_some(),
+        adapter_connected: lease.as_ref().is_some_and(|l| l.authenticated_adapter().is_ok()),
+        tools_registered: lease.as_ref().is_some_and(|l| l.tools_registered.load(Ordering::Acquire)),
         state: if native::available() {
             "requiresFullAccess"
         } else {
@@ -277,7 +305,7 @@ pub fn status(agent: Option<AgentId>) -> ToolIntegrationStatus {
                 status.state = "desktopInactive".into();
             } else if lease.is_some() {
                 status.state = if status.accessibility && status.screen_recording {
-                    "ready"
+                    if status.tools_registered && status.adapter_connected { "ready" } else { "connecting" }
                 } else {
                     "permissionRequired"
                 }

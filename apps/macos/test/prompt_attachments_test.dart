@@ -162,14 +162,7 @@ void main() {
       );
       expect(
         tester
-            .widget<FilledButton>(
-              find.ancestor(
-                of: find.text('Send'),
-                matching: find.byWidgetPredicate(
-                  (widget) => widget is FilledButton,
-                ),
-              ),
-            )
+            .widget<IconButton>(find.byKey(const Key('composer-submit')))
             .onPressed,
         isNotNull,
       );

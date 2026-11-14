@@ -101,6 +101,35 @@ impl ServerHandler for Adapter {
         _: Option<PaginatedRequestParams>,
         _: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
+        let connected = tokio::time::timeout(
+            Duration::from_secs(3),
+            self.request(
+                uuid::Uuid::new_v4(),
+                ditch_core::tool_integrations::ADAPTER_READY.into(),
+                json!({}),
+            ),
+        )
+        .await;
+        match connected {
+            Ok(Ok(ref value)) if value["ok"] == true => {}
+            Ok(Ok(value)) => {
+                let reason = match value["error"].as_str() {
+                    Some("invalidCredential") => "invalidCredential",
+                    Some("revoked") => "revoked",
+                    Some("adapterChanged") => "adapterChanged",
+                    _ => "handshake rejected",
+                };
+                return Err(ErrorData::internal_error(
+                    format!("Ditch adapter authentication failed: {reason}"), None,
+                ));
+            }
+            Err(_) => return Err(ErrorData::internal_error(
+                "Ditch adapter authentication timed out", None,
+            )),
+            Ok(Err(_)) => return Err(ErrorData::internal_error(
+                "Ditch runtime connection unavailable (transport or peer authentication)", None,
+            )),
+        }
         Ok(ListToolsResult {
             tools: desktop_tool_schemas()
                 .into_iter()

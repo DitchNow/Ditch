@@ -425,6 +425,7 @@ fn removed_registered_project_cannot_fall_back_to_a_local_launch() {
     let runtime = Arc::new(Mutex::new(test_runtime()));
     let response = handle_request(
         ClientRequest::StartCodexSession {
+            turn_options: Default::default(),
             project_id: Some(ProjectId::new()),
             project_name: "removed remote".into(),
             project_root: "/tmp".into(),
@@ -553,6 +554,7 @@ time.sleep(0.3) # Keep the thread writer alive briefly after turn completion.
         let state = Arc::new(Mutex::new(runtime));
         let response = handle_request(
             ClientRequest::StartCodexSession {
+                turn_options: Default::default(),
                 project_id: Some(project.id),
                 project_name: project.name.clone(),
                 project_root: root.to_string_lossy().into_owned(),
@@ -669,6 +671,7 @@ time.sleep(0.3) # Keep the thread writer alive briefly after turn completion.
             assert_eq!(
                 handle_request(
                     ClientRequest::PromptAgent {
+                        turn_options: Default::default(),
                         agent_id: id,
                         prompt: prompt.into(),
                         execution_profile: AgentExecutionProfile {

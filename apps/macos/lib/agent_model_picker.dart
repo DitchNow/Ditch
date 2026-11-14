@@ -118,7 +118,13 @@ class _AgentModelPickerState extends State<AgentModelPicker> {
           ? null
           : model?.endpointName ?? 'Saved server';
       return Tooltip(
-        message: [label, ?server].join(' · '),
+        message: [
+          label,
+          ?server,
+          model?.contextWindowTokens == null
+              ? 'Context size unavailable'
+              : '${ContextWindowIndicator._formatTokens(model!.contextWindowTokens!)} context window; live usage is unavailable',
+        ].join(' · '),
         child: Semantics(
           expanded: _open,
           child: TextButton(
@@ -128,28 +134,24 @@ class _AgentModelPickerState extends State<AgentModelPicker> {
             style: TextButton.styleFrom(
               foregroundColor: context.ditch.ink,
               padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
-              textStyle: Theme.of(context).textTheme.bodyMedium,
+              minimumSize: const Size(0, 28),
+              tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+              textStyle: Theme.of(context).textTheme.labelSmall?.copyWith(
+                fontSize: 12,
+                fontWeight: FontWeight.w400,
+              ),
             ),
             child: Row(
               children: [
                 Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      Text(label, maxLines: 1, overflow: TextOverflow.ellipsis),
-                      if (server != null)
-                        Text(
-                          server,
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: Theme.of(context).textTheme.bodySmall,
-                        ),
-                    ],
+                  child: Text(
+                    label,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
                   ),
                 ),
                 const SizedBox(width: 6),
-                Icon(_open ? Icons.expand_less : Icons.expand_more, size: 18),
+                Icon(_open ? Icons.expand_less : Icons.expand_more, size: 14),
               ],
             ),
           ),

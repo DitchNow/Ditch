@@ -25,6 +25,7 @@ struct NativeRequest: Decodable, Sendable {
     let operationId: String
     let tool: String
     let arguments: DesktopArguments
+    let visualizer: Bool?
 }
 
 enum AutomationFailure: String, Error {
@@ -40,6 +41,7 @@ final class PeekabooAdapter {
         let imageSize: CGSize
         let capturedAt: Date
         let artifact: URL
+        let elementBounds: [String: CGRect]
     }
 
     private let host: AutomationHost
@@ -67,6 +69,8 @@ final class PeekabooAdapter {
 
     func invoke(_ request: NativeRequest) async throws -> Data {
         try Task.checkCancellation()
+        // Remove feedback before any fresh observation or input dispatch.
+        self.host.visualizer.clear()
         if request.tool == "desktop_status" {
             return try self.encode(self.host.permissions())
         }
@@ -93,7 +97,10 @@ final class PeekabooAdapter {
         }
     }
 
+    func clearFeedback() { self.host.visualizer.clear() }
+
     func invalidate(session: String? = nil) async {
+        self.host.visualizer.clear(session: session)
         let keys = self.snapshots.filter { session == nil || $0.value.session == session }.map(\.key)
         for key in keys {
             if let snapshot = self.snapshots.removeValue(forKey: key) {
@@ -122,6 +129,10 @@ final class PeekabooAdapter {
         try self.validateTarget(pid)
         await self.invalidate(session: request.sessionId)
         if self.snapshots.count >= 8 { await self.invalidate() }
+        // Allow the window server to retire the overlay before capture. sharingType
+        // alone is not a reliable exclusion across all capture backends.
+        try await Task.sleep(for: .milliseconds(35))
+        try Task.checkCancellation()
         let artifact = self.captures.appendingPathComponent("capture-\(UUID().uuidString).png")
         var retained = false
         defer { if !retained { try? FileManager.default.removeItem(at: artifact) } }
@@ -144,7 +155,9 @@ final class PeekabooAdapter {
         let (image, imageSize) = try self.thumbnail(result.capture.imageData)
         let id = UUID().uuidString
         self.snapshots[id] = Snapshot(session: request.sessionId, nativeID: nativeID, context: context,
-                                      imageSize: imageSize, capturedAt: Date(), artifact: artifact)
+                                      imageSize: imageSize, capturedAt: Date(), artifact: artifact,
+                                      elementBounds: Dictionary((result.elements?.elements.all ?? []).prefix(200)
+                                        .map { ($0.id, $0.bounds) }, uniquingKeysWith: { first, _ in first }))
         Task { @MainActor [weak self] in
             try? await Task.sleep(for: .seconds(30))
             guard let self, let snapshot = self.snapshots.removeValue(forKey: id) else { return }
@@ -170,6 +183,10 @@ final class PeekabooAdapter {
                                      "truncated": elements.count < (result.elements?.elements.all.count ?? 0)]
         if request.arguments.include_image == true {
             output["image"] = ["mime_type": "image/png", "data": image.base64EncodedString()]
+        }
+        if let bounds = context.windowBounds {
+            self.host.visualizer.show(enabled: request.visualizer == true, session: request.sessionId,
+                                      action: "observe", windowID: window, pid: pid, bounds: bounds)
         }
         return try JSONSerialization.data(withJSONObject: output)
     }
@@ -202,15 +219,21 @@ final class PeekabooAdapter {
                 operation: "Ditch desktop action")
         }
         let outcome: DesktopActionOutcome
+        var clickPoint: CGPoint?
         switch args.action {
         case "click":
             let target: ClickTarget
             if let element = args.element_id {
                 target = .elementId(element)
+                if let rect = snapshot.elementBounds[element] {
+                    clickPoint = CGPoint(x: rect.midX, y: rect.midY)
+                }
             } else if let x = args.x, let y = args.y, x.isFinite, y.isFinite,
                       x >= 0, y >= 0, x < snapshot.imageSize.width, y < snapshot.imageSize.height {
-                target = .coordinates(CGPoint(x: bounds.minX + x * bounds.width / snapshot.imageSize.width,
-                                              y: bounds.minY + y * bounds.height / snapshot.imageSize.height))
+                let point = CGPoint(x: bounds.minX + x * bounds.width / snapshot.imageSize.width,
+                                              y: bounds.minY + y * bounds.height / snapshot.imageSize.height)
+                target = .coordinates(point)
+                clickPoint = point
             } else { throw AutomationFailure.invalidArguments }
             outcome = try accepted(await automation.clickWithOutcome(target: target, clickType: .single,
                 snapshotId: snapshot.nativeID, expectedWindowIdentity: identity, expectedWindowBounds: bounds))
@@ -237,6 +260,12 @@ final class PeekabooAdapter {
                 target: .windowId(identity.windowID), expectedIdentity: identity))
         default:
             throw AutomationFailure.invalidArguments
+        }
+        try Task.checkCancellation()
+        if let windowID = UInt32(exactly: identity.windowID) {
+            self.host.visualizer.show(enabled: request.visualizer == true, session: request.sessionId,
+                                      action: args.action ?? "", windowID: windowID,
+                                      pid: pid, bounds: bounds, point: clickPoint)
         }
         try? await self.host.services.snapshots.cleanSnapshot(snapshotId: snapshot.nativeID)
         return try JSONSerialization.data(withJSONObject: ["outcome": outcome.state.rawValue, "verification_required": true, "snapshot_consumed": true])

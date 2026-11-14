@@ -525,6 +525,7 @@ impl RuntimeState {
         edition::extend_runtime_capabilities(&self.edition, &mut capabilities);
         if tool_integrations::native::available() {
             capabilities.push(ditch_core::tool_integrations::DESKTOP_CAPABILITY.to_owned());
+            capabilities.push(ditch_core::tool_integrations::VISUALIZER_CAPABILITY.to_owned());
         }
         RuntimeStatus {
             identity: RUNTIME_IDENTITY.to_owned(),
@@ -2050,6 +2051,7 @@ fn handle_request(request: ClientRequest, state: Arc<Mutex<RuntimeState>>) -> Se
             prompt,
             mode,
             execution_profile,
+            turn_options,
         } => {
             if project_id.is_some_and(|id| project_by_id(&state, id).is_none()) {
                 return protocol_error(
@@ -2091,7 +2093,7 @@ fn handle_request(request: ClientRequest, state: Arc<Mutex<RuntimeState>>) -> Se
                 let project = project_id
                     .and_then(|id| project_by_id(&state, id))
                     .unwrap_or_else(|| project_for_launch(&state, project_name, project_root));
-                start_app_server_session(
+                start_app_server_session_with_options(
                     state,
                     project.id,
                     project.name,
@@ -2099,6 +2101,7 @@ fn handle_request(request: ClientRequest, state: Arc<Mutex<RuntimeState>>) -> Se
                     None,
                     prompt,
                     execution_profile,
+                    turn_options,
                 )
             }
         }
@@ -2109,6 +2112,7 @@ fn handle_request(request: ClientRequest, state: Arc<Mutex<RuntimeState>>) -> Se
             thread_id,
             prompt,
             execution_profile,
+            turn_options,
         } => {
             if let Some(project) = project_id
                 .and_then(|id| project_by_id(&state, id))
@@ -2143,7 +2147,7 @@ fn handle_request(request: ClientRequest, state: Arc<Mutex<RuntimeState>>) -> Se
                 let project = project_id
                     .and_then(|id| project_by_id(&state, id))
                     .unwrap_or_else(|| project_for_launch(&state, project_name, project_root));
-                start_app_server_session(
+                start_app_server_session_with_options(
                     state,
                     project.id,
                     project.name,
@@ -2151,6 +2155,7 @@ fn handle_request(request: ClientRequest, state: Arc<Mutex<RuntimeState>>) -> Se
                     Some(thread_id),
                     prompt,
                     execution_profile,
+                    turn_options,
                 )
             }
         }
@@ -2191,10 +2196,8 @@ fn handle_request(request: ClientRequest, state: Arc<Mutex<RuntimeState>>) -> Se
             execution_profile,
         } => prompt_remote_app_server_agent(state, agent_id, prompt, execution_profile),
         ClientRequest::PromptAgent {
-            agent_id,
-            prompt,
-            execution_profile,
-        } => forward_or_prompt_agent(state, agent_id, prompt, execution_profile),
+            agent_id, prompt, execution_profile, turn_options,
+        } => forward_or_prompt_agent_with_options(state, agent_id, prompt, execution_profile, turn_options),
         ClientRequest::ListAgentModels {
             provider,
             project_id,
@@ -3407,15 +3410,26 @@ fn remote_agent_connection(
     ))
 }
 
+#[cfg(test)]
 fn forward_or_prompt_agent(
     state: Arc<Mutex<RuntimeState>>,
     agent_id: AgentId,
     prompt: String,
     execution_profile: AgentExecutionProfile,
 ) -> ServerResponse {
+    forward_or_prompt_agent_with_options(state, agent_id, prompt, execution_profile, Default::default())
+}
+
+fn forward_or_prompt_agent_with_options(
+    state: Arc<Mutex<RuntimeState>>,
+    agent_id: AgentId,
+    prompt: String,
+    execution_profile: AgentExecutionProfile,
+    turn_options: ditch_core::tool_integrations::TurnOptions,
+) -> ServerResponse {
     let remote = remote_agent_connection(&state, agent_id);
     let Some((alias, _connections)) = remote else {
-        return prompt_agent(state, agent_id, prompt, execution_profile);
+        return prompt_app_server_agent_with_options(state, agent_id, prompt, execution_profile, turn_options);
     };
     ensure_remote_event_subscription(&state, &alias);
     let project = { let locked=state.lock().expect("runtime lock poisoned"); locked.agents.get(&agent_id).and_then(|r|locked.projects.values().find(|p|p.id == r.run.project_id)).cloned() };
@@ -4098,6 +4112,7 @@ fn validate_thread_project(
     }
 }
 
+#[cfg(test)]
 fn prompt_agent(
     state: Arc<Mutex<RuntimeState>>,
     agent_id: AgentId,

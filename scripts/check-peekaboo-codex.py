@@ -23,6 +23,165 @@ import uuid
 import zlib
 
 
+def check_adapter_startup(args):
+    """Real Codex + production CLI, controlled runtime transport, no native calls.
+
+    Rust tests exercise the production authorization helper. This separate probe
+    checks Codex's process lifecycle against the same owner/discovery contract.
+    """
+    import hmac
+    import socket
+    import sys
+    if sys.platform != "darwin":
+        raise RuntimeError("Adapter PID probe requires macOS LOCAL_PEERPID")
+    base = args.build_root.resolve()
+    base.mkdir(parents=True, exist_ok=True)
+    root = base / ("adapter-startup-" + uuid.uuid4().hex[:12])
+    home = root / "home"
+    home.mkdir(parents=True, mode=0o700)
+    # No external inference: starting/interruption of an offline turn only makes
+    # Codex persist the thread so the next process can genuinely resume it.
+    (home / "config.toml").write_text('''model_provider = "offline_fixture"
+model = "fixture"
+[model_providers.offline_fixture]
+name = "Offline fixture"
+base_url = "http://127.0.0.1:1/v1"
+wire_api = "responses"
+requires_openai_auth = false
+request_max_retries = 0
+stream_max_retries = 0
+''')
+    cli = args.server.resolve(strict=True)
+    expected = {"desktop_status", "desktop_list_targets", "desktop_observe", "desktop_act"}
+    report = {"desktop_access": False, "external_inference": False, "cases": []}
+    env = dict(os.environ, CODEX_HOME=str(home))
+    for key in ("OPENAI_API_KEY", "CODEX_API_KEY", "DITCH_SSH_ASKPASS_SOCKET"):
+        env.pop(key, None)
+
+    def run(thread_id, strict):
+        token = secrets.token_hex(32)
+        token_path = root / (uuid.uuid4().hex + ".token")
+        token_path.touch(mode=0o600)
+        token_path.write_text(token)
+        path = base / ("s-" + uuid.uuid4().hex[:12])
+        if len(os.fsencode(path)) >= 104:
+            raise RuntimeError("Use a shorter --build-root for the Unix socket")
+        listener = socket.socket(socket.AF_UNIX)
+        listener.bind(str(path))
+        path.chmod(0o600)
+        listener.listen()
+        listener.settimeout(0.1)
+        done = threading.Event()
+        state = {"owner": None, "requests": [], "revoked": False}
+
+        def serve():
+            while not done.is_set():
+                try:
+                    conn, _ = listener.accept()
+                except socket.timeout:
+                    continue
+                with conn:
+                    conn.settimeout(3)
+                    pid = conn.getsockopt(0, 0x002)
+                    try:
+                        request = json.loads(conn.makefile().readline())
+                        tool = request["tool"]
+                        if not hmac.compare_digest(request["credential"], token):
+                            result = {"ok": False, "error": "invalidCredential"}
+                        elif state["revoked"]:
+                            result = {"ok": False, "error": "revoked"}
+                        elif tool == "_ditch_adapter_ready":
+                            if state["owner"] is None:
+                                state["owner"] = pid
+                            result = ({"ok": False, "error": "adapterChanged"}
+                                      if strict and pid != state["owner"] else {"ok": True})
+                        elif pid != state["owner"]:
+                            result = {"ok": False, "error": "adapterChanged"}
+                        else:
+                            # Fixture responses only. Never forward to Ditch/macOS.
+                            result = {"ok": True, "result": {"fixture": True}}
+                        state["requests"].append({"pid": pid, "tool": tool, "accepted": result["ok"]})
+                        conn.sendall((json.dumps(result) + "\n").encode())
+                    except (OSError, ValueError, KeyError):
+                        pass
+        worker = threading.Thread(target=serve)
+        worker.start()
+        peer = None
+        secondary = None
+        try:
+            peer = Peer([args.codex, "app-server"], env, root, root / "codex.stderr")
+            peer.request("initialize", {"clientInfo": {"name": "the_ditch", "version": "probe"}, "capabilities": {"experimentalApi": True}})
+            peer.send({"method": "initialized", "params": {}})
+            adapter_env = {"DITCH_TOOL_SOCKET": str(path), "DITCH_TOOL_CREDENTIAL_FILE": str(token_path)}
+            params = {"cwd": str(root), "approvalPolicy": "never", "sandbox": "danger-full-access", "config": {"features": {"apps": False}, "mcp_servers": {"ditch_tools": {"command": str(cli), "args": ["tools", "serve", "--stdio"], "env": adapter_env, "enabled_tools": sorted(expected), "startup_timeout_sec": 5}}}}
+            if thread_id:
+                params["threadId"] = thread_id
+                params["excludeTurns"] = True
+            result = peer.request("thread/resume" if thread_id else "thread/start", params)
+            native_id = result["thread"]["id"]
+            if thread_id:
+                assert native_id == thread_id, "resume replaced the conversation"
+            primary = peer.request("mcpServerStatus/list", {"threadId": native_id, "serverName": "ditch_tools", "detail": "toolsAndAuthOnly"})["data"]
+            assert len(primary) == 1 and set(primary[0]["tools"]) == expected, primary
+            owner = state["owner"]
+            assert owner is not None
+            broad = peer.request("mcpServerStatus/list", {"threadId": native_id})["data"]
+            desktop = next(s for s in broad if s["name"] == "ditch_tools")
+            if strict:
+                assert desktop.get("toolsError") and not desktop["tools"], "old PID rule did not reproduce the failure"
+            else:
+                assert desktop["runtimeStatus"] == "connected" and not desktop.get("toolsError") and set(desktop["tools"]) == expected, desktop
+            assert state["owner"] == owner, "inventory changed execution ownership"
+            assert any(r["pid"] != owner for r in state["requests"]), "Codex did not create the expected discovery helper"
+            if not strict:
+                # A separate real CLI can list schemas but cannot invoke even
+                # desktop_status, and cannot transfer authority to itself.
+                secondary = Peer([str(cli), "tools", "serve", "--stdio"], dict(env, **adapter_env), root, root / "adapter.stderr")
+                secondary.request("initialize", {"protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "probe", "version": "1"}})
+                secondary.send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+                assert {t["name"] for t in secondary.request("tools/list", {})["tools"]} == expected
+                rejected = secondary.request("tools/call", {"name": "desktop_status", "arguments": {}})
+                assert rejected["isError"] and "adapterChanged" in json.dumps(rejected), rejected
+                assert state["owner"] == owner
+                state["revoked"] = True
+                rejected = secondary.request("tools/call", {"name": "desktop_status", "arguments": {}})
+                assert rejected["isError"] and "revoked" in json.dumps(rejected), rejected
+            turn = peer.request("turn/start", {"threadId": native_id, "input": [{"type": "text", "text": "Offline adapter lifecycle fixture"}]})
+            try:
+                peer.request("turn/interrupt", {"threadId": native_id, "turnId": turn["turn"]["id"]})
+            except RuntimeError:
+                pass  # Offline request may already have failed.
+            for _ in range(40):
+                try:
+                    peer.request("thread/read", {"threadId": native_id, "includeTurns": False})
+                    break
+                except RuntimeError:
+                    time.sleep(0.05)
+            else:
+                raise AssertionError("fixture rollout was not persisted")
+            report["cases"].append({"resume": bool(thread_id), "old_guard": strict, "owner_unchanged": True, "second_helper_observed": True, "catalogue_verified": not strict, "regression_reproduced": strict})
+            return native_id
+        finally:
+            if secondary:
+                secondary.close()
+            if peer:
+                peer.close()
+            done.set()
+            worker.join(timeout=5)
+            listener.close()
+            path.unlink(missing_ok=True)
+            token_path.unlink(missing_ok=True)
+    try:
+        thread = run(None, True)
+        run(thread, True)
+        thread = run(None, False)
+        run(thread, False)
+    finally:
+        (root / "result.json").write_text(json.dumps(report, indent=2) + "\n")
+        print(json.dumps(report, indent=2))
+        print("Evidence:", root)
+
+
 class Peer:
     def __init__(self, command, env, cwd, log):
         self.log = log.open("a")
@@ -110,7 +269,12 @@ def main():
     parser.add_argument("--endpoint")
     parser.add_argument("--model")
     parser.add_argument("--vision", action="store_true")
+    parser.add_argument("--adapter-startup", action="store_true", help="Use --server as the production ditch_cli; test owner/discovery lifecycle without desktop access")
     args = parser.parse_args()
+    if args.adapter_startup:
+        if args.live or args.vision:
+            parser.error("--adapter-startup never performs inference or desktop actions")
+        return check_adapter_startup(args)
     if args.live and not (args.endpoint and args.model):
         parser.error("--live requires --endpoint and --model")
     if args.vision and not args.live:

@@ -197,7 +197,7 @@ void main() {
         find.byType(DropdownButton<AgentApprovalPreset>),
       );
       expect(approval.items!.first.enabled, isTrue);
-      expect(find.text('Applies next turn'), findsOneWidget);
+      expect(find.byTooltip('Changes apply next turn'), findsOneWidget);
       expect(tester.takeException(), isNull);
     },
   );

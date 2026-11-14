@@ -193,6 +193,8 @@ pub enum ClientRequest {
         mode: CodexLaunchMode,
         #[serde(default)]
         execution_profile: AgentExecutionProfile,
+        #[serde(default)]
+        turn_options: ditch_core::tool_integrations::TurnOptions,
     },
     ResumeCodexSession {
         #[serde(default)]
@@ -203,6 +205,8 @@ pub enum ClientRequest {
         prompt: String,
         #[serde(default)]
         execution_profile: AgentExecutionProfile,
+        #[serde(default)]
+        turn_options: ditch_core::tool_integrations::TurnOptions,
     },
     /// Internal SSH-daemon command. Desktop clients use `StartCodexSession`;
     /// the local runtime translates remote projects to this App Server-only
@@ -242,6 +246,8 @@ pub enum ClientRequest {
         prompt: String,
         #[serde(default)]
         execution_profile: AgentExecutionProfile,
+        #[serde(default)]
+        turn_options: ditch_core::tool_integrations::TurnOptions,
     },
     ListAgentModels {
         provider: ditch_core::AgentProvider,
@@ -917,5 +923,25 @@ mod release_protocol_tests {
             serde_json::from_slice::<ServerEvent>(&serde_json::to_vec(&event).unwrap()).unwrap(),
             event
         );
+    }
+}
+
+#[cfg(test)]
+mod visualizer_protocol_tests {
+    use super::*;
+    #[test]
+    fn visualizer_is_optional_per_turn_metadata() {
+        let old = serde_json::json!({"PromptAgent":{
+            "agent_id":Uuid::new_v4(),"prompt":"test"
+        }});
+        let request: ClientRequest = serde_json::from_value(old.clone()).unwrap();
+        let ClientRequest::PromptAgent { turn_options, .. } = request else { panic!() };
+        assert!(!turn_options.computer_use_visualizer);
+        let mut enabled = old;
+        enabled["PromptAgent"]["turn_options"] = serde_json::json!({"computer_use_visualizer":true});
+        let request: ClientRequest = serde_json::from_value(enabled).unwrap();
+        let value = serde_json::to_value(&request).unwrap();
+        assert_eq!(value["PromptAgent"]["turn_options"]["computer_use_visualizer"], true);
+        assert!(value["PromptAgent"]["execution_profile"].get("computer_use_visualizer").is_none());
     }
 }

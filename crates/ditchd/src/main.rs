@@ -7,6 +7,7 @@
 mod acceptance_evidence;
 mod project_clone;
 mod app_server_client;
+mod oss_tool_policy;
 mod ollama;
 mod codex_app_server;
 mod tool_integrations;

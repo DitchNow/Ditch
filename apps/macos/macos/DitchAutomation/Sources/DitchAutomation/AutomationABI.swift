@@ -118,6 +118,11 @@ public func automationInitialize(_ bytes: UnsafePointer<UInt8>?, _ length: Int,
                     MainActor.assumeIsolated { NativeRuntime.invalidate() }
                 })
             }
+            for name in [NSWorkspace.didActivateApplicationNotification, NSWorkspace.activeSpaceDidChangeNotification] {
+                NativeRuntime.observers.append(workspace.addObserver(forName: name, object: nil, queue: .main) { _ in
+                    MainActor.assumeIsolated { NativeRuntime.adapter?.clearFeedback() }
+                })
+            }
             NativeRuntime.observers.append(DistributedNotificationCenter.default().addObserver(
                 forName: NSNotification.Name("com.apple.screenIsLocked"), object: nil, queue: .main
             ) { _ in MainActor.assumeIsolated { NativeRuntime.invalidate() } })
@@ -163,7 +168,10 @@ public func automationInvoke(_ id: UInt64, _ bytes: UnsafePointer<UInt8>?, _ len
 }
 
 @_cdecl("ditch_automation_cancel")
-public func automationCancel(_ id: UInt64) { OperationTable.shared.cancel(id) }
+public func automationCancel(_ id: UInt64) {
+    OperationTable.shared.cancel(id)
+    Task { @MainActor in NativeRuntime.adapter?.clearFeedback() }
+}
 
 @_cdecl("ditch_automation_forget_session")
 public func automationForgetSession(_ bytes: UnsafePointer<UInt8>?, _ length: Int) {

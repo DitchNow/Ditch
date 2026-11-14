@@ -3221,10 +3221,16 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(
-      find.widgetWithText(AlertDialog, 'Start Codex Session'),
+      find.widgetWithText(StartCodexSessionDialog, 'Start Codex Session'),
       findsOneWidget,
     );
-    expect(find.text('Initial prompt'), findsOneWidget);
+    expect(
+      find.descendant(
+        of: find.byType(StartCodexSessionDialog),
+        matching: find.byType(AgentComposer),
+      ),
+      findsOneWidget,
+    );
     final dialog = find.byType(StartCodexSessionDialog);
     expect(
       tester
@@ -3245,6 +3251,13 @@ void main() {
     expect(
       find.descendant(of: dialog, matching: find.text('new initial prompt')),
       findsOneWidget,
+    );
+    await tester.tap(find.widgetWithText(TextButton, 'Cancel'));
+    await tester.pumpAndSettle();
+    expect(find.byType(StartCodexSessionDialog), findsNothing);
+    expect(
+      tester.widget<TextField>(find.byType(TextField)).controller?.text,
+      'new initial prompt',
     );
   });
 
@@ -3554,37 +3567,40 @@ void main() {
   });
 
   for (final fail in [false, true]) {
-    testWidgets('file Copy Path tolerates disposal while copying (fail: $fail)', (
-      tester,
-    ) async {
-      final pending = Completer<void>();
-      tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
-        SystemChannels.platform,
-        (call) async {
-          if (call.method == 'Clipboard.setData') await pending.future;
-          return null;
-        },
-      );
-      addTearDown(
-        () => tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+    testWidgets(
+      'file Copy Path tolerates disposal while copying (fail: $fail)',
+      (tester) async {
+        final pending = Completer<void>();
+        tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
           SystemChannels.platform,
-          null,
-        ),
-      );
-      await _pumpCopyPathApp(tester, const [
-        DitchProject(id: 'copy', name: 'Copy project', path: '/work/project'),
-      ]);
-      await _chooseCopyPath(tester, 'README.md');
-      expect(find.text('Path copied.'), findsNothing);
-      await tester.pumpWidget(const SizedBox());
-      if (fail) {
-        pending.completeError(PlatformException(code: 'clipboard_unavailable'));
-      } else {
-        pending.complete();
-      }
-      await tester.pumpAndSettle();
-      expect(tester.takeException(), isNull);
-    });
+          (call) async {
+            if (call.method == 'Clipboard.setData') await pending.future;
+            return null;
+          },
+        );
+        addTearDown(
+          () => tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+            SystemChannels.platform,
+            null,
+          ),
+        );
+        await _pumpCopyPathApp(tester, const [
+          DitchProject(id: 'copy', name: 'Copy project', path: '/work/project'),
+        ]);
+        await _chooseCopyPath(tester, 'README.md');
+        expect(find.text('Path copied.'), findsNothing);
+        await tester.pumpWidget(const SizedBox());
+        if (fail) {
+          pending.completeError(
+            PlatformException(code: 'clipboard_unavailable'),
+          );
+        } else {
+          pending.complete();
+        }
+        await tester.pumpAndSettle();
+        expect(tester.takeException(), isNull);
+      },
+    );
   }
 
   testWidgets('file Copy Path keeps the menu owning project after a switch', (
@@ -4258,7 +4274,7 @@ void main() {
       tester.widget<TextField>(find.byType(TextField)).controller?.text,
       isEmpty,
     );
-    expect(find.text('Start'), findsOneWidget);
+    expect(find.byTooltip('Start'), findsOneWidget);
     expect(
       tester.widget<TextField>(find.byType(TextField)).focusNode?.hasFocus,
       isTrue,
@@ -4282,12 +4298,14 @@ void main() {
     final editorShell = tester.widget<AnimatedContainer>(
       find.byKey(const Key('composer-editor-shell')),
     );
-    expect(editorShell.constraints?.maxHeight, 48);
+    expect(editorShell.constraints?.maxHeight, 72);
 
     final editorTop = tester.getTopLeft(
       find.byKey(const Key('composer-editor-shell')),
     );
-    final approvalTop = tester.getTopLeft(find.text('Approve for me'));
+    final approvalTop = tester.getTopLeft(
+      find.byType(DropdownButton<AgentApprovalPreset>),
+    );
     expect(approvalTop.dy, greaterThan(editorTop.dy));
   });
 
@@ -4341,7 +4359,7 @@ void main() {
 
     await tester.enterText(find.byType(TextField), 'still a button');
     await tester.pump();
-    await tester.tap(find.text('Send'));
+    await tester.tap(find.byTooltip('Send'));
     await tester.pump();
     expect(submitted, 'still a button');
   });

@@ -47,12 +47,20 @@ class DesktopIntegrationStatus extends StatefulWidget {
     this.agentId,
     super.key,
     this.toolsDeclared,
+    this.visualizer = false,
+    this.onVisualizerChanged,
+    this.appliesNextTurn = false,
+    this.compact = false,
   });
   final DitchRuntimeClient client;
   final String? agentId;
   final bool fullAccess;
   final bool isRemote;
   final bool? toolsDeclared;
+  final bool visualizer;
+  final ValueChanged<bool>? onVisualizerChanged;
+  final bool appliesNextTurn;
+  final bool compact;
 
   @override
   State<DesktopIntegrationStatus> createState() =>
@@ -63,6 +71,7 @@ class _DesktopIntegrationStatusState extends State<DesktopIntegrationStatus> {
   Map<String, dynamic>? _status;
   String? _error;
   bool _loading = false;
+  bool _visualizerSupported = false;
   Timer? _timer;
   StreamSubscription<Map<String, dynamic>>? _events;
   String? _activity;
@@ -101,6 +110,9 @@ class _DesktopIntegrationStatusState extends State<DesktopIntegrationStatus> {
     final agentId = widget.agentId;
     try {
       final runtime = await widget.client.runtimeStatus();
+      _visualizerSupported = runtime.capabilities.contains(
+        'desktop_visualizer_v1',
+      );
       if (!runtime.capabilities.contains('tool_integrations_v1')) {
         if (mounted) {
           setState(() {
@@ -173,9 +185,13 @@ class _DesktopIntegrationStatusState extends State<DesktopIntegrationStatus> {
     if (status['accessibility'] != true || status['screen_recording'] != true) {
       return 'Computer use · macOS permissions required';
     }
-    return status['eligible'] == true
-        ? 'Computer use · ready'
-        : 'Computer use · ready for next turn';
+    if (status['eligible'] == true) {
+      return status['tools_registered'] == true &&
+              status['adapter_connected'] == true
+          ? 'Computer use · Peekaboo connected'
+          : 'Computer use · connecting Peekaboo tools';
+    }
+    return 'Computer use · available for next turn';
   }
 
   Future<void> _setup() async {
@@ -242,16 +258,101 @@ class _DesktopIntegrationStatusState extends State<DesktopIntegrationStatus> {
     if (mounted) await _refresh();
   }
 
+  String? get _visualizerUnavailable {
+    if (widget.isRemote) return 'Available for local Mac sessions';
+    if (!widget.fullAccess) return 'Requires Full Access';
+    if (_error != null) return _error;
+    if (!_visualizerSupported) {
+      return 'Requires a runtime with visualizer support';
+    }
+    if (_status?['native_available'] != true) return 'Computer use unavailable';
+    if (_status?['state'] == 'desktopInactive') return 'Desktop is inactive';
+    if (widget.toolsDeclared == false && _status?['eligible'] != true) {
+      return 'Model tool support is unverified';
+    }
+    if (_status?['accessibility'] != true ||
+        _status?['screen_recording'] != true) {
+      return 'Grant macOS computer-use permissions first';
+    }
+    return null;
+  }
+
+  String get _compactLabel {
+    if (_label.contains('Peekaboo connected')) return 'Peekaboo';
+    if (_label.contains('connecting')) return 'Connecting';
+    if (_label.contains('available for next turn')) return 'Available';
+    if (_activity != null) return 'Active';
+    if (_label.contains('checking')) return 'Checking';
+    if (_label.contains('busy')) return 'Busy';
+    return 'Setup';
+  }
+
   @override
-  Widget build(BuildContext context) => TextButton.icon(
-    onPressed:
-        !widget.isRemote &&
-            widget.fullAccess &&
-            _status?['native_available'] == true
-        ? _setup
-        : null,
-    icon: const Icon(Icons.desktop_mac_outlined, size: 16),
-    label: Text(_label),
-    style: TextButton.styleFrom(visualDensity: VisualDensity.compact),
+  Widget build(BuildContext context) => Wrap(
+    spacing: 4,
+    runSpacing: 4,
+    crossAxisAlignment: WrapCrossAlignment.center,
+    children: [
+      Tooltip(
+        message: _label,
+        child: TextButton.icon(
+          onPressed: widget.isRemote ? null : _setup,
+          icon: const Icon(Icons.desktop_mac_outlined, size: 14),
+          label: widget.compact ? const SizedBox.shrink() : Text(_compactLabel),
+          style: TextButton.styleFrom(
+            foregroundColor: context.ditch.muted,
+            minimumSize: const Size(0, 28),
+            padding: const EdgeInsets.symmetric(horizontal: 6),
+            tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+            textStyle: Theme.of(context).textTheme.labelSmall?.copyWith(
+              fontSize: 12,
+              fontWeight: FontWeight.w400,
+            ),
+          ),
+        ),
+      ),
+      if (widget.onVisualizerChanged != null)
+        Tooltip(
+          message:
+              _visualizerUnavailable ??
+              (widget.appliesNextTurn
+                  ? 'Show computer-use targets and actions on the next turn'
+                  : 'Show computer-use targets and actions for this turn'),
+          child: Semantics(
+            label: 'Computer-use visualizer',
+            toggled: widget.visualizer,
+            child: TextButton.icon(
+              key: const Key('computer-use-visualizer'),
+              onPressed: _visualizerUnavailable == null
+                  ? () => widget.onVisualizerChanged!(!widget.visualizer)
+                  : null,
+              icon: Icon(
+                widget.visualizer
+                    ? Icons.visibility
+                    : Icons.visibility_off_outlined,
+                size: 14,
+              ),
+              label: widget.compact
+                  ? const SizedBox.shrink()
+                  : const Text('Visualizer'),
+              style: TextButton.styleFrom(
+                foregroundColor: widget.visualizer
+                    ? context.ditch.accent
+                    : context.ditch.muted,
+                backgroundColor: widget.visualizer
+                    ? context.ditch.accent.withValues(alpha: 0.08)
+                    : null,
+                minimumSize: const Size(0, 28),
+                padding: const EdgeInsets.symmetric(horizontal: 6),
+                tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                textStyle: Theme.of(context).textTheme.labelSmall?.copyWith(
+                  fontSize: 12,
+                  fontWeight: FontWeight.w400,
+                ),
+              ),
+            ),
+          ),
+        ),
+    ],
   );
 }

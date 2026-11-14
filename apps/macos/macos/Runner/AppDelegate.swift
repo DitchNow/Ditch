@@ -1132,22 +1132,31 @@ class AppDelegate: FlutterAppDelegate, SPUUpdaterDelegate {
       binaryMessenger: messenger)
 
     channel.setMethodCallHandler { call, result in
-      guard call.method == "chooseDirectory" else {
+      if call.method == "openFile", let path = call.arguments as? String {
+        result(NSWorkspace.shared.open(URL(fileURLWithPath: path)))
+        return
+      }
+      guard call.method == "chooseDirectory" || call.method == "chooseFiles" else {
         result(FlutterMethodNotImplemented)
         return
       }
 
       let panel = NSOpenPanel()
-      panel.title = "Choose a project folder"
+      let files = call.method == "chooseFiles"
+      panel.title = files ? "Attach files" : "Choose a project folder"
       panel.prompt = "Choose"
-      panel.canChooseFiles = false
-      panel.canChooseDirectories = true
-      panel.allowsMultipleSelection = false
-      panel.canCreateDirectories = true
+      panel.canChooseFiles = files
+      panel.canChooseDirectories = !files
+      panel.allowsMultipleSelection = files
+      panel.canCreateDirectories = !files
       panel.resolvesAliases = true
 
       if panel.runModal() == .OK {
-        result(panel.url?.standardizedFileURL.path)
+        if files {
+          result(panel.urls.map { $0.standardizedFileURL.path })
+        } else {
+          result(panel.url?.standardizedFileURL.path)
+        }
       } else {
         result(nil)
       }

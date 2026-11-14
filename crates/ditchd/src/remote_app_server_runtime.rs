@@ -10,6 +10,19 @@ fn start_app_server_session(
     prompt: String,
     execution_profile: AgentExecutionProfile,
 ) -> ServerResponse {
+    start_app_server_session_with_options(state, project_id, project_name, project_root, resume_thread, prompt, execution_profile, Default::default())
+}
+
+fn start_app_server_session_with_options(
+    state: Arc<Mutex<RuntimeState>>,
+    project_id: ProjectId,
+    project_name: String,
+    project_root: String,
+    resume_thread: Option<String>,
+    prompt: String,
+    execution_profile: AgentExecutionProfile,
+    turn_options: ditch_core::tool_integrations::TurnOptions,
+) -> ServerResponse {
     start_remote_app_server_session_linked(
         state,
         project_id,
@@ -19,6 +32,7 @@ fn start_app_server_session(
         prompt,
         execution_profile,
         None,
+        turn_options,
     )
 }
 
@@ -32,6 +46,7 @@ fn start_remote_app_server_session_linked(
     prompt: String,
     execution_profile: AgentExecutionProfile,
     binding: Option<(TaskId, AgentId)>,
+    turn_options: ditch_core::tool_integrations::TurnOptions,
 ) -> ServerResponse {
     let project = {
         let state = state
@@ -192,7 +207,7 @@ fn start_remote_app_server_session_linked(
     let restricted = edition::restricted_agent(&state.lock().unwrap(), run.id);
     let protected_roots = {let s=state.lock().unwrap();let mut roots=vec![s.paths.data_dir.clone()];if let Some(home)=s.codex_home.clone().or_else(||std::env::var_os("HOME").map(|h|PathBuf::from(h).join(".codex"))){roots.push(home);}roots};
     let run_id = uuid::Uuid::new_v4();
-    let desktop = tool_integrations::prepare(&state, run.id, run_id, &execution_profile,
+    let desktop = tool_integrations::prepare(&state, run.id, run_id, &execution_profile, turn_options,
         if binding.is_some() || restricted { ditch_core::tool_integrations::InvocationPurpose::Worker } else { ditch_core::tool_integrations::InvocationPurpose::User });
     let spawned = match codex_app_server::spawn_turn(
         codex_app_server::Launch {
@@ -302,6 +317,16 @@ fn prompt_app_server_agent(
     agent_id: AgentId,
     prompt: String,
     execution_profile: AgentExecutionProfile,
+) -> ServerResponse {
+    prompt_app_server_agent_with_options(state, agent_id, prompt, execution_profile, Default::default())
+}
+
+fn prompt_app_server_agent_with_options(
+    state: Arc<Mutex<RuntimeState>>,
+    agent_id: AgentId,
+    prompt: String,
+    execution_profile: AgentExecutionProfile,
+    turn_options: ditch_core::tool_integrations::TurnOptions,
 ) -> ServerResponse {
     let mut execution_profile = execution_profile;
     {
@@ -425,7 +450,7 @@ fn prompt_app_server_agent(
     let protected_roots = {let s=state.lock().unwrap();let mut roots=vec![s.paths.data_dir.clone()];if let Some(home)=s.codex_home.clone().or_else(||std::env::var_os("HOME").map(|h|PathBuf::from(h).join(".codex"))){roots.push(home);}roots};
     let run_id = uuid::Uuid::new_v4();
     let is_worker = state.lock().unwrap().agents.get(&agent_id).is_some_and(|a| a.run.task_id.is_some());
-    let desktop = tool_integrations::prepare(&state, agent_id, run_id, &execution_profile,
+    let desktop = tool_integrations::prepare(&state, agent_id, run_id, &execution_profile, turn_options,
         if is_worker || restricted { ditch_core::tool_integrations::InvocationPurpose::Worker } else { ditch_core::tool_integrations::InvocationPurpose::User });
     let spawned = match codex_app_server::spawn_turn(
         codex_app_server::Launch {

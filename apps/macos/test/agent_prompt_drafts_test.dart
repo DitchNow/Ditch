@@ -88,7 +88,7 @@ void main() {
         await f.mount(tester);
         await tester.enterText(find.byType(TextField), 'Original follow-up');
         await tester.pump();
-        await tester.tap(find.text('Send'));
+        await tester.tap(find.byTooltip('Send'));
         await tester.pumpAndSettle();
         expect(f.text(tester), 'Original follow-up');
         await f.composerKey.currentState!.submit();
@@ -123,7 +123,7 @@ void main() {
       await f.mount(tester);
       await tester.enterText(find.byType(TextField), 'Original');
       await tester.pump();
-      await tester.tap(find.text('Send'));
+      await tester.tap(find.byTooltip('Send'));
       await tester.pumpAndSettle();
       await f.recreate(tester);
       await tester.enterText(find.byType(TextField), 'Next turn');
@@ -142,7 +142,7 @@ void main() {
     await f.mount(tester);
     await tester.enterText(find.byType(TextField), 'Original');
     await tester.pump();
-    await tester.tap(find.text('Send'));
+    await tester.tap(find.byTooltip('Send'));
     await tester.pumpAndSettle();
     await f.recreate(tester);
     acknowledgement.complete(true);
@@ -156,7 +156,7 @@ void main() {
     await f.mount(tester);
     await tester.enterText(find.byType(TextField), 'Retry this');
     await tester.pump();
-    await tester.tap(find.text('Send'));
+    await tester.tap(find.byTooltip('Send'));
     await tester.pumpAndSettle();
     expect(f.text(tester), 'Retry this');
     expect(find.textContaining('Prompt was not accepted'), findsOneWidget);
@@ -258,7 +258,7 @@ void main() {
     expect(f.drafts.forAgent('agent-a', '').text, nativeText);
     await f.recreate(tester);
     expect(createdTexts.last, 'Native draft\nwith more detail');
-    await tester.tap(find.text('Send'));
+    await tester.tap(find.byTooltip('Send'));
     await tester.pumpAndSettle();
     expect(f.submitted, ['Native draft\nwith more detail']);
     await f.recreate(tester);
@@ -321,7 +321,7 @@ void main() {
     f.drafts.forAgent('agent-b', '').text = 'Keep me';
     await tester.enterText(find.byType(TextField), 'Send this');
     await tester.pump();
-    await tester.tap(find.text('Send'));
+    await tester.tap(find.byTooltip('Send'));
     await tester.pumpAndSettle();
     expect(f.submitted, ['Send this']);
     await f.recreate(tester);

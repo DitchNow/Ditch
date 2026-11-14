@@ -14,13 +14,34 @@ class AgentPromptDraft extends ChangeNotifier {
     if (_text == value) return;
     _text = value;
     revision++;
+    notifyListeners();
   }
 
+  bool _visualizer = false;
+  bool get visualizer => _visualizer;
+  set visualizer(bool value) {
+    if (_visualizer == value) return;
+    _visualizer = value;
+    notifyListeners();
+  }
+
+  // Frozen until acknowledgement, even if the user changes the next draft.
+  bool submittedVisualizer = false;
+  Map<String, dynamic> get submittedTurnOptions => {
+    'computer_use_visualizer': submitting && submittedVisualizer,
+  };
+
   final attachments = <PromptAttachment>[];
+
+  void attachmentsChanged() {
+    revision++;
+    notifyListeners();
+  }
 
   bool beginSubmission() {
     if (submitting) return false;
     submitting = true;
+    submittedVisualizer = visualizer;
     notifyListeners();
     return true;
   }

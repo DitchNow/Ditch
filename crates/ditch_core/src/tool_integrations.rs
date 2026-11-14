@@ -5,9 +5,20 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 pub const CAPABILITY: &str = "tool_integrations_v1";
+pub const VISUALIZER_CAPABILITY: &str = "desktop_visualizer_v1";
+
+/// UI-owned options captured at submission, never supplied by the model.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TurnOptions {
+    #[serde(default)]
+    pub computer_use_visualizer: bool,
+}
+
 pub const DESKTOP_CAPABILITY: &str = "desktop_automation_v1";
 pub const MAX_REQUEST_BYTES: usize = 64 * 1024;
 pub const MAX_RESULT_BYTES: usize = 3 * 1024 * 1024;
+/// Private transport handshake; never advertised as a model tool.
+pub const ADAPTER_READY: &str = "_ditch_adapter_ready";
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct AdapterRequest {
@@ -96,6 +107,10 @@ pub struct ToolIntegrationStatus {
     pub integration: String,
     pub native_available: bool,
     pub eligible: bool,
+    #[serde(default)]
+    pub adapter_connected: bool,
+    #[serde(default)]
+    pub tools_registered: bool,
     pub state: String,
     pub accessibility: bool,
     pub screen_recording: bool,
