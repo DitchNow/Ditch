@@ -81,8 +81,10 @@ mod tests {
             tools_registered: AtomicBool::new(false),
             binding: Mutex::new((None, None)),
             completed: Mutex::new(HashMap::new()),
+            interaction_policy: Mutex::new(Default::default()),
             vision: false,
             visualizer: false,
+            verification_target: None,
         };
         let request = |id, tool: &str| AdapterRequest {
             credential: String::new(),
@@ -157,10 +159,10 @@ pub fn execute(lease: &Lease, request: AdapterRequest) -> Value {
         return json!({"ok":false,"error":"turnNotReady"});
     }
     if request.tool == "desktop_observe"
-        && request.arguments["include_image"] == true
+        && (request.arguments["mode"] != "accessibility" || request.arguments["include_image"] == true)
         && !lease.vision
     {
-        return json!({"ok":false,"error":"visionUnsupported","message":"Use accessibility observations without include_image for this model."});
+        return json!({"ok":false,"error":"visionUnsupported","message":"Use mode=accessibility without include_image for this model."});
     }
     if let Some(result) = lease
         .completed
@@ -174,6 +176,9 @@ pub fn execute(lease: &Lease, request: AdapterRequest) -> Value {
     let Some(state) = lease.state.upgrade() else {
         return json!({"ok":false,"error":"revoked"});
     };
+    if let Err(error) = lease.interaction_policy.lock().unwrap().before(&request.tool) {
+        return json!({"ok":false,"error":error,"message":"Desktop recovery/capture limit reached. Stop repeating requests and report what failed. A new user turn resets the budget."});
+    }
     let receipt = ToolOperationReceipt {
         operation_id: request.operation_id,
         run_id: lease.run_id,
@@ -206,10 +211,12 @@ pub fn execute(lease: &Lease, request: AdapterRequest) -> Value {
     lease.event(request.operation_id, &request.tool, "running");
     let result = lease.provider.invoke(
         &json!({"sessionId":lease.run_id,"operationId":request.operation_id,
-        "tool":request.tool,"arguments":request.arguments,"visualizer":lease.visualizer}),
+        "tool":request.tool,"arguments":request.arguments,"visualizer":lease.visualizer,
+        "targetBundle":lease.verification_target.map(|t| t.bundle_identifier())}),
         &lease.cancelled,
         lock,
     );
+    lease.interaction_policy.lock().unwrap().after(&request.tool, &result);
     let outcome = if result["error"] == "outcome_unknown" {
         "outcome_unknown"
     } else if result["ok"] == true {
@@ -230,6 +237,26 @@ pub fn execute(lease: &Lease, request: AdapterRequest) -> Value {
         return json!({"ok":false,"error":"outcome_unknown"});
     }
     lease.event(request.operation_id, &request.tool, outcome);
+    // Correlate native execution without logging screenshots, text, paths or
+    // arbitrary upstream error messages. Dispatch completion is not verification.
+    let error = result["error"].as_str().map(|error| match error {
+        "invalidArguments" | "permissionRequired" | "protectedTarget" | "staleSnapshot"
+        | "captureFailed" | "captureCoordinationFailed" | "captureStorageFailed"
+        | "accessibilityIncomplete" | "observationTimedOut" | "outcome_unknown"
+        | "actionRefused" | "cancelled" | "unavailable" | "busy" | "busyOrRevoked"
+        | "targetNotFound" | "ambiguousTarget" | "unsupportedOperation" => error,
+        "targetNotDiscovered" | "applicationGone" | "processIdentityUnavailable" | "windowGone" | "targetChanged"
+        | "targetObscured" | "targetNotFocused" | "windowRequired" | "discoveryLimit" => error,
+        _ => "otherNativeFailure",
+    });
+    crate::log_codex_diagnostic(&state, lease.agent_id, "desktop-operation", &json!({
+        "agent_id": lease.agent_id, "run_id": lease.run_id,
+        "operation_id": request.operation_id, "tool": request.tool,
+        "state": outcome, "error": error,
+        "discovery_status": result["result"]["status"].as_str().filter(|s|
+            matches!(*s, "ready" | "partial" | "unavailable" | "noMatches" | "noVisibleWindows")),
+        "verification_required": result["result"]["verification_required"].as_bool(),
+    }).to_string());
     let mut completed = lease.completed.lock().unwrap();
     if completed.len() >= 8 {
         completed.clear();

@@ -95,7 +95,8 @@ private enum NativeRuntime {
 }
 
 @_cdecl("ditch_automation_abi_version")
-public func automationABIVersion() -> UInt32 { 1 }
+// ABI 3 requires turn-scoped targets and the visual foreground action contract.
+public func automationABIVersion() -> UInt32 { 3 }
 
 /// Called on AppKit's main thread before starting the Rust runtime. Byte input
 /// is borrowed for this call only. No system permission is requested here.

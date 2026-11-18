@@ -207,10 +207,16 @@ fn start_remote_app_server_session_linked(
     let restricted = edition::restricted_agent(&state.lock().unwrap(), run.id);
     let protected_roots = {let s=state.lock().unwrap();let mut roots=vec![s.paths.data_dir.clone()];if let Some(home)=s.codex_home.clone().or_else(||std::env::var_os("HOME").map(|h|PathBuf::from(h).join(".codex"))){roots.push(home);}roots};
     let run_id = uuid::Uuid::new_v4();
-    let desktop = tool_integrations::prepare(&state, run.id, run_id, &execution_profile, turn_options,
-        if binding.is_some() || restricted { ditch_core::tool_integrations::InvocationPurpose::Worker } else { ditch_core::tool_integrations::InvocationPurpose::User });
+    let desktop_setup = match tool_integrations::prepare(&state, run.id, run_id, &execution_profile, turn_options,
+        if binding.is_some() || restricted { ditch_core::tool_integrations::InvocationPurpose::Worker } else { ditch_core::tool_integrations::InvocationPurpose::User }) {
+        Ok(setup) => setup,
+        Err(reason) => return persist_launch_failure(&state, project, run, user_message,
+            format!("Ditch desktop setup failed: {reason}. No model turn was started.")),
+    };
+    let desktop = desktop_setup.lease();
     let spawned = match codex_app_server::spawn_turn(
         codex_app_server::Launch {
+            desktop_setup: Some(&desktop_setup),
             inference_provider: inference_provider.as_ref(),
             restricted,
             protected_roots,
@@ -450,10 +456,19 @@ fn prompt_app_server_agent_with_options(
     let protected_roots = {let s=state.lock().unwrap();let mut roots=vec![s.paths.data_dir.clone()];if let Some(home)=s.codex_home.clone().or_else(||std::env::var_os("HOME").map(|h|PathBuf::from(h).join(".codex"))){roots.push(home);}roots};
     let run_id = uuid::Uuid::new_v4();
     let is_worker = state.lock().unwrap().agents.get(&agent_id).is_some_and(|a| a.run.task_id.is_some());
-    let desktop = tool_integrations::prepare(&state, agent_id, run_id, &execution_profile, turn_options,
-        if is_worker || restricted { ditch_core::tool_integrations::InvocationPurpose::Worker } else { ditch_core::tool_integrations::InvocationPurpose::User });
+    let desktop_setup = match tool_integrations::prepare(&state, agent_id, run_id, &execution_profile, turn_options,
+        if is_worker || restricted { ditch_core::tool_integrations::InvocationPurpose::Worker } else { ditch_core::tool_integrations::InvocationPurpose::User }) {
+        Ok(setup) => setup,
+        Err(reason) => {
+            let message = format!("Ditch desktop setup failed: {reason}. No model turn was started.");
+            record_terminal_failure(&state, agent_id, message.clone(), None);
+            return protocol_error("desktop_setup_failed", message);
+        }
+    };
+    let desktop = desktop_setup.lease();
     let spawned = match codex_app_server::spawn_turn(
         codex_app_server::Launch {
+            desktop_setup: Some(&desktop_setup),
             inference_provider: inference_provider.as_ref(),
             restricted,
             protected_roots,

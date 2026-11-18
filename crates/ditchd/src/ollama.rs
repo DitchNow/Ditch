@@ -447,6 +447,7 @@ mod tests {
             let (tx, rx) = std::sync::mpsc::channel();
             let spawned = codex_app_server::spawn_turn(
                 Launch {
+                    desktop_setup: None,
                     inference_provider: Some(&provider),
                     restricted: false,
                     protected_roots: vec![],
@@ -733,6 +734,7 @@ for line in sys.stdin:
             let (tx, rx) = std::sync::mpsc::channel();
             let spawned = codex_app_server::spawn_turn(
                 Launch {
+                    desktop_setup: None,
                     inference_provider: Some(&provider),
                     restricted: false,
                     protected_roots: vec![],

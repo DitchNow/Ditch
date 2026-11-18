@@ -45,13 +45,15 @@ final class AutomationHostTests: XCTestCase {
     }
 
     func testABIRejectsUnboundedInputWithoutSchedulingWork() {
-        XCTAssertEqual(automationABIVersion(), 1)
+        XCTAssertEqual(automationABIVersion(), 3)
         XCTAssertNotEqual(automationInvoke(1, nil, 0, nil), 0)
         XCTAssertNotEqual(automationInitialize(nil, 0, nil), 0)
     }
 
     @MainActor func testStartupRemovesOnlyOwnedCaptureArtifacts() throws {
-        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let root = ProcessInfo.processInfo.environment["TMPDIR"].map { URL(fileURLWithPath: $0) }
+            ?? FileManager.default.temporaryDirectory
+        let directory = root.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
         let capture = directory.appendingPathComponent("capture-expired.png")

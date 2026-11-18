@@ -33,7 +33,7 @@ enum AutomationModuleLoader {
     }
     typealias Version = @convention(c) () -> UInt32
     typealias Initialize = @convention(c) (UnsafePointer<UInt8>?, Int, AutomationRevoke?) -> Int32
-    guard let version = symbol("ditch_automation_abi_version", Version.self), version() == 1,
+    guard let version = symbol("ditch_automation_abi_version", Version.self), version() == 3,
           let initialize = symbol("ditch_automation_initialize", Initialize.self),
           let invoke = symbol("ditch_automation_invoke", AutomationInvoke.self),
           let cancel = symbol("ditch_automation_cancel", AutomationCancel.self),
@@ -59,7 +59,7 @@ enum AutomationModuleLoader {
     let name = Data((Bundle.main.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String
                      ?? Bundle.main.object(forInfoDictionaryKey: "CFBundleName") as? String ?? "Ditch Runtime").utf8)
     return name.withUnsafeBytes { buffer in
-      registerAutomation(1, invoke, cancel, revoke, permission, verify, forget,
+      registerAutomation(3, invoke, cancel, revoke, permission, verify, forget,
                          buffer.bindMemory(to: UInt8.self).baseAddress, buffer.count) == 0
     }
   }

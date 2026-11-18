@@ -4,6 +4,7 @@ import QuartzCore
 /// Local presentation only. No distributed notifications, files, or model-visible events.
 @MainActor
 final class AutomationVisualizer {
+    static private(set) var overlayWindowIDs = Set<UInt32>()
     private var window: AutomationOverlayWindow?
     private var owner: String?
     private var expiry: Task<Void, Never>?
@@ -37,6 +38,7 @@ final class AutomationVisualizer {
         generation += 1
         expiry?.cancel()
         expiry = nil
+        if let window { Self.overlayWindowIDs.remove(UInt32(window.windowNumber)) }
         window?.orderOut(nil)
         window?.close()
         window = nil
@@ -61,6 +63,7 @@ final class AutomationVisualizer {
                                                     action: action, point: localPoint)
         owner = session
         window = overlay
+        Self.overlayWindowIDs.insert(UInt32(overlay.windowNumber))
         overlay.orderFrontRegardless()
         let token = generation
         expiry = Task { @MainActor [weak self, weak overlay] in
@@ -74,6 +77,50 @@ final class AutomationVisualizer {
                 }
             }
             guard !Task.isCancelled, self.generation == token else { return }
+            self.clear(session: session)
+        }
+    }
+
+    private func pointerWindow(session: String, action: String, point: CGPoint) -> AutomationOverlayWindow? {
+        clear()
+        guard let top = NSScreen.screens.first?.frame.maxY else { return nil }
+        let overlay = AutomationOverlayWindow(frame: CGRect(x: point.x - 36, y: top - point.y - 36, width: 72, height: 72))
+        overlay.contentView = AutomationPointerView(action: action)
+        owner = session
+        window = overlay
+        Self.overlayWindowIDs.insert(UInt32(overlay.windowNumber))
+        overlay.orderFrontRegardless()
+        return overlay
+    }
+
+    /// Sample the real global pointer during native dispatch. Never replay an
+    /// imagined path after a failed action or move the physical pointer here.
+    func trackPointer(session: String, duration: TimeInterval, dragging: Bool) {
+        guard let point = CGEvent(source: nil)?.location,
+              let overlay = pointerWindow(session: session, action: dragging ? "drag" : "move", point: point),
+              let top = NSScreen.screens.first?.frame.maxY else { return }
+        let token = generation
+        expiry = Task { @MainActor [weak self, weak overlay] in
+            let end = Date().addingTimeInterval(min(2, max(0.1, duration)) + 0.25)
+            while Date() < end, !Task.isCancelled {
+                guard let self, self.generation == token, let overlay else { return }
+                if let point = CGEvent(source: nil)?.location {
+                    overlay.setFrameOrigin(CGPoint(x: point.x - 36, y: top - point.y - 36))
+                }
+                try? await Task.sleep(for: .milliseconds(16))
+            }
+            guard !Task.isCancelled, let self, self.generation == token else { return }
+            self.clear(session: session)
+        }
+    }
+
+    func pointerFeedback(enabled: Bool, session: String, action: String, point: CGPoint?) {
+        guard enabled, !Task.isCancelled, let point = point ?? CGEvent(source: nil)?.location,
+              pointerWindow(session: session, action: action, point: point) != nil else { return }
+        let token = generation
+        expiry = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(750))
+            guard !Task.isCancelled, let self, self.generation == token else { return }
             self.clear(session: session)
         }
     }

@@ -526,6 +526,7 @@ impl RuntimeState {
         if tool_integrations::native::available() {
             capabilities.push(ditch_core::tool_integrations::DESKTOP_CAPABILITY.to_owned());
             capabilities.push(ditch_core::tool_integrations::VISUALIZER_CAPABILITY.to_owned());
+            capabilities.push(ditch_core::tool_integrations::VERIFICATION_CAPABILITY.to_owned());
         }
         RuntimeStatus {
             identity: RUNTIME_IDENTITY.to_owned(),

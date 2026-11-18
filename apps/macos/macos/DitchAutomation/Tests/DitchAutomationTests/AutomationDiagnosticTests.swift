@@ -5,6 +5,18 @@ import XCTest
 @testable import DitchAutomation
 
 final class AutomationDiagnosticTests: XCTestCase {
+    func testMalformedLegacyArgumentsAreDiagnosedWithoutEchoingInput() throws {
+        let data = Data(#"{"sessionId":"turn","operationId":"op","tool":"desktop_observe","arguments":{"pid":"SECRET-80207","window_id":"1"}}"#.utf8)
+        XCTAssertThrowsError(try JSONDecoder().decode(NativeRequest.self, from: data)) {
+            let diagnostic = AutomationDiagnostic($0)
+            XCTAssertEqual(diagnostic.error, "invalidArguments")
+            XCTAssertTrue(diagnostic.message.contains("target_id"))
+            XCTAssertFalse(diagnostic.message.contains("SECRET"))
+        }
+        XCTAssertEqual(AutomationDiagnostic(AutomationFailure.processIdentityUnavailable).error, "processIdentityUnavailable")
+        XCTAssertNotEqual(AutomationDiagnostic(AutomationFailure.applicationGone).message,
+                          AutomationDiagnostic(AutomationFailure.protectedTarget).message)
+    }
     func testFailureCategoriesDoNotConflatePermissionsTargetsAndCapture() {
         XCTAssertEqual(AutomationDiagnostic(AutomationFailure.protectedTarget).error, "protectedTarget")
         XCTAssertEqual(AutomationDiagnostic(PeekabooError.permissionDeniedAccessibility).error, "permissionRequired")

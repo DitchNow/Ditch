@@ -85,6 +85,7 @@ pub struct SpawnedTurn {
 }
 
 pub struct Launch<'a> {
+    pub desktop_setup: Option<&'a crate::tool_integrations::Preparation>,
     pub inference_provider: Option<&'a crate::ollama::ResolvedOllamaProvider>,
     pub restricted: bool,
     pub protected_roots: Vec<std::path::PathBuf>,
@@ -250,7 +251,7 @@ pub fn spawn_turn(launch: Launch<'_>, events: Sender<Event>) -> io::Result<Spawn
     let desktop = if launch.inference_provider.is_some()
         && launch.execution_profile.approval == ditch_core::AgentApprovalPreset::FullAccess
         && !launch.remote && !launch.restricted {
-        crate::tool_integrations::lease_for(launch.agent_id)
+        launch.desktop_setup.and_then(crate::tool_integrations::Preparation::lease)
     } else { None };
     let home = launch.codex_home.as_ref().map(std::path::Path::new);
     let mut client = crate::app_server_client::Client::open_with_provider(
@@ -313,8 +314,11 @@ pub fn spawn_turn(launch: Launch<'_>, events: Sender<Event>) -> io::Result<Spawn
             &config["config"],
             &plugins,
             desktop.as_ref().map(|d| d.config()),
-        );
+        ).with_unavailable_reason(launch.desktop_setup.map(|s| s.reason()).unwrap_or("notPrepared"));
         policy.apply_thread(&mut thread_params);
+        if desktop.as_ref().is_some_and(|d| d.verification_target.is_some()) {
+            crate::oss_tool_policy::apply_desktop_verification(&mut thread_params);
+        }
         oss_policy = Some(policy);
         let catalog = client.call(
             "skills/list",
@@ -474,6 +478,23 @@ pub fn spawn_turn(launch: Launch<'_>, events: Sender<Event>) -> io::Result<Spawn
         if let (Some(desktop), Some(pid)) = (&desktop, execution_adapter) {
             desktop.confirm_registered(pid)?;
         }
+        let _ = events.send(Event::Diagnostic(format!("Ditch OSS turn setup {}", json!({
+            "agent_id": launch.agent_id,
+            "run_id": desktop.as_ref().map(|d| d.run_id),
+            "thread_id": thread,
+            "resumed": launch.resume_thread.is_some(),
+            "endpoint_id": provider.endpoint.id,
+            "model": provider.model,
+            "policy_version": crate::oss_tool_policy::POLICY_VERSION,
+            "desktop_state": launch.desktop_setup.map(|s| s.reason()).unwrap_or("notPrepared"),
+            "verification_target": desktop.as_ref().and_then(|d| d.verification_target).map(|t| t.bundle_identifier()),
+            "adapter_pid": execution_adapter,
+            "catalogue_verified": true,
+            "desktop_tools": desktop.as_ref().map(|_| ditch_core::tool_integrations::desktop_tool_schemas()
+                .into_iter().map(|t| t.0).collect::<Vec<_>>()).unwrap_or_default(),
+            "instructions_submitted": true,
+            "inference_delivery_verified": false,
+        }))));
         Some(json!({"id":THREAD_ID,"result":result}).to_string())
     } else {
         client.send(&json!({"id":THREAD_ID,"method":method,"params":thread_params}))?;
@@ -1551,6 +1572,7 @@ printf '%s\n' '{{"method":"turn/completed","params":{{"turn":{{"id":"turn_remote
         let (tx, rx) = mpsc::channel();
         let spawned = spawn_turn(
             Launch {
+                desktop_setup: None,
                 inference_provider: None,
                 restricted: false,
                 protected_roots: vec![],
@@ -1641,6 +1663,7 @@ printf '%s' '{"id":"ditch:thread","result":'
         let (tx, rx) = mpsc::channel();
         let spawned = spawn_turn(
             Launch {
+                desktop_setup: None,
                 inference_provider: None,
                 restricted: false,
                 protected_roots: vec![],
@@ -1708,6 +1731,7 @@ printf '%s' '{"id":"ditch:thread","result":'
             let (tx, rx) = mpsc::channel();
             let spawned = spawn_turn(
                 Launch {
+                    desktop_setup: None,
                     inference_provider: None,
                     binary: &binary,
                     cwd: Path::new(&root),

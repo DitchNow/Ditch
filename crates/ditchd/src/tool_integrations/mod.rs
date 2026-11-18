@@ -1,6 +1,7 @@
 //! Community-owned, statically composed tool integrations. The adapter is a
 //! transport client; this registry owns all execution authority and lifecycle.
 mod executor;
+mod interaction_policy;
 pub mod local_transport;
 pub mod native;
 mod peekaboo;
@@ -57,8 +58,10 @@ pub struct Lease {
     tools_registered: AtomicBool,
     binding: Mutex<(Option<String>, Option<String>)>,
     completed: Mutex<HashMap<Uuid, Value>>,
+    interaction_policy: Mutex<interaction_policy::InteractionPolicy>,
     vision: bool,
     visualizer: bool,
+    pub verification_target: Option<DesktopVerificationTarget>,
 }
 static LEASES: OnceLock<Mutex<HashMap<AgentId, Arc<Lease>>>> = OnceLock::new();
 static SUBSCRIBERS: OnceLock<Mutex<Vec<mpsc::SyncSender<ToolIntegrationEvent>>>> = OnceLock::new();
@@ -140,18 +143,48 @@ pub fn lease_for(id: AgentId) -> Option<Arc<Lease>> {
         .cloned()
 }
 
-/// Called before launching a normal user turn. An unavailable integration must
-/// never prevent ordinary chat; it simply has no adapter entry in that turn.
+/// Setup failures stop launch; expected ineligibility keeps ordinary chat available.
+pub enum Preparation {
+    Ready(Arc<Lease>),
+    Ineligible(&'static str),
+}
+impl Preparation {
+    pub fn lease(&self) -> Option<Arc<Lease>> {
+        match self { Self::Ready(lease) => Some(lease.clone()), Self::Ineligible(_) => None }
+    }
+    pub fn reason(&self) -> &'static str {
+        match self { Self::Ready(_) => "ready", Self::Ineligible(reason) => reason }
+    }
+}
+
 pub fn prepare(
+    state: &Arc<Mutex<RuntimeState>>, agent_id: AgentId, run_id: Uuid,
+    profile: &AgentExecutionProfile, turn_options: TurnOptions, purpose: InvocationPurpose,
+) -> Result<Preparation, &'static str> {
+    let result = prepare_inner(state, agent_id, run_id, profile, turn_options, purpose)
+        .and_then(|preparation| match preparation {
+            Preparation::Ineligible(reason) if turn_options.desktop_verification_target.is_some() => Err(reason),
+            other => Ok(other),
+        });
+    crate::log_codex_diagnostic(state, agent_id, "desktop-setup", &json!({
+        "agent_id": agent_id, "run_id": run_id,
+        "endpoint_id": profile.inference_endpoint_id,
+        "state": match &result { Ok(Preparation::Ready(_)) => "ready", Ok(_) => "ineligible", Err(_) => "failed" },
+        "reason": match &result { Ok(preparation) => preparation.reason(), Err(reason) => reason },
+    }).to_string());
+    result
+}
+
+fn prepare_inner(
     state: &Arc<Mutex<RuntimeState>>,
     agent_id: AgentId,
     run_id: Uuid,
     profile: &AgentExecutionProfile,
     turn_options: TurnOptions,
     purpose: InvocationPurpose,
-) -> Option<Arc<Lease>> {
+) -> Result<Preparation, &'static str> {
     if !revoke(agent_id) {
-        return None;
+        return Err("previousRunStillStopping");
     }
     let (remote, paths) = {
         let state = state.lock().unwrap();
@@ -162,32 +195,35 @@ pub fn prepare(
     } else {
         InvocationOrigin::Local
     };
-    if !desktop_eligible(profile, purpose, origin, remote, native::available()) {
-        return None;
+    if let Some(reason) = desktop_ineligibility(profile, purpose, origin, remote, native::available()) {
+        return Ok(Preparation::Ineligible(reason));
     }
     let model_status = {
         let locked = state.lock().unwrap();
         let endpoint = locked
             .store
-            .ollama_endpoint(profile.inference_endpoint_id?)
-            .ok()??;
-        endpoint.model_status.get(profile.model.as_ref()?)?.clone()
+            .ollama_endpoint(profile.inference_endpoint_id.ok_or("endpointMissing")?)
+            .map_err(|_| "endpointLookupFailed")?.ok_or("endpointMissing")?;
+        endpoint.model_status.get(profile.model.as_ref().ok_or("modelMissing")?)
+            .ok_or("modelCapabilitiesMissing")?.clone()
     };
     if !model_status.tools_declared {
-        return None;
+        return Ok(Preparation::Ineligible("modelToolsUnsupported"));
     }
     let readiness = native::invoke(
         &json!({"sessionId":"status","operationId":Uuid::new_v4(),"tool":"desktop_status","arguments":{}}),
         &Arc::new(AtomicBool::new(false)),
         None,
     );
+    if readiness["ok"] != true { return Err("nativeStatusFailed"); }
     if readiness["result"]["activeDesktop"] != true {
-        return None;
+        return Ok(Preparation::Ineligible("desktopInactive"));
     }
     // The signed StatusHost and bundled CLI are siblings in the runtime bundle.
-    let cli = std::env::current_exe().ok()?.parent()?.join("ditch_cli");
+    let cli = std::env::current_exe().map_err(|_| "runtimePathUnavailable")?
+        .parent().ok_or("runtimePathUnavailable")?.join("ditch_cli");
     if !cli.is_file() {
-        return None;
+        return Err("bundledAdapterMissing");
     }
     let socket = PathBuf::from("/tmp").join(format!(
         "ditch-tools-{}-{}.sock",
@@ -211,14 +247,14 @@ pub fn prepare(
         tools_registered: AtomicBool::new(false),
         binding: Mutex::new((None, None)),
         completed: Mutex::new(HashMap::new()),
+        interaction_policy: Mutex::new(Default::default()),
         vision: model_status.vision_declared,
         visualizer: turn_options.computer_use_visualizer,
+        verification_target: turn_options.desktop_verification_target,
     });
-    if local_transport::start(lease.clone()).is_err() {
-        return None;
-    }
+    local_transport::start(lease.clone()).map_err(|_| "adapterTransportFailed")?;
     leases().lock().unwrap().insert(agent_id, lease.clone());
-    Some(lease)
+    Ok(Preparation::Ready(lease))
 }
 
 pub fn revoke(id: AgentId) -> bool {

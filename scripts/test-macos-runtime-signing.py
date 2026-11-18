@@ -62,7 +62,7 @@ class RuntimeSigningTests(unittest.TestCase):
         version = framework / 'Versions/A'
         (version / 'Resources').mkdir(parents=True)
         source = self.root / 'automation.c'
-        source.write_text('int ditch_automation_abi_version(void) { return 1; }\n')
+        source.write_text('int ditch_automation_abi_version(void) { return 3; }\n')
         run('xcrun', 'clang', '-dynamiclib', str(source), '-o', str(version / 'DitchAutomation'))
         (version / 'Resources/Info.plist').write_bytes(plistlib.dumps({
             'CFBundleIdentifier': 'ai.theditch.automation', 'CFBundleExecutable': 'DitchAutomation',

@@ -6,6 +6,11 @@ import PeekabooFoundation
 import UniformTypeIdentifiers
 
 struct DesktopArguments: Decodable, Sendable {
+    let target_id: String?
+    let query: String?
+    let mode: String?
+    let to_x: Double?
+    let to_y: Double?
     let pid: Int32?
     let window_id: UInt32?
     let include_image: Bool?
@@ -26,10 +31,13 @@ struct NativeRequest: Decodable, Sendable {
     let tool: String
     let arguments: DesktopArguments
     let visualizer: Bool?
+    let targetBundle: String?
 }
 
 enum AutomationFailure: String, Error {
+    case outcomeUnknown = "outcome_unknown"
     case permissionRequired, invalidArguments, staleSnapshot, protectedTarget, busy, unavailable
+    case applicationGone, processIdentityUnavailable, discoveryLimit, targetNotDiscovered, windowGone, targetChanged, targetObscured, windowRequired, targetNotFocused
 }
 
 @MainActor
@@ -40,11 +48,12 @@ final class PeekabooAdapter {
         let context: WindowContext
         let imageSize: CGSize
         let capturedAt: Date
-        let artifact: URL
         let elementBounds: [String: CGRect]
     }
 
-    private let host: AutomationHost
+    let host: AutomationHost
+    let registry = AutomationTargetRegistry()
+    var visualObservations: [String: VisualObservation] = [:]
     private let captures: URL
     private var snapshots: [String: Snapshot] = [:]
 
@@ -74,23 +83,32 @@ final class PeekabooAdapter {
         if request.tool == "desktop_status" {
             return try self.encode(self.host.permissions())
         }
+        // Legacy PIDs/window IDs are not current-turn target authority.
+        guard request.arguments.pid == nil, request.arguments.window_id == nil else {
+            throw AutomationFailure.invalidArguments
+        }
         let permissions = self.host.permissions()
         guard permissions.activeDesktop else { throw AutomationFailure.unavailable }
         guard permissions.accessibility else { throw AutomationFailure.permissionRequired }
         switch request.tool {
         case "desktop_list_targets":
-            if let pid = request.arguments.pid {
-                try self.validateTarget(pid)
-                let result = try await self.host.services.applications.listWindows(for: "PID:\(pid)", timeout: 2)
-                return try self.encode(Array(result.data.windows.prefix(64)))
-            }
-            let result = try await self.host.services.applications.listApplications()
-            let apps = result.data.applications.filter { (try? self.validateTarget($0.processIdentifier)) != nil }
-            return try self.encode(Array(apps.prefix(64)))
+            return try self.discover(request)
         case "desktop_observe":
-            guard permissions.screenRecording else { throw AutomationFailure.permissionRequired }
+            guard request.arguments.mode == nil || ["visual", "accessibility"].contains(request.arguments.mode!) else { throw AutomationFailure.invalidArguments }
+            if request.arguments.mode != "accessibility" || request.arguments.include_image == true {
+                guard permissions.screenRecording else { throw AutomationFailure.permissionRequired }
+            }
+            await clearSnapshots(session: request.sessionId)
+            visualObservations = visualObservations.filter { $0.value.session != request.sessionId }
+            if request.arguments.mode != "accessibility" { return try await self.observeVisual(request) }
             return try await self.observe(request)
         case "desktop_act":
+            if request.arguments.action == "focus" && request.arguments.snapshot_id == nil {
+                return try await self.focusTarget(request)
+            }
+            if let id = request.arguments.snapshot_id, self.visualObservations[id] != nil {
+                return try await self.actVisual(request)
+            }
             return try await self.act(request)
         default:
             throw AutomationFailure.invalidArguments
@@ -100,95 +118,89 @@ final class PeekabooAdapter {
     func clearFeedback() { self.host.visualizer.clear() }
 
     func invalidate(session: String? = nil) async {
+        self.registry.clear(session: session)
+        self.visualObservations = self.visualObservations.filter { session != nil && $0.value.session != session }
+        await self.clearSnapshots(session: session)
+    }
+
+    private func clearSnapshots(session: String? = nil) async {
         self.host.visualizer.clear(session: session)
         let keys = self.snapshots.filter { session == nil || $0.value.session == session }.map(\.key)
         for key in keys {
             if let snapshot = self.snapshots.removeValue(forKey: key) {
                 try? await self.host.services.snapshots.cleanSnapshot(snapshotId: snapshot.nativeID)
-                try? FileManager.default.removeItem(at: snapshot.artifact)
             }
         }
     }
 
-    private func validateTarget(_ pid: Int32) throws {
+    static func validateTarget(_ pid: Int32, requiredBundle: String? = nil) throws {
         guard pid > 0, let app = NSRunningApplication(processIdentifier: pid) else {
             throw AutomationFailure.staleSnapshot
         }
-        let bundle = app.bundleIdentifier ?? ""
-        // Permission changes remain first-party user actions, even under Full Access.
-        guard pid != ProcessInfo.processInfo.processIdentifier,
-              !bundle.hasPrefix("ai.theditch."),
-              !["com.apple.systempreferences", "com.apple.SecurityAgent", "com.apple.loginwindow"].contains(bundle)
+        try Self.validateApplication(bundleIdentifier: app.bundleIdentifier ?? "", requiredBundle: requiredBundle)
+    }
+
+    static func validateApplication(bundleIdentifier: String, requiredBundle: String? = nil) throws {
+        if let requiredBundle, bundleIdentifier != requiredBundle { throw AutomationFailure.protectedTarget }
+        // Full Access eligibility is enforced by the runtime. Ditch windows,
+        // including the host's own windows, are ordinary automation targets.
+        // Keep OS permission and authentication surfaces out of this adapter.
+        guard !["com.apple.systempreferences", "com.apple.SecurityAgent", "com.apple.loginwindow"].contains(bundleIdentifier)
         else { throw AutomationFailure.protectedTarget }
     }
 
     private func observe(_ request: NativeRequest) async throws -> Data {
-        guard let pid = request.arguments.pid, pid > 0,
-              let window = request.arguments.window_id, window > 0 else {
-            throw AutomationFailure.invalidArguments
-        }
-        try self.validateTarget(pid)
-        await self.invalidate(session: request.sessionId)
-        if self.snapshots.count >= 8 { await self.invalidate() }
-        // Allow the window server to retire the overlay before capture. sharingType
-        // alone is not a reliable exclusion across all capture backends.
-        try await Task.sleep(for: .milliseconds(35))
+        let target = try registry.resolve(request.arguments.target_id, session: request.sessionId, requiredBundle: request.targetBundle)
+        guard let window = target.window else { throw AutomationFailure.windowRequired }
+        let resolved = try await ObservationTargetResolver(applications: host.services.applications)
+            .resolve(.windowID(window), snapshot: .init())
+        guard let initialContext = resolved.detectionContext else { throw AutomationFailure.staleSnapshot }
+        let result = try await host.services.automation.inspectAccessibilityTree(windowContext: initialContext)
         try Task.checkCancellation()
-        let artifact = self.captures.appendingPathComponent("capture-\(UUID().uuidString).png")
-        var retained = false
-        defer { if !retained { try? FileManager.default.removeItem(at: artifact) } }
-        let result = try await self.host.services.desktopObservation.observe(.init(
-            target: .pid(pid, window: .id(window)),
-            capture: .init(scale: .logical1x, focus: .background),
-            detection: .init(mode: .accessibility, allowWebFocusFallback: false,
-                             traversalBudget: .init(maxDepth: 10, maxElementCount: 200, maxChildrenPerNode: 80),
-                             requiresFreshAccessibilityTree: true),
-            output: .init(path: artifact.path, saveRawScreenshot: true, saveSnapshot: true, includeImageData: true),
-            timeout: .init(overall: 8, detection: 3)
-        ))
-        try Task.checkCancellation()
-        guard let context = result.target.detectionContext,
-              context.applicationProcessId == pid,
-              context.windowID == Int(window),
-              context.windowMutationIdentity != nil,
-              let nativeID = result.files.publishedSnapshotID
-        else { throw AutomationFailure.staleSnapshot }
-        let (image, imageSize) = try self.thumbnail(result.capture.imageData)
+        _ = try registry.resolve(request.arguments.target_id, session: request.sessionId, requiredBundle: request.targetBundle)
+        guard let context = result.metadata.windowContext, context.windowMutationIdentity != nil,
+              context.applicationProcessId == target.pid, context.windowID == Int(window),
+              let bounds = context.windowBounds else { throw PeekabooError.accessibilityIncomplete("Exact window Accessibility context is unavailable") }
+        let nativeID = try await Self.publishAccessibility(result, manager: host.services.snapshots)
         let id = UUID().uuidString
-        self.snapshots[id] = Snapshot(session: request.sessionId, nativeID: nativeID, context: context,
-                                      imageSize: imageSize, capturedAt: Date(), artifact: artifact,
-                                      elementBounds: Dictionary((result.elements?.elements.all ?? []).prefix(200)
-                                        .map { ($0.id, $0.bounds) }, uniquingKeysWith: { first, _ in first }))
+        var size = bounds.size
+        var output: [String: Any] = ["snapshot_id": id, "target_id": request.arguments.target_id!,
+            "mode": "accessibility"]
+        if request.arguments.include_image == true {
+            do {
+                let capture = try await host.services.screenCapture.captureWindow(windowID: window, visualizerMode: .none, scale: .logical1x)
+                let (bytes, imageSize) = try thumbnail(capture.imageData)
+                size = imageSize
+                output["image"] = ["mime_type": "image/png", "data": bytes.base64EncodedString()]
+            } catch {
+                try? await host.services.snapshots.cleanSnapshot(snapshotId: nativeID)
+                throw error
+            }
+        }
+        snapshots[id] = Snapshot(session: request.sessionId, nativeID: nativeID, context: context,
+            imageSize: size, capturedAt: Date(),
+            elementBounds: Dictionary(result.elements.all.prefix(200).map { ($0.id, $0.bounds) },
+                                      uniquingKeysWith: { first, _ in first }))
         Task { @MainActor [weak self] in
             try? await Task.sleep(for: .seconds(30))
             guard let self, let snapshot = self.snapshots.removeValue(forKey: id) else { return }
             try? await self.host.services.snapshots.cleanSnapshot(snapshotId: snapshot.nativeID)
-            try? FileManager.default.removeItem(at: snapshot.artifact)
         }
-        retained = true
         var elements: [[String: Any]] = []
         var byteCount = 0
-        for element in result.elements?.elements.all ?? [] {
+        for element in result.elements.all.prefix(200) {
             let value: [String: Any] = ["id": element.id, "role": String(describing: element.type),
-                                       "label": String((element.label ?? "").prefix(512)),
-                                       "value": String((element.value ?? "").prefix(512)),
-                                       "enabled": element.isEnabled]
+                "label": String((element.label ?? "").prefix(512)),
+                "value": String((element.value ?? "").prefix(512)), "enabled": element.isEnabled]
             let count = try JSONSerialization.data(withJSONObject: value).count
             guard byteCount + count <= 32 * 1024 else { break }
             byteCount += count
             elements.append(value)
         }
-        var output: [String: Any] = ["snapshot_id": id, "pid": pid, "window_id": window,
-                                     "width": imageSize.width, "height": imageSize.height,
-                                     "elements": elements,
-                                     "truncated": elements.count < (result.elements?.elements.all.count ?? 0)]
-        if request.arguments.include_image == true {
-            output["image"] = ["mime_type": "image/png", "data": image.base64EncodedString()]
-        }
-        if let bounds = context.windowBounds {
-            self.host.visualizer.show(enabled: request.visualizer == true, session: request.sessionId,
-                                      action: "observe", windowID: window, pid: pid, bounds: bounds)
-        }
+        output["width"] = size.width
+        output["height"] = size.height
+        output["elements"] = elements
+        output["truncated"] = elements.count < result.elements.all.count
         return try JSONSerialization.data(withJSONObject: output)
     }
 
@@ -198,7 +210,6 @@ final class PeekabooAdapter {
         else { throw AutomationFailure.staleSnapshot }
         self.snapshots.removeValue(forKey: id)
         defer {
-            try? FileManager.default.removeItem(at: snapshot.artifact)
             Task { @MainActor in try? await self.host.services.snapshots.cleanSnapshot(snapshotId: snapshot.nativeID) }
         }
         guard Date().timeIntervalSince(snapshot.capturedAt) <= 30,
@@ -206,7 +217,7 @@ final class PeekabooAdapter {
               let bounds = snapshot.context.windowBounds,
               let pid = snapshot.context.applicationProcessId
         else { throw AutomationFailure.staleSnapshot }
-        try self.validateTarget(pid)
+        try Self.validateTarget(pid, requiredBundle: request.targetBundle)
         try Task.checkCancellation()
         guard let automation = self.host.services.automation as? any UIAutomationActionOutcomeProviding else {
             throw AutomationFailure.unavailable
@@ -272,7 +283,7 @@ final class PeekabooAdapter {
         return try JSONSerialization.data(withJSONObject: ["outcome": outcome.state.rawValue, "verification_required": true, "snapshot_consumed": true])
     }
 
-    private func thumbnail(_ data: Data) throws -> (Data, CGSize) {
+    func thumbnail(_ data: Data) throws -> (Data, CGSize) {
         guard let source = CGImageSourceCreateWithData(data as CFData, nil),
               let image = CGImageSourceCreateThumbnailAtIndex(source, 0, [
                 kCGImageSourceCreateThumbnailFromImageAlways: true,

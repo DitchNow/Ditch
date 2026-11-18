@@ -16,7 +16,7 @@ pub unsafe extern "C" fn ditch_register_automation(
     name: *const u8,
     name_length: usize,
 ) -> i32 {
-    if version != 1 || name.is_null() || name_length > 256 {
+    if version != 3 || name.is_null() || name_length > 256 {
         return 1;
     }
     let (

@@ -15,11 +15,64 @@ used by this integration.
   receive this desktop integration.
 
 The four tools are `desktop_status`, `desktop_list_targets`, `desktop_observe`,
-and `desktop_act`. Actions support one click, text entry, key combination, scroll,
-or window focus against a fresh exact-window snapshot. Other Peekaboo features
-are outside this initial tool surface.
+and `desktop_act`. Discover applications, then their windows, using opaque
+`target_id` references from the current turn. Focus a selected window before
+observing. The default `mode=visual` returns a screenshot without traversing
+Accessibility; its single-use snapshot supports foreground click, double/right
+click, move, drag, type, key and scroll. Coordinates are pixels of the returned
+image, transformed into global display points by the native adapter.
+`mode=accessibility` returns elements for the existing background action path
+and captures no screenshot unless `include_image=true`.
+
+Target identity uses Peekaboo's kernel process-start identity, not the optional
+LaunchServices `NSRunningApplication.launchDate`. References remain scoped to the
+turn, process generation, bundle and window. If identity cannot be read, the
+adapter reports `processIdentityUnavailable`; it never authorizes input using a
+bare PID or describes this as a permission denial.
+
+Discovery returns `targets`, `unavailable` candidate diagnostics, and `status`:
+`ready`, `partial`, `unavailable`, `noMatches` or `noVisibleWindows`. One failed
+candidate does not discard other usable targets. Only entries in `targets` have
+actionable references. An empty discovery is a successful enumeration with no
+usable target, not proof of control: it consumes the runtime recovery budget just
+like a failed discovery. Status checks and successful lists cannot reset that
+budget. A successful observation or action can restore progress. Malformed
+arguments, including legacy PID/window fields, report `invalidArguments`.
+
+Application launching, desktop-wide/status-bar targets and arbitrary browser DOM
+operations are not exposed by these four tools. This is window automation, not
+the entire Peekaboo CLI surface.
+
+Ditch's own application windows are eligible targets, including Kanban and task
+forms. Select the exact application returned by discovery: Staging uses
+`ai.theditch.app.staging`, while production uses `ai.theditch.app`. A Staging
+request must not fall back to production. Creating a task through the New Task
+form uses the existing `CreateBacklog` operation; it does not require a web UI.
+
+System Settings, SecurityAgent and loginwindow remain protected targets. This
+adapter policy is independent of macOS permissions; `protectedTarget` does not
+mean an application's Accessibility API is disabled. Allowing Ditch windows does
+not change the Full Access requirement, snapshot validation or lease revocation.
+It does not establish a boundary against an agent using Ditch's own settings UI:
+the signed-UI check on permission setup authenticates the application, not whether
+a human or an automation tool clicked a control.
 
 ## OSS tool routing
+
+Each launch now persists a sanitized `desktop-setup` record in `runtime.log` with its agent/run
+IDs and an explicit readiness reason. Expected ineligibility (for example,
+`requiresFullAccess`, `remoteExecution` or `nativeUnavailable`) permits ordinary
+chat with that reason in the current developer instructions. A missing bundled
+adapter, unreadable endpoint metadata or failed transport is a setup failure and
+stops the model turn. These failures must not silently become chat-only sessions.
+
+After thread discovery, `Ditch OSS turn setup` records the selected endpoint ID,
+model, thread, policy version, adapter PID and verified tool names. It deliberately
+reports `inference_delivery_verified: false`: submitting instructions to Codex is
+not proof of their delivery to inference. Native operations emit a separate
+`desktop-operation` record in that log with the same run ID, operation ID, state and
+allowlisted error code. No screenshots, captured text, credentials or raw tool
+arguments are logged. A completed dispatch still requires a fresh observation.
 
 `oss_tool_policy.rs` scopes inherited MCP servers and installed/configured plugins
 out of each OSS thread. `features.apps=false` alone does not disable plugin MCP
@@ -95,11 +148,16 @@ is labelled **Visualizer · next turn**; changing it does not alter the active
 turn. Failed submissions retain the choice. Turning it off hides feedback only;
 it does not disable computer use or change permissions.
 
-Native feedback briefly outlines an observed target, pulses a click location, or
-shows a fixed typing/shortcut/scroll icon. It never displays typed text and never
-means an action was verified successful. Fresh observations still verify results.
-The current tools use background delivery: there is no travelling physical cursor.
-Hidden, moved, minimized, or partly covered windows receive no overlay.
+Visual actions move the physical pointer through Peekaboo. A non-interactive
+Ditch cursor indicator samples its real position during movement/dragging; it
+does not replay a guessed path. Dispatch shows a click/input indicator, and failed
+input shows a red error indicator. The native callbacks schedule feedback without
+delaying dispatch. The indicator does not prove application-level success.
+
+Background Accessibility actions retain target outlines/pulses and never pretend
+to move the pointer. Hidden or covered background targets receive no outline.
+Typed text and captured labels never appear in overlays. Fresh observations
+remain necessary to verify results.
 
 `turn_options.computer_use_visualizer` is optional request metadata, defaulting
 to false. The runtime captures it on the eligible run's lease and supplies it to
@@ -133,9 +191,20 @@ must have matching live code signatures, team and expected executable identities
 debug builds also support explicitly ad-hoc-signed bundled executables.
 
 An OS-backed lock prevents simultaneous desktop operations from Ditch instances.
-Snapshots are single-use, expire after 30 seconds, and are discarded on revocation.
-Window/process generation and outcome validation reuse Peekaboo's exact-target
-APIs. Partial or uncertain dispatch returns `outcome_unknown`; it is not replayed.
+Snapshots are single-use and discarded on revocation or replacement. Accessibility
+snapshots expire after 30 seconds; visual snapshots after 60 seconds. Target
+references bind the turn, process launch time, bundle, window ID and bounds.
+Foreground input also checks the active application/window and point occlusion;
+drag requires an unobscured window. Accessibility actions retain Peekaboo's
+exact-target checks. Partial or uncertain input returns `outcome_unknown` and
+must be observed before another action; it is not automatically replayed.
+
+The runtime limits each turn to 120 non-status operations, 40 observations, three
+observations without a successful action, and three consecutive observation/input
+failures. Four identical image observations of the same target stop further
+desktop work even if dispatches reported success. Only an in-memory image hash is
+used for this check. A fresh user turn resets limits. These bounds stop repeated
+tool loops; they cannot guarantee that Qwen interprets every screen correctly.
 
 Images are bounded to 1280 pixels on the longest edge and 2 MiB encoded PNG;
 accessibility summaries to 32 KiB and complete native responses to 3 MiB. Raw
@@ -281,3 +350,170 @@ qualified with macOS permissions. Before release, use a disposable text document
 
 Do not run these checks against a document or application where unintended input
 would have consequential effects.
+
+## Fresh/resumed inference contract and Arc verification
+
+The opt-in Rust regression test
+`actual_inference_request_preserves_current_policy_on_fresh_and_resumed_threads`
+exports the production instructions, schemas and diagnostic restrictions, then
+runs `scripts/check-oss-turn-contract.py` against installed Codex and a loopback
+Responses fixture. It checks the actual outgoing developer messages and tool
+catalogue for a fresh thread, a resumed current thread, and a resumed thread with
+obsolete CUA references. Resume must retain the original thread and recall marker.
+The fixture never performs desktop actions or external inference.
+
+```sh
+DITCH_TEST_CODEX_BINARY=/absolute/path/to/codex \
+  cargo test -p ditchd actual_inference_request_preserves_current_policy \
+  --lib -- --ignored --nocapture
+```
+
+The printed evidence directory contains `policy.json`. To compare an actual OSS
+model, pass that file to the same Python script with `--codex`, `--build-root`,
+`--endpoint` and `--model`. This is opt-in inference against the specified custom
+endpoint. The test relay rejects executable/delegation tools before forwarding,
+does not follow redirects, and uses a disposable Codex home without OpenAI
+credentials. The MCP server is still a fixture, not a native desktop test. An
+optional `DITCH_OLLAMA_SMOKE_TOKEN` stays in the relay, not Codex's environment.
+
+`TurnOptions.desktop_verification_target` is an optional diagnostic restriction
+(`Arc` or `DitchStaging`), not an additional permission or a UI default. It requires
+an eligible local Full Access OSS turn. It disables shell/delegation/image-file
+tools and restricts native discovery, observation and action to that exact bundle
+ID. Normal turns omit it. Native ABI 3 is required so a stale module cannot silently
+ignore the target restriction. This is not complete host credential isolation;
+the target application's own capabilities remain relevant.
+
+After rebuilding and launching signed Staging, the explicit native probe is:
+
+```sh
+python3 scripts/check-signed-desktop.py \
+  --support "$HOME/Library/Application Support/The Ditch Staging" \
+  --project-id EXISTING_LOCAL_PROJECT_UUID \
+  --endpoint-id SELECTED_OLLAMA_ENDPOINT_UUID \
+  --model qwen3.5:9b --report target/arc-verification.json
+```
+
+In a Commercial checkout, prefix script paths with `community/`. The probe refuses
+production and builds lacking `desktop_verification_v1` or `desktop_automation_v2`. It creates a diagnostic
+agent, opens one new Arc tab at example.com with a unique URL marker, and enables
+the existing visualizer. It does not create Kanban tasks or invoke GitHub. It
+requires native action receipts and a subsequent fresh observation containing
+that marker; model claims alone cannot pass. A timeout requests cancellation.
+The report contains IDs, states and verification booleans, not browser contents.
+It requires visual observations and foreground action receipts. Actual overlay appearance and pointer travel still need visual verification on the signed application.
+
+Qualify ordinary Arc operation before running repeated browser/Kanban workflows.
+Record native failures separately from model mistakes, false completion claims,
+latency and retries. Do not generalize a fixture pass to autonomous desktop
+reliability or delete an old conversation to conceal a resume failure.
+
+### Validation recorded on 2026-11-16
+
+The installed Codex 0.166.0 passed the loopback request-boundary checks for fresh,
+resumed current, and resumed legacy-CUA threads. Current developer instructions,
+the four desktop schemas, and retained history reached the inference request;
+diagnostic shell/delegation tools were absent.
+
+Live Qwen3.5:9b checks against the selected Ollama endpoint selected the correct
+desktop tool in all three cases. One run passed the recall checks; a repeat
+inserted an extra character in the synthetic recall marker on both resumed turns.
+The original marker was present in each outgoing request. These are recorded
+model transcription failures, not evidence of dropped history, and the test
+continues to fail them. Fixture success does not establish native Arc reliability.
+
+Targeted Rust checks passed for both editions. A direct build of the current
+Swift module and target-policy tests passed (four tests, with the GUI-host-only
+self-PID test skipped). The signed Staging rebuild failed during Xcode package
+resolution/result-bundle writes because of filesystem permissions. The running
+older build was correctly refused by the native probe before creating an agent.
+Actual signed-host Arc input and visualizer visibility remain unverified until
+Staging is rebuilt and the native probe completes.
+
+### Visual input implementation and validation — 2026-11-17
+
+The native visual route, turn-scoped target registry, cursor feedback, separate
+Accessibility-only observation, runtime recovery limits, and v3 developer
+instructions are implemented in Community and shared by Commercial. No vendor
+source or inference provider configuration was changed by this increment.
+
+The native module compiles against the pinned Peekaboo dependencies. Native
+regressions cover coordinate scaling, same-host occlusion, turn ownership,
+Accessibility snapshot publication without images, cancellation and overlay
+input isolation. Community and Commercial runtime tests cover scope, receipts,
+revocation and bounded recovery.
+
+The installed Codex 0.166.0 passed the actual inference-request checks on fresh
+and resumed threads with the new schemas. A live Qwen3.5:9b image fixture at the
+selected Ollama endpoint passed: the exact MCP PNG reached the inference request,
+and Qwen identified the randomly placed red half correctly. This is image
+transport/perception evidence, not proof of successful desktop automation.
+
+Signed Staging build was attempted using the existing Developer ID identity.
+Xcode package resolution failed on sandbox-denied cache/result writes outside the
+workspace. No new signed app was launched, so physical clicks, visible cursor
+travel, Ditch task creation and clean-install behavior remain unqualified.
+Rebuild and launch signed Staging, confirm desktop_automation_v2, then run the Arc
+probe above and a Ditch Staging workflow before treating this as release-ready.
+Status/menu-bar integration and absolute host-account inference isolation remain
+separate unresolved work; this increment does not claim to implement either.
+
+### Discovery repair and validation — 2026-11-17
+
+The morning signed Staging run exposed a native registration bug: a missing
+optional LaunchServices timestamp caused `applicationGone`, and one registration
+failure aborted the complete list. Discovery failures also bypassed the failure
+counter. The general repair above applies to all applications; Staging is the
+regression scenario. OSS instruction policy v4 prioritizes current tool errors
+over stale conversation summaries and prohibits substituting production or shell
+launches for failed target discovery. These instructions are not a guarantee of
+model compliance.
+
+Validation of this repair:
+
+- Native module compiled against the existing pinned dependency objects; the
+  direct XCTest runner executed 28 tests, 27 passed and one GUI-host test skipped.
+  New regressions cover kernel identity, missing identity, PID reuse, bundle and
+  session mismatches, partial/empty discovery, and malformed argument diagnostics.
+- Community and Commercial: nine tool-integration tests passed in each edition;
+  one opt-in live transport test was not run in each suite. Five OSS-policy tests
+  passed in Commercial. The real installed Codex request-boundary test also passed
+  for fresh, resumed-current and resumed-legacy threads with policy v4. That test
+  uses a loopback fixture, not live Qwen inference or desktop input.
+- Four offline signed-probe regressions passed. They reject nonexistent,
+  duplicate, wrong-project, non-Backlog and GitHub-linked tasks.
+- Full SwiftPM testing was blocked writing its existing build directory. The
+  signed Staging build was attempted separately and failed during Xcode package
+  resolution with filesystem permission errors. No repaired signed application
+  was launched. Real cursor visibility and Qwen task creation remain unverified.
+
+The signed probe now supports `--target DitchStaging`. This explicitly creates
+one uniquely titled diagnostic Backlog task through the UI in the supplied
+project. It requires native foreground click receipts, a later visual observation,
+and a read-only database check for exactly one task in that project, Backlog state,
+and no GitHub source. It leaves the task in place for inspection. No task API or
+database write is used by the probe to create it. Visual cursor appearance still
+requires observation by the tester; a dispatch receipt cannot prove it was visible.
+
+After rebuilding and launching signed Staging, from the Commercial root:
+
+```sh
+python3 community/scripts/check-signed-desktop.py \
+  --support "$HOME/Library/Application Support/The Ditch Staging" \
+  --project-id EXISTING_LOCAL_PROJECT_UUID \
+  --endpoint-id SELECTED_OLLAMA_ENDPOINT_UUID \
+  --model qwen3.5:9b --target DitchStaging \
+  --expected-build "$(./scripts/build-identifier)" \
+  --timeout 300 --report target/staging-desktop-verification.json
+```
+
+`--expected-build` rejects a mismatched Rust runtime build before starting an
+agent; it does not independently attest native module contents. Use the normal
+complete signed-app build, not a manually replaced dylib. In Community, omit the
+`community/` script prefix. To exercise an existing failing conversation, add
+`--resume-thread THREAD_UUID` and use a separate report path. Resume requires an
+inactive thread with the same project, endpoint and model. Verification reads
+only new transcript bytes and operation receipts and requires the same thread ID;
+old successful actions cannot satisfy the new run. Each probe run creates its own
+uniquely named task if it succeeds. OpenAI inference is never requested by this
+probe; provider isolation beyond the existing diagnostic restrictions is separate.

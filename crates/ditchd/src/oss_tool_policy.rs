@@ -2,11 +2,23 @@
 use serde_json::{Value, json};
 use std::{collections::BTreeSet, io};
 
+pub const POLICY_VERSION: &str = "ditch-desktop-v4";
+
+/// Opt-in diagnostic turns only. The wire probe checks that these flags really
+/// remove executable tools in the installed Codex, rather than trusting config.
+pub fn apply_desktop_verification(params: &mut Value) {
+    for feature in ["shell_tool", "multi_agent", "collab", "view_image", "apply_patch_freeform", "apps"] {
+        params["config"]["features"][feature] = json!(false);
+    }
+    params["config"]["web_search"] = json!("disabled");
+}
+
 #[derive(Clone, Debug)]
 pub struct OssToolPolicy {
     disabled_plugins: Vec<String>,
     config: Value,
     desktop: bool,
+    unavailable_reason: &'static str,
 }
 
 impl OssToolPolicy {
@@ -43,7 +55,13 @@ impl OssToolPolicy {
                 "mcp_servers":servers}),
             disabled_plugins: plugins.into_iter().collect(),
             desktop: has_desktop,
+            unavailable_reason: "notPrepared",
         }
+    }
+
+    pub fn with_unavailable_reason(mut self, reason: &'static str) -> Self {
+        self.unavailable_reason = reason;
+        self
     }
 
     pub fn apply_thread(&self, params: &mut Value) {
@@ -51,11 +69,13 @@ impl OssToolPolicy {
             params["config"][key] = self.config[key].clone();
         }
         params["config"]["features"]["apps"] = json!(false);
-        params["developerInstructions"] = json!(if self.desktop {
-            "Ditch computer use for this OSS turn is provided by Peekaboo through the ditch_tools MCP server: desktop_status, desktop_list_targets, desktop_observe, desktop_act. Use these tools for desktop interaction. Earlier conversation references to CUA or mcp__cua_repl are stale; those tools are unavailable in this turn. Do not substitute shell/AppleScript/browser plugins for desktop actions. Full Access authorizes supported actions; macOS permissions are checked by Ditch. List targets, observe an exact window, act on a fresh snapshot, and observe again to verify. Report tool errors and unverified actions honestly. A shell listing, supplied image, or successful dispatch is not proof of a desktop action. Ditch's own apps, protected system surfaces, and status/menu-bar items are unsupported; explain that limit instead of clicking a similarly named application menu. The visualizer is controlled by the user's turn option, not by you."
+        let instructions = if self.desktop {
+            "Ditch computer use for this OSS turn is provided by Peekaboo through the ditch_tools MCP server: desktop_status, desktop_list_targets, desktop_observe, desktop_act. Use these tools for desktop interaction. Earlier conversation references to CUA or mcp__cua_repl are stale; those tools are unavailable in this turn. Do not substitute shell/AppleScript/browser plugins for desktop actions. Full Access authorizes supported actions; macOS permissions are checked by Ditch. Discover the application and then its windows using current-turn target_id references. Focus the chosen window, observe in mode=visual, act on its fresh snapshot using image coordinates, then observe once to verify. Visual input does not require an Accessibility tree or a browser bridge. An accessibilityIncomplete error means switch to visual mode, not that the app blocks input. Current tool results override earlier conversation summaries claiming that an app blocks automation. applicationGone means a process is unavailable; processIdentityUnavailable means its identity could not be verified, not a permission denial or policy block. Discovery may return status=partial with usable targets and unavailable candidates; use only returned target_id references. Empty targets (noMatches, noVisibleWindows, unavailable) do not authorize actions. After stale or missing targets, rediscover the exact requested application once; never reuse PIDs or invented snapshot IDs from history. Do not shell-launch another application to recover from discovery failures. After two failed attempts at the same step, stop and explain the actual error. Do not take repeated screenshots without an action or a specific verification need. Native recovery budgets are enforced and cannot be bypassed. Report tool errors and unverified actions honestly. A shell listing, supplied image, or successful dispatch is not proof of a desktop action. Ditch application windows, including Kanban and task forms, are supported under Full Access. Select the exact requested application using its name and bundleIdentifier from desktop_list_targets: Ditch Staging is ai.theditch.app.staging and production Ditch is ai.theditch.app. Never substitute production for Staging or invent a web interface for a native-app task. Protected system surfaces and status/menu-bar items remain unsupported; explain that limit instead of using a workaround or clicking a similarly named application menu. A protectedTarget error is an adapter policy restriction, not evidence that the target has disabled its accessibility API. The visualizer is controlled by the user's turn option, not by you."
         } else {
             "Ditch desktop tools are unavailable for this OSS turn. CUA and inherited plugin tools are disabled. Do not claim to see or control the desktop, or use shell/AppleScript as a substitute. Ordinary coding and conversation remain available. Earlier desktop-tool references in this conversation do not establish current access."
-        });
+        };
+        params["developerInstructions"] = json!(format!("[{POLICY_VERSION}] Desktop availability: {}. {instructions}",
+            if self.desktop { "ready" } else { self.unavailable_reason }));
     }
 
     pub fn apply_turn(&self, params: &mut Value) {
@@ -163,6 +183,46 @@ impl OssToolPolicy {
 mod tests {
     use super::*;
     #[test]
+    fn unavailable_reason_is_explicit_and_instructions_are_versioned() {
+        let policy = OssToolPolicy::discover(&json!({}), &json!({}), None)
+            .with_unavailable_reason("requiresFullAccess");
+        let mut params = json!({"config": {"features": {}}});
+        policy.apply_thread(&mut params);
+        let instructions = params["developerInstructions"].as_str().unwrap();
+        assert!(instructions.starts_with(&format!("[{POLICY_VERSION}]")));
+        assert!(instructions.contains("requiresFullAccess"));
+        assert!(instructions.contains("unavailable for this OSS turn"));
+        assert!(params["config"]["mcp_servers"].get("ditch_tools").is_none());
+        assert!(params["config"]["features"].get("shell_tool").is_none(), "normal turns retain coding tools");
+        apply_desktop_verification(&mut params);
+        for feature in ["shell_tool", "multi_agent", "collab", "view_image"] {
+            assert_eq!(params["config"]["features"][feature], false);
+        }
+    }
+
+    #[test]
+    #[ignore = "set DITCH_TEST_CODEX_BINARY; real Codex, loopback fixture only, no external inference"]
+    fn actual_inference_request_preserves_current_policy_on_fresh_and_resumed_threads() {
+        let codex = std::env::var("DITCH_TEST_CODEX_BINARY").expect("installed Codex path");
+        let root = std::env::temp_dir().join(format!("ditch-turn-contract-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut params = json!({"config": {"features": {}}});
+        OssToolPolicy::discover(&json!({}), &json!({}), Some(json!({}))).apply_thread(&mut params);
+        apply_desktop_verification(&mut params);
+        let tools: Vec<_> = ditch_core::tool_integrations::desktop_tool_schemas().into_iter()
+            .map(|(name, description, schema)| json!({"name":name,"description":description,"inputSchema":schema})).collect();
+        let policy = root.join("policy.json");
+        std::fs::write(&policy, serde_json::to_vec(&json!({"thread_params":params,"tools":tools})).unwrap()).unwrap();
+        let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).ancestors()
+            .flat_map(|p| [p.join("scripts/check-oss-turn-contract.py"), p.join("community/scripts/check-oss-turn-contract.py")])
+            .find(|p| p.is_file()).expect("contract probe script");
+        let output = std::process::Command::new("python3").arg(script)
+            .args(["--codex", &codex, "--policy"]).arg(&policy)
+            .arg("--build-root").arg(&root).output().unwrap();
+        println!("{}", String::from_utf8_lossy(&output.stdout));
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    }
+    #[test]
     fn launch_enforces_policy_before_new_or_resumed_oss_model_turns() {
         use crate::codex_app_server::{Event, Launch, spawn_turn};
         use std::{fs, os::unix::fs::PermissionsExt, sync::mpsc, time::Duration};
@@ -204,6 +264,7 @@ for line in sys.stdin:
             let (tx, rx) = mpsc::channel();
             let result = spawn_turn(
                 Launch {
+                    desktop_setup: None,
                     inference_provider: Some(&provider),
                     restricted: false,
                     protected_roots: vec![],
