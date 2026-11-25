@@ -3035,6 +3035,7 @@ void main() {
           identity: 'message-older',
           role: ChatMessageRole.assistant,
           text: 'Older history',
+          arrival: ChatMessageArrival.history,
           createdAt: DateTime(2025),
         ),
       );
@@ -4842,6 +4843,7 @@ void main() {
             identity: 'older-formatted',
             role: ChatMessageRole.assistant,
             text: '**Older history**',
+            arrival: ChatMessageArrival.history,
             createdAt: DateTime(2025),
           ),
         ),

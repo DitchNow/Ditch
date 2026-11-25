@@ -10,7 +10,7 @@ import 'dart:io';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
-import 'package:flutter/rendering.dart' show ScrollDirection;
+import 'package:flutter/rendering.dart';
 import 'package:flutter/services.dart';
 import 'package:xterm/xterm.dart';
 
@@ -48,6 +48,7 @@ part 'ollama_ui.dart';
 part 'agent_model_picker.dart';
 part 'agent_composer.dart';
 part 'tool_integration_ui.dart';
+part 'conversation_scroll.dart';
 
 const ditchDeploymentEnvironment = runtimeDeploymentEnvironment;
 const ditchRelayOrigin = String.fromEnvironment(
@@ -1038,11 +1039,14 @@ Set<String> unreadResultAttentionIdsForAgent({
 
 enum ChatMessageRole { user, assistant, system, tool }
 
+enum ChatMessageArrival { history, live }
+
 class AgentChatMessage {
   AgentChatMessage({
     required this.role,
     required this.text,
     required this.createdAt,
+    this.arrival = ChatMessageArrival.live,
     String? identity,
   }) : identity = identity ?? 'local-message-${_nextChatMessageIdentity++}';
 
@@ -1050,6 +1054,8 @@ class AgentChatMessage {
   final ChatMessageRole role;
   final String text;
   final DateTime createdAt;
+  // UI provenance, independent of the persisted identity/content used to dedupe.
+  final ChatMessageArrival arrival;
 }
 
 int _nextChatMessageIdentity = 1;
@@ -1105,7 +1111,12 @@ class ConversationItem {
 List<ConversationItem> buildConversationItems(
   List<AgentChatMessage> messages, {
   required bool isWorking,
+  List<ConversationItem> previousItems = const [],
 }) {
+  final previousGroups = <String, String>{
+    for (final item in previousItems)
+      for (final tool in item.toolMessages) tool.identity: item.identity,
+  };
   final items = <ConversationItem>[];
   var segmentStart = 0;
   while (segmentStart < messages.length) {
@@ -1125,7 +1136,12 @@ List<ConversationItem> buildConversationItems(
         if (!emittedTools) {
           items.add(
             ConversationItem.toolGroup(
-              identity: 'tool-activity:${tools.first.identity}',
+              identity:
+                  tools
+                      .map((tool) => previousGroups[tool.identity])
+                      .nonNulls
+                      .firstOrNull ??
+                  'tool-activity:${tools.first.identity}',
               toolMessages: tools,
               isActiveToolGroup: isWorking && segmentEnd == messages.length,
             ),
@@ -1139,218 +1155,6 @@ List<ConversationItem> buildConversationItems(
     segmentStart = segmentEnd;
   }
   return items;
-}
-
-enum ConversationViewportMode { initializing, following, detached }
-
-class ConversationViewportController extends ChangeNotifier {
-  ConversationViewportController({ScrollController? scrollController})
-    : scrollController = scrollController ?? ScrollController();
-
-  static const nearLatestThreshold = 72.0;
-  static const _arrivalDuration = Duration(milliseconds: 180);
-
-  final ScrollController scrollController;
-  ConversationViewportMode _mode = ConversationViewportMode.initializing;
-  final Set<String> _knownItemIds = {};
-  List<String> _orderedItemIds = const [];
-  final Set<String> _unseenItemIds = {};
-  bool _frameScheduled = false;
-  bool _disposed = false;
-  int _openingGeneration = 0;
-  VoidCallback? _onInitialPositioned;
-
-  ConversationViewportMode get mode => _mode;
-  int get unseenCount => _unseenItemIds.length;
-  bool get isDetached => _mode == ConversationViewportMode.detached;
-
-  // The transcript is reversed. All coordinate assumptions stay here:
-  // visual latest = minScrollExtent; visual oldest = maxScrollExtent.
-  double get _distanceFromLatest {
-    if (!scrollController.hasClients) return 0;
-    final position = scrollController.position;
-    return position.pixels - position.minScrollExtent;
-  }
-
-  bool get isNearLatest =>
-      !scrollController.hasClients ||
-      _distanceFromLatest <= nearLatestThreshold;
-
-  bool get isNearOldest {
-    if (!scrollController.hasClients) return false;
-    final position = scrollController.position;
-    return position.maxScrollExtent - position.pixels <= nearLatestThreshold;
-  }
-
-  void beginOpening({VoidCallback? onInitialPositioned}) {
-    _openingGeneration += 1;
-    _mode = ConversationViewportMode.initializing;
-    _knownItemIds.clear();
-    _orderedItemIds = const [];
-    _unseenItemIds.clear();
-    _onInitialPositioned = onInitialPositioned;
-    _scheduleLatest(immediate: true, generation: _openingGeneration);
-    notifyListeners();
-  }
-
-  void attach({VoidCallback? onInitialPositioned}) {
-    if (_mode == ConversationViewportMode.initializing) {
-      _onInitialPositioned ??= onInitialPositioned;
-      _scheduleLatest(immediate: true, generation: _openingGeneration);
-    } else if (_mode == ConversationViewportMode.following) {
-      _scheduleLatest(immediate: true, generation: _openingGeneration);
-    }
-  }
-
-  void synchronizeItems(List<String> itemIds) {
-    if (_disposed) return;
-    if (_mode == ConversationViewportMode.initializing) {
-      _knownItemIds
-        ..clear()
-        ..addAll(itemIds);
-      _orderedItemIds = List.of(itemIds);
-      _scheduleLatest(immediate: true, generation: _openingGeneration);
-      return;
-    }
-
-    final previousOrder = _orderedItemIds;
-    final added = itemIds.where((id) => !_knownItemIds.contains(id)).toList();
-    final olderHistoryOnly =
-        added.isNotEmpty &&
-        itemIds.length >= previousOrder.length &&
-        _listSuffixEquals(itemIds, previousOrder);
-    _knownItemIds
-      ..clear()
-      ..addAll(itemIds);
-    _orderedItemIds = List.of(itemIds);
-    if (added.isEmpty) {
-      if (_mode == ConversationViewportMode.following) {
-        _scheduleLatest(immediate: true, generation: _openingGeneration);
-      }
-      return;
-    }
-    if (olderHistoryOnly) return;
-
-    if (_mode == ConversationViewportMode.detached) {
-      _preserveDetachedAnchor(added);
-    } else {
-      _scheduleLatest(immediate: true, generation: _openingGeneration);
-    }
-  }
-
-  bool _listSuffixEquals(List<String> values, List<String> suffix) {
-    if (suffix.length > values.length) return false;
-    final start = values.length - suffix.length;
-    for (var index = 0; index < suffix.length; index++) {
-      if (values[start + index] != suffix[index]) return false;
-    }
-    return true;
-  }
-
-  bool handleScrollNotification(ScrollNotification notification) {
-    if (_disposed || !scrollController.hasClients) return false;
-    final userDriven = switch (notification) {
-      ScrollStartNotification(:final dragDetails) => dragDetails != null,
-      ScrollUpdateNotification(:final dragDetails) => dragDetails != null,
-      UserScrollNotification(:final direction) =>
-        direction != ScrollDirection.idle,
-      _ => false,
-    };
-
-    if (isNearLatest) {
-      _setFollowing();
-    } else if (userDriven && _mode != ConversationViewportMode.detached) {
-      _mode = ConversationViewportMode.detached;
-      notifyListeners();
-    }
-    return false;
-  }
-
-  void showLatest() {
-    if (_disposed) return;
-    _mode = ConversationViewportMode.following;
-    _unseenItemIds.clear();
-    notifyListeners();
-    if (!scrollController.hasClients) {
-      _scheduleLatest(immediate: true, generation: _openingGeneration);
-      return;
-    }
-    final position = scrollController.position;
-    final distance = _distanceFromLatest;
-    if (distance > position.viewportDimension * 4) {
-      scrollController.jumpTo(position.minScrollExtent);
-    } else {
-      unawaited(
-        scrollController.animateTo(
-          position.minScrollExtent,
-          duration: _arrivalDuration,
-          curve: Curves.easeOut,
-        ),
-      );
-    }
-  }
-
-  void _setFollowing() {
-    if (_mode == ConversationViewportMode.following && _unseenItemIds.isEmpty) {
-      return;
-    }
-    _mode = ConversationViewportMode.following;
-    _unseenItemIds.clear();
-    notifyListeners();
-  }
-
-  void _preserveDetachedAnchor(List<String> added) {
-    if (!scrollController.hasClients) {
-      _unseenItemIds.addAll(added);
-      notifyListeners();
-      return;
-    }
-    final position = scrollController.position;
-    final oldPixels = position.pixels;
-    final oldMaxExtent = position.maxScrollExtent;
-    _unseenItemIds.addAll(added);
-    notifyListeners();
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (_disposed || !scrollController.hasClients) return;
-      final current = scrollController.position;
-      final extentGrowth = current.maxScrollExtent - oldMaxExtent;
-      if (extentGrowth <= 0) return;
-      scrollController.jumpTo(
-        (oldPixels + extentGrowth).clamp(
-          current.minScrollExtent,
-          current.maxScrollExtent,
-        ),
-      );
-    });
-  }
-
-  void _scheduleLatest({required bool immediate, required int generation}) {
-    if (_disposed || _frameScheduled) return;
-    _frameScheduled = true;
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      _frameScheduled = false;
-      if (_disposed || generation != _openingGeneration) return;
-      if (!scrollController.hasClients) return;
-      final position = scrollController.position;
-      scrollController.jumpTo(position.minScrollExtent);
-      if (_mode == ConversationViewportMode.initializing) {
-        _mode = ConversationViewportMode.following;
-        final callback = _onInitialPositioned;
-        _onInitialPositioned = null;
-        notifyListeners();
-        callback?.call();
-      }
-    });
-  }
-
-  @override
-  void dispose() {
-    _disposed = true;
-    _openingGeneration += 1;
-    _onInitialPositioned = null;
-    scrollController.dispose();
-    super.dispose();
-  }
 }
 
 List<AgentSession> sessionsForProject(
@@ -3260,6 +3064,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen>
         final message = _agentChatMessageFromRuntime(
           messageJson,
           identity: agentId == null ? null : 'persisted:$agentId:$ordinal',
+          arrival: ChatMessageArrival.history,
         );
         if (message != null && agentId != null) {
           messagesByAgent.putIfAbsent(agentId, () => []).add(message);
@@ -5066,6 +4871,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen>
   AgentChatMessage? _agentChatMessageFromRuntime(
     Object? messageJson, {
     String? identity,
+    ChatMessageArrival arrival = ChatMessageArrival.live,
   }) {
     if (messageJson is! Map<String, dynamic>) {
       return null;
@@ -5086,6 +4892,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen>
       role: role,
       text: text,
       createdAt: createdAt,
+      arrival: arrival,
     );
   }
 
@@ -5223,7 +5030,11 @@ class _CommandCenterScreenState extends State<CommandCenterScreen>
     if (!refreshLatest && session.messagesLoaded && !session.hasOlderMessages) {
       return;
     }
-    final initial = refreshLatest || !session.messagesLoaded;
+    final wasLoaded = session.messagesLoaded;
+    final initial = refreshLatest || !wasLoaded;
+    final arrival = refreshLatest && wasLoaded
+        ? ChatMessageArrival.live
+        : ChatMessageArrival.history;
     setState(() {
       session.messagesLoading = true;
       session.historyError = null;
@@ -5263,6 +5074,7 @@ class _CommandCenterScreenState extends State<CommandCenterScreen>
             identity: sequence is int
                 ? 'persisted:${session.localId}:$sequence'
                 : null,
+            arrival: arrival,
           );
           if (message != null) pageItems.add(message);
         }
@@ -9305,12 +9117,89 @@ class ConversationTranscript extends StatefulWidget {
 
 class _ConversationTranscriptState extends State<ConversationTranscript> {
   bool get _canRender => widget.ready || widget.approvals.isNotEmpty;
+  List<ConversationItem> _items = const [];
+  final Map<String, GlobalKey> _anchorKeys = {};
+  List<_ConversationAnchor> _anchors = const [];
+  int _anchorGeneration = 0;
+  bool _historyRequestPending = false;
+
+  GlobalKey _anchorKey(String id) => _anchorKeys.putIfAbsent(id, GlobalKey.new);
+
+  _RenderConversationAnchorMarker? _anchorRenderObject(GlobalKey key) {
+    final element = key.currentContext;
+    // Lazy slivers can deactivate a row during this very layout. Its key may
+    // still have a context until finalization; findRenderObject() rejects it.
+    if (element is! RenderObjectElement || !element.mounted) return null;
+    final row = element.renderObject;
+    return row is _RenderConversationAnchorMarker && row.attached ? row : null;
+  }
+
+  void _bindAnchoring() {
+    final controller = widget.viewport.scrollController;
+    if (controller is _ConversationScrollController) {
+      controller.anchorCorrection = _anchorCorrection;
+    }
+  }
+
+  void _captureAnchors() {
+    _anchors = const [];
+    final generation = ++_anchorGeneration;
+    if (!widget.viewport.isDetached || !mounted) return;
+    final anchors = <_ConversationAnchor>[];
+    for (final entry in _anchorKeys.entries) {
+      final row = _anchorRenderObject(entry.value);
+      if (row == null) continue;
+      final y = row.viewportY;
+      if (y != null &&
+          y < widget.viewport.scrollController.position.viewportDimension &&
+          y + row.layoutHeight > 0) {
+        anchors.add(_ConversationAnchor(entry.value, y));
+      }
+    }
+    // Prefer a row whose top is visible over a large partially visible group.
+    anchors.sort(
+      (a, b) => (a.y < 0 ? double.infinity : a.y).compareTo(
+        b.y < 0 ? double.infinity : b.y,
+      ),
+    );
+    _anchors = anchors;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted && generation == _anchorGeneration) _anchors = const [];
+    });
+  }
+
+  double? _anchorCorrection(double pixels) {
+    if (!mounted || !widget.viewport.isDetached || _anchors.isEmpty) {
+      return null;
+    }
+    for (final anchor in _anchors) {
+      final row = _anchorRenderObject(anchor.key);
+      if (row == null) continue;
+      final y = row.viewportY;
+      if (y == null) continue;
+      _anchors = const [];
+      // AxisDirection.up: increasing pixels moves an existing row downward.
+      return anchor.y - y;
+    }
+    return null;
+  }
+
+  @override
+  void dispose() {
+    final controller = widget.viewport.scrollController;
+    if (controller is _ConversationScrollController &&
+        controller.anchorCorrection == _anchorCorrection) {
+      controller.anchorCorrection = null;
+    }
+    super.dispose();
+  }
 
   @override
   void initState() {
     super.initState();
+    _bindAnchoring();
     if (_canRender) {
-      widget.viewport.synchronizeItems(_itemIds);
+      _synchronizeItems();
       widget.viewport.attach(onInitialPositioned: widget.onInitialPositioned);
     }
     if (!widget.ready) {
@@ -9324,22 +9213,36 @@ class _ConversationTranscriptState extends State<ConversationTranscript> {
   void didUpdateWidget(ConversationTranscript oldWidget) {
     super.didUpdateWidget(oldWidget);
     if (oldWidget.viewport != widget.viewport) {
+      final oldController = oldWidget.viewport.scrollController;
+      if (oldController is _ConversationScrollController &&
+          oldController.anchorCorrection == _anchorCorrection) {
+        oldController.anchorCorrection = null;
+      }
+      _anchors = const [];
+      _anchorKeys.clear();
+      _bindAnchoring();
       if (_canRender) {
         widget.viewport.attach(onInitialPositioned: widget.onInitialPositioned);
       }
+    } else {
+      _captureAnchors();
+    }
+    if (oldWidget.loadingOlder && !widget.loadingOlder) {
+      _historyRequestPending = false;
     }
     if (_canRender) {
-      widget.viewport.synchronizeItems(_itemIds);
+      _synchronizeItems();
       if (!oldWidget.ready && oldWidget.approvals.isEmpty) {
         widget.viewport.attach(onInitialPositioned: widget.onInitialPositioned);
       }
     }
   }
 
-  List<ConversationItem> get _items {
+  void _synchronizeItems() {
     final items = buildConversationItems(
       widget.messages,
       isWorking: widget.isWorking,
+      previousItems: widget.viewport._items,
     );
     for (final approval in widget.approvals) {
       final index = items.indexWhere(
@@ -9350,11 +9253,16 @@ class _ConversationTranscriptState extends State<ConversationTranscript> {
         ConversationItem.approval(approval),
       );
     }
-    return items;
+    _items = List.unmodifiable(items);
+    widget.viewport.synchronizeItems(_items);
+    final retained = <String>{
+      for (final item in items) ...[
+        item.identity,
+        for (final tool in item.toolMessages) 'tool-entry:${tool.identity}',
+      ],
+    };
+    _anchorKeys.removeWhere((id, _) => !retained.contains(id));
   }
-
-  List<String> get _itemIds =>
-      _items.map((item) => item.identity).toList(growable: false);
 
   @override
   Widget build(BuildContext context) {
@@ -9378,6 +9286,10 @@ class _ConversationTranscriptState extends State<ConversationTranscript> {
         widget.historyError != null;
     final showEmptyState = widget.messages.isEmpty && widget.approvals.isEmpty;
     final items = _items;
+    final indices = <String, int>{
+      for (var i = 0; i < items.length; i++)
+        items[i].identity: items.length - 1 - i,
+    };
     return Stack(
       fit: StackFit.expand,
       children: [
@@ -9387,13 +9299,22 @@ class _ConversationTranscriptState extends State<ConversationTranscript> {
                 notification.metrics.axis != Axis.vertical) {
               return false;
             }
-            widget.viewport.handleScrollNotification(notification);
-            if ((notification is ScrollUpdateNotification ||
-                    notification is ScrollEndNotification) &&
+            final towardHistory = widget.viewport.handleScrollNotification(
+              notification,
+            );
+            if (towardHistory &&
                 widget.viewport.isNearOldest &&
                 widget.hasOlderMessages &&
-                !widget.loadingOlder) {
+                !widget.loadingOlder &&
+                !_historyRequestPending &&
+                widget.historyError == null) {
+              _historyRequestPending = true;
               widget.onLoadOlder();
+              WidgetsBinding.instance.addPostFrameCallback((_) {
+                if (mounted && !widget.loadingOlder) {
+                  _historyRequestPending = false;
+                }
+              });
             }
             return false;
           },
@@ -9404,6 +9325,10 @@ class _ConversationTranscriptState extends State<ConversationTranscript> {
               key: PageStorageKey<String>('transcript-${widget.key}'),
               controller: controller,
               reverse: true,
+              findItemIndexCallback: (key) {
+                if (key is! ValueKey<String>) return null;
+                return indices[key.value];
+              },
               padding: const EdgeInsets.fromLTRB(12, 12, 12, 20),
               itemCount: showEmptyState
                   ? 1
@@ -9425,14 +9350,20 @@ class _ConversationTranscriptState extends State<ConversationTranscript> {
                 final item = items[items.length - 1 - index];
                 return KeyedSubtree(
                   key: ValueKey(item.identity),
-                  child: item.approval != null
-                      ? InlineApprovalCard(approval: item.approval!)
-                      : item.isToolGroup
-                      ? ToolActivityGroup(
-                          messages: item.toolMessages,
-                          active: item.isActiveToolGroup,
-                        )
-                      : AgentChatBubble(message: item.message!),
+                  child: _ConversationAnchorMarker(
+                    key: _anchorKey(item.identity),
+                    child: item.approval != null
+                        ? InlineApprovalCard(approval: item.approval!)
+                        : item.isToolGroup
+                        ? ToolActivityGroup(
+                            messages: item.toolMessages,
+                            active: item.isActiveToolGroup,
+                            anchorKeyForTool: (id) =>
+                                _anchorKey('tool-entry:$id'),
+                            onBeforeResize: _captureAnchors,
+                          )
+                        : AgentChatBubble(message: item.message!),
+                  ),
                 );
               },
             ),
@@ -9638,11 +9569,15 @@ class ToolActivityGroup extends StatefulWidget {
   const ToolActivityGroup({
     required this.messages,
     required this.active,
+    this.anchorKeyForTool,
+    this.onBeforeResize,
     super.key,
   });
 
   final List<AgentChatMessage> messages;
   final bool active;
+  final GlobalKey Function(String)? anchorKeyForTool;
+  final VoidCallback? onBeforeResize;
 
   @override
   State<ToolActivityGroup> createState() => _ToolActivityGroupState();
@@ -9698,7 +9633,10 @@ class _ToolActivityGroupState extends State<ToolActivityGroup> {
                       borderRadius: BorderRadius.circular(
                         context.ditch.radiusMedium,
                       ),
-                      onTap: () => setState(() => _expanded = !_expanded),
+                      onTap: () {
+                        widget.onBeforeResize?.call();
+                        setState(() => _expanded = !_expanded);
+                      },
                       child: Padding(
                         padding: const EdgeInsets.fromLTRB(12, 8, 8, 8),
                         child: Row(
@@ -9746,39 +9684,44 @@ class _ToolActivityGroupState extends State<ToolActivityGroup> {
                         crossAxisAlignment: CrossAxisAlignment.stretch,
                         children: [
                           for (var index = 0; index < count; index++) ...[
-                            Row(
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              children: [
-                                Expanded(
-                                  child: SelectionArea(
-                                    child: Text(
-                                      widget.messages[index].text,
-                                      style: Theme.of(context)
-                                          .textTheme
-                                          .bodySmall
-                                          ?.copyWith(
-                                            color: foreground,
-                                            height: 1.4,
-                                            fontFamily: 'SF Mono',
-                                            fontSize: 12.5,
-                                          ),
+                            _ConversationAnchorMarker(
+                              key: widget.anchorKeyForTool?.call(
+                                widget.messages[index].identity,
+                              ),
+                              child: Row(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Expanded(
+                                    child: SelectionArea(
+                                      child: Text(
+                                        widget.messages[index].text,
+                                        style: Theme.of(context)
+                                            .textTheme
+                                            .bodySmall
+                                            ?.copyWith(
+                                              color: foreground,
+                                              height: 1.4,
+                                              fontFamily: 'SF Mono',
+                                              fontSize: 12.5,
+                                            ),
+                                      ),
                                     ),
                                   ),
-                                ),
-                                IconButton(
-                                  visualDensity: VisualDensity.compact,
-                                  tooltip: 'Copy tool action',
-                                  icon: const Icon(
-                                    Icons.copy_outlined,
-                                    size: 15,
-                                  ),
-                                  onPressed: () => Clipboard.setData(
-                                    ClipboardData(
-                                      text: widget.messages[index].text,
+                                  IconButton(
+                                    visualDensity: VisualDensity.compact,
+                                    tooltip: 'Copy tool action',
+                                    icon: const Icon(
+                                      Icons.copy_outlined,
+                                      size: 15,
+                                    ),
+                                    onPressed: () => Clipboard.setData(
+                                      ClipboardData(
+                                        text: widget.messages[index].text,
+                                      ),
                                     ),
                                   ),
-                                ),
-                              ],
+                                ],
+                              ),
                             ),
                             if (index < count - 1)
                               Divider(
